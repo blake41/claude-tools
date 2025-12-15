@@ -48,6 +48,9 @@ COMMANDS
   issue <ID>
       Get details for a specific issue (e.g., "ENG-123")
       
+  comment <ID> "<body>"
+      Add a comment to an issue. Use @username for mentions.
+      
   search <query>
       Search issues by text
       
@@ -75,6 +78,10 @@ EXAMPLES
   # Create issues (auto-assigned to you)
   linear-cli create GTM "Fix login bug"
   linear-cli create GTM "Add dark mode" --description "User requested feature" --priority 2
+  
+  # Add comments
+  linear-cli comment GTM-123 "This is ready for review"
+  linear-cli comment GTM-123 "@niharika.ray can you take a look?"
 
 SETUP
   1. Go to Linear Settings → Security & access → API keys
@@ -114,6 +121,56 @@ cmd_issue() {
   fi
   
   graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty'
+}
+
+cmd_comment() {
+  local issue_id="$1"
+  local body="$2"
+  
+  # Parse identifier like "GTM-3424" into team key and number
+  local team_key="${issue_id%-*}"
+  local number="${issue_id##*-}"
+  
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    echo "❌ Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" >&2
+    exit 1
+  fi
+  
+  # Get the issue's internal UUID
+  local issue_result
+  issue_result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id } } }")
+  local issue_uuid
+  issue_uuid=$(echo "$issue_result" | jq -r '.data.issues.nodes[0].id // empty')
+  
+  if [[ -z "$issue_uuid" ]]; then
+    echo "❌ Issue '$issue_id' not found" >&2
+    exit 1
+  fi
+  
+  # Escape quotes and newlines in body
+  body=$(echo "$body" | sed 's/"/\\\\"/g' | tr '\n' ' ')
+  
+  echo "💬 Adding comment to $issue_id..." >&2
+  
+  local result
+  result=$(graphql "mutation { commentCreate(input: { issueId: \\\"$issue_uuid\\\", body: \\\"$body\\\" }) { success comment { id body createdAt user { name } } } }")
+  
+  # Check for errors
+  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+    echo "$result" | jq -r '.errors[0].message // "Unknown error"' >&2
+    exit 1
+  fi
+  
+  local success
+  success=$(echo "$result" | jq -r '.data.commentCreate.success')
+  
+  if [[ "$success" != "true" ]]; then
+    echo "❌ Failed to add comment" >&2
+    echo "$result" | jq >&2
+    exit 1
+  fi
+  
+  echo "$result" | jq '.data.commentCreate.comment'
 }
 
 cmd_search() {
@@ -268,6 +325,10 @@ case "$CMD" in
   issue)
     [[ $# -lt 1 ]] && { echo "Usage: linear-cli issue <ID>"; exit 1; }
     cmd_issue "$1"
+    ;;
+  comment)
+    [[ $# -lt 2 ]] && { echo "Usage: linear-cli comment <ID> \"<body>\""; exit 1; }
+    cmd_comment "$1" "$2"
     ;;
   search)
     [[ $# -lt 1 ]] && { echo "Usage: linear-cli search <query>"; exit 1; }
