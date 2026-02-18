@@ -13,13 +13,13 @@ const CDP = require('chrome-remote-interface');
 const fs = require('fs');
 const path = require('path');
 
-// Config
+// Config (pidFile set after parsing port)
 const config = {
   port: parseInt(process.env.CDP_PORT) || 9222,
   host: process.env.CDP_HOST || 'localhost',
   output: process.env.BROWSER_LOG_FILE || '/tmp/browser-ctl-logs.jsonl',
   maxSize: 10 * 1024 * 1024, // 10MB max file size, then rotate
-  pidFile: '/tmp/browser-log-collector.pid',
+  pidFile: null, // Set after port is known
 };
 
 // Parse args
@@ -29,6 +29,9 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === '--output' || args[i] === '-o') config.output = args[++i];
   if (args[i] === '--host') config.host = args[++i];
 }
+
+// Set PID file based on port (matches browser-open expectations)
+config.pidFile = `/tmp/browser-log-collector-${config.port}.pid`;
 
 // Write PID file
 fs.writeFileSync(config.pidFile, process.pid.toString());
@@ -163,9 +166,31 @@ async function setupListeners(client, tabInfo) {
   });
 }
 
+// Wait for Chrome to be available (retries with backoff)
+async function waitForChrome(maxAttempts = 30, initialDelay = 1000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await CDP.Version({ port: config.port, host: config.host });
+      return true;
+    } catch (e) {
+      const delay = Math.min(initialDelay * attempt, 5000); // Cap at 5s
+      console.log(`Waiting for Chrome (attempt ${attempt}/${maxAttempts})...`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  return false;
+}
+
 async function main() {
   rotateIfNeeded();
-  
+
+  // Wait for Chrome before proceeding
+  const chromeReady = await waitForChrome();
+  if (!chromeReady) {
+    console.error(`Chrome not available on ${config.host}:${config.port} after retries`);
+    process.exit(1);
+  }
+
   // Write startup marker
   writeLog({
     ts: new Date().toISOString(),

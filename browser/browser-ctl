@@ -6,7 +6,6 @@
  * - Screenshots
  * - Console logs
  * - Click, type, navigate
- * - JavaScript evaluation
  * - Accessibility snapshots
  * 
  * Usage:
@@ -14,18 +13,53 @@
  *   browser-ctl logs                          # Stream console logs
  *   browser-ctl click "button.submit"         # Click element
  *   browser-ctl goto "/accounts"              # Navigate
- *   browser-ctl eval "document.title"         # Run JS
+ *   browser-ctl text "h1"                     # Get text content
  */
 
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
+const http = require('http');
+const { spawn, execSync } = require('child_process');
 
-// Config
-const CDP_PORT = process.env.CDP_PORT || 9222;
+// Profile configuration (must match browser-open)
+const PROFILE_PORTS = {
+  default: 9222,
+  work: 9223,
+  personal: 9224
+};
+
+// Parse --profile flag from args before anything else
+function getProfileFromArgs() {
+  const args = process.argv;
+  const profileIdx = args.findIndex(a => a === '--profile');
+  if (profileIdx !== -1 && args[profileIdx + 1]) {
+    const profile = args[profileIdx + 1];
+    // Remove --profile and its value from argv so commands don't see them
+    process.argv.splice(profileIdx, 2);
+    return profile;
+  }
+  return process.env.BROWSER_PROFILE || 'default';
+}
+
+// Parse --headless flag from args
+function getHeadlessFromArgs() {
+  const args = process.argv;
+  const headlessIdx = args.findIndex(a => a === '--headless');
+  if (headlessIdx !== -1) {
+    process.argv.splice(headlessIdx, 1);
+    return true;
+  }
+  return process.env.BROWSER_HEADLESS === '1';
+}
+
+const CURRENT_PROFILE = getProfileFromArgs();
+const HEADLESS_MODE = getHeadlessFromArgs();
+const CDP_PORT = PROFILE_PORTS[CURRENT_PROFILE] || process.env.CDP_PORT || 9222;
 const CDP_HOST = process.env.CDP_HOST || 'localhost';
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || '/tmp/browser-ctl';
+const PROFILE_DIR = path.join(process.env.HOME, '.chrome-dev-profiles', CURRENT_PROFILE);
 
 // ANSI colors
 const c = {
@@ -42,6 +76,124 @@ const c = {
 // Ensure screenshot directory exists
 if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+}
+
+// Headless mode management
+const HEADLESS_PID_FILE = `/tmp/browser-ctl-headless-${CURRENT_PROFILE}.pid`;
+
+// Check if Chrome is running on the port
+async function isChromeRunning() {
+  return new Promise((resolve) => {
+    http.get(`http://${CDP_HOST}:${CDP_PORT}/json/version`, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const info = JSON.parse(data);
+          // Check if it's headless by looking at the user agent
+          const isHeadless = info['User-Agent']?.includes('Headless');
+          resolve({ running: true, headless: isHeadless, info });
+        } catch (e) {
+          resolve({ running: false });
+        }
+      });
+    }).on('error', () => {
+      resolve({ running: false });
+    });
+  });
+}
+
+// Kill Chrome process on the port
+async function killChromeOnPort() {
+  try {
+    // Use pkill to target Chrome processes specifically
+    execSync(`pkill -f "Google Chrome.*--remote-debugging-port=${CDP_PORT}"`, { encoding: 'utf8' });
+  } catch (e) {
+    // pkill returns non-zero if no processes matched, that's fine
+  }
+
+  // Wait for process to fully exit
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Verify port is free
+  try {
+    execSync(`lsof -ti:${CDP_PORT}`, { encoding: 'utf8' });
+    return false; // Port still in use
+  } catch (e) {
+    return true; // Port is free
+  }
+}
+
+// Start headless Chrome
+async function startHeadlessChrome() {
+  const chromeArgs = [
+    `--remote-debugging-port=${CDP_PORT}`,
+    `--user-data-dir=${PROFILE_DIR}`,
+    '--headless=new',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--window-size=1280,800',
+  ];
+
+  const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+  const chromeProcess = spawn(chromePath, chromeArgs, {
+    detached: true,
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+
+  chromeProcess.on('error', (err) => {
+    console.error(`${c.red}Chrome spawn error: ${err.message}${c.reset}`);
+  });
+
+  chromeProcess.unref();
+
+  // Save PID
+  fs.writeFileSync(HEADLESS_PID_FILE, chromeProcess.pid.toString());
+
+  // Wait for Chrome to be ready
+  for (let i = 0; i < 30; i++) {
+    const status = await isChromeRunning();
+    if (status.running) {
+      return true;
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  return false;
+}
+
+// Ensure headless Chrome is running (switch from headful if needed)
+async function ensureHeadlessChrome() {
+  const status = await isChromeRunning();
+
+  if (status.running && status.headless) {
+    // Already headless, good to go
+    return true;
+  }
+
+  if (status.running && !status.headless) {
+    // Headful is running, need to switch
+    console.log(`${c.yellow}Switching to headless mode...${c.reset}`);
+    const killed = await killChromeOnPort();
+    if (!killed) {
+      console.error(`${c.red}Failed to stop headful Chrome${c.reset}`);
+      return false;
+    }
+  }
+
+  // Start headless
+  const started = await startHeadlessChrome();
+
+  if (started) {
+    console.log(`${c.green}Headless Chrome ready${c.reset}`);
+    return true;
+  } else {
+    console.error(`${c.red}Failed to start headless Chrome${c.reset}`);
+    return false;
+  }
 }
 
 // ARIA Snapshot script - injected into browser for YAML snapshots with refs
@@ -861,15 +1013,34 @@ const SNAPSHOT_SCRIPT = `
 `;
 
 async function connect() {
+  // If headless mode requested, ensure headless Chrome is running
+  if (HEADLESS_MODE) {
+    const ready = await ensureHeadlessChrome();
+    if (!ready) {
+      process.exit(1);
+    }
+  }
+
   try {
     const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
     const contexts = browser.contexts();
     if (contexts.length === 0) {
+      // In headless mode, create a new context if none exists
+      if (HEADLESS_MODE) {
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        return { browser, page, contexts: [context] };
+      }
       console.error(`${c.red}No browser contexts found${c.reset}`);
       process.exit(1);
     }
     const pages = contexts[0].pages();
     if (pages.length === 0) {
+      // In headless mode, create a new page if none exists
+      if (HEADLESS_MODE) {
+        const page = await contexts[0].newPage();
+        return { browser, page, contexts };
+      }
       console.error(`${c.red}No pages found${c.reset}`);
       process.exit(1);
     }
@@ -877,7 +1048,11 @@ async function connect() {
   } catch (err) {
     if (err.message.includes('ECONNREFUSED')) {
       console.error(`${c.red}Cannot connect to Chrome on ${CDP_HOST}:${CDP_PORT}${c.reset}`);
-      console.error(`\nStart Chrome with: ${c.cyan}browser-open${c.reset}`);
+      if (HEADLESS_MODE) {
+        console.error(`${c.yellow}Headless Chrome may have failed to start${c.reset}`);
+      } else {
+        console.error(`\nStart Chrome with: ${c.cyan}browser-open${c.reset}`);
+      }
     } else {
       console.error(`${c.red}Connection error: ${err.message}${c.reset}`);
     }
@@ -885,17 +1060,37 @@ async function connect() {
   }
 }
 
-// Commands
+// Helpers: resolve element by CSS selector or ref:eN
 
-async function cmdScreenshot(args) {
-  const { execSync } = require('child_process');
-  const { page, browser } = await connect();
-  
+async function resolveElement(page, selectorOrRef) {
+  if (selectorOrRef.startsWith('ref:')) {
+    const refId = selectorOrRef.slice(4);
+    const elementHandle = await page.evaluateHandle(({ script, refId }) => {
+      if (!window.__devBrowser_getAISnapshot) eval(script);
+      const refs = window.__browserCtlRefs;
+      if (!refs) throw new Error("No refs found. Run 'browser-ctl snapshot' first.");
+      const element = refs[refId];
+      if (!element) throw new Error(`Ref "${refId}" not found. Run 'browser-ctl snapshot' to see available refs.`);
+      return element;
+    }, { script: SNAPSHOT_SCRIPT, refId });
+    const element = elementHandle.asElement();
+    if (!element) throw new Error(`Ref "${refId}" did not resolve to an element`);
+    return element;
+  } else {
+    const element = await page.$(selectorOrRef);
+    if (!element) throw new Error(`Element not found: ${selectorOrRef}`);
+    return element;
+  }
+}
+
+// exec* helpers: take (page, args), return { output, data }
+
+async function execScreenshot(page, args) {
   let selector = null;
   let fullPage = false;
   let filename = null;
-  let maxDimension = 1500; // Default max dimension (under 2000px limit for AI models)
-  
+  let maxDimension = 1500;
+
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--full' || args[i] === '-f') {
       fullPage = true;
@@ -911,43 +1106,330 @@ async function cmdScreenshot(args) {
       selector = args[i];
     }
   }
-  
+
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
   filename = filename || path.join(SCREENSHOT_DIR, `screenshot-${timestamp}.png`);
-  
-  try {
-    if (selector) {
-      const element = await page.$(selector);
-      if (!element) {
-        console.error(`${c.red}Element not found: ${selector}${c.reset}`);
-        await browser.close();
-        process.exit(1);
+
+  if (selector) {
+    const element = await page.$(selector);
+    if (!element) throw new Error(`Element not found: ${selector}`);
+    await element.screenshot({ path: filename });
+  } else {
+    await page.screenshot({ path: filename, fullPage });
+  }
+
+  let resizeMsg = '';
+  if (maxDimension) {
+    try {
+      const info = execSync(`sips -g pixelWidth -g pixelHeight "${filename}" 2>/dev/null`, { encoding: 'utf8' });
+      const width = parseInt(info.match(/pixelWidth:\s*(\d+)/)?.[1] || '0');
+      const height = parseInt(info.match(/pixelHeight:\s*(\d+)/)?.[1] || '0');
+      if (width > maxDimension || height > maxDimension) {
+        execSync(`sips --resampleHeightWidthMax ${maxDimension} "${filename}" >/dev/null 2>&1`);
+        resizeMsg = `${c.dim}Resized to max ${maxDimension}px${c.reset}\n`;
       }
-      await element.screenshot({ path: filename });
+    } catch (e) {}
+  }
+
+  const output = `${resizeMsg}${c.green}Screenshot saved:${c.reset} ${filename}\n${c.dim}Page: ${page.url()}${c.reset}`;
+  return { output, data: { path: filename, url: page.url() } };
+}
+
+async function execClick(page, args) {
+  const selector = args[0];
+  if (!selector) throw new Error('Usage: click <selector>');
+  await page.click(selector, { timeout: 5000 });
+  return { output: `${c.green}Clicked:${c.reset} ${selector}`, data: { clicked: selector } };
+}
+
+async function execClickRef(page, args) {
+  const ref = args[0];
+  if (!ref) throw new Error("Usage: click-ref <ref>");
+  const element = await resolveElement(page, `ref:${ref}`);
+  await element.click({ timeout: 5000 });
+  return { output: `${c.green}Clicked:${c.reset} ${ref}`, data: { clicked: ref } };
+}
+
+async function execType(page, args) {
+  const selector = args[0];
+  const text = args.slice(1).join(' ');
+  if (!selector || !text) throw new Error('Usage: type <selector> <text>');
+  await page.fill(selector, text, { timeout: 5000 });
+  return { output: `${c.green}Typed into ${selector}:${c.reset} "${text}"`, data: { typed: text, selector } };
+}
+
+async function execTypeRef(page, args) {
+  const ref = args[0];
+  const text = args.slice(1).join(' ');
+  if (!ref || !text) throw new Error('Usage: type-ref <ref> <text>');
+  const element = await resolveElement(page, `ref:${ref}`);
+  await element.fill(text, { timeout: 5000 });
+  return { output: `${c.green}Typed into ${ref}:${c.reset} "${text}"`, data: { typed: text, ref } };
+}
+
+async function execGoto(page, args) {
+  let url = args[0];
+  if (!url) throw new Error('Usage: goto <url>');
+  if (url.startsWith('/')) {
+    const currentUrl = new URL(page.url());
+    url = `${currentUrl.origin}${url}`;
+  }
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  return { output: `${c.green}Navigated to:${c.reset} ${page.url()}`, data: { url: page.url() } };
+}
+
+async function execHtml(page, args) {
+  const selector = args[0];
+  let html;
+  if (selector) {
+    const element = await page.$(selector);
+    if (!element) throw new Error(`Element not found: ${selector}`);
+    html = await element.innerHTML();
+  } else {
+    html = await page.content();
+  }
+  return { output: html, data: { html, selector: selector || null } };
+}
+
+async function execSnapshot(page, args) {
+  const jsonOutput = args.includes('--json') || args.includes('-j');
+  if (jsonOutput) {
+    if (!page.accessibility) throw new Error('--json not available over CDP connection. Use YAML format (default).');
+    const snapshot = await page.accessibility.snapshot({ interestingOnly: true });
+    const output = JSON.stringify(snapshot, null, 2);
+    return { output, data: snapshot };
+  } else {
+    const yamlStr = await page.evaluate((script) => {
+      eval(script);
+      return window.__devBrowser_getAISnapshot();
+    }, SNAPSHOT_SCRIPT);
+    return { output: yamlStr, data: yamlStr };
+  }
+}
+
+async function execUrl(page, args) {
+  const url = page.url();
+  return { output: url, data: { url } };
+}
+
+async function execTitle(page, args) {
+  const title = await page.title();
+  return { output: title, data: { title } };
+}
+
+async function execWait(page, args) {
+  const target = args[0];
+  const timeout = parseInt(args[1]) || 30000;
+  if (!target) throw new Error('Usage: wait <selector|url:pattern|text:content> [timeout_ms]');
+  if (target.startsWith('url:')) {
+    const pattern = target.slice(4);
+    await page.waitForURL(`**${pattern}**`, { timeout });
+  } else if (target.startsWith('text:')) {
+    const text = target.slice(5);
+    await page.waitForSelector(`text=${text}`, { timeout });
+  } else {
+    await page.waitForSelector(target, { timeout });
+  }
+  return { output: `${c.green}Wait complete:${c.reset} ${target}`, data: { waited: target } };
+}
+
+async function execReload(page, args) {
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  return { output: `${c.green}Reloaded:${c.reset} ${page.url()}`, data: { url: page.url() } };
+}
+
+// Structured data commands
+
+async function execStorage(page, args) {
+  const action = args[0];
+  const storageType = args[1];
+  const key = args[2];
+  const value = args.slice(3).join(' ');
+
+  if (!action || !storageType || !['local', 'session'].includes(storageType)) {
+    throw new Error('Usage: storage <get|set|keys|clear> <local|session> [key] [value]');
+  }
+
+  const storageProp = storageType === 'local' ? 'localStorage' : 'sessionStorage';
+
+  switch (action) {
+    case 'get': {
+      if (!key) throw new Error('Usage: storage get <local|session> <key>');
+      const result = await page.evaluate(({ storageProp, key }) => {
+        const val = window[storageProp].getItem(key);
+        if (val === null) return null;
+        try { return JSON.parse(val); } catch { return val; }
+      }, { storageProp, key });
+      if (result === null) return { output: `${c.dim}(null)${c.reset}`, data: { key, value: null, storage: storageType } };
+      const output = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+      return { output, data: { key, value: result, storage: storageType } };
+    }
+    case 'set': {
+      if (!key || !value) throw new Error('Usage: storage set <local|session> <key> <value>');
+      await page.evaluate(({ storageProp, key, value }) => {
+        window[storageProp].setItem(key, value);
+      }, { storageProp, key, value });
+      return { output: `${c.green}Set ${storageType}Storage["${key}"]${c.reset}`, data: { key, value, storage: storageType } };
+    }
+    case 'keys': {
+      const keys = await page.evaluate(({ storageProp }) => {
+        const keys = [];
+        for (let i = 0; i < window[storageProp].length; i++) keys.push(window[storageProp].key(i));
+        return keys;
+      }, { storageProp });
+      return { output: keys.length ? keys.join('\n') : `${c.dim}(no keys)${c.reset}`, data: { keys, storage: storageType } };
+    }
+    case 'clear': {
+      await page.evaluate(({ storageProp }) => window[storageProp].clear(), { storageProp });
+      return { output: `${c.green}Cleared ${storageType}Storage${c.reset}`, data: { storage: storageType } };
+    }
+    default:
+      throw new Error(`Unknown storage action: ${action}. Use get, set, keys, or clear.`);
+  }
+}
+
+async function execText(page, args) {
+  const selectorOrRef = args[0];
+  if (!selectorOrRef) throw new Error('Usage: text <selector|ref:eN>');
+  const element = await resolveElement(page, selectorOrRef);
+  const text = await element.textContent();
+  return { output: text || '', data: { text, selector: selectorOrRef } };
+}
+
+async function execValue(page, args) {
+  const selectorOrRef = args[0];
+  if (!selectorOrRef) throw new Error('Usage: value <selector|ref:eN>');
+  const element = await resolveElement(page, selectorOrRef);
+  const val = await element.inputValue();
+  return { output: val || '', data: { value: val, selector: selectorOrRef } };
+}
+
+async function execAttr(page, args) {
+  const selectorOrRef = args[0];
+  const attrName = args[1];
+  if (!selectorOrRef || !attrName) throw new Error('Usage: attr <selector|ref:eN> <attribute>');
+  const element = await resolveElement(page, selectorOrRef);
+  const val = await element.getAttribute(attrName);
+  return { output: val !== null ? val : `${c.dim}(null)${c.reset}`, data: { attribute: attrName, value: val, selector: selectorOrRef } };
+}
+
+async function execCount(page, args) {
+  const selector = args[0];
+  if (!selector) throw new Error('Usage: count <selector>');
+  const count = await page.$$eval(selector, els => els.length);
+  return { output: String(count), data: { count, selector } };
+}
+
+async function execCheck(page, args) {
+  const selectorOrRef = args[0];
+  const condition = args[1];
+  if (!selectorOrRef || !condition) throw new Error('Usage: check <selector|ref:eN> <visible|hidden|enabled|disabled|checked>');
+  const element = await resolveElement(page, selectorOrRef);
+  let result;
+  switch (condition) {
+    case 'visible': result = await element.isVisible(); break;
+    case 'hidden': result = !(await element.isVisible()); break;
+    case 'enabled': result = await element.isEnabled(); break;
+    case 'disabled': result = !(await element.isEnabled()); break;
+    case 'checked': result = await element.isChecked(); break;
+    default: throw new Error(`Unknown condition: ${condition}. Use visible, hidden, enabled, disabled, or checked.`);
+  }
+  return { output: String(result), data: { condition, result, selector: selectorOrRef } };
+}
+
+// Dispatch table for compound commands
+
+const EXEC_DISPATCH = {
+  snapshot: execSnapshot, snap: execSnapshot,
+  click: execClick,
+  'click-ref': execClickRef, clickref: execClickRef,
+  type: execType,
+  'type-ref': execTypeRef, typeref: execTypeRef,
+  goto: execGoto, go: execGoto,
+  html: execHtml,
+  screenshot: execScreenshot, ss: execScreenshot,
+  url: execUrl, title: execTitle,
+  wait: execWait, reload: execReload,
+  storage: execStorage, text: execText,
+  value: execValue, attr: execAttr,
+  count: execCount, check: execCheck,
+};
+
+// Compound command: do
+
+function parseDoSteps(args) {
+  const steps = [];
+  let current = [];
+  for (const arg of args) {
+    if (arg === ',' || arg === '--then') {
+      if (current.length > 0) { steps.push(current); current = []; }
     } else {
-      await page.screenshot({ path: filename, fullPage });
+      current.push(arg);
     }
-    
-    // Resize to max dimension if needed (keeps aspect ratio, uses macOS sips)
-    if (maxDimension) {
-      try {
-        // Get current dimensions
-        const info = execSync(`sips -g pixelWidth -g pixelHeight "${filename}" 2>/dev/null`, { encoding: 'utf8' });
-        const width = parseInt(info.match(/pixelWidth:\s*(\d+)/)?.[1] || '0');
-        const height = parseInt(info.match(/pixelHeight:\s*(\d+)/)?.[1] || '0');
-        
-        if (width > maxDimension || height > maxDimension) {
-          // Resize to fit within maxDimension, maintaining aspect ratio
-          execSync(`sips --resampleHeightWidthMax ${maxDimension} "${filename}" >/dev/null 2>&1`);
-          console.log(`${c.dim}Resized to max ${maxDimension}px${c.reset}`);
+  }
+  if (current.length > 0) steps.push(current);
+  return steps;
+}
+
+async function cmdDo(args) {
+  const jsonOutput = args.includes('--json');
+  const filteredArgs = args.filter(a => a !== '--json');
+  const steps = parseDoSteps(filteredArgs);
+
+  if (steps.length === 0) {
+    console.error(`${c.red}Usage: browser-ctl do <cmd1> [args] , <cmd2> [args] , ...${c.reset}`);
+    process.exit(1);
+  }
+
+  const { page, browser } = await connect();
+  const results = [];
+
+  try {
+    for (let i = 0; i < steps.length; i++) {
+      const [cmd, ...cmdArgs] = steps[i];
+      const execFn = EXEC_DISPATCH[cmd];
+
+      if (!execFn) {
+        throw new Error(`Unknown command in step ${i + 1}: "${cmd}"`);
+      }
+
+      const result = await execFn(page, cmdArgs);
+      results.push({ step: i + 1, command: cmd, ok: true, data: result.data });
+
+      if (!jsonOutput) {
+        if (steps.length > 1) {
+          console.log(`${c.dim}--- [${i + 1}/${steps.length}] ${cmd} ${cmdArgs.join(' ')} ---${c.reset}`);
         }
-      } catch (e) {
-        // sips not available or failed, continue without resize
+        console.log(result.output);
       }
     }
-    
-    console.log(`${c.green}Screenshot saved:${c.reset} ${filename}`);
-    console.log(`${c.dim}Page: ${page.url()}${c.reset}`);
+
+    if (jsonOutput) {
+      console.log(JSON.stringify(results, null, 2));
+    }
+  } catch (err) {
+    if (jsonOutput) {
+      results.push({ step: results.length + 1, ok: false, error: err.message });
+      console.log(JSON.stringify(results, null, 2));
+    } else {
+      console.error(`${c.red}Step ${results.length + 1} failed: ${err.message}${c.reset}`);
+    }
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+// Commands (thin wrappers around exec* helpers)
+
+async function cmdScreenshot(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execScreenshot(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Screenshot failed: ${err.message}${c.reset}`);
+    process.exit(1);
   } finally {
     await browser.close();
   }
@@ -1100,17 +1582,9 @@ async function cmdLogs(args) {
 
 async function cmdClick(args) {
   const { page, browser } = await connect();
-  
-  const selector = args[0];
-  if (!selector) {
-    console.error(`${c.red}Usage: browser-ctl click <selector>${c.reset}`);
-    await browser.close();
-    process.exit(1);
-  }
-  
   try {
-    await page.click(selector, { timeout: 5000 });
-    console.log(`${c.green}Clicked:${c.reset} ${selector}`);
+    const result = await execClick(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Click failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1121,19 +1595,9 @@ async function cmdClick(args) {
 
 async function cmdType(args) {
   const { page, browser } = await connect();
-  
-  const selector = args[0];
-  const text = args.slice(1).join(' ');
-  
-  if (!selector || !text) {
-    console.error(`${c.red}Usage: browser-ctl type <selector> <text>${c.reset}`);
-    await browser.close();
-    process.exit(1);
-  }
-  
   try {
-    await page.fill(selector, text, { timeout: 5000 });
-    console.log(`${c.green}Typed into ${selector}:${c.reset} "${text}"`);
+    const result = await execType(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Type failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1144,23 +1608,9 @@ async function cmdType(args) {
 
 async function cmdGoto(args) {
   const { page, browser } = await connect();
-  
-  let url = args[0];
-  if (!url) {
-    console.error(`${c.red}Usage: browser-ctl goto <url>${c.reset}`);
-    await browser.close();
-    process.exit(1);
-  }
-  
-  // Handle relative URLs
-  if (url.startsWith('/')) {
-    const currentUrl = new URL(page.url());
-    url = `${currentUrl.origin}${url}`;
-  }
-  
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log(`${c.green}Navigated to:${c.reset} ${page.url()}`);
+    const result = await execGoto(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Navigation failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1169,50 +1619,12 @@ async function cmdGoto(args) {
   }
 }
 
-async function cmdEval(args) {
-  const { page, browser } = await connect();
-  
-  const script = args.join(' ');
-  if (!script) {
-    console.error(`${c.red}Usage: browser-ctl eval <javascript>${c.reset}`);
-    await browser.close();
-    process.exit(1);
-  }
-  
-  try {
-    const result = await page.evaluate(script);
-    if (typeof result === 'object') {
-      console.log(JSON.stringify(result, null, 2));
-    } else {
-      console.log(result);
-    }
-  } catch (err) {
-    console.error(`${c.red}Eval failed: ${err.message}${c.reset}`);
-    process.exit(1);
-  } finally {
-    await browser.close();
-  }
-}
 
 async function cmdHtml(args) {
   const { page, browser } = await connect();
-  
-  const selector = args[0];
-  
   try {
-    let html;
-    if (selector) {
-      const element = await page.$(selector);
-      if (!element) {
-        console.error(`${c.red}Element not found: ${selector}${c.reset}`);
-        await browser.close();
-        process.exit(1);
-      }
-      html = await element.innerHTML();
-    } else {
-      html = await page.content();
-    }
-    console.log(html);
+    const result = await execHtml(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}HTML fetch failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1223,27 +1635,9 @@ async function cmdHtml(args) {
 
 async function cmdSnapshot(args) {
   const { page, browser } = await connect();
-  
-  let jsonOutput = args.includes('--json') || args.includes('-j');
-  
   try {
-    if (jsonOutput) {
-      // Legacy JSON format - may not work over CDP connection
-      if (!page.accessibility) {
-        console.error(`${c.red}--json not available over CDP connection. Use YAML format (default).${c.reset}`);
-        await browser.close();
-        process.exit(1);
-      }
-      const snapshot = await page.accessibility.snapshot({ interestingOnly: true });
-      console.log(JSON.stringify(snapshot, null, 2));
-    } else {
-      // New YAML format with refs
-      const yaml = await page.evaluate((script) => {
-        eval(script);
-        return window.__devBrowser_getAISnapshot();
-      }, SNAPSHOT_SCRIPT);
-      console.log(yaml);
-    }
+    const result = await execSnapshot(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Snapshot failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1254,35 +1648,9 @@ async function cmdSnapshot(args) {
 
 async function cmdClickRef(args) {
   const { page, browser } = await connect();
-  
-  const ref = args[0];
-  if (!ref) {
-    console.error(`${c.red}Usage: browser-ctl click-ref <ref>${c.reset}`);
-    console.error(`Run 'browser-ctl snapshot' first to see available refs`);
-    await browser.close();
-    process.exit(1);
-  }
-  
   try {
-    // Inject snapshot script if not already present, then get element by ref
-    const elementHandle = await page.evaluateHandle(({ script, refId }) => {
-      if (!window.__devBrowser_getAISnapshot) eval(script);
-      const refs = window.__browserCtlRefs;
-      if (!refs) throw new Error("No refs found. Run 'browser-ctl snapshot' first.");
-      const element = refs[refId];
-      if (!element) throw new Error(`Ref "${refId}" not found. Run 'browser-ctl snapshot' to see available refs.`);
-      return element;
-    }, { script: SNAPSHOT_SCRIPT, refId: ref });
-    
-    const element = elementHandle.asElement();
-    if (!element) {
-      console.error(`${c.red}Ref "${ref}" did not resolve to an element${c.reset}`);
-      await browser.close();
-      process.exit(1);
-    }
-    
-    await element.click({ timeout: 5000 });
-    console.log(`${c.green}Clicked:${c.reset} ${ref}`);
+    const result = await execClickRef(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Click failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1293,37 +1661,9 @@ async function cmdClickRef(args) {
 
 async function cmdTypeRef(args) {
   const { page, browser } = await connect();
-  
-  const ref = args[0];
-  const text = args.slice(1).join(' ');
-  
-  if (!ref || !text) {
-    console.error(`${c.red}Usage: browser-ctl type-ref <ref> <text>${c.reset}`);
-    console.error(`Run 'browser-ctl snapshot' first to see available refs`);
-    await browser.close();
-    process.exit(1);
-  }
-  
   try {
-    // Inject snapshot script if not already present, then get element by ref
-    const elementHandle = await page.evaluateHandle(({ script, refId }) => {
-      if (!window.__devBrowser_getAISnapshot) eval(script);
-      const refs = window.__browserCtlRefs;
-      if (!refs) throw new Error("No refs found. Run 'browser-ctl snapshot' first.");
-      const element = refs[refId];
-      if (!element) throw new Error(`Ref "${refId}" not found. Run 'browser-ctl snapshot' to see available refs.`);
-      return element;
-    }, { script: SNAPSHOT_SCRIPT, refId: ref });
-    
-    const element = elementHandle.asElement();
-    if (!element) {
-      console.error(`${c.red}Ref "${ref}" did not resolve to an element${c.reset}`);
-      await browser.close();
-      process.exit(1);
-    }
-    
-    await element.fill(text, { timeout: 5000 });
-    console.log(`${c.green}Typed into ${ref}:${c.reset} "${text}"`);
+    const result = await execTypeRef(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Type failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1334,39 +1674,29 @@ async function cmdTypeRef(args) {
 
 async function cmdUrl(args) {
   const { page, browser } = await connect();
-  console.log(page.url());
-  await browser.close();
+  try {
+    const result = await execUrl(page, args);
+    console.log(result.output);
+  } finally {
+    await browser.close();
+  }
 }
 
 async function cmdTitle(args) {
   const { page, browser } = await connect();
-  console.log(await page.title());
-  await browser.close();
+  try {
+    const result = await execTitle(page, args);
+    console.log(result.output);
+  } finally {
+    await browser.close();
+  }
 }
 
 async function cmdWait(args) {
   const { page, browser } = await connect();
-  
-  const target = args[0];
-  const timeout = parseInt(args[1]) || 30000;
-  
-  if (!target) {
-    console.error(`${c.red}Usage: browser-ctl wait <selector|url:pattern|text:content> [timeout_ms]${c.reset}`);
-    await browser.close();
-    process.exit(1);
-  }
-  
   try {
-    if (target.startsWith('url:')) {
-      const pattern = target.slice(4);
-      await page.waitForURL(`**${pattern}**`, { timeout });
-    } else if (target.startsWith('text:')) {
-      const text = target.slice(5);
-      await page.waitForSelector(`text=${text}`, { timeout });
-    } else {
-      await page.waitForSelector(target, { timeout });
-    }
-    console.log(`${c.green}Wait complete:${c.reset} ${target}`);
+    const result = await execWait(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Wait failed: ${err.message}${c.reset}`);
     process.exit(1);
@@ -1377,12 +1707,89 @@ async function cmdWait(args) {
 
 async function cmdReload(args) {
   const { page, browser } = await connect();
-  
   try {
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    console.log(`${c.green}Reloaded:${c.reset} ${page.url()}`);
+    const result = await execReload(page, args);
+    console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Reload failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdStorage(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execStorage(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Storage failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdText(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execText(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Text failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdValue(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execValue(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Value failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdAttr(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execAttr(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Attr failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdCount(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execCount(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Count failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdCheck(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execCheck(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Check failed: ${err.message}${c.reset}`);
     process.exit(1);
   } finally {
     await browser.close();
@@ -1479,7 +1886,6 @@ ${c.yellow}AVAILABLE STEPS${c.reset}
   wait: <selector|number>        Wait for element or milliseconds
   sleep: <ms>                    Wait for milliseconds
   screenshot: [name]             Take screenshot
-  eval: <javascript>             Execute JavaScript
   reload:                        Reload page
 
 ${c.yellow}AVAILABLE ASSERTIONS${c.reset}
@@ -1718,10 +2124,6 @@ async function runSteps(page, steps, verbose) {
         if (verbose) console.log(`      ${c.dim}Saved: ${screenshotPath}${c.reset}`);
         break;
         
-      case 'eval':
-        await page.evaluate(value);
-        break;
-        
       case 'reload':
         await page.reload({ waitUntil: 'domcontentloaded' });
         break;
@@ -1904,7 +2306,11 @@ function showHelp() {
 ${c.cyan}browser-ctl${c.reset} - Control browser via Playwright + CDP
 
 ${c.yellow}USAGE${c.reset}
-  browser-ctl <command> [options]
+  browser-ctl [--profile NAME] <command> [options]
+
+${c.yellow}PROFILES${c.reset}
+  --profile NAME   Use named profile (default, work, personal)
+                   default (port 9222), work (port 9223), personal (port 9224)
 
 ${c.yellow}COMMANDS${c.reset}
   ${c.green}screenshot${c.reset} [selector] [--full] [-o file] [--max N] [--no-resize]
@@ -1935,9 +2341,6 @@ ${c.yellow}COMMANDS${c.reset}
       
   ${c.green}goto${c.reset} <url>
       Navigate to URL (supports relative paths like /accounts)
-      
-  ${c.green}eval${c.reset} <javascript>
-      Execute JavaScript and print result
       
   ${c.green}html${c.reset} [selector]
       Get HTML content of page or element
@@ -1973,6 +2376,31 @@ ${c.yellow}COMMANDS${c.reset}
       --bail            Stop on first failure
       --filter=PATTERN  Only run tests matching pattern
 
+${c.yellow}COMPOUND${c.reset}
+  ${c.green}do${c.reset} <cmd1> [args] , <cmd2> [args] , ...
+      Run multiple commands in a single browser connection
+      Separate commands with , or --then
+      --json    Output all results as JSON array
+
+${c.yellow}DATA${c.reset}
+  ${c.green}storage${c.reset} <get|set|keys|clear> <local|session> [key] [value]
+      Read/write localStorage or sessionStorage
+
+  ${c.green}text${c.reset} <selector|ref:eN>
+      Get text content of element
+
+  ${c.green}value${c.reset} <selector|ref:eN>
+      Get input value of element
+
+  ${c.green}attr${c.reset} <selector|ref:eN> <attribute>
+      Get attribute value of element
+
+  ${c.green}count${c.reset} <selector>
+      Count elements matching selector
+
+  ${c.green}check${c.reset} <selector|ref:eN> <visible|hidden|enabled|disabled|checked>
+      Boolean condition check on element
+
 ${c.yellow}EXAMPLES${c.reset}
   browser-ctl screenshot --full
   browser-ctl logs                        # Last 50 log entries
@@ -1982,7 +2410,6 @@ ${c.yellow}EXAMPLES${c.reset}
   browser-ctl click "button[type=submit]"
   browser-ctl type "#search" "hello world"
   browser-ctl goto /accounts
-  browser-ctl eval "document.querySelectorAll('button').length"
   browser-ctl wait "text:Loading" 10000
   browser-ctl html ".sidebar"
   browser-ctl snapshot                         # YAML with refs like [ref=e5]
@@ -1992,6 +2419,16 @@ ${c.yellow}EXAMPLES${c.reset}
   browser-ctl test tests/browser/auth.yaml     # Run single test file
   browser-ctl test tests/ --junit=results.xml  # Generate JUnit report
   browser-ctl test tests/ --filter="login"     # Only run tests matching "login"
+  browser-ctl do snapshot , click-ref e3 , snapshot  # Compound: single connection
+  browser-ctl do goto /login , type "#email" me@test.com , click "#submit"
+  browser-ctl storage get session blueprint_wizard_cache
+  browser-ctl storage keys local
+  browser-ctl text "h1"                        # Get element text content
+  browser-ctl text ref:e5                      # Get text by snapshot ref
+  browser-ctl value ref:e3                     # Get input value by ref
+  browser-ctl attr ref:e5 aria-expanded        # Get attribute by ref
+  browser-ctl count "button"                   # Count matching elements
+  browser-ctl check ".modal" visible           # Boolean condition check
 
 ${c.yellow}ENVIRONMENT${c.reset}
   CDP_PORT         Chrome debugging port (default: 9222)
@@ -2044,10 +2481,6 @@ async function main() {
     case 'go':
       await cmdGoto(cmdArgs);
       break;
-    case 'eval':
-    case 'js':
-      await cmdEval(cmdArgs);
-      break;
     case 'html':
       await cmdHtml(cmdArgs);
       break;
@@ -2075,6 +2508,27 @@ async function main() {
       break;
     case 'test':
       await cmdTest(cmdArgs);
+      break;
+    case 'do':
+      await cmdDo(cmdArgs);
+      break;
+    case 'storage':
+      await cmdStorage(cmdArgs);
+      break;
+    case 'text':
+      await cmdText(cmdArgs);
+      break;
+    case 'value':
+      await cmdValue(cmdArgs);
+      break;
+    case 'attr':
+      await cmdAttr(cmdArgs);
+      break;
+    case 'count':
+      await cmdCount(cmdArgs);
+      break;
+    case 'check':
+      await cmdCheck(cmdArgs);
       break;
     default:
       console.error(`${c.red}Unknown command: ${command}${c.reset}`);
