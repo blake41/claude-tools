@@ -2,36 +2,15 @@
 set -eo pipefail
 
 source "$(dirname "$0")/cf-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="cf-logs"
 
 # Defaults
 FORMAT="pretty"
 SAMPLING_RATE=""
 FILTER=""
 ONCE=false
-
-show_help() {
-    echo "Usage: cf-logs <worker-name> [options]"
-    echo ""
-    echo "Stream real-time logs from a Cloudflare Worker using wrangler tail."
-    echo ""
-    echo "Options:"
-    echo "  --format FORMAT    Output format: pretty, json (default: pretty)"
-    echo "  --sampling RATE    Sampling rate 0-1 (default: 1)"
-    echo "  --status CODE      Filter by HTTP status (e.g., 500)"
-    echo "  --search TEXT      Filter by text in log message"
-    echo "  --once             Exit after first log (useful for testing)"
-    echo "  --ip IP            Filter by client IP"
-    echo ""
-    echo "Examples:"
-    echo "  cf-logs summarizer"
-    echo "  cf-logs summarizer --format json"
-    echo "  cf-logs summarizer --status 500"
-    echo "  cf-logs summarizer --search error"
-    echo ""
-    echo "Note: This streams real-time logs. Press Ctrl+C to stop."
-    echo "For historical logs, Cloudflare requires Logpush (paid feature)."
-    exit 0
-}
 
 # Parse arguments
 WORKER_NAME=""
@@ -64,11 +43,13 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            show_help
+            cmd_tree "$TOOL_NAME" "Stream real-time logs from Cloudflare Workers" "$(jq -n '[
+                {name: "tail", description: "Stream logs from a worker", usage: "cf-logs <worker-name> [--format pretty|json] [--sampling RATE] [--status CODE] [--search TEXT] [--once]"}
+            ]')"
+            exit 0
             ;;
         -*)
-            echo "Unknown option: $1" >&2
-            exit 1
+            json_error "$TOOL_NAME" "Unknown option: $1" "INVALID_ARG" "Run: cf-logs --help"
             ;;
         *)
             WORKER_NAME="$1"
@@ -78,15 +59,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$WORKER_NAME" ]]; then
-    echo "Usage: cf-logs <worker-name> [options]" >&2
-    echo "Run with --help for more info" >&2
-    exit 1
+    cmd_tree "$TOOL_NAME" "Stream real-time logs from Cloudflare Workers" "$(jq -n '[
+        {name: "tail", description: "Stream logs from a worker", usage: "cf-logs <worker-name> [--format pretty|json] [--sampling RATE] [--status CODE] [--search TEXT] [--once]"}
+    ]')"
+    exit 0
 fi
 
 # Check if wrangler is available
 if ! command -v wrangler &>/dev/null; then
-    echo "Error: wrangler not found. Install with: npm install -g wrangler" >&2
-    exit 1
+    json_error "$TOOL_NAME" "wrangler not found" "MISSING_DEP" "Install with: npm install -g wrangler"
 fi
 
 # Build wrangler tail command
@@ -98,9 +79,11 @@ fi
 
 CMD+=("${EXTRA_ARGS[@]}")
 
-echo "Starting log stream for '$WORKER_NAME'..."
-echo "Press Ctrl+C to stop."
-echo ""
+# JSON preamble before streaming starts
+jq -n \
+    --arg cmd "$TOOL_NAME" \
+    --arg worker "$WORKER_NAME" \
+    '{ok: true, streaming: true, command: $cmd, worker: $worker, note: "Streaming output follows. Press Ctrl+C to stop."}'
 
 if [[ "$ONCE" == true ]]; then
     # Run briefly for testing (macOS compatible)

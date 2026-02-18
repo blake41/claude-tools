@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="linear-cli"
 CONFIG_DIR="${HOME}/.config/linear"
 API_URL="https://api.linear.app/graphql"
 
@@ -14,10 +18,7 @@ get_api_key() {
   elif [[ -f "$CONFIG_DIR/api-key" ]]; then
     cat "$CONFIG_DIR/api-key"
   else
-    echo "❌ No Linear API key found" >&2
-    echo "   Set LINEAR_API_KEY or create ~/.config/linear/api-key" >&2
-    echo "   Get your key from: Linear Settings → Security & access → API keys" >&2
-    exit 1
+    json_error "$TOOL_NAME" "No Linear API key found" "AUTH_MISSING" "Set LINEAR_API_KEY or create ~/.config/linear/api-key. Get your key from: Linear Settings > Security & access > API keys"
   fi
 }
 
@@ -26,87 +27,52 @@ graphql() {
   local query="$1"
   local api_key
   api_key=$(get_api_key)
-  
-  curl -s -X POST \
+
+  local result
+  result=$(curl -s -X POST \
     -H "Content-Type: application/json" \
     -H "Authorization: $api_key" \
     --data "{\"query\": \"$query\"}" \
-    "$API_URL"
-}
+    "$API_URL")
 
-usage() {
-  cat <<EOF
-linear-cli - Linear issue management for AI agents
+  # Check for GraphQL errors
+  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+    local msg
+    msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown GraphQL error"')
+    json_error "$TOOL_NAME" "$msg" "API_ERROR" "Check your query syntax and API key"
+  fi
 
-USAGE
-  linear-cli <command> [options]
-
-COMMANDS
-  issues [--mine] [--project NAME] [--status STATUS] [--limit N]
-      List issues with optional filters
-      
-  issue <ID>
-      Get details for a specific issue (e.g., "ENG-123")
-      
-  comment <ID> "<body>"
-      Add a comment to an issue. Use @username for mentions.
-      
-  search <query>
-      Search issues by text
-      
-  create <team-key> "<title>" [--description "..."] [--priority 1-4]
-      Create a new issue (auto-assigned to you)
-      
-  projects
-      List all projects
-      
-  teams
-      List all teams
-      
-  me
-      Show current user info
-
-EXAMPLES
-  # Read operations
-  linear-cli issues --mine --limit 10
-  linear-cli issues --project "Q1 Roadmap" --status "In Progress"
-  linear-cli issue ENG-123
-  linear-cli search "authentication bug"
-  linear-cli projects
-  linear-cli teams
-  
-  # Create issues (auto-assigned to you)
-  linear-cli create GTM "Fix login bug"
-  linear-cli create GTM "Add dark mode" --description "User requested feature" --priority 2
-  
-  # Add comments
-  linear-cli comment GTM-123 "This is ready for review"
-  linear-cli comment GTM-123 "@niharika.ray can you take a look?"
-
-SETUP
-  1. Go to Linear Settings → Security & access → API keys
-  2. Create a new personal API key
-  3. Save it:
-     echo "lin_api_xxxxx" > ~/.config/linear/api-key
-     chmod 600 ~/.config/linear/api-key
-
-OUTPUT
-  Returns JSON for easy parsing by agents
-EOF
-  exit 1
+  echo "$result"
 }
 
 # Commands
 cmd_me() {
-  graphql "{ viewer { id name email admin } }" | jq '.data.viewer'
+  local result
+  result=$(graphql "{ viewer { id name email admin } }" | jq '.data.viewer')
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli issues --mine" "List your assigned issues")" \
+      "$(next_action "linear-cli teams" "List all teams")")
+  json_ok "$TOOL_NAME me" "$result" "$na"
 }
 
 cmd_teams() {
-  graphql "{ teams { nodes { id name key description } } }" | jq '.data.teams.nodes'
+  local result
+  result=$(graphql "{ teams { nodes { id name key description } } }" | jq '.data.teams.nodes')
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli issues --mine" "List your assigned issues")" \
+      "$(next_action "linear-cli projects" "List all projects")")
+  json_ok "$TOOL_NAME teams" "$result" "$na"
 }
 
 cmd_projects() {
-  graphql "{ projects(first: 50) { nodes { id name description state { name } lead { name } targetDate } } }" | jq '.data.projects.nodes'
+  local result
+  result=$(graphql "{ projects(first: 50) { nodes { id name description state { name } lead { name } targetDate } } }" | jq '.data.projects.nodes')
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli issues --project \"<project-name>\"" "List issues in a project")")
+  json_ok "$TOOL_NAME projects" "$result" "$na"
 }
 
 cmd_issue() {
@@ -114,70 +80,89 @@ cmd_issue() {
   # Parse identifier like "GTM-3424" into team key and number
   local team_key="${issue_id%-*}"
   local number="${issue_id##*-}"
-  
+
   if [[ ! "$number" =~ ^[0-9]+$ ]]; then
-    echo "❌ Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" >&2
-    exit 1
+    json_error "$TOOL_NAME issue" "Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" "INVALID_ARG" "Use format TEAM-NUMBER, e.g. GTM-123"
   fi
-  
-  graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty'
+
+  local result
+  result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty')
+
+  if [[ -z "$result" || "$result" == "null" ]]; then
+    json_error "$TOOL_NAME issue" "Issue '$issue_id' not found" "NOT_FOUND" "Check the issue identifier"
+  fi
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli comment $issue_id \"<comment>\"" "Add a comment to this issue")" \
+      "$(next_action "linear-cli issues --mine" "List your assigned issues")")
+  json_ok "$TOOL_NAME issue" "$result" "$na"
 }
 
 cmd_comment() {
   local issue_id="$1"
   local body="$2"
-  
+
   # Parse identifier like "GTM-3424" into team key and number
   local team_key="${issue_id%-*}"
   local number="${issue_id##*-}"
-  
+
   if [[ ! "$number" =~ ^[0-9]+$ ]]; then
-    echo "❌ Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" >&2
-    exit 1
+    json_error "$TOOL_NAME comment" "Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" "INVALID_ARG" "Use format TEAM-NUMBER, e.g. GTM-123"
   fi
-  
+
   # Get the issue's internal UUID
   local issue_result
   issue_result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id } } }")
   local issue_uuid
   issue_uuid=$(echo "$issue_result" | jq -r '.data.issues.nodes[0].id // empty')
-  
+
   if [[ -z "$issue_uuid" ]]; then
-    echo "❌ Issue '$issue_id' not found" >&2
-    exit 1
+    json_error "$TOOL_NAME comment" "Issue '$issue_id' not found" "NOT_FOUND" "Check the issue identifier"
   fi
-  
+
   # Escape quotes and newlines in body
   body=$(echo "$body" | sed 's/"/\\\\"/g' | tr '\n' ' ')
-  
-  echo "💬 Adding comment to $issue_id..." >&2
-  
+
   local result
   result=$(graphql "mutation { commentCreate(input: { issueId: \\\"$issue_uuid\\\", body: \\\"$body\\\" }) { success comment { id body createdAt user { name } } } }")
-  
-  # Check for errors
-  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
-    echo "$result" | jq -r '.errors[0].message // "Unknown error"' >&2
-    exit 1
-  fi
-  
+
   local success
   success=$(echo "$result" | jq -r '.data.commentCreate.success')
-  
+
   if [[ "$success" != "true" ]]; then
-    echo "❌ Failed to add comment" >&2
-    echo "$result" | jq >&2
-    exit 1
+    json_error "$TOOL_NAME comment" "Failed to add comment" "API_ERROR" "Check the issue ID and comment body"
   fi
-  
-  echo "$result" | jq '.data.commentCreate.comment'
+
+  local comment_data
+  comment_data=$(echo "$result" | jq '.data.commentCreate.comment')
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli issue $issue_id" "View issue details")" \
+      "$(next_action "linear-cli issues --mine" "List your assigned issues")")
+  json_ok "$TOOL_NAME comment" "$comment_data" "$na"
 }
 
 cmd_search() {
   local query="$1"
   # Escape quotes in search query
   query=$(echo "$query" | sed 's/"/\\\\"/g')
-  graphql "{ searchIssues(term: \\\"$query\\\", first: 20) { nodes { id identifier title state { name } assignee { name } priority } } }" | jq '.data.searchIssues.nodes'
+  local raw
+  raw=$(graphql "{ searchIssues(term: \\\"$query\\\", first: 20) { nodes { id identifier title state { name } assignee { name } priority } } }")
+  local result
+  result=$(echo "$raw" | jq '.data.searchIssues.nodes')
+
+  local first_id
+  first_id=$(echo "$result" | jq -r '.[0].identifier // empty')
+  local na
+  if [[ -n "$first_id" ]]; then
+    na=$(next_actions \
+        "$(next_action "linear-cli issue $first_id" "View details for top result")")
+  else
+    na=$(next_actions)
+  fi
+  json_ok "$TOOL_NAME search" "$result" "$na"
 }
 
 # Get current user's ID (cached for session)
@@ -192,10 +177,9 @@ get_team_id() {
   result=$(graphql "{ teams(filter: { key: { eq: \\\"$team_key\\\" } }) { nodes { id } } }")
   local team_id
   team_id=$(echo "$result" | jq -r '.data.teams.nodes[0].id // empty')
-  
+
   if [[ -z "$team_id" ]]; then
-    echo "❌ Team '$team_key' not found. Run 'linear-cli teams' to see available teams." >&2
-    exit 1
+    json_error "$TOOL_NAME create" "Team '$team_key' not found" "NOT_FOUND" "Run 'linear-cli teams' to see available teams"
   fi
   echo "$team_id"
 }
@@ -212,18 +196,18 @@ cmd_create() {
   local team_key="$1"
   local title="$2"
   shift 2
-  
+
   local description=""
   local priority=""
-  
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --description|-d) description="$2"; shift 2 ;;
       --priority|-p) priority="$2"; shift 2 ;;
-      *) echo "Unknown option: $1" >&2; exit 1 ;;
+      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]" ;;
     esac
   done
-  
+
   # Get team ID, user ID, and Todo state ID
   local team_id
   team_id=$(get_team_id "$team_key")
@@ -231,46 +215,45 @@ cmd_create() {
   my_id=$(get_my_id)
   local todo_state_id
   todo_state_id=$(get_todo_state_id "$team_key")
-  
+
   # Build input fields
   local input_fields="teamId: \\\"$team_id\\\", title: \\\"$title\\\", assigneeId: \\\"$my_id\\\""
-  
+
   # Set state to Todo if found
   if [[ -n "$todo_state_id" ]]; then
     input_fields="$input_fields, stateId: \\\"$todo_state_id\\\""
   fi
-  
+
   if [[ -n "$description" ]]; then
     # Escape quotes and newlines in description
     description=$(echo "$description" | sed 's/"/\\\\"/g' | tr '\n' ' ')
     input_fields="$input_fields, description: \\\"$description\\\""
   fi
-  
+
   if [[ -n "$priority" ]]; then
     input_fields="$input_fields, priority: $priority"
   fi
-  
-  echo "📝 Creating issue in $team_key..." >&2
-  
+
   local result
   result=$(graphql "mutation { issueCreate(input: { $input_fields }) { success issue { id identifier title url state { name } assignee { name } } } }")
-  
-  # Check for errors
-  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
-    echo "$result" | jq -r '.errors[0].message // "Unknown error"' >&2
-    exit 1
-  fi
-  
+
   local success
   success=$(echo "$result" | jq -r '.data.issueCreate.success')
-  
+
   if [[ "$success" != "true" ]]; then
-    echo "❌ Failed to create issue" >&2
-    echo "$result" | jq >&2
-    exit 1
+    json_error "$TOOL_NAME create" "Failed to create issue" "API_ERROR" "Check the team key and title"
   fi
-  
-  echo "$result" | jq '.data.issueCreate.issue'
+
+  local issue_data
+  issue_data=$(echo "$result" | jq '.data.issueCreate.issue')
+  local new_id
+  new_id=$(echo "$issue_data" | jq -r '.identifier')
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli issue $new_id" "View the created issue")" \
+      "$(next_action "linear-cli comment $new_id \"<comment>\"" "Add a comment to the new issue")")
+  json_ok "$TOOL_NAME create" "$issue_data" "$na"
 }
 
 cmd_issues() {
@@ -278,42 +261,74 @@ cmd_issues() {
   local project=""
   local status=""
   local limit=20
-  
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mine) mine="true"; shift ;;
       --project) project="$2"; shift 2 ;;
       --status) status="$2"; shift 2 ;;
       --limit) limit="$2"; shift 2 ;;
-      *) echo "Unknown option: $1" >&2; exit 1 ;;
+      *) json_error "$TOOL_NAME issues" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]" ;;
     esac
   done
-  
+
   # Build filter
   local filter=""
   local filters=()
-  
+
   if [[ -n "$mine" ]]; then
     filters+=("assignee: { isMe: { eq: true } }")
   fi
-  
+
   if [[ -n "$status" ]]; then
     filters+=("state: { name: { eq: \\\"$status\\\" } }")
   fi
-  
+
   if [[ -n "$project" ]]; then
     filters+=("project: { name: { eq: \\\"$project\\\" } }")
   fi
-  
+
   if [[ ${#filters[@]} -gt 0 ]]; then
     filter="filter: { $(IFS=', '; echo "${filters[*]}") }, "
   fi
-  
-  graphql "{ issues(${filter}first: $limit, orderBy: updatedAt) { nodes { id identifier title state { name } priority assignee { name } project { name } updatedAt } } }" | jq '.data.issues.nodes'
+
+  local raw
+  raw=$(graphql "{ issues(${filter}first: $limit, orderBy: updatedAt) { nodes { id identifier title state { name } priority assignee { name } project { name } updatedAt } } }")
+  local issues
+  issues=$(echo "$raw" | jq '.data.issues.nodes')
+
+  # Truncate at 50
+  local truncated
+  truncated=$(json_truncate "$issues" 50)
+
+  local first_id
+  first_id=$(echo "$issues" | jq -r '.[0].identifier // empty')
+  local na
+  if [[ -n "$first_id" ]]; then
+    na=$(next_actions \
+        "$(next_action "linear-cli issue $first_id" "View details for first issue")" \
+        "$(next_action "linear-cli search \"<query>\"" "Search for specific issues")")
+  else
+    na=$(next_actions \
+        "$(next_action "linear-cli search \"<query>\"" "Search for issues")")
+  fi
+  json_ok "$TOOL_NAME issues" "$truncated" "$na"
 }
 
 # Main
-[[ $# -lt 1 ]] && usage
+if [[ $# -lt 1 ]]; then
+    cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
+        {name: "issues", description: "List issues with optional filters", usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
+        {name: "issue", description: "Get details for a specific issue", usage: "linear-cli issue <ID>"},
+        {name: "comment", description: "Add a comment to an issue", usage: "linear-cli comment <ID> \"<body>\""},
+        {name: "search", description: "Search issues by text", usage: "linear-cli search <query>"},
+        {name: "create", description: "Create a new issue (auto-assigned to you)", usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"},
+        {name: "projects", description: "List all projects", usage: "linear-cli projects"},
+        {name: "teams", description: "List all teams", usage: "linear-cli teams"},
+        {name: "me", description: "Show current user info", usage: "linear-cli me"}
+    ]')"
+    exit 0
+fi
 
 CMD="$1"
 shift
@@ -323,24 +338,32 @@ case "$CMD" in
   teams) cmd_teams ;;
   projects) cmd_projects ;;
   issue)
-    [[ $# -lt 1 ]] && { echo "Usage: linear-cli issue <ID>"; exit 1; }
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME issue" "Issue ID required" "MISSING_ARG" "Usage: linear-cli issue <ID>"
     cmd_issue "$1"
     ;;
   comment)
-    [[ $# -lt 2 ]] && { echo "Usage: linear-cli comment <ID> \"<body>\""; exit 1; }
+    [[ $# -lt 2 ]] && json_error "$TOOL_NAME comment" "Issue ID and comment body required" "MISSING_ARG" "Usage: linear-cli comment <ID> \"<body>\""
     cmd_comment "$1" "$2"
     ;;
   search)
-    [[ $# -lt 1 ]] && { echo "Usage: linear-cli search <query>"; exit 1; }
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME search" "Search query required" "MISSING_ARG" "Usage: linear-cli search <query>"
     cmd_search "$*"
     ;;
   issues) cmd_issues "$@" ;;
   create)
-    [[ $# -lt 2 ]] && { echo "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"; exit 1; }
+    [[ $# -lt 2 ]] && json_error "$TOOL_NAME create" "Team key and title required" "MISSING_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"
     cmd_create "$@"
     ;;
-  help|--help|-h) usage ;;
-  *) echo "Unknown command: $CMD"; usage ;;
+  help|--help|-h)
+    cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
+        {name: "issues", description: "List issues with optional filters", usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
+        {name: "issue", description: "Get details for a specific issue", usage: "linear-cli issue <ID>"},
+        {name: "search", description: "Search issues by text", usage: "linear-cli search <query>"},
+        {name: "create", description: "Create a new issue", usage: "linear-cli create <team-key> \"<title>\""},
+        {name: "me", description: "Show current user info", usage: "linear-cli me"}
+    ]')"
+    ;;
+  *)
+    json_error "$TOOL_NAME" "Unknown command: $CMD" "INVALID_ARG" "Run 'linear-cli' with no args to see available commands"
+    ;;
 esac
-
-

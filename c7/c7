@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# c7 - Context7 documentation lookup for AI agents
+# Token-efficient CLI replacement for Context7 MCP server
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="c7"
+CONFIG_DIR="${HOME}/.config/c7"
+CONFIG_FILE="${CONFIG_DIR}/config"
+
+# Load API key if available
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+  fi
+}
+
+auth_header() {
+  if [[ -n "${CONTEXT7_API_KEY:-}" ]]; then
+    echo "Authorization: Bearer ${CONTEXT7_API_KEY}"
+  else
+    echo ""
+  fi
+}
+
+urlencode() {
+  python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe='/'))" "$1"
+}
+
+cmd_setup() {
+  json_error "$TOOL_NAME setup" "Setup requires interactive input" "INTERACTIVE_REQUIRED" "Run 'c7 setup' in an interactive terminal. Get a free API key at https://context7.com/dashboard"
+}
+
+cmd_search() {
+  local library_name=""
+  local query=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --query|-q) query="$2"; shift 2 ;;
+      -*) json_error "$TOOL_NAME search" "Unknown option: $1" "INVALID_ARG" "Usage: c7 search <library> [--query <query>]" ;;
+      *) library_name="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$library_name" ]]; then
+    json_error "$TOOL_NAME search" "Library name required" "MISSING_ARG" "Usage: c7 search <library> [--query <query>]"
+  fi
+
+  query="${query:-$library_name}"
+
+  local auth
+  auth=$(auth_header)
+
+  local encoded_query encoded_name
+  encoded_query=$(urlencode "$query")
+  encoded_name=$(urlencode "$library_name")
+  local url="https://context7.com/api/v2/libs/search?query=${encoded_query}&libraryName=${encoded_name}"
+
+  local curl_args=(-s --max-time 15 -w "\n%{http_code}")
+  if [[ -n "$auth" ]]; then
+    curl_args+=(-H "$auth")
+  fi
+
+  local raw_response
+  raw_response=$(curl "${curl_args[@]}" "$url" 2>/dev/null)
+
+  local http_code body
+  http_code=$(echo "$raw_response" | tail -1)
+  body=$(echo "$raw_response" | sed '$d')
+
+  case "$http_code" in
+    200) ;;
+    429) json_error "$TOOL_NAME search" "Rate limited" "RATE_LIMITED" "Get an API key at https://context7.com/dashboard and run 'c7 setup'" ;;
+    *) json_error "$TOOL_NAME search" "HTTP $http_code" "HTTP_$http_code" "Check network connectivity" ;;
+  esac
+
+  # Parse results into structured JSON using jq
+  local results
+  results=$(echo "$body" | jq '
+    if type == "array" then . else (.results // .libraries // [.]) end
+    | if type != "array" then [.] else . end
+    | .[:10]
+    | map({
+        id: (.id // "unknown"),
+        name: (.name // .title // "unknown"),
+        total_snippets: (.totalSnippets // .snippets // null),
+        trust_score: (.trustScore // null),
+        description: ((.description // "") | .[:80])
+      })
+  ')
+
+  # Build dynamic next_actions for top result
+  local first_id
+  first_id=$(echo "$results" | jq -r '.[0].id // empty')
+  local na
+  if [[ -n "$first_id" ]]; then
+    na=$(next_actions \
+        "$(next_action "c7 docs $first_id --query \"$query\"" "Fetch docs for top result")")
+  else
+    na=$(next_actions)
+  fi
+
+  json_ok "$TOOL_NAME search" "$(jq -n --argjson r "$results" '{libraries: $r}')" "$na"
+}
+
+cmd_docs() {
+  local library_id=""
+  local query=""
+  local tokens="10000"
+  local format="txt"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --query|-q) query="$2"; shift 2 ;;
+      --tokens|-t) tokens="$2"; shift 2 ;;
+      --format|-f) format="$2"; shift 2 ;;
+      -*) json_error "$TOOL_NAME docs" "Unknown option: $1" "INVALID_ARG" "Usage: c7 docs <library-id> [--query <query>] [--tokens N] [--format txt|json]" ;;
+      *) library_id="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$library_id" ]]; then
+    json_error "$TOOL_NAME docs" "Library ID required (e.g. /facebook/react)" "MISSING_ARG" "Run 'c7 search <name>' first to find the ID"
+  fi
+
+  query="${query:-documentation}"
+
+  local auth
+  auth=$(auth_header)
+
+  local encoded_id encoded_query
+  encoded_id=$(urlencode "$library_id")
+  encoded_query=$(urlencode "$query")
+  local url="https://context7.com/api/v2/context?libraryId=${encoded_id}&query=${encoded_query}&type=${format}&tokens=${tokens}"
+
+  local curl_args=(-s --max-time 30 -w "\n%{http_code}")
+  if [[ -n "$auth" ]]; then
+    curl_args+=(-H "$auth")
+  fi
+
+  local raw_response
+  raw_response=$(curl "${curl_args[@]}" "$url" 2>/dev/null)
+
+  local http_code body
+  http_code=$(echo "$raw_response" | tail -1)
+  body=$(echo "$raw_response" | sed '$d')
+
+  case "$http_code" in
+    200) ;;
+    202) json_error "$TOOL_NAME docs" "Library is being indexed. Try again in a few minutes." "INDEXING" "Wait a few minutes and retry the same command" ;;
+    301) json_error "$TOOL_NAME docs" "Library redirected. Check new ID in response." "REDIRECTED" "The library ID has changed. Parse the response body for the new ID." \
+         "$(next_actions "$(next_action "c7 search $(basename "$library_id")" "Search for the correct library ID")")" ;;
+    429) json_error "$TOOL_NAME docs" "Rate limited" "RATE_LIMITED" "Get an API key at https://context7.com/dashboard and run 'c7 setup'" ;;
+    *) json_error "$TOOL_NAME docs" "HTTP $http_code" "HTTP_$http_code" "Check network connectivity" ;;
+  esac
+
+  # Wrap content in envelope with token count
+  local result
+  if [[ "$format" == "txt" ]]; then
+    # For text format, wrap the text content
+    local char_count
+    char_count=$(echo "$body" | wc -c | tr -d ' ')
+    # Truncate if very large (over 50000 chars)
+    if [[ "$char_count" -gt 50000 ]]; then
+      body=$(echo "$body" | head -c 50000)
+      result=$(jq -n --arg content "$body" --argjson tokens "$tokens" --argjson chars "$char_count" \
+        '{content: ($content + "\n... (truncated)"), tokens_requested: $tokens, characters: $chars, truncated: true}')
+    else
+      result=$(jq -n --arg content "$body" --argjson tokens "$tokens" --argjson chars "$char_count" \
+        '{content: $content, tokens_requested: $tokens, characters: $chars, truncated: false}')
+    fi
+  else
+    # For JSON format, pass through structured
+    result=$(jq -n --argjson data "$(echo "$body" | jq '.' 2>/dev/null || echo '[]')" --argjson tokens "$tokens" \
+      '{data: $data, tokens_requested: $tokens}')
+  fi
+
+  local na
+  na=$(next_actions \
+      "$(next_action "c7 docs $library_id --query \"different topic\" --tokens $tokens" "Search for a different topic in same library")" \
+      "$(next_action "c7 search $(basename "$library_id")" "Search for related libraries")")
+
+  json_ok "$TOOL_NAME docs" "$result" "$na"
+}
+
+# Main dispatch
+load_config
+
+case "${1:-}" in
+  search)  shift; cmd_search "$@" ;;
+  docs)    shift; cmd_docs "$@" ;;
+  setup)   cmd_setup ;;
+  *)
+    cmd_tree "$TOOL_NAME" "Context7 documentation lookup for AI agents" "$(jq -n '[
+        {name: "search", description: "Find a library ID", usage: "c7 search <library> [--query <query>]"},
+        {name: "docs", description: "Fetch documentation for a library", usage: "c7 docs <library-id> [--query <query>] [--tokens N] [--format txt|json]"},
+        {name: "setup", description: "Configure API key (interactive)", usage: "c7 setup"}
+    ]')"
+    ;;
+esac

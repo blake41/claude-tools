@@ -2,53 +2,16 @@
 set -euo pipefail
 
 source "$(dirname "$0")/infisical-api-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="infisical-api"
 
 # ============================================================================
 # SETUP COMMANDS
 # ============================================================================
 
 cmd_setup() {
-    ensure_config_dir
-    
-    echo "Infisical CLI Setup"
-    echo "==================="
-    echo ""
-    echo "You need a Machine Identity with Universal Auth."
-    echo "Create one in Infisical: Access Control > Machine Identities"
-    echo ""
-    
-    read -p "Client ID: " client_id
-    read -sp "Client Secret: " client_secret
-    echo ""
-    
-    # Optional: API host for self-hosted
-    read -p "API Host [https://us.infisical.com]: " api_host
-    api_host="${api_host:-https://us.infisical.com}"
-    
-    # Save credentials
-    cat > "$CONFIG_DIR/credentials" << EOF
-INFISICAL_CLIENT_ID="$client_id"
-INFISICAL_CLIENT_SECRET="$client_secret"
-EOF
-    chmod 600 "$CONFIG_DIR/credentials"
-    
-    # Save API host if not default
-    if [[ "$api_host" != "https://us.infisical.com" ]]; then
-        echo "$api_host" > "$CONFIG_DIR/api_host"
-    fi
-    
-    echo -e "${GREEN}Credentials saved to ~/.config/infisical/${NC}"
-    
-    # Test authentication
-    echo ""
-    echo "Testing authentication..."
-    load_credentials || exit 1
-    if get_access_token > /dev/null 2>&1; then
-        echo -e "${GREEN}✓ Authentication successful!${NC}"
-    else
-        echo -e "${RED}✗ Authentication failed. Check your credentials.${NC}"
-        exit 1
-    fi
+    json_error "$TOOL_NAME setup" "Setup requires interactive input" "INTERACTIVE_REQUIRED" "Run 'infisical-api setup' in an interactive terminal. Create a Machine Identity in Infisical: Access Control > Machine Identities"
 }
 
 # ============================================================================
@@ -56,22 +19,44 @@ EOF
 # ============================================================================
 
 cmd_projects_list() {
-    load_credentials || exit 1
-    
-    echo "Projects:"
-    echo "========="
-    infisical_api "/v1/workspace" | jq -r '.workspaces[] | "\(.id)\t\(.name)\t\(.environments | length) envs"' | column -t -s $'\t'
+    load_credentials || json_error "$TOOL_NAME projects list" "Infisical credentials not found" "AUTH_MISSING" "Set INFISICAL_CLIENT_ID and INFISICAL_CLIENT_SECRET in .env or ~/.config/infisical/credentials"
+
+    local raw
+    raw=$(infisical_api "/v1/workspace") || json_error "$TOOL_NAME projects list" "Authentication failed" "AUTH_FAILED" "Check your credentials"
+
+    local projects
+    projects=$(echo "$raw" | jq '[.workspaces[] | {id, name, environments: (.environments | length)}]')
+
+    local first_id
+    first_id=$(echo "$projects" | jq -r '.[0].id // empty')
+    local na
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "infisical-api projects get $first_id" "Get project details")" \
+            "$(next_action "infisical-api secrets list -p $first_id" "List secrets for first project")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME projects list" "$projects" "$na"
 }
 
 cmd_projects_get() {
     local project_id="${1:-}"
     if [[ -z "$project_id" ]]; then
-        echo "Usage: infisical projects get <project-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME projects get" "Project ID required" "MISSING_ARG" "Usage: infisical-api projects get <project-id>"
     fi
-    
-    load_credentials || exit 1
-    infisical_api "/v2/workspace/$project_id" | pretty_json '.'
+
+    load_credentials || json_error "$TOOL_NAME projects get" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local result
+    result=$(infisical_api "/v2/workspace/$project_id") || json_error "$TOOL_NAME projects get" "Failed to get project" "API_ERROR" "Check the project ID"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets list -p $project_id" "List secrets")" \
+        "$(next_action "infisical-api syncs list $project_id" "List syncs")")
+    json_ok "$TOOL_NAME projects get" "$result" "$na"
 }
 
 # ============================================================================
@@ -82,49 +67,37 @@ cmd_secrets_list() {
     local project_id=""
     local environment="prod"
     local path="/"
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -p|--project)
-                project_id="$2"
-                shift 2
-                ;;
-            -e|--env)
-                environment="$2"
-                shift 2
-                ;;
-            --path)
-                path="$2"
-                shift 2
-                ;;
-            *)
-                echo "Unknown option: $1" >&2
-                exit 1
-                ;;
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            *) json_error "$TOOL_NAME secrets list" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api secrets list -p <project-id> [-e env] [--path /path]" ;;
         esac
     done
-    
+
     if [[ -z "$project_id" ]]; then
-        echo "Usage: infisical secrets list -p <project-id> [-e <environment>] [--path <path>]" >&2
-        echo "" >&2
-        echo "Options:" >&2
-        echo "  -p, --project  Project ID (required)" >&2
-        echo "  -e, --env      Environment slug (default: prod)" >&2
-        echo "  --path         Secret path (default: /)" >&2
-        exit 1
+        json_error "$TOOL_NAME secrets list" "Project ID required" "MISSING_ARG" "Usage: infisical-api secrets list -p <project-id> [-e <environment>] [--path <path>]"
     fi
-    
-    load_credentials || exit 1
-    
-    echo "Secrets in $project_id / $environment / $path:"
-    echo "================================================"
-    
+
+    load_credentials || json_error "$TOOL_NAME secrets list" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
     local encoded_path
     encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
-    
-    infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path" \
-        | jq -r '.secrets[] | "\(.secretKey)\t\(.secretValue | if length > 40 then .[0:40] + "..." else . end)"' \
-        | column -t -s $'\t'
+
+    local raw
+    raw=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path") || \
+        json_error "$TOOL_NAME secrets list" "Failed to list secrets" "API_ERROR" "Check project ID, environment, and path"
+
+    local secrets
+    secrets=$(echo "$raw" | jq '[.secrets[] | {key: .secretKey, value: (.secretValue | if length > 40 then .[0:40] + "..." else . end)}]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets get <KEY> -p $project_id -e $environment" "Get a specific secret value")" \
+        "$(next_action "infisical-api secrets export -p $project_id -e $environment" "Export as env format")")
+    json_ok "$TOOL_NAME secrets list" "$secrets" "$na"
 }
 
 cmd_secrets_get() {
@@ -132,45 +105,39 @@ cmd_secrets_get() {
     local environment="prod"
     local path="/"
     local secret_key=""
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -p|--project)
-                project_id="$2"
-                shift 2
-                ;;
-            -e|--env)
-                environment="$2"
-                shift 2
-                ;;
-            --path)
-                path="$2"
-                shift 2
-                ;;
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
             *)
                 if [[ -z "$secret_key" ]]; then
-                    secret_key="$1"
-                    shift
+                    secret_key="$1"; shift
                 else
-                    echo "Unknown option: $1" >&2
-                    exit 1
+                    json_error "$TOOL_NAME secrets get" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api secrets get <key> -p <project-id>"
                 fi
                 ;;
         esac
     done
-    
+
     if [[ -z "$project_id" || -z "$secret_key" ]]; then
-        echo "Usage: infisical secrets get <secret-key> -p <project-id> [-e <environment>] [--path <path>]" >&2
-        exit 1
+        json_error "$TOOL_NAME secrets get" "Secret key and project ID required" "MISSING_ARG" "Usage: infisical-api secrets get <secret-key> -p <project-id> [-e <environment>] [--path <path>]"
     fi
-    
-    load_credentials || exit 1
-    
+
+    load_credentials || json_error "$TOOL_NAME secrets get" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
     local encoded_path
     encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
-    
-    infisical_api "/v3/secrets/raw/$secret_key?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path" \
-        | pretty_json '.'
+
+    local result
+    result=$(infisical_api "/v3/secrets/raw/$secret_key?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path") || \
+        json_error "$TOOL_NAME secrets get" "Failed to get secret" "NOT_FOUND" "Check the secret key, project ID, and environment"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List all secrets")")
+    json_ok "$TOOL_NAME secrets get" "$result" "$na"
 }
 
 cmd_secrets_export() {
@@ -178,59 +145,51 @@ cmd_secrets_export() {
     local environment="prod"
     local path="/"
     local format="env"
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -p|--project)
-                project_id="$2"
-                shift 2
-                ;;
-            -e|--env)
-                environment="$2"
-                shift 2
-                ;;
-            --path)
-                path="$2"
-                shift 2
-                ;;
-            -f|--format)
-                format="$2"
-                shift 2
-                ;;
-            *)
-                echo "Unknown option: $1" >&2
-                exit 1
-                ;;
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            -f|--format) format="$2"; shift 2 ;;
+            *) json_error "$TOOL_NAME secrets export" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api secrets export -p <project-id> [-f env|json]" ;;
         esac
     done
-    
+
     if [[ -z "$project_id" ]]; then
-        echo "Usage: infisical secrets export -p <project-id> [-e <environment>] [--path <path>] [-f format]" >&2
-        echo "" >&2
-        echo "Formats: env (default), json" >&2
-        exit 1
+        json_error "$TOOL_NAME secrets export" "Project ID required" "MISSING_ARG" "Usage: infisical-api secrets export -p <project-id> [-e <environment>] [--path <path>] [-f format]"
     fi
-    
-    load_credentials || exit 1
-    
+
+    load_credentials || json_error "$TOOL_NAME secrets export" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
     local encoded_path
     encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
-    
+
     local response
-    response=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path")
-    
+    response=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path") || \
+        json_error "$TOOL_NAME secrets export" "Failed to export secrets" "API_ERROR" "Check project ID, environment, and path"
+
+    local result
     case "$format" in
         env)
-            echo "$response" | jq -r '.secrets[] | "\(.secretKey)=\(.secretValue)"'
+            local content
+            content=$(echo "$response" | jq -r '.secrets[] | "\(.secretKey)=\(.secretValue)"')
+            result=$(jq -n --arg fmt "env" --arg content "$content" '{format: $fmt, content: $content}')
             ;;
         json)
-            echo "$response" | jq '.secrets | map({key: .secretKey, value: .secretValue}) | from_entries'
+            local json_content
+            json_content=$(echo "$response" | jq '.secrets | map({key: .secretKey, value: .secretValue}) | from_entries')
+            result=$(jq -n --arg fmt "json" --argjson content "$json_content" '{format: $fmt, content: $content}')
             ;;
         *)
-            echo "Unknown format: $format" >&2
-            exit 1
+            json_error "$TOOL_NAME secrets export" "Unknown format: $format" "INVALID_ARG" "Supported formats: env, json"
             ;;
     esac
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List secrets with truncated values")")
+    json_ok "$TOOL_NAME secrets export" "$result" "$na"
 }
 
 # ============================================================================
@@ -239,77 +198,97 @@ cmd_secrets_export() {
 
 cmd_syncs_list() {
     local project_id="${1:-}"
-    
+
     if [[ -z "$project_id" ]]; then
-        echo "Usage: infisical syncs list <project-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME syncs list" "Project ID required" "MISSING_ARG" "Usage: infisical-api syncs list <project-id>"
     fi
-    
-    load_credentials || exit 1
-    
-    echo "Secret Syncs for $project_id:"
-    echo "=============================="
-    
-    # Try the secret-syncs endpoint
+
+    load_credentials || json_error "$TOOL_NAME syncs list" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
     local response
-    response=$(infisical_api "/v1/secret-syncs?projectId=$project_id" 2>&1)
-    
+    response=$(infisical_api "/v1/secret-syncs?projectId=$project_id" 2>&1) || \
+        json_error "$TOOL_NAME syncs list" "Failed to list syncs" "API_ERROR" "Check the project ID"
+
+    local syncs
     if echo "$response" | jq -e '.secretSyncs' > /dev/null 2>&1; then
-        echo "$response" | jq -r '.secretSyncs[] | "\(.id)\t\(.destination)\t\(.status)\t\(.lastSyncedAt // "never")"' | column -t -s $'\t'
+        syncs=$(echo "$response" | jq '[.secretSyncs[] | {id, destination, status, lastSyncedAt}]')
     else
-        echo "$response" | pretty_json '.'
+        syncs=$(echo "$response" | jq '.')
     fi
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs get <sync-id>" "Get sync details")" \
+        "$(next_action "infisical-api syncs force <sync-id>" "Force a sync")")
+    json_ok "$TOOL_NAME syncs list" "$syncs" "$na"
 }
 
 cmd_syncs_get() {
     local sync_id="${1:-}"
-    
+
     if [[ -z "$sync_id" ]]; then
-        echo "Usage: infisical syncs get <sync-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME syncs get" "Sync ID required" "MISSING_ARG" "Usage: infisical-api syncs get <sync-id>"
     fi
-    
-    load_credentials || exit 1
-    
-    # Try Render-specific endpoint first
-    infisical_api "/v1/secret-syncs/render/$sync_id" | pretty_json '.'
+
+    load_credentials || json_error "$TOOL_NAME syncs get" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local result
+    result=$(infisical_api "/v1/secret-syncs/render/$sync_id") || \
+        json_error "$TOOL_NAME syncs get" "Failed to get sync" "NOT_FOUND" "Check the sync ID"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs trigger $sync_id" "Trigger this sync")" \
+        "$(next_action "infisical-api syncs force $sync_id" "Force sync via temp secret")")
+    json_ok "$TOOL_NAME syncs get" "$result" "$na"
 }
 
 cmd_syncs_trigger() {
     local sync_id="${1:-}"
-    
+
     if [[ -z "$sync_id" ]]; then
-        echo "Usage: infisical syncs trigger <sync-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME syncs trigger" "Sync ID required" "MISSING_ARG" "Usage: infisical-api syncs trigger <sync-id>"
     fi
-    
-    load_credentials || exit 1
-    
-    echo "Triggering sync $sync_id..."
-    infisical_api "/v1/secret-syncs/render/$sync_id/sync" -X POST | pretty_json '.'
+
+    load_credentials || json_error "$TOOL_NAME syncs trigger" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local result
+    result=$(infisical_api "/v1/secret-syncs/render/$sync_id/sync" -X POST) || \
+        json_error "$TOOL_NAME syncs trigger" "Failed to trigger sync" "API_ERROR" "Try: infisical-api syncs force $sync_id"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs get $sync_id" "Check sync status")")
+    json_ok "$TOOL_NAME syncs trigger" "$result" "$na"
 }
 
 cmd_syncs_remove_secrets() {
     local sync_id="${1:-}"
-    
+    local yes_flag=false
+
+    # Check for --yes flag
+    if [[ "${2:-}" == "--yes" ]]; then
+        yes_flag=true
+    fi
+
     if [[ -z "$sync_id" ]]; then
-        echo "Usage: infisical syncs remove-secrets <sync-id>" >&2
-        echo "" >&2
-        echo "This will remove secrets from Render that are not in Infisical." >&2
-        exit 1
+        json_error "$TOOL_NAME syncs remove-secrets" "Sync ID required" "MISSING_ARG" "Usage: infisical-api syncs remove-secrets <sync-id> [--yes]"
     fi
-    
-    load_credentials || exit 1
-    
-    echo -e "${YELLOW}WARNING: This will delete secrets from Render that are not in Infisical.${NC}"
-    read -p "Continue? [y/N] " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        echo "Aborted."
-        exit 0
+
+    if [[ "$yes_flag" != "true" ]]; then
+        json_error "$TOOL_NAME syncs remove-secrets" "This will delete secrets from Render that are not in Infisical. Pass --yes to confirm." "CONFIRMATION_REQUIRED" "Usage: infisical-api syncs remove-secrets $sync_id --yes"
     fi
-    
-    echo "Removing stale secrets via sync $sync_id..."
-    infisical_api "/v1/secret-syncs/render/$sync_id/remove-secrets" -X POST | pretty_json '.'
+
+    load_credentials || json_error "$TOOL_NAME syncs remove-secrets" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local result
+    result=$(infisical_api "/v1/secret-syncs/render/$sync_id/remove-secrets" -X POST) || \
+        json_error "$TOOL_NAME syncs remove-secrets" "Failed to remove secrets" "API_ERROR" "Check the sync ID"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs get $sync_id" "Check sync status")")
+    json_ok "$TOOL_NAME syncs remove-secrets" "$result" "$na"
 }
 
 # ============================================================================
@@ -318,43 +297,33 @@ cmd_syncs_remove_secrets() {
 
 cmd_syncs_force() {
     local sync_id="${1:-}"
-    
+
     if [[ -z "$sync_id" ]]; then
-        echo "Usage: infisical syncs force <sync-id>" >&2
-        echo "" >&2
-        echo "Forces a sync by adding/removing a temporary secret." >&2
-        echo "(Workaround for broken sync-secrets API)" >&2
-        exit 1
+        json_error "$TOOL_NAME syncs force" "Sync ID required" "MISSING_ARG" "Usage: infisical-api syncs force <sync-id>"
     fi
-    
-    load_credentials || exit 1
-    
+
+    load_credentials || json_error "$TOOL_NAME syncs force" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
     # Get sync details
-    echo "Getting sync details..."
     local sync_info
-    sync_info=$(infisical_api "/v1/secret-syncs/render/$sync_id")
-    
+    sync_info=$(infisical_api "/v1/secret-syncs/render/$sync_id") || \
+        json_error "$TOOL_NAME syncs force" "Failed to get sync details" "NOT_FOUND" "Check the sync ID"
+
     local project_id env_slug secret_path env_group_id
     project_id=$(echo "$sync_info" | jq -r '.secretSync.projectId')
     env_slug=$(echo "$sync_info" | jq -r '.secretSync.environment.slug')
     secret_path=$(echo "$sync_info" | jq -r '.secretSync.folder.path')
     env_group_id=$(echo "$sync_info" | jq -r '.secretSync.destinationConfig.environmentGroupId')
-    
+
     if [[ -z "$project_id" || "$project_id" == "null" ]]; then
-        echo -e "${RED}Error: Could not get sync details${NC}" >&2
-        exit 1
+        json_error "$TOOL_NAME syncs force" "Could not get sync details" "API_ERROR" "The sync response did not contain expected fields"
     fi
-    
-    echo "  Project: $project_id"
-    echo "  Environment: $env_slug"
-    echo "  Path: $secret_path"
-    echo "  Render Env Group: $env_group_id"
-    echo ""
-    
+
+    local steps='[]'
+
     # Create trigger secret
     local trigger_key="_INFISICAL_SYNC_TRIGGER_$(date +%s)"
-    echo "Creating temporary trigger secret: $trigger_key"
-    
+
     local create_result
     create_result=$(infisical_api "/v3/secrets/raw/$trigger_key" \
         -X POST \
@@ -364,59 +333,55 @@ cmd_syncs_force() {
             \"secretPath\": \"$secret_path\",
             \"secretValue\": \"$(date -Iseconds)\",
             \"type\": \"shared\"
-        }")
-    
+        }") || json_error "$TOOL_NAME syncs force" "Failed to create trigger secret" "API_ERROR" "Check project permissions"
+
     if ! echo "$create_result" | jq -e '.secret' > /dev/null 2>&1; then
-        echo -e "${RED}Error creating trigger secret:${NC}" >&2
-        echo "$create_result" | pretty_json '.'
-        exit 1
+        json_error "$TOOL_NAME syncs force" "Failed to create trigger secret" "API_ERROR" "The API response was unexpected"
     fi
-    
-    echo -e "${GREEN}✓ Trigger secret created${NC}"
-    
+
+    steps=$(echo "$steps" | jq --arg s "Created trigger secret: $trigger_key" '. + [$s]')
+
     # Wait for auto-sync
-    echo ""
-    echo "Waiting for auto-sync (5 seconds)..."
     sleep 5
-    
+    steps=$(echo "$steps" | jq '. + ["Waited 5s for auto-sync"]')
+
     # Delete trigger secret from Infisical
-    echo "Deleting trigger secret from Infisical..."
     infisical_api "/v3/secrets/raw/$trigger_key" \
         -X DELETE \
         -d "{
             \"workspaceId\": \"$project_id\",
             \"environment\": \"$env_slug\",
             \"secretPath\": \"$secret_path\"
-        }" > /dev/null
-    
-    echo -e "${GREEN}✓ Trigger secret deleted from Infisical${NC}"
-    
-    # Delete trigger secret from Render (since Infisical won't auto-delete it)
-    if command -v render-envgroups &> /dev/null || [[ -f "$(dirname "$0")/../render/render-common.sh" ]]; then
-        echo "Cleaning up trigger secret from Render..."
-        
-        # Source render-common
-        if [[ -f "$(dirname "$0")/../render/render-common.sh" ]]; then
-            source "$(dirname "$0")/../render/render-common.sh"
-        else
-            source "$HOME/.local/bin/render-common.sh" 2>/dev/null || true
-        fi
-        
+        }" > /dev/null 2>&1 || true
+
+    steps=$(echo "$steps" | jq '. + ["Deleted trigger secret from Infisical"]')
+
+    # Try to clean up from Render
+    local render_cleanup=false
+    if [[ -f "$(dirname "$0")/../render/render-common.sh" ]]; then
+        source "$(dirname "$0")/../render/render-common.sh"
         if load_api_key 2>/dev/null; then
-            sleep 2  # Wait a moment for sync to complete
+            sleep 2
             curl -sS "https://api.render.com/v1/env-groups/$env_group_id/env-vars/$trigger_key" \
                 -X DELETE \
                 -H "Authorization: Bearer $RENDER_API_KEY" > /dev/null 2>&1 || true
-            echo -e "${GREEN}✓ Trigger secret cleaned up from Render${NC}"
-        else
-            echo -e "${YELLOW}Note: Could not clean up trigger from Render (no API key). Delete '$trigger_key' manually.${NC}"
+            render_cleanup=true
+            steps=$(echo "$steps" | jq '. + ["Cleaned up trigger secret from Render"]')
         fi
-    else
-        echo -e "${YELLOW}Note: render-common.sh not found. Delete '$trigger_key' from Render manually.${NC}"
     fi
-    
-    echo ""
-    echo -e "${GREEN}✓ Sync triggered successfully!${NC}"
+
+    if [[ "$render_cleanup" != "true" ]]; then
+        steps=$(echo "$steps" | jq --arg key "$trigger_key" '. + ["Note: Could not clean up from Render. Delete " + $key + " manually."]')
+    fi
+
+    local result
+    result=$(jq -n --argjson steps "$steps" --argjson synced true \
+        '{steps: $steps, sync_triggered: $synced}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs get $sync_id" "Check sync status")")
+    json_ok "$TOOL_NAME syncs force" "$result" "$na"
 }
 
 # ============================================================================
@@ -428,85 +393,61 @@ cmd_debug_compare() {
     local environment="prod"
     local path="/"
     local render_env_group=""
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -p|--project)
-                project_id="$2"
-                shift 2
-                ;;
-            -e|--env)
-                environment="$2"
-                shift 2
-                ;;
-            --path)
-                path="$2"
-                shift 2
-                ;;
-            -r|--render-group)
-                render_env_group="$2"
-                shift 2
-                ;;
-            *)
-                echo "Unknown option: $1" >&2
-                exit 1
-                ;;
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            -r|--render-group) render_env_group="$2"; shift 2 ;;
+            *) json_error "$TOOL_NAME debug compare" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api debug compare -p <project-id> -r <render-env-group-id>" ;;
         esac
     done
-    
+
     if [[ -z "$project_id" || -z "$render_env_group" ]]; then
-        echo "Usage: infisical debug compare -p <project-id> -r <render-env-group-id> [-e <environment>] [--path <path>]" >&2
-        exit 1
+        json_error "$TOOL_NAME debug compare" "Project ID and Render env group ID required" "MISSING_ARG" "Usage: infisical-api debug compare -p <project-id> -r <render-env-group-id> [-e <environment>] [--path <path>]"
     fi
-    
-    load_credentials || exit 1
-    
+
+    load_credentials || json_error "$TOOL_NAME debug compare" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
     # Check if render tools are available
-    if ! command -v render-services &> /dev/null; then
-        echo -e "${RED}Error: render-services not found. Install render CLI tools first.${NC}" >&2
-        exit 1
+    if [[ ! -f "$(dirname "$0")/../render/render-common.sh" ]]; then
+        json_error "$TOOL_NAME debug compare" "render-common.sh not found" "MISSING_DEP" "Install render CLI tools first"
     fi
-    
-    echo "Comparing Infisical ($project_id/$environment$path) with Render env group ($render_env_group)"
-    echo "=========================================================================================="
-    echo ""
-    
+
     # Get Infisical secrets
     local encoded_path
     encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
     local infisical_secrets
     infisical_secrets=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path" \
         | jq -r '.secrets[].secretKey' | sort)
-    
-    # Get Render env vars (need to source render-common for this)
-    source "$(dirname "$0")/../render/render-common.sh" 2>/dev/null || {
-        echo -e "${RED}Error: Could not source render-common.sh${NC}" >&2
-        exit 1
-    }
-    load_api_key || exit 1
-    
+
+    # Get Render env vars
+    source "$(dirname "$0")/../render/render-common.sh" 2>/dev/null || \
+        json_error "$TOOL_NAME debug compare" "Could not source render-common.sh" "MISSING_DEP" "Check render tools installation"
+    load_api_key || json_error "$TOOL_NAME debug compare" "Render API key not found" "AUTH_MISSING" "Set RENDER_API_KEY"
+
     local render_vars
     render_vars=$(render_api "/env-groups/$render_env_group/env-vars" | jq -r '.[].key' | sort)
-    
-    echo "Keys in Infisical only (should be ADDED to Render):"
-    echo "----------------------------------------------------"
-    comm -23 <(echo "$infisical_secrets") <(echo "$render_vars") | while read key; do
-        echo -e "  ${GREEN}+ $key${NC}"
-    done
-    echo ""
-    
-    echo "Keys in Render only (should be DELETED from Render):"
-    echo "-----------------------------------------------------"
-    comm -13 <(echo "$infisical_secrets") <(echo "$render_vars") | while read key; do
-        echo -e "  ${RED}- $key${NC}"
-    done
-    echo ""
-    
-    echo "Keys in both (check values match):"
-    echo "-----------------------------------"
-    comm -12 <(echo "$infisical_secrets") <(echo "$render_vars") | while read key; do
-        echo -e "  ${BLUE}= $key${NC}"
-    done
+
+    # Compute diffs
+    local only_infisical only_render matching
+    only_infisical=$(comm -23 <(echo "$infisical_secrets") <(echo "$render_vars") | jq -R . | jq -s .)
+    only_render=$(comm -13 <(echo "$infisical_secrets") <(echo "$render_vars") | jq -R . | jq -s .)
+    matching=$(comm -12 <(echo "$infisical_secrets") <(echo "$render_vars") | jq -R . | jq -s .)
+
+    local result
+    result=$(jq -n \
+        --argjson only_in_infisical "$only_infisical" \
+        --argjson only_in_render "$only_render" \
+        --argjson matching "$matching" \
+        '{only_in_infisical: $only_in_infisical, only_in_render: $only_in_render, matching: $matching}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs force <sync-id>" "Force a sync to reconcile")" \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List Infisical secrets")")
+    json_ok "$TOOL_NAME debug compare" "$result" "$na"
 }
 
 # ============================================================================
@@ -515,18 +456,21 @@ cmd_debug_compare() {
 
 cmd_integrations_list() {
     local project_id="${1:-}"
-    
+
     if [[ -z "$project_id" ]]; then
-        echo "Usage: infisical integrations list <project-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME integrations list" "Project ID required" "MISSING_ARG" "Usage: infisical-api integrations list <project-id>"
     fi
-    
-    load_credentials || exit 1
-    
-    echo "Integrations for $project_id:"
-    echo "=============================="
-    
-    infisical_api "/v1/integration?workspaceId=$project_id" | pretty_json '.'
+
+    load_credentials || json_error "$TOOL_NAME integrations list" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local result
+    result=$(infisical_api "/v1/integration?workspaceId=$project_id") || \
+        json_error "$TOOL_NAME integrations list" "Failed to list integrations" "API_ERROR" "Check the project ID"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api syncs list $project_id" "List syncs for this project")")
+    json_ok "$TOOL_NAME integrations list" "$result" "$na"
 }
 
 # ============================================================================
@@ -537,93 +481,44 @@ cmd_api() {
     local method="GET"
     local endpoint=""
     local data=""
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -X|--method)
-                method="$2"
-                shift 2
-                ;;
-            -d|--data)
-                data="$2"
-                shift 2
-                ;;
+            -X|--method) method="$2"; shift 2 ;;
+            -d|--data) data="$2"; shift 2 ;;
             *)
                 if [[ -z "$endpoint" ]]; then
-                    endpoint="$1"
-                    shift
+                    endpoint="$1"; shift
                 else
-                    echo "Unknown option: $1" >&2
-                    exit 1
+                    json_error "$TOOL_NAME api" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api api <endpoint> [-X METHOD] [-d data]"
                 fi
                 ;;
         esac
     done
-    
+
     if [[ -z "$endpoint" ]]; then
-        echo "Usage: infisical api <endpoint> [-X METHOD] [-d data]" >&2
-        echo "" >&2
-        echo "Example: infisical api /v1/secret-syncs?projectId=xxx" >&2
-        exit 1
+        json_error "$TOOL_NAME api" "Endpoint required" "MISSING_ARG" "Usage: infisical-api api <endpoint> [-X METHOD] [-d data]"
     fi
-    
-    load_credentials || exit 1
-    
+
+    load_credentials || json_error "$TOOL_NAME api" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local result
     if [[ -n "$data" ]]; then
-        infisical_api "$endpoint" -X "$method" -d "$data" | pretty_json '.'
+        result=$(infisical_api "$endpoint" -X "$method" -d "$data") || \
+            json_error "$TOOL_NAME api" "API call failed" "API_ERROR" "Check the endpoint and data"
     else
-        infisical_api "$endpoint" -X "$method" | pretty_json '.'
+        result=$(infisical_api "$endpoint" -X "$method") || \
+            json_error "$TOOL_NAME api" "API call failed" "API_ERROR" "Check the endpoint"
     fi
+
+    json_ok "$TOOL_NAME api" "$result"
 }
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
-show_help() {
-    echo "Usage: infisical <command> [subcommand] [args]"
-    echo ""
-    echo "Setup:"
-    echo "  setup                       Configure credentials interactively"
-    echo ""
-    echo "Projects:"
-    echo "  projects list               List all projects"
-    echo "  projects get <id>           Get project details"
-    echo ""
-    echo "Secrets:"
-    echo "  secrets list -p <project> [-e env] [--path /path]"
-    echo "                              List secrets"
-    echo "  secrets get <key> -p <project> [-e env] [--path /path]"
-    echo "                              Get a specific secret"
-    echo "  secrets export -p <project> [-e env] [--path /path] [-f format]"
-    echo "                              Export secrets (env or json format)"
-    echo ""
-    echo "Syncs (Render):"
-    echo "  syncs list <project-id>     List secret syncs"
-    echo "  syncs get <sync-id>         Get sync details"
-    echo "  syncs trigger <sync-id>     Trigger a sync (API - may not work)"
-    echo "  syncs force <sync-id>       Force sync via temp secret (workaround)"
-    echo "  syncs remove-secrets <sync-id>"
-    echo "                              Remove stale secrets from Render"
-    echo ""
-    echo "Integrations:"
-    echo "  integrations list <project-id>"
-    echo "                              List all integrations"
-    echo ""
-    echo "Debug:"
-    echo "  debug compare -p <project> -r <render-env-group> [-e env] [--path /path]"
-    echo "                              Compare Infisical secrets with Render env group"
-    echo ""
-    echo "Raw API:"
-    echo "  api <endpoint> [-X METHOD] [-d data]"
-    echo "                              Make raw API call"
-    echo ""
-    echo "Config:"
-    echo "  Global: ~/.config/infisical/credentials"
-    echo "  Override: .env with INFISICAL_CLIENT_ID and INFISICAL_CLIENT_SECRET"
-}
-
-case "${1:-help}" in
+case "${1:-}" in
     setup)
         cmd_setup
         ;;
@@ -631,7 +526,7 @@ case "${1:-help}" in
         case "${2:-list}" in
             list) cmd_projects_list ;;
             get) cmd_projects_get "${3:-}" ;;
-            *) echo "Usage: infisical projects <list|get>" >&2 ;;
+            *) json_error "$TOOL_NAME projects" "Unknown subcommand: ${2:-}" "INVALID_ARG" "Usage: infisical-api projects <list|get>" ;;
         esac
         ;;
     secrets)
@@ -639,7 +534,7 @@ case "${1:-help}" in
             list) shift 2; cmd_secrets_list "$@" ;;
             get) shift 2; cmd_secrets_get "$@" ;;
             export) shift 2; cmd_secrets_export "$@" ;;
-            *) echo "Usage: infisical secrets <list|get|export>" >&2 ;;
+            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|export>" ;;
         esac
         ;;
     syncs)
@@ -648,32 +543,41 @@ case "${1:-help}" in
             get) cmd_syncs_get "${3:-}" ;;
             trigger) cmd_syncs_trigger "${3:-}" ;;
             force) cmd_syncs_force "${3:-}" ;;
-            remove-secrets) cmd_syncs_remove_secrets "${3:-}" ;;
-            *) echo "Usage: infisical syncs <list|get|trigger|force|remove-secrets>" >&2 ;;
+            remove-secrets) cmd_syncs_remove_secrets "${3:-}" "${4:-}" ;;
+            *) json_error "$TOOL_NAME syncs" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api syncs <list|get|trigger|force|remove-secrets>" ;;
         esac
         ;;
     integrations)
         case "${2:-}" in
             list) cmd_integrations_list "${3:-}" ;;
-            *) echo "Usage: infisical integrations <list>" >&2 ;;
+            *) json_error "$TOOL_NAME integrations" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api integrations <list>" ;;
         esac
         ;;
     debug)
         case "${2:-}" in
             compare) shift 2; cmd_debug_compare "$@" ;;
-            *) echo "Usage: infisical debug <compare>" >&2 ;;
+            *) json_error "$TOOL_NAME debug" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api debug <compare>" ;;
         esac
         ;;
     api)
         shift; cmd_api "$@"
         ;;
-    help|--help|-h)
-        show_help
-        ;;
     *)
-        echo "Unknown command: $1" >&2
-        show_help
-        exit 1
+        cmd_tree "$TOOL_NAME" "Infisical secrets management for AI agents" "$(jq -n '[
+            {name: "setup", description: "Configure credentials (interactive)", usage: "infisical-api setup"},
+            {name: "projects list", description: "List all projects", usage: "infisical-api projects list"},
+            {name: "projects get", description: "Get project details", usage: "infisical-api projects get <id>"},
+            {name: "secrets list", description: "List secrets", usage: "infisical-api secrets list -p <project> [-e env] [--path /path]"},
+            {name: "secrets get", description: "Get a specific secret", usage: "infisical-api secrets get <key> -p <project> [-e env]"},
+            {name: "secrets export", description: "Export secrets", usage: "infisical-api secrets export -p <project> [-f env|json]"},
+            {name: "syncs list", description: "List secret syncs", usage: "infisical-api syncs list <project-id>"},
+            {name: "syncs get", description: "Get sync details", usage: "infisical-api syncs get <sync-id>"},
+            {name: "syncs trigger", description: "Trigger a sync", usage: "infisical-api syncs trigger <sync-id>"},
+            {name: "syncs force", description: "Force sync via temp secret", usage: "infisical-api syncs force <sync-id>"},
+            {name: "syncs remove-secrets", description: "Remove stale secrets from Render", usage: "infisical-api syncs remove-secrets <sync-id> [--yes]"},
+            {name: "integrations list", description: "List integrations", usage: "infisical-api integrations list <project-id>"},
+            {name: "debug compare", description: "Compare Infisical vs Render secrets", usage: "infisical-api debug compare -p <project> -r <render-env-group>"},
+            {name: "api", description: "Raw API call", usage: "infisical-api api <endpoint> [-X METHOD] [-d data]"}
+        ]')"
         ;;
 esac
-

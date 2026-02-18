@@ -1,0 +1,467 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/notion-cc-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="notion-cc"
+
+# ============================================================================
+# SETUP COMMANDS
+# ============================================================================
+
+cmd_setup() {
+    json_error "$TOOL_NAME setup" "Setup requires interactive input" "INTERACTIVE_REQUIRED" "Run 'notion-cc setup [profile]' in an interactive terminal. Create an integration at https://www.notion.so/my-integrations"
+}
+
+# ============================================================================
+# TASK COMMANDS
+# ============================================================================
+
+cmd_create() {
+    local title="${1:-}"
+    shift || true
+    local description="$*"
+
+    if [[ -z "$title" ]]; then
+        json_error "$TOOL_NAME create" "Title required" "MISSING_ARG" "Usage: notion-cc create <title> [description]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME create" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local database_id
+    # Check .env first, then config file
+    if [[ -f ".env" ]]; then
+        database_id=$(grep -E "^NOTION_DATABASE_ID=" .env 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+    fi
+    if [[ -z "${database_id:-}" && -f "$CONFIG_DIR/database_id" ]]; then
+        database_id=$(cat "$CONFIG_DIR/database_id")
+    fi
+    if [[ -z "${database_id:-}" ]]; then
+        json_error "$TOOL_NAME create" "No database configured" "NOT_FOUND" "Add NOTION_DATABASE_ID to .env or run: notion-cc set-database <database-url>"
+    fi
+
+    local payload
+    payload=$(jq -n \
+        --arg db_id "$database_id" \
+        --arg title "$title" \
+        '{
+            parent: {database_id: $db_id},
+            properties: {
+                Name: {title: [{text: {content: $title}}]},
+                blocked: {checkbox: false},
+                "current status": {rich_text: [{text: {content: "Not started"}}]},
+                Status: {select: {name: "Not started"}}
+            }
+        }')
+
+    local response
+    response=$(notion_api "/pages" POST -d "$payload")
+
+    local url
+    url=$(echo "$response" | jq -r '.url // empty')
+
+    if [[ -n "$url" ]]; then
+        # Add description as page content if provided
+        if [[ -n "$description" ]]; then
+            local page_id
+            page_id=$(echo "$response" | jq -r '.id')
+            local content_payload
+            content_payload=$(jq -n --arg text "$description" '{
+                children: [{
+                    object: "block",
+                    type: "paragraph",
+                    paragraph: {
+                        rich_text: [{type: "text", text: {content: $text}}]
+                    }
+                }]
+            }')
+            notion_api "/blocks/$page_id/children" PATCH -d "$content_payload" > /dev/null
+        fi
+
+        local result
+        result=$(echo "$response" | jq '{id: .id, url: .url, title: .properties.Name.title[0].text.content}')
+        local na
+        na=$(next_actions \
+            "$(next_action "notion-cc get $url" "View the created task")" \
+            "$(next_action "notion-cc move $url \"In progress\"" "Move task to In progress")")
+        json_ok "$TOOL_NAME create" "$result" "$na"
+    else
+        json_error "$TOOL_NAME create" "Failed to create task" "API_ERROR" "Check database configuration and permissions"
+    fi
+}
+
+cmd_set_database() {
+    local db_url="${1:-}"
+
+    if [[ -z "$db_url" ]]; then
+        json_error "$TOOL_NAME set-database" "Database URL required" "MISSING_ARG" "Usage: notion-cc set-database <database-url>"
+    fi
+
+    ensure_config_dir
+
+    local db_id
+    db_id=$(extract_page_id "$db_url") || json_error "$TOOL_NAME set-database" "Could not extract database ID from URL" "INVALID_ARG" "Provide a valid Notion database URL"
+
+    echo "$db_id" > "$CONFIG_DIR/database_id"
+
+    local result
+    result=$(jq -n --arg id "$db_id" '{database_id: $id}')
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc create \"Test task\"" "Create a task to verify")")
+    json_ok "$TOOL_NAME set-database" "$result" "$na"
+}
+
+# ============================================================================
+# PAGE COMMANDS
+# ============================================================================
+
+cmd_get() {
+    local page_url="${1:-}"
+
+    if [[ -z "$page_url" ]]; then
+        json_error "$TOOL_NAME get" "Page URL required" "MISSING_ARG" "Usage: notion-cc get <page-url>"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME get" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME get" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    local result
+    result=$(get_page "$page_id")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc comments $page_url" "List comments on this page")" \
+        "$(next_action "notion-cc update-status $page_url \"<status>\"" "Update status")" \
+        "$(next_action "notion-cc move $page_url \"<status>\"" "Move to a status")")
+    json_ok "$TOOL_NAME get" "$result" "$na"
+}
+
+cmd_update_status() {
+    local page_url="${1:-}"
+    local status_text="${2:-}"
+    local property_name="${3:-current status}"
+
+    if [[ -z "$page_url" || -z "$status_text" ]]; then
+        json_error "$TOOL_NAME update-status" "Page URL and status text required" "MISSING_ARG" "Usage: notion-cc update-status <page-url> <status-text> [property-name]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME update-status" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME update-status" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    update_page_property "$page_id" "$property_name" "$status_text" "rich_text" > /dev/null
+
+    local result
+    result=$(jq -n --arg status "$status_text" --arg property "$property_name" '{status: $status, property: $property}')
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc get $page_url" "View updated page")" \
+        "$(next_action "notion-cc comment $page_url \"Status updated to: $status_text\"" "Add a comment about the update")")
+    json_ok "$TOOL_NAME update-status" "$result" "$na"
+}
+
+cmd_set_blocked() {
+    local page_url="${1:-}"
+    local blocked="${2:-true}"
+    local property_name="${3:-blocked}"
+
+    if [[ -z "$page_url" ]]; then
+        json_error "$TOOL_NAME set-blocked" "Page URL required" "MISSING_ARG" "Usage: notion-cc set-blocked <page-url> [true|false] [property-name]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME set-blocked" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME set-blocked" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    update_page_property "$page_id" "$property_name" "$blocked" "checkbox" > /dev/null
+
+    local result
+    result=$(jq -n --argjson blocked "$blocked" --arg property "$property_name" '{blocked: $blocked, property: $property}')
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc get $page_url" "View updated page")")
+    json_ok "$TOOL_NAME set-blocked" "$result" "$na"
+}
+
+cmd_move() {
+    local page_url="${1:-}"
+    local status="${2:-}"
+    local property_name="${3:-Status}"
+    local property_type="${4:-select}"
+
+    if [[ -z "$page_url" || -z "$status" ]]; then
+        json_error "$TOOL_NAME move" "Page URL and status required" "MISSING_ARG" "Usage: notion-cc move <page-url> <status> [property-name] [type]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME move" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME move" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    update_page_property "$page_id" "$property_name" "$status" "$property_type" > /dev/null
+
+    local result
+    result=$(jq -n --arg status "$status" --arg property "$property_name" '{status: $status, property: $property}')
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc get $page_url" "View updated page")" \
+        "$(next_action "notion-cc comment $page_url \"Moved to: $status\"" "Add a comment about the move")")
+    json_ok "$TOOL_NAME move" "$result" "$na"
+}
+
+# ============================================================================
+# COMMENT COMMANDS
+# ============================================================================
+
+cmd_comments() {
+    local page_url="${1:-}"
+
+    if [[ -z "$page_url" ]]; then
+        json_error "$TOOL_NAME comments" "Page URL required" "MISSING_ARG" "Usage: notion-cc comments <page-url>"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME comments" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME comments" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    local raw
+    raw=$(get_comments "$page_id")
+
+    local comments
+    comments=$(echo "$raw" | jq '[.results[] | {id: .id, created_time: .created_time, text: (.rich_text[0].plain_text // null)}]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc comment $page_url \"<text>\"" "Add a comment")" \
+        "$(next_action "notion-cc get $page_url" "View page details")")
+    json_ok "$TOOL_NAME comments" "$comments" "$na"
+}
+
+cmd_comment() {
+    local page_url="${1:-}"
+    shift || true
+    local comment_text="$*"
+
+    if [[ -z "$page_url" || -z "$comment_text" ]]; then
+        json_error "$TOOL_NAME comment" "Page URL and comment text required" "MISSING_ARG" "Usage: notion-cc comment <page-url> <comment-text>"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME comment" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME comment" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    local result
+    result=$(add_comment "$page_id" "$comment_text")
+
+    local comment_data
+    comment_data=$(echo "$result" | jq '{id: .id, created_time: .created_time}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc comments $page_url" "List all comments")" \
+        "$(next_action "notion-cc get $page_url" "View page details")")
+    json_ok "$TOOL_NAME comment" "$comment_data" "$na"
+}
+
+cmd_wait_for_comment() {
+    json_error "$TOOL_NAME wait-for-comment" "Streaming/polling commands are not supported in envelope mode" "STREAMING" "Use 'notion-cc comments <url>' to check for new comments instead"
+}
+
+# ============================================================================
+# CONTENT COMMANDS
+# ============================================================================
+
+cmd_create_child_page() {
+    local parent_url="${1:-}"
+    shift || true
+    local title="$*"
+
+    if [[ -z "$parent_url" || -z "$title" ]]; then
+        json_error "$TOOL_NAME create-child-page" "Parent URL and title required" "MISSING_ARG" "Usage: notion-cc create-child-page <parent-url> <title>"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME create-child-page" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local parent_id
+    parent_id=$(extract_page_id "$parent_url") || json_error "$TOOL_NAME create-child-page" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    local payload
+    payload=$(jq -n \
+        --arg parent_id "$parent_id" \
+        --arg title "$title" \
+        '{
+            parent: {page_id: $parent_id},
+            properties: {
+                title: [{text: {content: $title}}]
+            }
+        }')
+
+    local response
+    response=$(notion_api "/pages" POST -d "$payload")
+
+    local url
+    url=$(echo "$response" | jq -r '.url // empty')
+
+    if [[ -n "$url" ]]; then
+        local result
+        result=$(echo "$response" | jq '{id: .id, url: .url}')
+        local na
+        na=$(next_actions \
+            "$(next_action "notion-cc get $url" "View the created page")" \
+            "$(next_action "notion-cc append-blocks $url" "Add content to the new page")")
+        json_ok "$TOOL_NAME create-child-page" "$result" "$na"
+    else
+        json_error "$TOOL_NAME create-child-page" "Failed to create child page" "API_ERROR" "Check parent page permissions"
+    fi
+}
+
+cmd_append_blocks() {
+    local page_url="${1:-}"
+
+    if [[ -z "$page_url" ]]; then
+        json_error "$TOOL_NAME append-blocks" "Page URL required. Reads JSON block array from stdin." "MISSING_ARG" "Usage: echo '[{...}]' | notion-cc append-blocks <page-url>"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME append-blocks" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME append-blocks" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    # Read JSON block array from stdin
+    local blocks
+    blocks=$(cat)
+
+    if [[ -z "$blocks" ]]; then
+        json_error "$TOOL_NAME append-blocks" "No block data on stdin" "MISSING_ARG" "Pipe a JSON array of Notion block objects to stdin"
+    fi
+
+    # Notion API limits to 100 blocks per request; batch if needed
+    local total
+    total=$(echo "$blocks" | jq 'length')
+
+    local offset=0
+    local batch_size=100
+    local appended=0
+
+    while [[ $offset -lt $total ]]; do
+        local batch
+        batch=$(echo "$blocks" | jq --argjson offset "$offset" --argjson limit "$batch_size" '.[$offset:$offset+$limit]')
+
+        local payload
+        payload=$(echo "$batch" | jq '{children: .}')
+
+        notion_api "/blocks/$page_id/children" PATCH -d "$payload" > /dev/null
+
+        local batch_count
+        batch_count=$(echo "$batch" | jq 'length')
+        appended=$((appended + batch_count))
+        offset=$((offset + batch_size))
+    done
+
+    local result
+    result=$(jq -n --argjson count "$appended" '{blocks_appended: $count}')
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc get $page_url" "View the updated page")")
+    json_ok "$TOOL_NAME append-blocks" "$result" "$na"
+}
+
+# ============================================================================
+# PROPERTY COMMANDS
+# ============================================================================
+
+cmd_update_property() {
+    local page_url="${1:-}"
+    local property_name="${2:-}"
+    local property_value="${3:-}"
+    local property_type="${4:-rich_text}"
+
+    if [[ -z "$page_url" || -z "$property_name" || -z "$property_value" ]]; then
+        json_error "$TOOL_NAME update-property" "Page URL, property name, and value required" "MISSING_ARG" "Usage: notion-cc update-property <page-url> <name> <value> [type]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME update-property" "Notion API token not found" "AUTH_MISSING" "Set NOTION_API_TOKEN in .env or run: notion-cc setup"
+
+    local page_id
+    page_id=$(extract_page_id "$page_url") || json_error "$TOOL_NAME update-property" "Could not extract page ID from URL" "INVALID_ARG" "Provide a valid Notion page URL"
+
+    update_page_property "$page_id" "$property_name" "$property_value" "$property_type" > /dev/null
+
+    local result
+    result=$(jq -n --arg name "$property_name" --arg value "$property_value" --arg type "$property_type" \
+        '{property: $name, value: $value, type: $type}')
+    local na
+    na=$(next_actions \
+        "$(next_action "notion-cc get $page_url" "View updated page")")
+    json_ok "$TOOL_NAME update-property" "$result" "$na"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+case "${1:-}" in
+    setup)
+        cmd_setup "${2:-}"
+        ;;
+    set-database)
+        cmd_set_database "${2:-}"
+        ;;
+    create)
+        shift; cmd_create "$@"
+        ;;
+    get)
+        cmd_get "${2:-}"
+        ;;
+    update-status)
+        cmd_update_status "${2:-}" "${3:-}" "${4:-current status}"
+        ;;
+    set-blocked)
+        cmd_set_blocked "${2:-}" "${3:-true}" "${4:-blocked}"
+        ;;
+    move)
+        cmd_move "${2:-}" "${3:-}" "${4:-Status}" "${5:-select}"
+        ;;
+    comments)
+        cmd_comments "${2:-}"
+        ;;
+    comment)
+        shift; cmd_comment "$@"
+        ;;
+    wait-for-comment)
+        cmd_wait_for_comment
+        ;;
+    create-child-page)
+        shift; cmd_create_child_page "$@"
+        ;;
+    append-blocks)
+        cmd_append_blocks "${2:-}"
+        ;;
+    update-property)
+        cmd_update_property "${2:-}" "${3:-}" "${4:-}" "${5:-rich_text}"
+        ;;
+    *)
+        cmd_tree "$TOOL_NAME" "Notion kanban board task management" "$(jq -n '[
+            {name: "setup", description: "Configure API token (interactive)", usage: "notion-cc setup [profile]"},
+            {name: "set-database", description: "Set default database for tasks", usage: "notion-cc set-database <url>"},
+            {name: "create", description: "Create a new task", usage: "notion-cc create <title> [description]"},
+            {name: "get", description: "Get page details", usage: "notion-cc get <url>"},
+            {name: "update-status", description: "Update current status property", usage: "notion-cc update-status <url> <text> [property]"},
+            {name: "set-blocked", description: "Set blocked checkbox", usage: "notion-cc set-blocked <url> [true|false]"},
+            {name: "move", description: "Move to a kanban status", usage: "notion-cc move <url> <status> [property] [type]"},
+            {name: "comments", description: "List all comments", usage: "notion-cc comments <url>"},
+            {name: "comment", description: "Add a comment", usage: "notion-cc comment <url> <text>"},
+            {name: "create-child-page", description: "Create a child page", usage: "notion-cc create-child-page <url> <title>"},
+            {name: "append-blocks", description: "Append blocks from stdin", usage: "notion-cc append-blocks <url>"},
+            {name: "update-property", description: "Update any property", usage: "notion-cc update-property <url> <name> <value> [type]"}
+        ]')"
+        ;;
+esac

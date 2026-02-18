@@ -2,78 +2,113 @@
 set -euo pipefail
 
 source "$(dirname "$0")/cf-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="cf-workers"
 
 cmd_list() {
-    echo "Workers:"
-    echo "========"
-    
     # Try wrangler first (handles OAuth)
     if command -v wrangler &>/dev/null; then
         # List from current directory's wrangler.jsonc files if in a project
         if [[ -d "workers" ]]; then
+            local workers='[]'
             for dir in workers/*/; do
                 if [[ -f "${dir}wrangler.jsonc" ]] || [[ -f "${dir}wrangler.toml" ]]; then
-                    local name=$(basename "$dir")
-                    echo "$name"
+                    local name
+                    name=$(basename "$dir")
+                    workers=$(echo "$workers" | jq --arg n "$name" '. + [{name: $n, source: "local"}]')
                 fi
             done
+            local na
+            local first_name
+            first_name=$(echo "$workers" | jq -r '.[0].name // empty')
+            if [[ -n "$first_name" ]]; then
+                na=$(next_actions \
+                    "$(next_action "cf-workers info $first_name" "Get details for $first_name")" \
+                    "$(next_action "cf-logs $first_name" "Stream logs for $first_name")")
+            else
+                na=$(next_actions)
+            fi
+            json_ok "$TOOL_NAME list" "$workers" "$na"
         else
             # Use API to list all workers
-            load_api_token || {
-                echo "Note: Set CLOUDFLARE_API_TOKEN to list all account workers" >&2
-                echo "Currently showing workers from current project only" >&2
-                return 0
-            }
-            
+            load_api_token || json_error "$TOOL_NAME list" "CLOUDFLARE_API_TOKEN not found" "AUTH_MISSING" "Set CLOUDFLARE_API_TOKEN in .env or ~/.config/cloudflare/api_token"
+
             local account_id
             account_id=$(load_account_id)
-            
-            cf_api "/accounts/$account_id/workers/scripts" | \
-                jq -r '.result[]? | "\(.id)\t\(.modified_on)"' | \
-                column -t -s $'\t'
+
+            local raw
+            raw=$(cf_api "/accounts/$account_id/workers/scripts")
+
+            local workers
+            workers=$(echo "$raw" | jq '[.result[]? | {name: .id, modified_on}]')
+
+            local na
+            local first_name
+            first_name=$(echo "$workers" | jq -r '.[0].name // empty')
+            if [[ -n "$first_name" ]]; then
+                na=$(next_actions \
+                    "$(next_action "cf-workers info $first_name" "Get details for $first_name")" \
+                    "$(next_action "cf-logs $first_name" "Stream logs for $first_name")")
+            else
+                na=$(next_actions)
+            fi
+            json_ok "$TOOL_NAME list" "$workers" "$na"
         fi
+    else
+        json_error "$TOOL_NAME list" "wrangler not found" "MISSING_DEP" "Install with: npm install -g wrangler"
     fi
 }
 
 cmd_info() {
     local worker_name="${1:-}"
     if [[ -z "$worker_name" ]]; then
-        echo "Usage: cf-workers info <worker-name>" >&2
-        exit 1
+        json_error "$TOOL_NAME info" "Worker name required" "MISSING_ARG" "Usage: cf-workers info <worker-name>"
     fi
-    
-    load_api_token || {
-        echo "Error: CLOUDFLARE_API_TOKEN required for worker info" >&2
-        exit 1
-    }
-    
+
+    load_api_token || json_error "$TOOL_NAME info" "CLOUDFLARE_API_TOKEN required" "AUTH_MISSING" "Set CLOUDFLARE_API_TOKEN in .env or ~/.config/cloudflare/api_token"
+
     local account_id
     account_id=$(load_account_id)
-    
-    cf_api "/accounts/$account_id/workers/scripts/$worker_name" | jq '.'
+
+    local result
+    result=$(cf_api "/accounts/$account_id/workers/scripts/$worker_name")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "cf-workers deployments $worker_name" "List deployments for $worker_name")" \
+        "$(next_action "cf-logs $worker_name" "Stream logs for $worker_name")" \
+        "$(next_action "cf-workers list" "List all workers")")
+
+    json_ok "$TOOL_NAME info" "$result" "$na"
 }
 
 cmd_deployments() {
     local worker_name="${1:-}"
     if [[ -z "$worker_name" ]]; then
-        echo "Usage: cf-workers deployments <worker-name>" >&2
-        exit 1
+        json_error "$TOOL_NAME deployments" "Worker name required" "MISSING_ARG" "Usage: cf-workers deployments <worker-name>"
     fi
-    
-    load_api_token || {
-        echo "Error: CLOUDFLARE_API_TOKEN required for deployments" >&2
-        exit 1
-    }
-    
+
+    load_api_token || json_error "$TOOL_NAME deployments" "CLOUDFLARE_API_TOKEN required" "AUTH_MISSING" "Set CLOUDFLARE_API_TOKEN in .env or ~/.config/cloudflare/api_token"
+
     local account_id
     account_id=$(load_account_id)
-    
-    cf_api "/accounts/$account_id/workers/scripts/$worker_name/deployments" | \
-        jq -r '.result.deployments[]? | "\(.id[:8])\t\(.created_on)\t\(.author_email)"' | \
-        column -t -s $'\t' | head -10
+
+    local raw
+    raw=$(cf_api "/accounts/$account_id/workers/scripts/$worker_name/deployments")
+
+    local deployments
+    deployments=$(echo "$raw" | jq '[.result.deployments[]? | {id: .id[:8], created_on, author_email}][:10]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "cf-workers info $worker_name" "Get worker details")" \
+        "$(next_action "cf-logs $worker_name" "Stream logs for $worker_name")")
+
+    json_ok "$TOOL_NAME deployments" "$deployments" "$na"
 }
 
-case "${1:-help}" in
+case "${1:-}" in
     list|ls)
         cmd_list
         ;;
@@ -84,11 +119,10 @@ case "${1:-help}" in
         cmd_deployments "${2:-}"
         ;;
     *)
-        echo "Usage: cf-workers <command> [args]"
-        echo ""
-        echo "Commands:"
-        echo "  list                  List workers"
-        echo "  info <name>           Get worker details"
-        echo "  deployments <name>    List recent deployments"
+        cmd_tree "$TOOL_NAME" "Cloudflare Workers management" "$(jq -n '[
+            {name: "list", description: "List workers", usage: "cf-workers list"},
+            {name: "info", description: "Get worker details", usage: "cf-workers info <name>"},
+            {name: "deployments", description: "List recent deployments", usage: "cf-workers deployments <name>"}
+        ]')"
         ;;
 esac

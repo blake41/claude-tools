@@ -2,51 +2,92 @@
 set -euo pipefail
 
 source "$(dirname "$0")/render-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="render-workspace"
 
 cmd_list() {
-    load_api_key || exit 1
-    echo "Workspaces:"
-    echo "==========="
-    render_api "/owners" | jq -r '.[] | "\(.owner.id)\t\(.owner.name)\t\(.owner.type)"' | column -t -s $'\t'
+    load_api_key || json_error "$TOOL_NAME list" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/owners")
+
+    local workspaces
+    workspaces=$(echo "$raw" | jq '[.[] | .owner | {id, name, type}]')
+
+    local first_id
+    first_id=$(echo "$workspaces" | jq -r '.[0].id // empty')
+    local na
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-workspace select $first_id" "Select first workspace")" \
+            "$(next_action "render-workspace current" "Show current workspace")")
+    else
+        na=$(next_actions \
+            "$(next_action "render-workspace current" "Show current workspace")")
+    fi
+
+    json_ok "$TOOL_NAME list" "$workspaces" "$na"
 }
 
 cmd_select() {
     local owner_id="${1:-}"
     if [[ -z "$owner_id" ]]; then
-        echo "Usage: render-workspace select <owner-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME select" "Owner ID required" "MISSING_ARG" "Usage: render-workspace select <owner-id>"
     fi
-    
+
     # Save to global config
     echo "$owner_id" > "$CONFIG_DIR/workspace"
-    echo "Selected workspace: $owner_id (saved to ~/.config/render/workspace)"
+
+    local result
+    result=$(jq -n --arg id "$owner_id" --arg path "$CONFIG_DIR/workspace" \
+        '{workspace_id: $id, saved_to: $path}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-workspace current" "Verify current workspace")" \
+        "$(next_action "render-services list" "List services in this workspace")")
+
+    json_ok "$TOOL_NAME select" "$result" "$na"
 }
 
 cmd_select_local() {
     local owner_id="${1:-}"
     if [[ -z "$owner_id" ]]; then
-        echo "Usage: render-workspace select-local <owner-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME select-local" "Owner ID required" "MISSING_ARG" "Usage: render-workspace select-local <owner-id>"
     fi
-    
+
     # Save to local directory
     echo "$owner_id" > ".render-workspace"
-    echo "Selected workspace: $owner_id (saved to .render-workspace)"
+
+    local result
+    result=$(jq -n --arg id "$owner_id" '{workspace_id: $id, saved_to: ".render-workspace"}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-workspace current" "Verify current workspace")" \
+        "$(next_action "render-services list" "List services in this workspace")")
+
+    json_ok "$TOOL_NAME select-local" "$result" "$na"
 }
 
 cmd_current() {
     local ws
-    ws=$(load_workspace)
+    ws=$(load_workspace) || true
     if [[ -n "$ws" ]]; then
-        echo "$ws"
+        local result
+        result=$(jq -n --arg id "$ws" '{workspace_id: $id}')
+        local na
+        na=$(next_actions \
+            "$(next_action "render-services list" "List services in this workspace")" \
+            "$(next_action "render-workspace list" "List all workspaces")")
+        json_ok "$TOOL_NAME current" "$result" "$na"
     else
-        echo "No workspace selected." >&2
-        echo "Run: render-workspace select <owner-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME current" "No workspace selected" "NOT_FOUND" "Run: render-workspace select <owner-id>"
     fi
 }
 
-case "${1:-help}" in
+case "${1:-}" in
     list)
         cmd_list
         ;;
@@ -60,14 +101,11 @@ case "${1:-help}" in
         cmd_current
         ;;
     *)
-        echo "Usage: render-workspace <command> [args]"
-        echo ""
-        echo "Commands:"
-        echo "  list                  List all workspaces"
-        echo "  select <id>           Set global default workspace"
-        echo "  select-local <id>     Set workspace for current project"
-        echo "  current               Show current workspace"
-        echo ""
-        echo "Config resolution: .env > .render-workspace > ~/.config/render/workspace"
+        cmd_tree "$TOOL_NAME" "Render.com workspace management" "$(jq -n '[
+            {name: "list", description: "List all workspaces", usage: "render-workspace list"},
+            {name: "select", description: "Set global default workspace", usage: "render-workspace select <owner-id>"},
+            {name: "select-local", description: "Set workspace for current project", usage: "render-workspace select-local <owner-id>"},
+            {name: "current", description: "Show current workspace", usage: "render-workspace current"}
+        ]')"
         ;;
 esac

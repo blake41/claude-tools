@@ -2,33 +2,60 @@
 set -euo pipefail
 
 source "$(dirname "$0")/render-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="render-services"
 
 cmd_list() {
-    load_api_key || exit 1
+    load_api_key || json_error "$TOOL_NAME list" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
     local owner_id
     owner_id=$(load_workspace) || true
-    
+
     local url="/services?limit=50"
     if [[ -n "$owner_id" ]]; then
         url="$url&ownerId=$owner_id"
     fi
-    
-    echo "Services:"
-    echo "========="
-    render_api "$url" | jq -r '.[] | .service | "\(.id)\t\(.name)\t\(.type)\t\(.serviceDetails.url // "n/a")"' | column -t -s $'\t'
+
+    local raw
+    raw=$(render_api "$url")
+
+    local services
+    services=$(echo "$raw" | jq '[.[] | .service | {id, name, type, url: (.serviceDetails.url // null)}]')
+
+    local na
+    local first_id
+    first_id=$(echo "$services" | jq -r '.[0].id // empty')
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-services get $first_id" "Get details for first service")" \
+            "$(next_action "render-logs $first_id" "View logs for first service")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME list" "$services" "$na"
 }
 
 cmd_get() {
-    load_api_key || exit 1
     local service_id="${1:-}"
     if [[ -z "$service_id" ]]; then
-        echo "Usage: render-services get <service-id>" >&2
-        exit 1
+        json_error "$TOOL_NAME get" "Service ID required" "MISSING_ARG" "Usage: render-services get <service-id>"
     fi
-    render_api "/services/$service_id" | jq '.'
+
+    load_api_key || json_error "$TOOL_NAME get" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api "/services/$service_id")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-logs $service_id" "View logs for this service")" \
+        "$(next_action "render-services list" "List all services")")
+
+    json_ok "$TOOL_NAME get" "$result" "$na"
 }
 
-case "${1:-help}" in
+case "${1:-}" in
     list)
         cmd_list
         ;;
@@ -36,10 +63,9 @@ case "${1:-help}" in
         cmd_get "${2:-}"
         ;;
     *)
-        echo "Usage: render-services <command> [args]"
-        echo ""
-        echo "Commands:"
-        echo "  list              List all services"
-        echo "  get <id>          Get service details"
+        cmd_tree "$TOOL_NAME" "Render.com service management" "$(jq -n '[
+            {name: "list", description: "List all services", usage: "render-services list"},
+            {name: "get", description: "Get service details", usage: "render-services get <service-id>"}
+        ]')"
         ;;
 esac

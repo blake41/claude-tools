@@ -2,9 +2,12 @@
 set -euo pipefail
 
 source "$(dirname "$0")/render-common.sh"
+source "$(dirname "$0")/../cli-envelope.sh"
+
+TOOL_NAME="render-logs"
 
 # Defaults
-LINES=20
+LINES=50
 LOG_TYPE=""
 LOG_LEVEL=""
 SINCE=""
@@ -45,32 +48,13 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            echo "Usage: render-logs <service-id> [options]"
-            echo ""
-            echo "Options:"
-            echo "  --lines, -n N      Number of log lines (default: 20)"
-            echo "  --type TYPE        Filter by type: app, request, build"
-            echo "  --level LEVEL      Filter by level: error, warn, info"
-            echo "  --since TIME       Get logs from TIME ago until now"
-            echo "                     Examples: 1h, 30m, 7d, 24h"
-            echo "  --start TIME       Start time (RFC3339) - where to begin reading"
-            echo "  --end TIME         End time (RFC3339) - where to stop reading"
-            echo "  --direction DIR    Direction: backward (default), forward"
-            echo ""
-            echo "Time parameters:"
-            echo "  --since 7d         Logs from last 7 days (uses forward direction)"
-            echo "  --start/--end      For precise time ranges (both RFC3339 format)"
-            echo ""
-            echo "Examples:"
-            echo "  render-logs srv-xxxxx                        # Recent logs"
-            echo "  render-logs srv-xxxxx --since 1h             # Last hour"
-            echo "  render-logs srv-xxxxx --since 7d --lines 500 # Last 7 days"
-            echo "  render-logs srv-xxxxx --level error          # Only errors"
+            cmd_tree "$TOOL_NAME" "Render.com log viewer" "$(jq -n '[
+                {name: "logs", description: "Fetch logs for a service", usage: "render-logs <service-id> [--lines N] [--type app|request|build] [--level error|warn|info] [--since 1h|7d] [--start TIME] [--end TIME]"}
+            ]')"
             exit 0
             ;;
         -*)
-            echo "Unknown option: $1" >&2
-            exit 1
+            json_error "$TOOL_NAME" "Unknown option: $1" "INVALID_ARG" "Run: render-logs --help"
             ;;
         *)
             SERVICE_ID="$1"
@@ -80,27 +64,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SERVICE_ID" ]]; then
-    echo "Usage: render-logs <service-id> [options]" >&2
-    echo "Run with --help for more info" >&2
-    exit 1
+    cmd_tree "$TOOL_NAME" "Render.com log viewer" "$(jq -n '[
+        {name: "logs", description: "Fetch logs for a service", usage: "render-logs <service-id> [--lines N] [--type app|request|build] [--level error|warn|info] [--since 1h|7d]"}
+    ]')"
+    exit 0
 fi
 
-load_api_key || exit 1
+load_api_key || json_error "$TOOL_NAME" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
 
-OWNER_ID=$(load_workspace)
+OWNER_ID=$(load_workspace) || true
 if [[ -z "$OWNER_ID" ]]; then
-    echo "Error: No workspace selected." >&2
-    echo "Run: render-workspace select <owner-id>" >&2
-    exit 1
+    json_error "$TOOL_NAME" "No workspace selected" "NOT_FOUND" "Run: render-workspace select <owner-id>"
 fi
 
 # Convert relative time to RFC3339 helper
 parse_relative_time() {
     local time_spec="$1"
     local result=""
-    
+
     if [[ "$time_spec" =~ ^[0-9]{4}- ]]; then
-        # Already RFC3339 format
         echo "$time_spec"
         return 0
     elif [[ "$time_spec" =~ ^([0-9]+)d$ ]]; then
@@ -116,7 +98,7 @@ parse_relative_time() {
         result=$(date -u -v-"${mins}M" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
                  date -u -d "${mins} minutes ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
     fi
-    
+
     if [[ -n "$result" ]]; then
         echo "$result"
         return 0
@@ -126,14 +108,9 @@ parse_relative_time() {
 
 # Handle --since: converts to startTime with forward direction
 if [[ -n "$SINCE" ]]; then
-    COMPUTED_START_TIME=$(parse_relative_time "$SINCE")
-    if [[ -z "$COMPUTED_START_TIME" ]]; then
-        echo "Could not parse time: $SINCE" >&2
-        echo "Use relative time like '1h', '30m', '7d' or RFC3339 format" >&2
-        exit 1
-    fi
+    COMPUTED_START_TIME=$(parse_relative_time "$SINCE") || \
+        json_error "$TOOL_NAME" "Could not parse time: $SINCE" "INVALID_ARG" "Use relative time like '1h', '30m', '7d' or RFC3339 format"
     START_TIME="$COMPUTED_START_TIME"
-    # Use forward direction to read from past toward present
     if [[ -z "$DIRECTION" ]]; then
         DIRECTION="forward"
     fi
@@ -163,7 +140,22 @@ if [[ -n "$END_TIME" ]]; then
     PARAMS="$PARAMS&endTime=$END_TIME"
 fi
 
-# Fetch and format logs
-render_api "/logs?$PARAMS" | \
-    jq -r '.logs[]? | "\(.timestamp | split(".")[0])Z [\(.labels[] | select(.name=="level") | .value)] \(.message)"' 2>/dev/null || \
-    render_api "/logs?$PARAMS" | jq '.'
+# Fetch logs
+raw=$(render_api "/logs?$PARAMS")
+
+# Parse log entries into structured JSON
+entries=$(echo "$raw" | jq '[.logs[]? | {
+    timestamp: (.timestamp | split(".")[0] + "Z"),
+    level: ((.labels // [])[] | select(.name=="level") | .value) // "info",
+    message: .message
+}]')
+
+# Truncate
+truncated=$(json_truncate "$entries" "$LINES")
+
+local_na=$(next_actions \
+    "$(next_action "render-logs $SERVICE_ID --lines 100" "Show more log lines")" \
+    "$(next_action "render-logs $SERVICE_ID --level error" "Show only errors")" \
+    "$(next_action "render-services get $SERVICE_ID" "Get service details")")
+
+json_ok "$TOOL_NAME" "$truncated" "$local_na"

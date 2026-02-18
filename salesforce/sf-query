@@ -5,6 +5,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="sf-query"
 
 # Environment to org alias mapping
 declare -A ORG_ALIASES=(
@@ -14,60 +17,29 @@ declare -A ORG_ALIASES=(
   [clayuni]="MySandbox"
 )
 
-usage() {
-  cat <<EOF
-sf-query - Safe Salesforce SOQL queries for AI agents
-
-USAGE
-  sf-query <environment> "<soql-query>"
-  sf-query <environment> describe <object>
-
-ENVIRONMENTS
-  prod, production  → Clay production org
-  sandbox, clayuni  → Clay sandbox org
-
-EXAMPLES
-  # List accounts
-  sf-query prod "SELECT Id, Name, Industry FROM Account LIMIT 10"
-
-  # Find opportunities
-  sf-query prod "SELECT Id, Name, StageName, Amount FROM Opportunity WHERE IsClosed = false"
-
-  # Count records
-  sf-query sandbox "SELECT COUNT() FROM Contact"
-
-  # Describe an object's fields
-  sf-query prod describe Account
-
-  # Search across objects
-  sf-query prod "SELECT Id, Name FROM Account WHERE Name LIKE '%Acme%'"
-
-COMMON OBJECTS
-  Account, Contact, Opportunity, Lead, Case, Task, Event, User
-
-OUTPUT
-  Returns JSON array of records (or count for COUNT queries)
-
-NOTE
-  SOQL is read-only by design. This tool cannot modify any data.
-EOF
-  exit 1
-}
-
 # Resolve environment to org alias
 get_org_alias() {
   local env="${1,,}"  # lowercase
   if [[ -v "ORG_ALIASES[$env]" ]]; then
     echo "${ORG_ALIASES[$env]}"
   else
-    echo "❌ Unknown environment: $1" >&2
-    echo "   Valid: ${!ORG_ALIASES[*]}" >&2
-    exit 1
+    json_error "$TOOL_NAME" "Unknown environment: $1. Valid: ${!ORG_ALIASES[*]}" "UNKNOWN_ENV" "Use one of: prod, production, sandbox, clayuni"
   fi
 }
 
+# Check sf CLI is available
+if ! command -v sf &>/dev/null; then
+    json_error "$TOOL_NAME" "Salesforce CLI (sf) not installed" "MISSING_DEP" "Install with: npm install -g @salesforce/cli"
+fi
+
 # Main
-[[ $# -lt 2 ]] && usage
+if [[ $# -lt 2 ]]; then
+    cmd_tree "$TOOL_NAME" "Safe Salesforce SOQL queries for AI agents" "$(jq -n '[
+        {name: "query", description: "Run a SOQL query", usage: "sf-query <environment> \"SELECT ...\""},
+        {name: "describe", description: "Describe an object fields", usage: "sf-query <environment> describe <ObjectName>"}
+    ]')"
+    exit 0
+fi
 
 ENV="$1"
 shift
@@ -76,31 +48,36 @@ ORG_ALIAS=$(get_org_alias "$ENV")
 
 # Handle describe command
 if [[ "$1" == "describe" ]]; then
-  [[ $# -lt 2 ]] && { echo "❌ Usage: sf-query $ENV describe <ObjectName>"; exit 1; }
-  OBJECT="$2"
-  echo "📋 Describing $OBJECT in $ENV..." >&2
-  sf sobject describe --sobject "$OBJECT" --target-org "$ORG_ALIAS" --json 2>/dev/null | jq '.result.fields | map({name, type, label, length, picklistValues: (.picklistValues // [] | map(.value))})'
-  exit 0
+    [[ $# -lt 2 ]] && json_error "$TOOL_NAME describe" "Object name required" "MISSING_ARG" "Usage: sf-query $ENV describe <ObjectName>"
+    OBJECT="$2"
+
+    local_result=$(sf sobject describe --sobject "$OBJECT" --target-org "$ORG_ALIAS" --json 2>/dev/null) || \
+        json_error "$TOOL_NAME describe" "Failed to describe $OBJECT" "API_ERROR" "Check that the object name is correct and your org is authenticated"
+
+    fields=$(echo "$local_result" | jq '.result.fields | map({name, type, label, length, picklistValues: (.picklistValues // [] | map(.value))})')
+
+    na=$(next_actions \
+        "$(next_action "sf-query $ENV \"SELECT Id, Name FROM $OBJECT LIMIT 10\"" "Query $OBJECT records")")
+
+    json_ok "$TOOL_NAME describe" "$fields" "$na"
+    exit 0
 fi
 
 QUERY="$1"
 
 # Validate it looks like a SELECT query
 if [[ ! "$QUERY" =~ ^[[:space:]]*(SELECT|select) ]]; then
-  echo "❌ Query must start with SELECT" >&2
-  echo "   Got: $QUERY" >&2
-  exit 1
+    json_error "$TOOL_NAME query" "Query must start with SELECT. Got: $QUERY" "INVALID_QUERY" "SOQL queries must begin with SELECT"
 fi
 
-echo "🔍 Querying $ENV..." >&2
-
-# Run query and extract records (filter out CLI warnings)
-RESULT=$(sf data query --query "$QUERY" --target-org "$ORG_ALIAS" --json 2>/dev/null)
+# Run query and extract records
+RESULT=$(sf data query --query "$QUERY" --target-org "$ORG_ALIAS" --json 2>/dev/null) || \
+    json_error "$TOOL_NAME query" "Query execution failed" "API_ERROR" "Check your SOQL syntax and org authentication"
 
 # Check for errors
 if echo "$RESULT" | jq -e '.status != 0' > /dev/null 2>&1; then
-  echo "$RESULT" | jq -r '.message // .result.message // "Unknown error"' >&2
-  exit 1
+    local_msg=$(echo "$RESULT" | jq -r '.message // .result.message // "Unknown error"')
+    json_error "$TOOL_NAME query" "$local_msg" "INVALID_QUERY" "Check your SOQL syntax"
 fi
 
 # Output records (or totalSize for COUNT queries)
@@ -108,8 +85,15 @@ RECORDS=$(echo "$RESULT" | jq '.result.records')
 TOTAL_SIZE=$(echo "$RESULT" | jq '.result.totalSize')
 
 if [[ "$RECORDS" == "[]" && "$TOTAL_SIZE" != "0" && "$TOTAL_SIZE" != "null" ]]; then
-  # COUNT() query - return the count
-  echo "{\"count\": $TOTAL_SIZE}"
+    # COUNT() query - return the count
+    count_result=$(jq -n --argjson count "$TOTAL_SIZE" '{count: $count}')
+    na=$(next_actions \
+        "$(next_action "sf-query $ENV \"SELECT Id FROM ... LIMIT 10\"" "Fetch actual records")")
+    json_ok "$TOOL_NAME query" "$count_result" "$na"
 else
-  echo "$RECORDS"
+    # Truncate at 50 records
+    truncated=$(json_truncate "$RECORDS" 50)
+    na=$(next_actions \
+        "$(next_action "sf-query $ENV describe <ObjectName>" "Describe an object's fields")")
+    json_ok "$TOOL_NAME query" "$truncated" "$na"
 fi

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# exa-search - Exa AI web search for AI agents
+# Combines search + content retrieval in one call
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="exa-search"
+CONFIG_DIR="${HOME}/.config/exa"
+API_URL="https://api.exa.ai"
+
+get_api_key() {
+  if [[ -n "${EXA_API_KEY:-}" ]]; then
+    echo "$EXA_API_KEY"
+  elif [[ -f "$CONFIG_DIR/api_key" ]]; then
+    cat "$CONFIG_DIR/api_key"
+  else
+    json_error "$TOOL_NAME" "No Exa API key found" "AUTH_MISSING" "Set EXA_API_KEY or create ~/.config/exa/api_key. Get your key from: https://dashboard.exa.ai/api-keys"
+  fi
+}
+
+exa_api() {
+  local endpoint="$1"
+  local body="$2"
+  local api_key
+  api_key=$(get_api_key)
+
+  curl -sS -X POST "${API_URL}${endpoint}" \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: ${api_key}" \
+    --data "$body"
+}
+
+# --- Main ---
+
+if [[ $# -lt 1 ]]; then
+    cmd_tree "$TOOL_NAME" "Exa AI web search with content extraction" "$(jq -n '[
+        {name: "search", description: "Search the web with optional content extraction", usage: "exa-search <query> [--num N] [--type auto|neural|keyword] [--category company|news|tweet|...] [--text] [--text-max N] [--domain d] [--since DATE] [--until DATE]"}
+    ]')"
+    exit 0
+fi
+
+QUERY=""
+NUM_RESULTS=5
+SEARCH_TYPE="auto"
+CATEGORY=""
+INCLUDE_TEXT=false
+TEXT_MAX=3000
+INCLUDE_DOMAINS=()
+EXCLUDE_DOMAINS=()
+START_DATE=""
+END_DATE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)
+        cmd_tree "$TOOL_NAME" "Exa AI web search with content extraction" "$(jq -n '[
+            {name: "search", description: "Search the web with optional content extraction", usage: "exa-search <query> [--num N] [--type auto|neural|keyword] [--category company|news|tweet|...] [--text] [--text-max N] [--domain d] [--since DATE] [--until DATE]"}
+        ]')"
+        exit 0
+        ;;
+    --num|-n) NUM_RESULTS="$2"; shift 2 ;;
+    --type) SEARCH_TYPE="$2"; shift 2 ;;
+    --category) CATEGORY="$2"; shift 2 ;;
+    --text) INCLUDE_TEXT=true; shift ;;
+    --text-max) TEXT_MAX="$2"; shift 2 ;;
+    --domain) INCLUDE_DOMAINS+=("$2"); shift 2 ;;
+    --exclude-domain) EXCLUDE_DOMAINS+=("$2"); shift 2 ;;
+    --since) START_DATE="$2"; shift 2 ;;
+    --until) END_DATE="$2"; shift 2 ;;
+    -*)
+      json_error "$TOOL_NAME" "Unknown option: $1" "INVALID_ARG" "Run: exa-search --help"
+      ;;
+    *)
+      if [[ -z "$QUERY" ]]; then
+        QUERY="$1"
+      else
+        QUERY="$QUERY $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+    json_error "$TOOL_NAME" "Query is required" "MISSING_ARG" "Usage: exa-search <query> [options]"
+fi
+
+# Build JSON body
+BODY=$(jq -n \
+  --arg query "$QUERY" \
+  --arg type "$SEARCH_TYPE" \
+  --argjson num "$NUM_RESULTS" \
+  '{query: $query, type: $type, numResults: $num}')
+
+# Optional fields
+if [[ -n "$CATEGORY" ]]; then
+  BODY=$(echo "$BODY" | jq --arg cat "$CATEGORY" '. + {category: $cat}')
+fi
+
+if [[ -n "$START_DATE" ]]; then
+  BODY=$(echo "$BODY" | jq --arg d "${START_DATE}T00:00:00.000Z" '. + {startPublishedDate: $d}')
+fi
+
+if [[ -n "$END_DATE" ]]; then
+  BODY=$(echo "$BODY" | jq --arg d "${END_DATE}T23:59:59.999Z" '. + {endPublishedDate: $d}')
+fi
+
+if [[ ${#INCLUDE_DOMAINS[@]} -gt 0 ]]; then
+  DOMAINS_JSON=$(printf '%s\n' "${INCLUDE_DOMAINS[@]}" | jq -R . | jq -s .)
+  BODY=$(echo "$BODY" | jq --argjson d "$DOMAINS_JSON" '. + {includeDomains: $d}')
+fi
+
+if [[ ${#EXCLUDE_DOMAINS[@]} -gt 0 ]]; then
+  DOMAINS_JSON=$(printf '%s\n' "${EXCLUDE_DOMAINS[@]}" | jq -R . | jq -s .)
+  BODY=$(echo "$BODY" | jq --argjson d "$DOMAINS_JSON" '. + {excludeDomains: $d}')
+fi
+
+# Content retrieval - always request highlights; optionally full text
+if [[ "$INCLUDE_TEXT" == "true" ]]; then
+  BODY=$(echo "$BODY" | jq --argjson max "$TEXT_MAX" '. + {contents: {text: {maxCharacters: $max}, highlights: {numSentences: 3}}}')
+else
+  BODY=$(echo "$BODY" | jq '. + {contents: {highlights: {numSentences: 3}}}')
+fi
+
+# Execute search
+RESULT=$(exa_api "/search" "$BODY")
+
+# Check for errors
+if echo "$RESULT" | jq -e '.error' > /dev/null 2>&1; then
+  local_msg=$(echo "$RESULT" | jq -r '.error')
+  json_error "$TOOL_NAME" "$local_msg" "API_ERROR" "Check your query and API key"
+fi
+
+# Extract and structure results
+results=$(echo "$RESULT" | jq '[.results[] | {
+    title: (.title // "Untitled"),
+    url,
+    published_date: (.publishedDate // null | if . then .[:10] else null end),
+    author: (.author // null),
+    highlights: (.highlights // []),
+    text: (.text // null | if . and (. | length) > 3000 then .[:3000] + "..." else . end)
+}]')
+
+na=$(next_actions \
+    "$(next_action "exa-search \"$QUERY\" --text" "Re-search with full text content")" \
+    "$(next_action "exa-search \"$QUERY\" --num 10" "Get more results")")
+
+json_ok "$TOOL_NAME" "$(jq -n --argjson r "$results" '{results: $r}')" "$na"
