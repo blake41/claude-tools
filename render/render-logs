@@ -11,12 +11,16 @@ TOOL_NAME="render-logs"
 
 # Defaults
 LINES=50
-LOG_TYPE=""
-LOG_LEVEL=""
+LOG_TYPES=()      # API supports array of strings
+LOG_LEVELS=()     # API supports array of strings
+LOG_TEXTS=()      # API text filter (server-side, regex/wildcards)
+LOG_PATHS=()      # API path filter (server-side, regex/wildcards)
 SINCE=""
 START_TIME=""
 END_TIME=""
 DIRECTION=""
+GREP_PATTERN=""   # Client-side fallback filter
+STATS_MODE=false
 
 # Parse arguments
 SERVICE_ID=""
@@ -27,11 +31,19 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --type)
-            LOG_TYPE="$2"
+            LOG_TYPES+=("$2")
             shift 2
             ;;
         --level)
-            LOG_LEVEL="$2"
+            LOG_LEVELS+=("$2")
+            shift 2
+            ;;
+        --text|-t)
+            LOG_TEXTS+=("$2")
+            shift 2
+            ;;
+        --path)
+            LOG_PATHS+=("$2")
             shift 2
             ;;
         --since)
@@ -50,9 +62,27 @@ while [[ $# -gt 0 ]]; do
             DIRECTION="$2"
             shift 2
             ;;
+        --grep|-g)
+            GREP_PATTERN="$2"
+            shift 2
+            ;;
+        --stats)
+            STATS_MODE=true
+            shift
+            ;;
         --help|-h)
             cmd_tree "$TOOL_NAME" "Render.com log viewer" "$(jq -n '[
-                {name: "logs", description: "Fetch logs for a service", usage: "render-logs <service-id> [--lines N] [--type app|request|build] [--level error|warn|info] [--since 1h|7d] [--start TIME] [--end TIME]"}
+                {name: "logs", description: "Fetch logs for a service", usage: "render-logs <service-id> [options]"},
+                {name: "--text PATTERN", description: "Server-side text filter (regex/wildcards supported, can repeat)", usage: "--text \"generate\" --text \"error\""},
+                {name: "--path PATTERN", description: "Server-side request path filter (regex/wildcards)", usage: "--path \"/api/accounts/*/generate\""},
+                {name: "--type TYPE", description: "Log type filter: app, request, build (can repeat)", usage: "--type app --type request"},
+                {name: "--level LEVEL", description: "Severity filter: error, warn, info (can repeat, regex supported)", usage: "--level error"},
+                {name: "--grep PATTERN", description: "Client-side regex filter (fallback when API filters are insufficient)", usage: "--grep \"status=[45][0-9]{2}\""},
+                {name: "--stats", description: "Return summary stats: counts by day/status/endpoint, duration percentiles", usage: "--stats --text \"generate\" --since 1d"},
+                {name: "--since TIME", description: "Relative time: 1h, 30m, 7d", usage: "--since 1d"},
+                {name: "--start/--end", description: "Absolute time bounds (RFC3339)", usage: "--start 2026-02-25T00:00:00Z"},
+                {name: "--lines N", description: "Max lines to return (default 50)", usage: "--lines 200"},
+                {name: "--direction", description: "forward or backward (default: backward, --since defaults forward)", usage: "--direction forward"}
             ]')"
             exit 0
             ;;
@@ -68,7 +98,7 @@ done
 
 if [[ -z "$SERVICE_ID" ]]; then
     cmd_tree "$TOOL_NAME" "Render.com log viewer" "$(jq -n '[
-        {name: "logs", description: "Fetch logs for a service", usage: "render-logs <service-id> [--lines N] [--type app|request|build] [--level error|warn|info] [--since 1h|7d]"}
+        {name: "logs", description: "Fetch logs for a service", usage: "render-logs <service-id> [--text PATTERN] [--path PATTERN] [--type app] [--level error] [--since 1h] [--stats]"}
     ]')"
     exit 0
 fi
@@ -124,41 +154,211 @@ if [[ -z "$DIRECTION" ]]; then
     DIRECTION="backward"
 fi
 
-# Build query params
-PARAMS="ownerId=$OWNER_ID&resource=$SERVICE_ID&limit=$LINES&direction=$DIRECTION"
-
-if [[ -n "$LOG_TYPE" ]]; then
-    PARAMS="$PARAMS&type=$LOG_TYPE"
+# Render API caps at 100 per page. Paginate to collect up to $LINES.
+PAGE_SIZE=100
+if [[ "$LINES" -lt "$PAGE_SIZE" ]]; then
+    PAGE_SIZE="$LINES"
 fi
 
-if [[ -n "$LOG_LEVEL" ]]; then
-    PARAMS="$PARAMS&level=$LOG_LEVEL"
+# Build base query params (without time cursors — those change per page)
+BASE_PARAMS="ownerId=$OWNER_ID&resource=$SERVICE_ID&limit=$PAGE_SIZE&direction=$DIRECTION"
+
+# URL-encode helper (avoids spawning python per param)
+urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1"; }
+
+# Append array params (API supports multiple values for type, level, text, path)
+for t in "${LOG_TYPES[@]+"${LOG_TYPES[@]}"}"; do
+    [[ -n "$t" ]] && BASE_PARAMS="$BASE_PARAMS&type=$(urlencode "$t")"
+done
+for l in "${LOG_LEVELS[@]+"${LOG_LEVELS[@]}"}"; do
+    [[ -n "$l" ]] && BASE_PARAMS="$BASE_PARAMS&level=$(urlencode "$l")"
+done
+for txt in "${LOG_TEXTS[@]+"${LOG_TEXTS[@]}"}"; do
+    [[ -n "$txt" ]] && BASE_PARAMS="$BASE_PARAMS&text=$(urlencode "$txt")"
+done
+for p in "${LOG_PATHS[@]+"${LOG_PATHS[@]}"}"; do
+    [[ -n "$p" ]] && BASE_PARAMS="$BASE_PARAMS&path=$(urlencode "$p")"
+done
+
+# Initial time bounds (may be empty)
+CUR_START="$START_TIME"
+CUR_END="$END_TIME"
+
+# Collect entries across pages using temp files to avoid shell variable limits
+TMPFILE=$(mktemp)
+trap 'rm -f "$TMPFILE" "${TMPFILE}.tmp"' EXIT
+echo '[]' > "$TMPFILE"
+
+COLLECTED=0       # matched entries (post-grep if applicable)
+SCANNED=0         # total entries fetched from API
+MAX_PAGES=50      # Safety limit
+# When collecting stats, scan more pages to get a fuller picture
+if [[ "$STATS_MODE" == true ]]; then
+    MAX_PAGES=100
 fi
 
-if [[ -n "$START_TIME" ]]; then
-    PARAMS="$PARAMS&startTime=$START_TIME"
+for (( page=0; page<MAX_PAGES; page++ )); do
+    PARAMS="$BASE_PARAMS"
+    if [[ -n "$CUR_START" ]]; then
+        PARAMS="$PARAMS&startTime=$CUR_START"
+    fi
+    if [[ -n "$CUR_END" ]]; then
+        PARAMS="$PARAMS&endTime=$CUR_END"
+    fi
+
+    # Fetch and sanitize: strip control chars
+    raw=$(render_api "/logs?$PARAMS" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
+
+    # Parse this page
+    page_entries=$(echo "$raw" | jq -c '[.logs[]? | {
+        timestamp: ((.timestamp // "") | split(".")[0] + "Z"),
+        level: ((.labels // [])[] | select(.name=="level") | .value) // "info",
+        message: (.message // "")
+    }]' 2>/dev/null) || page_entries="[]"
+
+    page_count=$(echo "$page_entries" | jq 'length' 2>/dev/null) || page_count=0
+
+    if [[ "$page_count" -eq 0 ]]; then
+        break
+    fi
+
+    SCANNED=$((SCANNED + page_count))
+
+    # Apply client-side grep filter if set (on top of server-side text/path filters)
+    if [[ -n "$GREP_PATTERN" ]]; then
+        filtered=$(echo "$page_entries" | jq -c --arg pat "$GREP_PATTERN" '[.[] | select(.message | test($pat))]' 2>/dev/null) || filtered="[]"
+    else
+        filtered="$page_entries"
+    fi
+
+    filtered_count=$(echo "$filtered" | jq 'length' 2>/dev/null) || filtered_count=0
+
+    if [[ "$filtered_count" -gt 0 ]]; then
+        jq -n --slurpfile existing "$TMPFILE" --argjson new "$filtered" '$existing[0] + $new' > "${TMPFILE}.tmp" \
+            && mv "${TMPFILE}.tmp" "$TMPFILE"
+        COLLECTED=$((COLLECTED + filtered_count))
+    fi
+
+    # Stop when we have enough matched lines (unless stats mode wants everything)
+    if [[ "$STATS_MODE" != true ]] && [[ "$COLLECTED" -ge "$LINES" ]]; then
+        break
+    fi
+
+    # Check hasMore and get next cursor
+    has_more=$(echo "$raw" | jq -r '.hasMore // false' 2>/dev/null) || has_more="false"
+    if [[ "$has_more" != "true" ]]; then
+        break
+    fi
+
+    # Advance cursor based on direction
+    if [[ "$DIRECTION" == "backward" ]]; then
+        CUR_END=$(echo "$raw" | jq -r '.nextEndTime // empty' 2>/dev/null) || CUR_END=""
+        if [[ -z "$CUR_END" ]]; then
+            break
+        fi
+    else
+        CUR_START=$(echo "$raw" | jq -r '.nextStartTime // empty' 2>/dev/null) || CUR_START=""
+        if [[ -z "$CUR_START" ]]; then
+            break
+        fi
+    fi
+done
+
+# Build the result based on mode
+if [[ "$STATS_MODE" == true ]]; then
+    # Stats mode: return compact summary instead of raw lines
+    ALL_MATCHED=$(cat "$TMPFILE")
+    stats_result=$(echo "$ALL_MATCHED" | jq --argjson scanned "$SCANNED" --arg grep_pat "$GREP_PATTERN" '
+        length as $matched |
+
+        # Time window
+        (if length > 0 then [.[].timestamp] | sort | {first: first, last: last} else {first: null, last: null} end) as $window |
+
+        # Count by level
+        (group_by(.level) | map({(.[0].level): length}) | add // {}) as $by_level |
+
+        # Count by day
+        ([.[].timestamp[:10]] | group_by(.) | map({(.[0]): length}) | add // {}) as $by_day |
+
+        # Extract status codes from messages (status=NNN pattern)
+        ([.[] | .message | capture("status=(?<code>[0-9]+)") // empty | .code] | group_by(.) | map({(.[0]): length}) | add // {}) as $by_status |
+
+        # Extract URL paths, normalize IDs, count top endpoints
+        ([.[] | .message | capture("(?<method>POST|GET|PUT|DELETE|PATCH) (?<path>/[^ ]+)") // empty | "\(.method) \(.path)" | gsub("/[A-Za-z0-9]{15,18}/"; "/:id/")] | group_by(.) | map({key: .[0], count: length}) | sort_by(-.count) | .[:10] | map({(.key): .count}) | add // {}) as $by_endpoint |
+
+        # Duration stats from duration_ms=NNN
+        ([.[] | .message | capture("duration_ms=(?<ms>[0-9]+)") // empty | .ms | tonumber] |
+            if length > 0 then
+                sort | {
+                    count: length,
+                    min_ms: first,
+                    max_ms: last,
+                    avg_ms: ((add / length) | floor),
+                    p50_ms: .[length/2 | floor],
+                    p95_ms: .[(length * 0.95) | floor],
+                    p99_ms: .[(length * 0.99) | floor]
+                }
+            else null end
+        ) as $durations |
+
+        # Sample: first 3 and last 3 matched messages (trimmed)
+        (if length > 0 then
+            ([.[:3][] | {timestamp, message: (.message[:150])}]) as $head |
+            ([.[-3:][] | {timestamp, message: (.message[:150])}]) as $tail |
+            {first: $head, last: $tail}
+        else null end) as $samples |
+
+        {
+            scanned: $scanned,
+            matched: $matched,
+            grep: (if $grep_pat == "" then null else $grep_pat end),
+            window: $window,
+            by_level: $by_level,
+            by_day: $by_day,
+            by_status: $by_status,
+            by_endpoint: $by_endpoint,
+            durations: $durations,
+            samples: $samples
+        }
+    ' 2>/dev/null) || stats_result='{"error": "failed to compute stats"}'
+
+    TEXT_HINT=""
+    [[ ${#LOG_TEXTS[@]} -gt 0 ]] && TEXT_HINT=" --text \"${LOG_TEXTS[0]}\""
+    local_na=$(next_actions \
+        "$(next_action "render-logs $SERVICE_ID --lines 50${TEXT_HINT}" "Show matching log lines")" \
+        "$(next_action "render-logs $SERVICE_ID --stats --since 1d" "Stats for last 24h")" \
+        "$(next_action "render-logs $SERVICE_ID --level error --stats" "Error stats")")
+
+    json_ok "$TOOL_NAME" "$stats_result" "$local_na"
+else
+    # Normal mode: return log lines
+    ALL_ENTRIES=$(cat "$TMPFILE")
+    truncated=$(json_truncate "$ALL_ENTRIES" "$LINES")
+
+    # Add filter metadata when any filtering was applied
+    HAS_FILTERS=false
+    [[ -n "$GREP_PATTERN" ]] && HAS_FILTERS=true
+    [[ ${#LOG_TEXTS[@]} -gt 0 ]] && HAS_FILTERS=true
+    [[ ${#LOG_PATHS[@]} -gt 0 ]] && HAS_FILTERS=true
+
+    if [[ "$HAS_FILTERS" == true ]]; then
+        TEXTS_JSON="[]"
+        PATHS_JSON="[]"
+        [[ ${#LOG_TEXTS[@]} -gt 0 ]] && TEXTS_JSON=$(printf '%s\n' "${LOG_TEXTS[@]}" | jq -R . | jq -s '.')
+        [[ ${#LOG_PATHS[@]} -gt 0 ]] && PATHS_JSON=$(printf '%s\n' "${LOG_PATHS[@]}" | jq -R . | jq -s '.')
+
+        truncated=$(echo "$truncated" | jq \
+            --arg grep "$GREP_PATTERN" \
+            --argjson scanned "$SCANNED" \
+            --argjson texts "$TEXTS_JSON" \
+            --argjson paths "$PATHS_JSON" \
+            '. + {scanned: $scanned} + (if $grep != "" then {grep: $grep} else {} end) + (if ($texts | length) > 0 then {text_filter: $texts} else {} end) + (if ($paths | length) > 0 then {path_filter: $paths} else {} end)')
+    fi
+
+    local_na=$(next_actions \
+        "$(next_action "render-logs $SERVICE_ID --lines 200" "Show more log lines")" \
+        "$(next_action "render-logs $SERVICE_ID --level error" "Show only errors")" \
+        "$(next_action "render-logs $SERVICE_ID --stats" "Show stats summary")")
+
+    json_ok "$TOOL_NAME" "$truncated" "$local_na"
 fi
-
-if [[ -n "$END_TIME" ]]; then
-    PARAMS="$PARAMS&endTime=$END_TIME"
-fi
-
-# Fetch logs
-raw=$(render_api "/logs?$PARAMS")
-
-# Parse log entries into structured JSON
-entries=$(echo "$raw" | jq '[.logs[]? | {
-    timestamp: (.timestamp | split(".")[0] + "Z"),
-    level: ((.labels // [])[] | select(.name=="level") | .value) // "info",
-    message: .message
-}]')
-
-# Truncate
-truncated=$(json_truncate "$entries" "$LINES")
-
-local_na=$(next_actions \
-    "$(next_action "render-logs $SERVICE_ID --lines 100" "Show more log lines")" \
-    "$(next_action "render-logs $SERVICE_ID --level error" "Show only errors")" \
-    "$(next_action "render-services get $SERVICE_ID" "Get service details")")
-
-json_ok "$TOOL_NAME" "$truncated" "$local_na"
