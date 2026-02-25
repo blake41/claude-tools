@@ -195,6 +195,236 @@ cmd_secrets_export() {
     json_ok "$TOOL_NAME secrets export" "$result" "$na"
 }
 
+cmd_secrets_create() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local secret_key=""
+    local secret_value=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            *)
+                if [[ -z "$secret_key" ]]; then
+                    secret_key="$1"; shift
+                elif [[ -z "$secret_value" ]]; then
+                    secret_value="$1"; shift
+                else
+                    json_error "$TOOL_NAME secrets create" "Unknown option: $1" "INVALID_ARG" \
+                        "Usage: infisical-api secrets create <KEY> <VALUE> -p <project-id> [-e env] [--path /path]"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$project_id" || -z "$secret_key" || -z "$secret_value" ]]; then
+        json_error "$TOOL_NAME secrets create" "Key, value, and project ID required" "MISSING_ARG" \
+            "Usage: infisical-api secrets create <KEY> <VALUE> -p <project-id> [-e env] [--path /path]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME secrets create" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local payload
+    payload=$(jq -n \
+        --arg wid "$project_id" \
+        --arg env "$environment" \
+        --arg path "$path" \
+        --arg val "$secret_value" \
+        --arg type "shared" \
+        '{workspaceId: $wid, environment: $env, secretPath: $path, secretValue: $val, type: $type}')
+
+    local result
+    result=$(infisical_api "/v3/secrets/raw/$secret_key" -X POST -d "$payload") || \
+        json_error "$TOOL_NAME secrets create" "Failed to create secret" "API_ERROR" "Check project ID and permissions"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets get $secret_key -p $project_id -e $environment" "Verify the created secret")" \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List all secrets")")
+    json_ok "$TOOL_NAME secrets create" "$result" "$na"
+}
+
+cmd_secrets_update() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local secret_key=""
+    local secret_value=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            *)
+                if [[ -z "$secret_key" ]]; then
+                    secret_key="$1"; shift
+                elif [[ -z "$secret_value" ]]; then
+                    secret_value="$1"; shift
+                else
+                    json_error "$TOOL_NAME secrets update" "Unknown option: $1" "INVALID_ARG" \
+                        "Usage: infisical-api secrets update <KEY> <NEW_VALUE> -p <project-id> [-e env] [--path /path]"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$project_id" || -z "$secret_key" || -z "$secret_value" ]]; then
+        json_error "$TOOL_NAME secrets update" "Key, new value, and project ID required" "MISSING_ARG" \
+            "Usage: infisical-api secrets update <KEY> <NEW_VALUE> -p <project-id> [-e env] [--path /path]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME secrets update" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local payload
+    payload=$(jq -n \
+        --arg wid "$project_id" \
+        --arg env "$environment" \
+        --arg path "$path" \
+        --arg val "$secret_value" \
+        '{workspaceId: $wid, environment: $env, secretPath: $path, secretValue: $val}')
+
+    local result
+    result=$(infisical_api "/v3/secrets/raw/$secret_key" -X PATCH -d "$payload") || \
+        json_error "$TOOL_NAME secrets update" "Failed to update secret" "API_ERROR" "Check secret key exists and permissions"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets get $secret_key -p $project_id -e $environment" "Verify the updated secret")" \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List all secrets")")
+    json_ok "$TOOL_NAME secrets update" "$result" "$na"
+}
+
+cmd_secrets_delete() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local secret_key=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            *)
+                if [[ -z "$secret_key" ]]; then
+                    secret_key="$1"; shift
+                else
+                    json_error "$TOOL_NAME secrets delete" "Unknown option: $1" "INVALID_ARG" \
+                        "Usage: infisical-api secrets delete <KEY> -p <project-id> [-e env] [--path /path]"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$project_id" || -z "$secret_key" ]]; then
+        json_error "$TOOL_NAME secrets delete" "Key and project ID required" "MISSING_ARG" \
+            "Usage: infisical-api secrets delete <KEY> -p <project-id> [-e env] [--path /path]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME secrets delete" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local payload
+    payload=$(jq -n \
+        --arg wid "$project_id" \
+        --arg env "$environment" \
+        --arg path "$path" \
+        '{workspaceId: $wid, environment: $env, secretPath: $path}')
+
+    local result
+    result=$(infisical_api "/v3/secrets/raw/$secret_key" -X DELETE -d "$payload") || \
+        json_error "$TOOL_NAME secrets delete" "Failed to delete secret" "API_ERROR" "Check secret key exists and permissions"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List remaining secrets")")
+    json_ok "$TOOL_NAME secrets delete" "$result" "$na"
+}
+
+# ============================================================================
+# FOLDER COMMANDS
+# ============================================================================
+
+cmd_folders_list() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            *) json_error "$TOOL_NAME folders list" "Unknown option: $1" "INVALID_ARG" \
+                "Usage: infisical-api folders list -p <project-id> [-e env] [--path /path]" ;;
+        esac
+    done
+
+    if [[ -z "$project_id" ]]; then
+        json_error "$TOOL_NAME folders list" "Project ID required" "MISSING_ARG" \
+            "Usage: infisical-api folders list -p <project-id> [-e env] [--path /path]"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME folders list" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local encoded_path
+    encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+
+    local raw
+    raw=$(infisical_api "/v1/folders?workspaceId=$project_id&environment=$environment&path=$encoded_path") || \
+        json_error "$TOOL_NAME folders list" "Failed to list folders" "API_ERROR" "Check project ID and environment"
+
+    local folders
+    folders=$(echo "$raw" | jq '[.folders[] | {id, name}]' 2>/dev/null || echo '[]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets list -p $project_id -e $environment --path /subfolder" "List secrets in a subfolder")")
+    json_ok "$TOOL_NAME folders list" "$folders" "$na"
+}
+
+# ============================================================================
+# ENVIRONMENT COMMANDS
+# ============================================================================
+
+cmd_environments_list() {
+    local project_id="${1:-}"
+
+    if [[ -z "$project_id" ]]; then
+        json_error "$TOOL_NAME environments list" "Project ID required" "MISSING_ARG" \
+            "Usage: infisical-api environments list <project-id>"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME environments list" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    # Environments are embedded in the workspace listing
+    local raw
+    raw=$(infisical_api "/v1/workspace") || \
+        json_error "$TOOL_NAME environments list" "Failed to list workspaces" "API_ERROR" "Check credentials"
+
+    local envs
+    envs=$(echo "$raw" | jq --arg pid "$project_id" \
+        '[.workspaces[] | select(.id == $pid) | .environments[] | {name, slug}]' 2>/dev/null || echo '[]')
+
+    if [[ "$envs" == "[]" ]]; then
+        json_error "$TOOL_NAME environments list" "Project '$project_id' not found" "NOT_FOUND" \
+            "Run 'infisical-api projects list' to see available projects"
+    fi
+
+    local na
+    na=$(next_actions \
+        "$(next_action "infisical-api secrets list -p $project_id -e <slug>" "List secrets for an environment")")
+    json_ok "$TOOL_NAME environments list" "$envs" "$na"
+}
+
 # ============================================================================
 # SYNC COMMANDS
 # ============================================================================
@@ -536,8 +766,11 @@ case "${1:-}" in
         case "${2:-}" in
             list) shift 2; cmd_secrets_list "$@" ;;
             get) shift 2; cmd_secrets_get "$@" ;;
+            create) shift 2; cmd_secrets_create "$@" ;;
+            update) shift 2; cmd_secrets_update "$@" ;;
+            delete) shift 2; cmd_secrets_delete "$@" ;;
             export) shift 2; cmd_secrets_export "$@" ;;
-            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|export>" ;;
+            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|create|update|delete|export>" ;;
         esac
         ;;
     syncs)
@@ -548,6 +781,18 @@ case "${1:-}" in
             force) cmd_syncs_force "${3:-}" ;;
             remove-secrets) cmd_syncs_remove_secrets "${3:-}" "${4:-}" ;;
             *) json_error "$TOOL_NAME syncs" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api syncs <list|get|trigger|force|remove-secrets>" ;;
+        esac
+        ;;
+    folders)
+        case "${2:-}" in
+            list) shift 2; cmd_folders_list "$@" ;;
+            *) json_error "$TOOL_NAME folders" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api folders <list>" ;;
+        esac
+        ;;
+    environments)
+        case "${2:-}" in
+            list) cmd_environments_list "${3:-}" ;;
+            *) json_error "$TOOL_NAME environments" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api environments <list>" ;;
         esac
         ;;
     integrations)
@@ -572,7 +817,12 @@ case "${1:-}" in
             {name: "projects get", description: "Get project details", usage: "infisical-api projects get <id>"},
             {name: "secrets list", description: "List secrets", usage: "infisical-api secrets list -p <project> [-e env] [--path /path]"},
             {name: "secrets get", description: "Get a specific secret", usage: "infisical-api secrets get <key> -p <project> [-e env]"},
+            {name: "secrets create", description: "Create a secret", usage: "infisical-api secrets create <KEY> <VALUE> -p <project> [-e env] [--path /path]"},
+            {name: "secrets update", description: "Update a secret value", usage: "infisical-api secrets update <KEY> <NEW_VALUE> -p <project> [-e env] [--path /path]"},
+            {name: "secrets delete", description: "Delete a secret", usage: "infisical-api secrets delete <KEY> -p <project> [-e env] [--path /path]"},
             {name: "secrets export", description: "Export secrets", usage: "infisical-api secrets export -p <project> [-f env|json]"},
+            {name: "folders list", description: "List secret folders", usage: "infisical-api folders list -p <project> [-e env] [--path /path]"},
+            {name: "environments list", description: "List project environments", usage: "infisical-api environments list <project-id>"},
             {name: "syncs list", description: "List secret syncs", usage: "infisical-api syncs list <project-id>"},
             {name: "syncs get", description: "Get sync details", usage: "infisical-api syncs get <sync-id>"},
             {name: "syncs trigger", description: "Trigger a sync", usage: "infisical-api syncs trigger <sync-id>"},
