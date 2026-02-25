@@ -9,6 +9,68 @@ source "$SCRIPT_DIR/../cli-envelope.sh"
 
 TOOL_NAME="api-probe"
 
+# --- Output directory for file-based results ---
+RESULT_DIR="/tmp/api-probe"
+mkdir -p "$RESULT_DIR"
+
+# Override json_ok: write full result to file, return summary + path on stdout.
+# This prevents large API catalogs from blowing up conversation context.
+json_ok() {
+  local cmd="$1"
+  local result="$2"
+  local next_actions="${3:-[]}"
+
+  # For small/simple results (like command tree), emit directly
+  if echo "$result" | jq -e 'has("commands")' &>/dev/null; then
+    jq -n \
+      --arg cmd "$cmd" \
+      --argjson result "$result" \
+      --argjson next "$next_actions" \
+      '{ok: true, command: $cmd, result: $result, next_actions: $next}'
+    return
+  fi
+
+  # Generate unique filename from command + timestamp
+  local slug
+  slug=$(echo "$cmd" | tr ' ' '-')
+  local result_file="${RESULT_DIR}/${slug}-$(date +%s).json"
+
+  # Write full result to file
+  jq -n \
+    --arg cmd "$cmd" \
+    --argjson result "$result" \
+    --argjson next "$next_actions" \
+    '{ok: true, command: $cmd, result: $result, next_actions: $next}' > "$result_file"
+
+  # Build a compact summary for stdout
+  local summary
+  summary=$(echo "$result" | jq -c '{
+    spec_found: .spec_found,
+    spec_format: .spec_format,
+    endpoint_count: .endpoint_count,
+    filtered_count: .filtered_count,
+    total_endpoints: .total_endpoints,
+    from_spec: .from_spec,
+    from_probe: .from_probe,
+    graphql: .graphql,
+    introspection_enabled: .introspection_enabled,
+    query_count: .query_count,
+    mutation_count: .mutation_count,
+    type_count: .type_count,
+    tags: (if (.tags // [] | length) > 0 then .tags else null end),
+    active_filters: (if (.active_filters // {} | to_entries | map(select(.value != null)) | length) > 0
+                     then (.active_filters | with_entries(select(.value != null)))
+                     else null end)
+  } | with_entries(select(.value != null))' 2>/dev/null || echo '{}')
+
+  jq -n \
+    --arg cmd "$cmd" \
+    --argjson summary "$summary" \
+    --arg detail_file "$result_file" \
+    --argjson next "$next_actions" \
+    '{ok: true, command: $cmd, summary: $summary, detail_file: $detail_file, next_actions: $next}'
+}
+
 # --- Parse auth flags globally (direct call, no subshell) ---
 parse_auth_flags "$@"
 if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
@@ -567,7 +629,7 @@ cmd_graphql() {
   fi
 
   local has_errors
-  has_errors=$(echo "$body" | jq -e '.errors' 2>/dev/null && echo "true" || echo "false")
+  has_errors=$(echo "$body" | jq -e 'has("errors")' 2>/dev/null || echo "false")
 
   if [[ "$has_errors" == "true" ]] && ! echo "$body" | jq -e '.data.__schema' &>/dev/null; then
     local err_msg
@@ -775,10 +837,10 @@ case "${1:-}" in
   graphql)  shift; cmd_graphql "$@" ;;
   *)
     cmd_tree "$TOOL_NAME" "API endpoint discovery and catalog generation" "$(jq -n '[
-      {name: "spec",    description: "Check well-known spec paths (OpenAPI, Swagger)", usage: "api-probe spec <url> [--limit N] [--offset N] [--tag TAG] [--filter PAT] [--compact] [auth]"},
-      {name: "probe",   description: "Active probing for endpoints and resources",     usage: "api-probe probe <url> [--limit N] [--compact] [auth]"},
-      {name: "scan",    description: "Full scan: spec + probe combined",               usage: "api-probe scan <url> [--limit N] [--offset N] [--tag TAG] [--filter PAT] [--compact] [auth]"},
-      {name: "graphql", description: "GraphQL introspection",                          usage: "api-probe graphql <url> [--limit N] [--offset N] [--filter PAT] [--compact] [--queries-only|--types-only|--mutations-only] [auth]"}
+      {name: "spec",    description: "Check well-known spec paths (OpenAPI, Swagger)", usage: "api-probe spec <url> [--limit N] [--offset N] [--tag TAG] [--filter PAT] [--verbose] [auth]"},
+      {name: "probe",   description: "Active probing for endpoints and resources",     usage: "api-probe probe <url> [--limit N] [--verbose] [auth]"},
+      {name: "scan",    description: "Full scan: spec + probe combined",               usage: "api-probe scan <url> [--limit N] [--offset N] [--tag TAG] [--filter PAT] [--verbose] [auth]"},
+      {name: "graphql", description: "GraphQL introspection",                          usage: "api-probe graphql <url> [--limit N] [--offset N] [--filter PAT] [--verbose] [--queries-only|--types-only|--mutations-only] [auth]"}
     ]')"
     ;;
 esac

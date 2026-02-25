@@ -53,11 +53,11 @@ GRAPHQL_QUERY='{"query":"{ __schema { queryType { name } mutationType { name } t
 AUTH_CURL_ARGS=()
 
 # Display/filter flags, populated by parse_display_flags
-DISPLAY_LIMIT=50
+DISPLAY_LIMIT=20
 DISPLAY_OFFSET=0
 DISPLAY_TAG=""
 DISPLAY_FILTER=""
-DISPLAY_COMPACT=false
+DISPLAY_COMPACT=true
 DISPLAY_QUERIES_ONLY=false
 DISPLAY_TYPES_ONLY=false
 DISPLAY_MUTATIONS_ONLY=false
@@ -114,7 +114,7 @@ parse_display_flags() {
       --filter)
         [[ $# -lt 2 ]] && echo "ERROR: --filter requires a value" >&2 && return 1
         DISPLAY_FILTER="$2"; shift 2 ;;
-      --compact)        DISPLAY_COMPACT=true; shift ;;
+      --verbose)        DISPLAY_COMPACT=false; shift ;;
       --queries-only)   DISPLAY_QUERIES_ONLY=true; shift ;;
       --types-only)     DISPLAY_TYPES_ONLY=true; shift ;;
       --mutations-only) DISPLAY_MUTATIONS_ONLY=true; shift ;;
