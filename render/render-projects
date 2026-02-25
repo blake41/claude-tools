@@ -1,0 +1,117 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+source "$SCRIPT_DIR/render-common.sh"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="render-projects"
+
+cmd_list() {
+    load_api_key || json_error "$TOOL_NAME list" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+    local owner_id
+    owner_id=$(load_workspace) || true
+
+    local url="/projects?limit=50"
+    if [[ -n "$owner_id" ]]; then
+        url="$url&ownerId=$owner_id"
+    fi
+
+    local raw
+    raw=$(render_api "$url")
+
+    local projects
+    projects=$(echo "$raw" | jq '[.[] | .project | {id, name, createdAt, updatedAt, environmentIds}]')
+
+    local na
+    local first_id
+    first_id=$(echo "$projects" | jq -r '.[0].id // empty')
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-projects get $first_id" "Get project details")" \
+            "$(next_action "render-projects services $first_id" "List services in project")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME list" "$projects" "$na"
+}
+
+cmd_get() {
+    local project_id="${1:-}"
+    if [[ -z "$project_id" ]]; then
+        json_error "$TOOL_NAME get" "Project ID required" "MISSING_ARG" "Usage: render-projects get <project-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME get" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api "/projects/$project_id")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-projects services $project_id" "List services in this project")" \
+        "$(next_action "render-projects list" "List all projects")")
+
+    json_ok "$TOOL_NAME get" "$result" "$na"
+}
+
+cmd_services() {
+    local project_id="${1:-}"
+    if [[ -z "$project_id" ]]; then
+        json_error "$TOOL_NAME services" "Project ID required" "MISSING_ARG" "Usage: render-projects services <project-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME services" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    # Get project to find environment IDs
+    local project
+    project=$(render_api "/projects/$project_id")
+    local env_ids
+    env_ids=$(echo "$project" | jq -r '.environmentIds[]' 2>/dev/null)
+
+    # Fetch services for each environment
+    local all_services="[]"
+    for env_id in $env_ids; do
+        local raw
+        raw=$(render_api "/services?environmentId=$env_id&limit=50")
+        local services
+        services=$(echo "$raw" | jq '[.[] | .service | {id, name, type, url: (.serviceDetails.url // null), suspended}]')
+        all_services=$(echo "$all_services" "$services" | jq -s 'add')
+    done
+
+    local na
+    local first_id
+    first_id=$(echo "$all_services" | jq -r '.[0].id // empty')
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-services get $first_id" "Get service details")" \
+            "$(next_action "render-services deploys $first_id" "View deploys for first service")" \
+            "$(next_action "render-logs $first_id" "View logs for first service")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME services" "$all_services" "$na"
+}
+
+case "${1:-}" in
+    list)
+        cmd_list
+        ;;
+    get)
+        cmd_get "${2:-}"
+        ;;
+    services)
+        cmd_services "${2:-}"
+        ;;
+    *)
+        cmd_tree "$TOOL_NAME" "Render.com project management" "$(jq -n '[
+            {name: "list", description: "List all projects", usage: "render-projects list"},
+            {name: "get", description: "Get project details", usage: "render-projects get <project-id>"},
+            {name: "services", description: "List services in a project", usage: "render-projects services <project-id>"}
+        ]')"
+        ;;
+esac

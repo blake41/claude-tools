@@ -52,10 +52,89 @@ cmd_get() {
 
     local na
     na=$(next_actions \
-        "$(next_action "render-logs $service_id" "View logs for this service")" \
-        "$(next_action "render-services list" "List all services")")
+        "$(next_action "render-services deploys $service_id" "View recent deploys")" \
+        "$(next_action "render-services env $service_id" "View environment variables")" \
+        "$(next_action "render-logs $service_id" "View logs for this service")")
 
     json_ok "$TOOL_NAME get" "$result" "$na"
+}
+
+cmd_deploys() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME deploys" "Service ID required" "MISSING_ARG" "Usage: render-services deploys <service-id> [--limit N]"
+    fi
+    local limit="${2:-10}"
+
+    load_api_key || json_error "$TOOL_NAME deploys" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/services/$service_id/deploys?limit=$limit")
+
+    local deploys
+    deploys=$(echo "$raw" | jq '[.[] | .deploy | {
+        id, status,
+        trigger: (.trigger // "unknown"),
+        commit: (.commit // {}),
+        createdAt, updatedAt,
+        finishedAt: (.finishedAt // null)
+    }]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $service_id" "View service details")" \
+        "$(next_action "render-logs $service_id" "View logs")" \
+        "$(next_action "render-services env $service_id" "View environment variables")")
+
+    json_ok "$TOOL_NAME deploys" "$deploys" "$na"
+}
+
+cmd_env() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME env" "Service ID required" "MISSING_ARG" "Usage: render-services env <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME env" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/services/$service_id/env-vars")
+
+    # Mask secret values (show first 4 chars + ...)
+    local env_vars
+    env_vars=$(echo "$raw" | jq '[.[] | .envVar | {
+        key, value: (if .value then (.value[:4] + "...") else "(secret)" end)
+    }]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services env-set $service_id KEY VALUE" "Set an environment variable")" \
+        "$(next_action "render-services get $service_id" "View service details")" \
+        "$(next_action "render-services deploys $service_id" "View recent deploys")")
+
+    json_ok "$TOOL_NAME env" "$env_vars" "$na"
+}
+
+cmd_env_set() {
+    local service_id="${1:-}"
+    local key="${2:-}"
+    local value="${3:-}"
+    if [[ -z "$service_id" || -z "$key" || -z "$value" ]]; then
+        json_error "$TOOL_NAME env-set" "Service ID, key, and value required" "MISSING_ARG" \
+            "Usage: render-services env-set <service-id> <KEY> <VALUE>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME env-set" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_put "/services/$service_id/env-vars" "[{\"key\":\"$key\",\"value\":\"$value\"}]")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services env $service_id" "View all env vars")" \
+        "$(next_action "render-services deploys $service_id" "Check deploy status")")
+
+    json_ok "$TOOL_NAME env-set" "$(jq -n --arg key "$key" '{key: $key, updated: true}')" "$na"
 }
 
 case "${1:-}" in
@@ -65,10 +144,22 @@ case "${1:-}" in
     get)
         cmd_get "${2:-}"
         ;;
+    deploys)
+        shift; cmd_deploys "$@"
+        ;;
+    env)
+        cmd_env "${2:-}"
+        ;;
+    env-set)
+        shift; cmd_env_set "$@"
+        ;;
     *)
         cmd_tree "$TOOL_NAME" "Render.com service management" "$(jq -n '[
             {name: "list", description: "List all services", usage: "render-services list"},
-            {name: "get", description: "Get service details", usage: "render-services get <service-id>"}
+            {name: "get", description: "Get service details", usage: "render-services get <service-id>"},
+            {name: "deploys", description: "List recent deploys", usage: "render-services deploys <service-id> [--limit N]"},
+            {name: "env", description: "List environment variables (masked)", usage: "render-services env <service-id>"},
+            {name: "env-set", description: "Set an environment variable", usage: "render-services env-set <service-id> <KEY> <VALUE>"}
         ]')"
         ;;
 esac

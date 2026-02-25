@@ -1,0 +1,580 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+source "$SCRIPT_DIR/api-probe-common.sh"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="api-probe"
+
+# --- Parse auth flags globally (direct call, no subshell) ---
+parse_auth_flags "$@"
+if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+  set -- "${REMAINING_ARGS[@]}"
+else
+  set --
+fi
+
+# Helper: read body from probe temp file
+probe_body() { cat "$PROBE_BODY"; }
+probe_headers() { cat "$PROBE_HEADERS"; }
+
+# --- Subcommands ---
+
+cmd_spec() {
+  local base_url="${1:-}"
+  [[ -z "$base_url" ]] && json_error "$TOOL_NAME spec" "Base URL required" "MISSING_ARG" \
+    "Usage: api-probe spec <base-url> --token <token>"
+
+  base_url=$(normalize_url "$base_url")
+
+  local paths_checked=0
+  local paths_hit=()
+  local paths_with_auth=()
+  local spec_url=""
+  local spec_body=""
+  local spec_format=""
+
+  for path in "${SPEC_PATHS[@]}"; do
+    paths_checked=$((paths_checked + 1))
+    probe_url GET "${base_url}${path}" || continue
+
+    case "$PROBE_HTTP_CODE" in
+      200)
+        local body
+        body=$(probe_body)
+        if is_json "$body" && echo "$body" | jq -e '.paths or .swagger or .openapi' &>/dev/null; then
+          paths_hit+=("$path")
+          if [[ -z "$spec_url" ]]; then
+            spec_url="$path"
+            spec_body="$body"
+            if echo "$body" | jq -e '.openapi' &>/dev/null; then
+              spec_format="openapi-$(echo "$body" | jq -r '.openapi')"
+            elif echo "$body" | jq -e '.swagger' &>/dev/null; then
+              spec_format="swagger-$(echo "$body" | jq -r '.swagger')"
+            else
+              spec_format="unknown"
+            fi
+          fi
+        fi
+        ;;
+      401|403)
+        paths_with_auth+=("$path")
+        ;;
+    esac
+  done
+
+  if [[ -n "$spec_url" ]]; then
+    local endpoints
+    endpoints=$(parse_openapi_spec "$spec_body")
+    local endpoint_count
+    endpoint_count=$(echo "$endpoints" | jq 'length')
+
+    local result
+    result=$(jq -n \
+      --argjson spec_found true \
+      --arg spec_url "$spec_url" \
+      --arg spec_format "$spec_format" \
+      --argjson endpoints "$endpoints" \
+      --argjson endpoint_count "$endpoint_count" \
+      --argjson paths_checked "$paths_checked" \
+      --argjson paths_hit "$(printf '%s\n' "${paths_hit[@]}" | jq -R . | jq -s .)" \
+      '{spec_found: $spec_found, spec_url: $spec_url, spec_format: $spec_format,
+        endpoints: $endpoints, endpoint_count: $endpoint_count,
+        paths_checked: $paths_checked, paths_hit: $paths_hit}')
+
+    local na
+    na=$(next_actions \
+      "$(next_action "api-probe scan ${base_url} [auth-flags]" "Full scan to find endpoints not in the spec")")
+    json_ok "$TOOL_NAME spec" "$result" "$na"
+  else
+    local result
+    local auth_json="[]"
+    if [[ ${#paths_with_auth[@]} -gt 0 ]]; then
+      auth_json=$(printf '%s\n' "${paths_with_auth[@]}" | jq -R . | jq -s .)
+    fi
+    result=$(jq -n \
+      --argjson spec_found false \
+      --argjson paths_checked "$paths_checked" \
+      --argjson paths_with_auth "$auth_json" \
+      '{spec_found: $spec_found, paths_checked: $paths_checked,
+        paths_hit: [], paths_with_auth: $paths_with_auth}')
+
+    local na
+    na=$(next_actions \
+      "$(next_action "api-probe probe ${base_url} [auth-flags]" "Try active probing to discover endpoints")" \
+      "$(next_action "api-probe graphql ${base_url} [auth-flags]" "Try GraphQL introspection")")
+    json_ok "$TOOL_NAME spec" "$result" "$na"
+  fi
+}
+
+cmd_probe() {
+  local base_url="${1:-}"
+  [[ -z "$base_url" ]] && json_error "$TOOL_NAME probe" "Base URL required" "MISSING_ARG" \
+    "Usage: api-probe probe <base-url> --token <token>"
+
+  base_url=$(normalize_url "$base_url")
+
+  local api_bases=()
+  local probes_sent=0
+  local resources_json="[]"
+  local auth_info='{"scheme":null,"www_authenticate":null}'
+  local rate_info='{"detected":false}'
+  local pagination_info='{"style":"unknown","details":{}}'
+  local graphql_detected=false
+
+  # Phase 1: Base path discovery
+  for bp in "${BASE_PATHS[@]}"; do
+    probes_sent=$((probes_sent + 1))
+    probe_url GET "${base_url}${bp}" || continue
+
+    case "$PROBE_HTTP_CODE" in
+      200)
+        local body
+        body=$(probe_body)
+        if is_json "$body"; then
+          api_bases+=("$bp")
+        fi
+        ;;
+      401|403)
+        api_bases+=("$bp")
+        auth_info=$(detect_auth_scheme "$(probe_headers)")
+        ;;
+    esac
+  done
+
+  # Check GraphQL endpoint
+  probes_sent=$((probes_sent + 1))
+  probe_url GET "${base_url}/graphql" || true
+  if [[ "$PROBE_HTTP_CODE" == "200" || "$PROBE_HTTP_CODE" == "400" || "$PROBE_HTTP_CODE" == "405" ]]; then
+    graphql_detected=true
+  fi
+
+  # Phase 2: Resource discovery
+  # Try discovered bases first, then all BASE_PATHS (some APIs 404 on the
+  # base itself but 200 on base/resource, e.g. Render: /v1 → 404, /v1/services → 200)
+  local all_bases=()
+  for b in "${api_bases[@]+"${api_bases[@]}"}"; do all_bases+=("$b"); done
+  for b in "${BASE_PATHS[@]}"; do
+    local already=false
+    for existing in "${all_bases[@]+"${all_bases[@]}"}"; do
+      [[ "$existing" == "$b" ]] && already=true && break
+    done
+    [[ "$already" == "false" ]] && all_bases+=("$b")
+  done
+
+  local found_resources=()
+  local tried_paths=()
+
+  for active_base in "${all_bases[@]}"; do
+  for resource in "${RESOURCE_NAMES[@]}"; do
+    probes_sent=$((probes_sent + 1))
+    local resource_path
+    if [[ -z "$active_base" ]]; then
+      resource_path="/${resource}"
+    else
+      resource_path="${active_base}/${resource}"
+    fi
+
+    # Skip if we already found this resource via a different base
+    local already_found=false
+    for tp in "${tried_paths[@]+"${tried_paths[@]}"}"; do
+      [[ "$tp" == "$resource" ]] && already_found=true && break
+    done
+    [[ "$already_found" == "true" ]] && continue
+
+    probe_url GET "${base_url}${resource_path}" || continue
+
+    case "$PROBE_HTTP_CODE" in
+      200)
+        local body
+        body=$(probe_body)
+        local methods='["GET"]'
+        local sample_fields="[]"
+        local res_pagination='{"style":"unknown","details":{}}'
+
+        if is_json "$body"; then
+          sample_fields=$(extract_sample_fields "$body")
+          res_pagination=$(detect_pagination "$body")
+
+          local header_pag
+          header_pag=$(detect_pagination_from_headers "$(probe_headers)")
+          if [[ "$header_pag" != "null" ]]; then
+            res_pagination="$header_pag"
+          fi
+
+          if [[ "$(echo "$rate_info" | jq -r '.detected')" == "false" ]]; then
+            rate_info=$(detect_rate_limits "$(probe_headers)")
+          fi
+
+          if [[ "$(echo "$pagination_info" | jq -r '.style')" == "unknown" ]]; then
+            pagination_info="$res_pagination"
+          fi
+        fi
+
+        # OPTIONS to discover methods
+        probes_sent=$((probes_sent + 1))
+        probe_url OPTIONS "${base_url}${resource_path}" || true
+        local allow_header
+        allow_header=$(probe_headers | grep -i '^allow:' | head -1 | sed 's/^[^:]*: *//' | tr -d '\r')
+        if [[ -n "$allow_header" ]]; then
+          methods=$(echo "$allow_header" | tr ',' '\n' | tr -d ' ' | jq -R . | jq -s .)
+        fi
+
+        tried_paths+=("$resource")
+        found_resources+=("$(jq -n \
+          --arg path "$resource_path" \
+          --argjson methods "$methods" \
+          --argjson status "$PROBE_HTTP_CODE" \
+          --argjson auth_required false \
+          --argjson pagination "$res_pagination" \
+          --argjson sample_fields "$sample_fields" \
+          '{path: $path, methods: $methods, status: $status,
+            auth_required: $auth_required, pagination: $pagination,
+            sample_fields: $sample_fields}')")
+        ;;
+      401|403)
+        tried_paths+=("$resource")
+        found_resources+=("$(jq -n \
+          --arg path "$resource_path" \
+          --argjson status "$PROBE_HTTP_CODE" \
+          '{path: $path, methods: ["unknown"], status: $status,
+            auth_required: true, pagination: {"style":"unknown","details":{}},
+            sample_fields: []}')")
+
+        if [[ "$(echo "$auth_info" | jq -r '.scheme')" == "null" ]]; then
+          auth_info=$(detect_auth_scheme "$(probe_headers)")
+        fi
+        ;;
+    esac
+  done
+  done  # end for active_base
+
+  # Build resources JSON array
+  if [[ ${#found_resources[@]} -gt 0 ]]; then
+    resources_json=$(printf '%s\n' "${found_resources[@]}" | jq -s .)
+  fi
+
+  local api_bases_json="[]"
+  if [[ ${#api_bases[@]} -gt 0 ]]; then
+    api_bases_json=$(printf '%s\n' "${api_bases[@]}" | jq -R . | jq -s .)
+  fi
+
+  local resource_count
+  resource_count=$(echo "$resources_json" | jq 'length')
+
+  local result
+  result=$(jq -n \
+    --arg base_url "$base_url" \
+    --argjson api_bases "$api_bases_json" \
+    --argjson resources "$resources_json" \
+    --argjson auth "$auth_info" \
+    --argjson pagination "$pagination_info" \
+    --argjson rate_limits "$rate_info" \
+    --argjson resource_count "$resource_count" \
+    --argjson probes_sent "$probes_sent" \
+    --argjson graphql_detected "$graphql_detected" \
+    '{base_url: $base_url, api_bases_found: $api_bases,
+      resources: $resources, auth: $auth, pagination: $pagination,
+      rate_limits: $rate_limits, resource_count: $resource_count,
+      probes_sent: $probes_sent, graphql_detected: $graphql_detected}')
+
+  local na_items=()
+  na_items+=("$(next_action "api-probe scan ${base_url} [auth-flags]" "Full scan (spec + probe)")")
+  if [[ "$graphql_detected" == "true" ]]; then
+    na_items+=("$(next_action "api-probe graphql ${base_url} [auth-flags]" "Try GraphQL introspection")")
+  fi
+  local na
+  na=$(next_actions "${na_items[@]}")
+
+  json_ok "$TOOL_NAME probe" "$result" "$na"
+}
+
+cmd_scan() {
+  local base_url="${1:-}"
+  [[ -z "$base_url" ]] && json_error "$TOOL_NAME scan" "Base URL required" "MISSING_ARG" \
+    "Usage: api-probe scan <base-url> --token <token>"
+
+  base_url=$(normalize_url "$base_url")
+
+  # Phase 1: Try to find a spec
+  local spec_found=false
+  local spec_url=""
+  local spec_format=""
+  local spec_endpoints="[]"
+  local spec_endpoint_count=0
+
+  for path in "${SPEC_PATHS[@]}"; do
+    probe_url GET "${base_url}${path}" || continue
+    if [[ "$PROBE_HTTP_CODE" == "200" ]]; then
+      local body
+      body=$(probe_body)
+      if is_json "$body" && echo "$body" | jq -e '.paths or .swagger or .openapi' &>/dev/null; then
+        spec_found=true
+        spec_url="$path"
+        if echo "$body" | jq -e '.openapi' &>/dev/null; then
+          spec_format="openapi-$(echo "$body" | jq -r '.openapi')"
+        elif echo "$body" | jq -e '.swagger' &>/dev/null; then
+          spec_format="swagger-$(echo "$body" | jq -r '.swagger')"
+        fi
+        spec_endpoints=$(parse_openapi_spec "$body")
+        spec_endpoint_count=$(echo "$spec_endpoints" | jq 'length')
+        break
+      fi
+    fi
+  done
+
+  # Phase 2: Probe for resources not covered by spec
+  local probe_resources=()
+  local probes_sent=0
+  local auth_info='{"scheme":null,"www_authenticate":null}'
+  local rate_info='{"detected":false}'
+  local pagination_info='{"style":"unknown","details":{}}'
+
+  # Build set of paths already in spec for dedup
+  local spec_path_set=""
+  if [[ "$spec_found" == "true" ]]; then
+    spec_path_set=$(echo "$spec_endpoints" | jq -r '.[].path' | sort -u)
+  fi
+
+  # Try all base paths for resource discovery
+  local tried_resources=()
+  for bp in "${BASE_PATHS[@]}"; do
+  for resource in "${RESOURCE_NAMES[@]}"; do
+    # Skip if spec already covers this resource
+    if [[ -n "$spec_path_set" ]] && echo "$spec_path_set" | grep -q "/${resource}"; then
+      continue
+    fi
+
+    # Skip if already found via different base
+    local already_found=false
+    for tr in "${tried_resources[@]+"${tried_resources[@]}"}"; do
+      [[ "$tr" == "$resource" ]] && already_found=true && break
+    done
+    [[ "$already_found" == "true" ]] && continue
+
+    local resource_path
+    if [[ -z "$bp" ]]; then
+      resource_path="/${resource}"
+    else
+      resource_path="${bp}/${resource}"
+    fi
+
+    probes_sent=$((probes_sent + 1))
+    probe_url GET "${base_url}${resource_path}" || continue
+
+    case "$PROBE_HTTP_CODE" in
+      200)
+        local body
+        body=$(probe_body)
+        local sample_fields="[]"
+        if is_json "$body"; then
+          sample_fields=$(extract_sample_fields "$body")
+          if [[ "$(echo "$rate_info" | jq -r '.detected')" == "false" ]]; then
+            rate_info=$(detect_rate_limits "$(probe_headers)")
+          fi
+          if [[ "$(echo "$pagination_info" | jq -r '.style')" == "unknown" ]]; then
+            pagination_info=$(detect_pagination "$body")
+          fi
+        fi
+        tried_resources+=("$resource")
+        probe_resources+=("$(jq -n \
+          --arg method "GET" \
+          --arg path "$resource_path" \
+          --arg source "probe" \
+          --arg summary "Discovered via probing" \
+          --argjson sample_fields "$sample_fields" \
+          '{method: $method, path: $path, source: $source,
+            summary: $summary, sample_fields: $sample_fields}')")
+        ;;
+      401|403)
+        tried_resources+=("$resource")
+        probe_resources+=("$(jq -n \
+          --arg method "GET" \
+          --arg path "$resource_path" \
+          --arg source "probe" \
+          --arg summary "Exists (auth required)" \
+          '{method: $method, path: $path, source: $source,
+            summary: $summary, auth_required: true}')")
+        if [[ "$(echo "$auth_info" | jq -r '.scheme')" == "null" ]]; then
+          auth_info=$(detect_auth_scheme "$(probe_headers)")
+        fi
+        ;;
+    esac
+  done
+  done  # end for bp
+
+  # Build unified catalog
+  local spec_catalog="[]"
+  if [[ "$spec_found" == "true" ]]; then
+    spec_catalog=$(echo "$spec_endpoints" | jq '[.[] | . + {source: "spec"}]')
+  fi
+
+  local probe_catalog="[]"
+  if [[ ${#probe_resources[@]} -gt 0 ]]; then
+    probe_catalog=$(printf '%s\n' "${probe_resources[@]}" | jq -s .)
+  fi
+
+  local catalog
+  catalog=$(jq -n --argjson spec "$spec_catalog" --argjson probe "$probe_catalog" '$spec + $probe')
+  local total_endpoints
+  total_endpoints=$(echo "$catalog" | jq 'length')
+  local from_probe
+  from_probe=$(echo "$probe_catalog" | jq 'length')
+
+  local result
+  result=$(jq -n \
+    --arg base_url "$base_url" \
+    --argjson spec_found "$spec_found" \
+    --arg spec_url "${spec_url:-}" \
+    --arg spec_format "${spec_format:-}" \
+    --argjson spec_endpoint_count "$spec_endpoint_count" \
+    --argjson catalog "$catalog" \
+    --argjson auth "$auth_info" \
+    --argjson pagination "$pagination_info" \
+    --argjson rate_limits "$rate_info" \
+    --argjson total_endpoints "$total_endpoints" \
+    --argjson from_spec "$spec_endpoint_count" \
+    --argjson from_probe "$from_probe" \
+    --argjson probes_sent "$probes_sent" \
+    '{base_url: $base_url,
+      spec: {found: $spec_found, url: $spec_url, format: $spec_format, endpoint_count: $spec_endpoint_count},
+      catalog: $catalog, auth: $auth, pagination: $pagination,
+      rate_limits: $rate_limits,
+      total_endpoints: $total_endpoints, from_spec: $from_spec, from_probe: $from_probe,
+      probes_sent: $probes_sent}')
+
+  local na
+  na=$(next_actions \
+    "$(next_action "api-probe graphql ${base_url} [auth-flags]" "Try GraphQL introspection")")
+  json_ok "$TOOL_NAME scan" "$result" "$na"
+}
+
+cmd_graphql() {
+  local base_url="${1:-}"
+  [[ -z "$base_url" ]] && json_error "$TOOL_NAME graphql" "Base URL required" "MISSING_ARG" \
+    "Usage: api-probe graphql <base-url> --token <token>"
+
+  base_url=$(normalize_url "$base_url")
+
+  local gql_url
+  if [[ "$base_url" =~ /graphql$ ]]; then
+    gql_url="$base_url"
+  else
+    gql_url="${base_url}/graphql"
+  fi
+
+  local body
+  body=$(graphql_post "$gql_url" "$GRAPHQL_QUERY") || {
+    json_error "$TOOL_NAME graphql" "Failed to connect to $gql_url" "NETWORK_ERROR" \
+      "Check the URL is correct and accessible"
+  }
+
+  if [[ "$PROBE_HTTP_CODE" -ge 400 ]]; then
+    local msg
+    msg=$(echo "$body" | jq -r '.message // .error // .errors[0].message // empty' 2>/dev/null)
+    [[ -z "$msg" ]] && msg="HTTP $PROBE_HTTP_CODE"
+    json_error "$TOOL_NAME graphql" "$msg" "HTTP_$PROBE_HTTP_CODE" \
+      "Check auth credentials and that $gql_url supports introspection"
+  fi
+
+  local has_errors
+  has_errors=$(echo "$body" | jq -e '.errors' 2>/dev/null && echo "true" || echo "false")
+
+  if [[ "$has_errors" == "true" ]] && ! echo "$body" | jq -e '.data.__schema' &>/dev/null; then
+    local err_msg
+    err_msg=$(echo "$body" | jq -r '.errors[0].message // "Introspection failed"')
+    local result
+    result=$(jq -n \
+      --argjson graphql true \
+      --argjson introspection_enabled false \
+      --arg endpoint "$gql_url" \
+      --arg error "$err_msg" \
+      '{graphql: $graphql, introspection_enabled: $introspection_enabled,
+        endpoint: $endpoint, error: $error}')
+    local na
+    na=$(next_actions \
+      "$(next_action "api-probe probe ${base_url} [auth-flags]" "Try REST probing instead")")
+    json_ok "$TOOL_NAME graphql" "$result" "$na"
+    return
+  fi
+
+  local result
+  result=$(echo "$body" | jq '
+    .data.__schema as $schema |
+    {
+      graphql: true,
+      introspection_enabled: true,
+      endpoint: "",
+      queries: [
+        $schema.types[] |
+        select(.name == $schema.queryType.name) |
+        .fields[] |
+        {
+          name: .name,
+          args: [.args[] | {name: .name, type: (.type.name // .type.ofType.name // "unknown")}],
+          return_type: (.type.name // .type.ofType.name // "unknown")
+        }
+      ],
+      mutations: (
+        if $schema.mutationType then
+          [
+            $schema.types[] |
+            select(.name == $schema.mutationType.name) |
+            .fields[] |
+            {
+              name: .name,
+              args: [.args[] | {name: .name, type: (.type.name // .type.ofType.name // "unknown")}],
+              return_type: (.type.name // .type.ofType.name // "unknown")
+            }
+          ]
+        else []
+        end
+      ),
+      types: [
+        $schema.types[] |
+        select(.name | startswith("__") | not) |
+        select(.kind == "OBJECT" or .kind == "INPUT_OBJECT") |
+        {name: .name, kind: .kind, fields: [.fields[]?.name]}
+      ]
+    }
+  ' 2>/dev/null)
+
+  if [[ -z "$result" || "$result" == "null" ]]; then
+    json_error "$TOOL_NAME graphql" "Failed to parse introspection response" "PARSE_ERROR" \
+      "The response was valid JSON but could not be parsed as a GraphQL schema"
+  fi
+
+  result=$(echo "$result" | jq \
+    --arg endpoint "$gql_url" \
+    '. + {
+      endpoint: $endpoint,
+      query_count: (.queries | length),
+      mutation_count: (.mutations | length),
+      type_count: (.types | length)
+    }')
+
+  local na
+  na=$(next_actions \
+    "$(next_action "api-probe scan ${base_url} [auth-flags]" "Also scan for REST endpoints")")
+  json_ok "$TOOL_NAME graphql" "$result" "$na"
+}
+
+# --- Dispatch ---
+
+case "${1:-}" in
+  spec)     shift; cmd_spec "$@" ;;
+  probe)    shift; cmd_probe "$@" ;;
+  scan)     shift; cmd_scan "$@" ;;
+  graphql)  shift; cmd_graphql "$@" ;;
+  *)
+    cmd_tree "$TOOL_NAME" "API endpoint discovery and catalog generation" "$(jq -n '[
+      {name: "spec",    description: "Check well-known spec paths (OpenAPI, Swagger)", usage: "api-probe spec <base-url> [--token T | --api-key K | --header \"H: V\"]"},
+      {name: "probe",   description: "Active probing for endpoints and resources",     usage: "api-probe probe <base-url> [--token T | --api-key K | --header \"H: V\"]"},
+      {name: "scan",    description: "Full scan: spec + probe combined",               usage: "api-probe scan <base-url> [--token T | --api-key K | --header \"H: V\"]"},
+      {name: "graphql", description: "GraphQL introspection",                          usage: "api-probe graphql <base-url> [--token T | --api-key K | --header \"H: V\"]"}
+    ]')"
+    ;;
+esac
