@@ -52,6 +52,16 @@ GRAPHQL_QUERY='{"query":"{ __schema { queryType { name } mutationType { name } t
 # Auth headers array, populated by parse_auth_flags
 AUTH_CURL_ARGS=()
 
+# Display/filter flags, populated by parse_display_flags
+DISPLAY_LIMIT=50
+DISPLAY_OFFSET=0
+DISPLAY_TAG=""
+DISPLAY_FILTER=""
+DISPLAY_COMPACT=false
+DISPLAY_QUERIES_ONLY=false
+DISPLAY_TYPES_ONLY=false
+DISPLAY_MUTATIONS_ONLY=false
+
 # parse_auth_flags <args...>
 # Extracts --token, --api-key, --header from args.
 # Sets AUTH_CURL_ARGS in the current shell.
@@ -83,6 +93,112 @@ parse_auth_flags() {
         ;;
     esac
   done
+}
+
+# parse_display_flags <args...>
+# Extracts display/filter flags from args.
+# Sets DISPLAY_* globals. Remaining args stored in REMAINING_ARGS.
+parse_display_flags() {
+  local new_remaining=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit)
+        [[ $# -lt 2 ]] && echo "ERROR: --limit requires a value" >&2 && return 1
+        DISPLAY_LIMIT="$2"; shift 2 ;;
+      --offset)
+        [[ $# -lt 2 ]] && echo "ERROR: --offset requires a value" >&2 && return 1
+        DISPLAY_OFFSET="$2"; shift 2 ;;
+      --tag)
+        [[ $# -lt 2 ]] && echo "ERROR: --tag requires a value" >&2 && return 1
+        DISPLAY_TAG="$2"; shift 2 ;;
+      --filter)
+        [[ $# -lt 2 ]] && echo "ERROR: --filter requires a value" >&2 && return 1
+        DISPLAY_FILTER="$2"; shift 2 ;;
+      --compact)        DISPLAY_COMPACT=true; shift ;;
+      --queries-only)   DISPLAY_QUERIES_ONLY=true; shift ;;
+      --types-only)     DISPLAY_TYPES_ONLY=true; shift ;;
+      --mutations-only) DISPLAY_MUTATIONS_ONLY=true; shift ;;
+      *)                new_remaining+=("$1"); shift ;;
+    esac
+  done
+  REMAINING_ARGS=("${new_remaining[@]+"${new_remaining[@]}"}")
+}
+
+# filter_endpoints <endpoints_json>
+# Applies DISPLAY_TAG and DISPLAY_FILTER to an endpoint array.
+filter_endpoints() {
+  local endpoints="$1"
+  if [[ -n "$DISPLAY_TAG" ]]; then
+    endpoints=$(echo "$endpoints" | jq --arg tag "$DISPLAY_TAG" \
+      '[.[] | select(.tags[]? | ascii_downcase == ($tag | ascii_downcase))]')
+  fi
+  if [[ -n "$DISPLAY_FILTER" ]]; then
+    endpoints=$(echo "$endpoints" | jq --arg pat "$DISPLAY_FILTER" \
+      '[.[] | select(.path | test($pat; "i"))]')
+  fi
+  echo "$endpoints"
+}
+
+# paginate_and_summarize <array_json> <item_type>
+# Applies DISPLAY_OFFSET and DISPLAY_LIMIT using json_truncate.
+# Returns: {items, total, shown, truncated, offset, item_type}
+paginate_and_summarize() {
+  local array="$1"
+  local item_type="$2"
+  if [[ "$DISPLAY_OFFSET" -gt 0 ]]; then
+    array=$(echo "$array" | jq --argjson off "$DISPLAY_OFFSET" '.[$off:]')
+  fi
+  local result
+  result=$(json_truncate "$array" "$DISPLAY_LIMIT")
+  echo "$result" | jq --argjson off "$DISPLAY_OFFSET" --arg type "$item_type" \
+    '. + {offset: $off, item_type: $type}'
+}
+
+# extract_tag_summary <endpoints_json>
+# Returns JSON array of {tag, count} sorted by count desc.
+extract_tag_summary() {
+  echo "$1" | jq '
+    [.[] | .tags[]?] | group_by(.) |
+    map({tag: .[0], count: length}) |
+    sort_by(-.count)' 2>/dev/null || echo '[]'
+}
+
+# compact_endpoints <endpoints_json>
+# Strips verbose fields when DISPLAY_COMPACT is true.
+compact_endpoints() {
+  local endpoints="$1"
+  if [[ "$DISPLAY_COMPACT" == "true" ]]; then
+    echo "$endpoints" | jq '[.[] | {method, path, summary, tags, source}
+      | with_entries(select(.value != null))]'
+  else
+    echo "$endpoints"
+  fi
+}
+
+# filter_graphql_items <items_json>
+# Applies DISPLAY_FILTER regex to .name field.
+filter_graphql_items() {
+  local items="$1"
+  if [[ -n "$DISPLAY_FILTER" ]]; then
+    echo "$items" | jq --arg pat "$DISPLAY_FILTER" \
+      '[.[] | select(.name | test($pat; "i"))]'
+  else
+    echo "$items"
+  fi
+}
+
+# compact_graphql_result <result_json>
+# Strips .fields from types, .args from queries/mutations when DISPLAY_COMPACT is true.
+compact_graphql_result() {
+  local result="$1"
+  if [[ "$DISPLAY_COMPACT" == "true" ]]; then
+    echo "$result" | jq '
+      .types = [.types[] | {name, kind}] |
+      .queries = [.queries[] | {name, return_type}] |
+      .mutations = [.mutations[] | {name, return_type}]'
+  else
+    echo "$result"
+  fi
 }
 
 # normalize_url <url>

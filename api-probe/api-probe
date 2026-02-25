@@ -17,6 +17,14 @@ else
   set --
 fi
 
+# --- Parse display/filter flags ---
+parse_display_flags "$@"
+if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+  set -- "${REMAINING_ARGS[@]}"
+else
+  set --
+fi
+
 # Helper: read body from probe temp file
 probe_body() { cat "$PROBE_BODY"; }
 probe_headers() { cat "$PROBE_HEADERS"; }
@@ -72,22 +80,58 @@ cmd_spec() {
     local endpoint_count
     endpoint_count=$(echo "$endpoints" | jq 'length')
 
+    # Extract tag summary before filtering
+    local tag_summary
+    tag_summary=$(extract_tag_summary "$endpoints")
+
+    # Filter, compact, paginate
+    endpoints=$(filter_endpoints "$endpoints")
+    local filtered_count
+    filtered_count=$(echo "$endpoints" | jq 'length')
+    endpoints=$(compact_endpoints "$endpoints")
+    local paginated
+    paginated=$(paginate_and_summarize "$endpoints" "endpoints")
+
     local result
     result=$(jq -n \
       --argjson spec_found true \
       --arg spec_url "$spec_url" \
       --arg spec_format "$spec_format" \
-      --argjson endpoints "$endpoints" \
+      --argjson endpoints "$paginated" \
       --argjson endpoint_count "$endpoint_count" \
+      --argjson filtered_count "$filtered_count" \
+      --argjson tags "$tag_summary" \
       --argjson paths_checked "$paths_checked" \
       --argjson paths_hit "$(printf '%s\n' "${paths_hit[@]}" | jq -R . | jq -s .)" \
+      --arg active_tag "${DISPLAY_TAG:-}" \
+      --arg active_filter "${DISPLAY_FILTER:-}" \
       '{spec_found: $spec_found, spec_url: $spec_url, spec_format: $spec_format,
-        endpoints: $endpoints, endpoint_count: $endpoint_count,
-        paths_checked: $paths_checked, paths_hit: $paths_hit}')
+        endpoints: $endpoints, endpoint_count: $endpoint_count, filtered_count: $filtered_count,
+        tags: $tags, paths_checked: $paths_checked, paths_hit: $paths_hit,
+        active_filters: {tag: (if $active_tag != "" then $active_tag else null end),
+                         filter: (if $active_filter != "" then $active_filter else null end)}}')
+
+    # Dynamic next_actions
+    local na_items=()
+    na_items+=("$(next_action "api-probe scan ${base_url} [auth-flags]" "Full scan to find endpoints not in the spec")")
+
+    local is_truncated
+    is_truncated=$(echo "$paginated" | jq -r '.truncated')
+    if [[ "$is_truncated" == "true" ]]; then
+      local next_offset=$((DISPLAY_OFFSET + DISPLAY_LIMIT))
+      na_items+=("$(next_action "api-probe spec ${base_url} --offset $next_offset --limit $DISPLAY_LIMIT [auth-flags]" "Next page of endpoints")")
+    fi
+
+    # Suggest top 3 tags for drill-down
+    local top_tags
+    top_tags=$(echo "$tag_summary" | jq -r '.[0:3][].tag' 2>/dev/null)
+    while IFS= read -r tag; do
+      [[ -z "$tag" ]] && continue
+      na_items+=("$(next_action "api-probe spec ${base_url} --tag \"$tag\" [auth-flags]" "Show only '$tag' endpoints")")
+    done <<< "$top_tags"
 
     local na
-    na=$(next_actions \
-      "$(next_action "api-probe scan ${base_url} [auth-flags]" "Full scan to find endpoints not in the spec")")
+    na=$(next_actions "${na_items[@]}")
     json_ok "$TOOL_NAME spec" "$result" "$na"
   else
     local result
@@ -265,11 +309,16 @@ cmd_probe() {
   local resource_count
   resource_count=$(echo "$resources_json" | jq 'length')
 
+  # Compact and paginate resources
+  resources_json=$(compact_endpoints "$resources_json")
+  local paginated_resources
+  paginated_resources=$(paginate_and_summarize "$resources_json" "resources")
+
   local result
   result=$(jq -n \
     --arg base_url "$base_url" \
     --argjson api_bases "$api_bases_json" \
-    --argjson resources "$resources_json" \
+    --argjson resources "$paginated_resources" \
     --argjson auth "$auth_info" \
     --argjson pagination "$pagination_info" \
     --argjson rate_limits "$rate_info" \
@@ -424,6 +473,18 @@ cmd_scan() {
   local from_probe
   from_probe=$(echo "$probe_catalog" | jq 'length')
 
+  # Extract tag summary before filtering
+  local tag_summary
+  tag_summary=$(extract_tag_summary "$catalog")
+
+  # Filter, compact, paginate
+  catalog=$(filter_endpoints "$catalog")
+  local filtered_count
+  filtered_count=$(echo "$catalog" | jq 'length')
+  catalog=$(compact_endpoints "$catalog")
+  local paginated_catalog
+  paginated_catalog=$(paginate_and_summarize "$catalog" "endpoints")
+
   local result
   result=$(jq -n \
     --arg base_url "$base_url" \
@@ -431,24 +492,49 @@ cmd_scan() {
     --arg spec_url "${spec_url:-}" \
     --arg spec_format "${spec_format:-}" \
     --argjson spec_endpoint_count "$spec_endpoint_count" \
-    --argjson catalog "$catalog" \
+    --argjson catalog "$paginated_catalog" \
     --argjson auth "$auth_info" \
     --argjson pagination "$pagination_info" \
     --argjson rate_limits "$rate_info" \
     --argjson total_endpoints "$total_endpoints" \
+    --argjson filtered_count "$filtered_count" \
     --argjson from_spec "$spec_endpoint_count" \
     --argjson from_probe "$from_probe" \
     --argjson probes_sent "$probes_sent" \
+    --argjson tags "$tag_summary" \
+    --arg active_tag "${DISPLAY_TAG:-}" \
+    --arg active_filter "${DISPLAY_FILTER:-}" \
     '{base_url: $base_url,
       spec: {found: $spec_found, url: $spec_url, format: $spec_format, endpoint_count: $spec_endpoint_count},
       catalog: $catalog, auth: $auth, pagination: $pagination,
       rate_limits: $rate_limits,
-      total_endpoints: $total_endpoints, from_spec: $from_spec, from_probe: $from_probe,
-      probes_sent: $probes_sent}')
+      total_endpoints: $total_endpoints, filtered_count: $filtered_count,
+      from_spec: $from_spec, from_probe: $from_probe,
+      probes_sent: $probes_sent, tags: $tags,
+      active_filters: {tag: (if $active_tag != "" then $active_tag else null end),
+                       filter: (if $active_filter != "" then $active_filter else null end)}}')
+
+  # Dynamic next_actions
+  local na_items=()
+  na_items+=("$(next_action "api-probe graphql ${base_url} [auth-flags]" "Try GraphQL introspection")")
+
+  local is_truncated
+  is_truncated=$(echo "$paginated_catalog" | jq -r '.truncated')
+  if [[ "$is_truncated" == "true" ]]; then
+    local next_offset=$((DISPLAY_OFFSET + DISPLAY_LIMIT))
+    na_items+=("$(next_action "api-probe scan ${base_url} --offset $next_offset --limit $DISPLAY_LIMIT [auth-flags]" "Next page of endpoints")")
+  fi
+
+  # Suggest top 3 tags for drill-down
+  local top_tags
+  top_tags=$(echo "$tag_summary" | jq -r '.[0:3][].tag' 2>/dev/null)
+  while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    na_items+=("$(next_action "api-probe scan ${base_url} --tag \"$tag\" [auth-flags]" "Show only '$tag' endpoints")")
+  done <<< "$top_tags"
 
   local na
-  na=$(next_actions \
-    "$(next_action "api-probe graphql ${base_url} [auth-flags]" "Try GraphQL introspection")")
+  na=$(next_actions "${na_items[@]}")
   json_ok "$TOOL_NAME scan" "$result" "$na"
 }
 
@@ -501,8 +587,8 @@ cmd_graphql() {
     return
   fi
 
-  local result
-  result=$(echo "$body" | jq '
+  local raw_result
+  raw_result=$(echo "$body" | jq '
     .data.__schema as $schema |
     {
       graphql: true,
@@ -542,23 +628,141 @@ cmd_graphql() {
     }
   ' 2>/dev/null)
 
-  if [[ -z "$result" || "$result" == "null" ]]; then
+  if [[ -z "$raw_result" || "$raw_result" == "null" ]]; then
     json_error "$TOOL_NAME graphql" "Failed to parse introspection response" "PARSE_ERROR" \
       "The response was valid JSON but could not be parsed as a GraphQL schema"
   fi
 
-  result=$(echo "$result" | jq \
-    --arg endpoint "$gql_url" \
-    '. + {
-      endpoint: $endpoint,
-      query_count: (.queries | length),
-      mutation_count: (.mutations | length),
-      type_count: (.types | length)
-    }')
+  # Apply compact mode (strip .fields from types, .args from queries/mutations)
+  raw_result=$(compact_graphql_result "$raw_result")
+
+  # Extract raw counts before any filtering/truncation
+  local query_count mutation_count type_count
+  query_count=$(echo "$raw_result" | jq '.queries | length')
+  mutation_count=$(echo "$raw_result" | jq '.mutations | length')
+  type_count=$(echo "$raw_result" | jq '.types | length')
+
+  # Extract individual arrays
+  local queries mutations types
+  queries=$(echo "$raw_result" | jq '.queries')
+  mutations=$(echo "$raw_result" | jq '.mutations')
+  types=$(echo "$raw_result" | jq '.types')
+
+  # Apply filter
+  queries=$(filter_graphql_items "$queries")
+  mutations=$(filter_graphql_items "$mutations")
+  types=$(filter_graphql_items "$types")
+
+  local result
+  if [[ "$DISPLAY_QUERIES_ONLY" == "true" ]]; then
+    local paginated
+    paginated=$(paginate_and_summarize "$queries" "queries")
+    result=$(jq -n \
+      --arg endpoint "$gql_url" \
+      --argjson queries "$paginated" \
+      --argjson mutation_count "$mutation_count" \
+      --argjson type_count "$type_count" \
+      --argjson query_count "$query_count" \
+      '{graphql: true, introspection_enabled: true, endpoint: $endpoint,
+        queries: $queries,
+        mutations: {omitted: true, total: $mutation_count},
+        types: {omitted: true, total: $type_count},
+        query_count: $query_count, mutation_count: $mutation_count, type_count: $type_count}')
+  elif [[ "$DISPLAY_MUTATIONS_ONLY" == "true" ]]; then
+    local paginated
+    paginated=$(paginate_and_summarize "$mutations" "mutations")
+    result=$(jq -n \
+      --arg endpoint "$gql_url" \
+      --argjson mutations "$paginated" \
+      --argjson query_count "$query_count" \
+      --argjson type_count "$type_count" \
+      --argjson mutation_count "$mutation_count" \
+      '{graphql: true, introspection_enabled: true, endpoint: $endpoint,
+        queries: {omitted: true, total: $query_count},
+        mutations: $mutations,
+        types: {omitted: true, total: $type_count},
+        query_count: $query_count, mutation_count: $mutation_count, type_count: $type_count}')
+  elif [[ "$DISPLAY_TYPES_ONLY" == "true" ]]; then
+    local paginated
+    paginated=$(paginate_and_summarize "$types" "types")
+    result=$(jq -n \
+      --arg endpoint "$gql_url" \
+      --argjson types "$paginated" \
+      --argjson query_count "$query_count" \
+      --argjson mutation_count "$mutation_count" \
+      --argjson type_count "$type_count" \
+      '{graphql: true, introspection_enabled: true, endpoint: $endpoint,
+        queries: {omitted: true, total: $query_count},
+        mutations: {omitted: true, total: $mutation_count},
+        types: $types,
+        query_count: $query_count, mutation_count: $mutation_count, type_count: $type_count}')
+  else
+    # Default: split limit across 3 sections
+    local per_section=$(( DISPLAY_LIMIT / 3 ))
+    [[ $per_section -lt 10 ]] && per_section=10
+
+    # Save/restore limit for per-section truncation
+    local saved_limit="$DISPLAY_LIMIT"
+    local saved_offset="$DISPLAY_OFFSET"
+    DISPLAY_LIMIT="$per_section"
+    DISPLAY_OFFSET=0
+
+    local queries_t mutations_t types_t
+    queries_t=$(paginate_and_summarize "$queries" "queries")
+    mutations_t=$(paginate_and_summarize "$mutations" "mutations")
+    types_t=$(paginate_and_summarize "$types" "types")
+
+    DISPLAY_LIMIT="$saved_limit"
+    DISPLAY_OFFSET="$saved_offset"
+
+    result=$(jq -n \
+      --arg endpoint "$gql_url" \
+      --argjson queries "$queries_t" \
+      --argjson mutations "$mutations_t" \
+      --argjson types "$types_t" \
+      --argjson query_count "$query_count" \
+      --argjson mutation_count "$mutation_count" \
+      --argjson type_count "$type_count" \
+      '{graphql: true, introspection_enabled: true, endpoint: $endpoint,
+        queries: $queries, mutations: $mutations, types: $types,
+        query_count: $query_count, mutation_count: $mutation_count, type_count: $type_count}')
+  fi
+
+  # Dynamic next_actions
+  local na_items=()
+  na_items+=("$(next_action "api-probe scan ${base_url} [auth-flags]" "Also scan for REST endpoints")")
+
+  if [[ "$DISPLAY_QUERIES_ONLY" != "true" ]]; then
+    na_items+=("$(next_action "api-probe graphql ${base_url} --queries-only [auth-flags]" "Show all queries")")
+  fi
+  if [[ "$DISPLAY_MUTATIONS_ONLY" != "true" ]] && [[ "$mutation_count" -gt 0 ]]; then
+    na_items+=("$(next_action "api-probe graphql ${base_url} --mutations-only [auth-flags]" "Show all mutations")")
+  fi
+  if [[ "$DISPLAY_TYPES_ONLY" != "true" ]]; then
+    na_items+=("$(next_action "api-probe graphql ${base_url} --types-only [auth-flags]" "Show all types")")
+  fi
+
+  # If a section flag is active and truncated, offer pagination
+  if [[ "$DISPLAY_QUERIES_ONLY" == "true" || "$DISPLAY_MUTATIONS_ONLY" == "true" || "$DISPLAY_TYPES_ONLY" == "true" ]]; then
+    local section_flag=""
+    [[ "$DISPLAY_QUERIES_ONLY" == "true" ]] && section_flag="--queries-only"
+    [[ "$DISPLAY_MUTATIONS_ONLY" == "true" ]] && section_flag="--mutations-only"
+    [[ "$DISPLAY_TYPES_ONLY" == "true" ]] && section_flag="--types-only"
+
+    local is_truncated
+    is_truncated=$(echo "$result" | jq -r '
+      if .queries.truncated == true then "true"
+      elif .mutations.truncated == true then "true"
+      elif .types.truncated == true then "true"
+      else "false" end')
+    if [[ "$is_truncated" == "true" ]]; then
+      local next_offset=$((DISPLAY_OFFSET + DISPLAY_LIMIT))
+      na_items+=("$(next_action "api-probe graphql ${base_url} $section_flag --offset $next_offset --limit $DISPLAY_LIMIT [auth-flags]" "Next page")")
+    fi
+  fi
 
   local na
-  na=$(next_actions \
-    "$(next_action "api-probe scan ${base_url} [auth-flags]" "Also scan for REST endpoints")")
+  na=$(next_actions "${na_items[@]}")
   json_ok "$TOOL_NAME graphql" "$result" "$na"
 }
 
@@ -571,10 +775,10 @@ case "${1:-}" in
   graphql)  shift; cmd_graphql "$@" ;;
   *)
     cmd_tree "$TOOL_NAME" "API endpoint discovery and catalog generation" "$(jq -n '[
-      {name: "spec",    description: "Check well-known spec paths (OpenAPI, Swagger)", usage: "api-probe spec <base-url> [--token T | --api-key K | --header \"H: V\"]"},
-      {name: "probe",   description: "Active probing for endpoints and resources",     usage: "api-probe probe <base-url> [--token T | --api-key K | --header \"H: V\"]"},
-      {name: "scan",    description: "Full scan: spec + probe combined",               usage: "api-probe scan <base-url> [--token T | --api-key K | --header \"H: V\"]"},
-      {name: "graphql", description: "GraphQL introspection",                          usage: "api-probe graphql <base-url> [--token T | --api-key K | --header \"H: V\"]"}
+      {name: "spec",    description: "Check well-known spec paths (OpenAPI, Swagger)", usage: "api-probe spec <url> [--limit N] [--offset N] [--tag TAG] [--filter PAT] [--compact] [auth]"},
+      {name: "probe",   description: "Active probing for endpoints and resources",     usage: "api-probe probe <url> [--limit N] [--compact] [auth]"},
+      {name: "scan",    description: "Full scan: spec + probe combined",               usage: "api-probe scan <url> [--limit N] [--offset N] [--tag TAG] [--filter PAT] [--compact] [auth]"},
+      {name: "graphql", description: "GraphQL introspection",                          usage: "api-probe graphql <url> [--limit N] [--offset N] [--filter PAT] [--compact] [--queries-only|--types-only|--mutations-only] [auth]"}
     ]')"
     ;;
 esac
