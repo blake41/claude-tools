@@ -145,6 +145,68 @@ cmd_comment() {
   json_ok "$TOOL_NAME comment" "$comment_data" "$na"
 }
 
+# Resolve issue identifier (e.g. GTM-3768) to internal UUID
+resolve_issue_uuid() {
+  local issue_id="$1"
+  local team_key="${issue_id%-*}"
+  local number="${issue_id##*-}"
+
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    json_error "$TOOL_NAME" "Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" "INVALID_ARG" "Use format TEAM-NUMBER, e.g. GTM-123"
+  fi
+
+  local issue_result
+  issue_result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id } } }")
+  local uuid
+  uuid=$(echo "$issue_result" | jq -r '.data.issues.nodes[0].id // empty')
+
+  if [[ -z "$uuid" ]]; then
+    json_error "$TOOL_NAME" "Issue '$issue_id' not found" "NOT_FOUND" "Check the issue identifier"
+  fi
+  echo "$uuid"
+}
+
+cmd_cancel() {
+  local issue_id="$1"
+  local issue_uuid
+  issue_uuid=$(resolve_issue_uuid "$issue_id")
+
+  # Get the "Canceled" state ID for this issue's team
+  local team_key="${issue_id%-*}"
+  local state_result
+  state_result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } }, name: { eq: \\\"Canceled\\\" } }) { nodes { id name } } }")
+  local cancel_state_id
+  cancel_state_id=$(echo "$state_result" | jq -r '.data.workflowStates.nodes[0].id // empty')
+
+  if [[ -z "$cancel_state_id" ]]; then
+    # Try "Cancelled" (British spelling)
+    state_result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } }, name: { eq: \\\"Cancelled\\\" } }) { nodes { id name } } }")
+    cancel_state_id=$(echo "$state_result" | jq -r '.data.workflowStates.nodes[0].id // empty')
+  fi
+
+  if [[ -z "$cancel_state_id" ]]; then
+    json_error "$TOOL_NAME cancel" "No 'Canceled' state found for team $team_key" "NOT_FOUND" "Check team workflow states"
+  fi
+
+  local result
+  result=$(graphql "mutation { issueUpdate(id: \\\"$issue_uuid\\\", input: { stateId: \\\"$cancel_state_id\\\" }) { success issue { id identifier title state { name } } } }")
+
+  local success
+  success=$(echo "$result" | jq -r '.data.issueUpdate.success')
+
+  if [[ "$success" != "true" ]]; then
+    json_error "$TOOL_NAME cancel" "Failed to cancel issue" "API_ERROR" "Check the issue ID"
+  fi
+
+  local issue_data
+  issue_data=$(echo "$result" | jq '.data.issueUpdate.issue')
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli issue $issue_id" "View the canceled issue")")
+  json_ok "$TOOL_NAME cancel" "$issue_data" "$na"
+}
+
 cmd_search() {
   local query="$1"
   # Escape quotes in search query
@@ -200,12 +262,14 @@ cmd_create() {
 
   local description=""
   local priority=""
+  local parent=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --description|-d) description="$2"; shift 2 ;;
       --priority|-p) priority="$2"; shift 2 ;;
-      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]" ;;
+      --parent) parent="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123]" ;;
     esac
   done
 
@@ -217,26 +281,51 @@ cmd_create() {
   local todo_state_id
   todo_state_id=$(get_todo_state_id "$team_key")
 
-  # Build input fields
-  local input_fields="teamId: \\\"$team_id\\\", title: \\\"$title\\\", assigneeId: \\\"$my_id\\\""
+  # Build input as JSON using jq for proper escaping
+  local input
+  input=$(jq -n \
+    --arg teamId "$team_id" \
+    --arg title "$title" \
+    --arg assigneeId "$my_id" \
+    '{teamId: $teamId, title: $title, assigneeId: $assigneeId}')
 
-  # Set state to Todo if found
   if [[ -n "$todo_state_id" ]]; then
-    input_fields="$input_fields, stateId: \\\"$todo_state_id\\\""
+    input=$(echo "$input" | jq --arg stateId "$todo_state_id" '. + {stateId: $stateId}')
   fi
 
   if [[ -n "$description" ]]; then
-    # Escape quotes and newlines in description
-    description=$(echo "$description" | sed 's/"/\\\\"/g' | tr '\n' ' ')
-    input_fields="$input_fields, description: \\\"$description\\\""
+    input=$(echo "$input" | jq --arg desc "$description" '. + {description: $desc}')
   fi
 
   if [[ -n "$priority" ]]; then
-    input_fields="$input_fields, priority: $priority"
+    input=$(echo "$input" | jq --argjson pri "$priority" '. + {priority: $pri}')
   fi
 
+  if [[ -n "$parent" ]]; then
+    local parent_uuid
+    parent_uuid=$(resolve_issue_uuid "$parent")
+    input=$(echo "$input" | jq --arg pid "$parent_uuid" '. + {parentId: $pid}')
+  fi
+
+  local api_key
+  api_key=$(get_api_key)
+
+  local query='mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url state { name } assignee { name } } } }'
+  local payload
+  payload=$(jq -n --arg q "$query" --argjson vars "{\"input\": $input}" '{query: $q, variables: $vars}')
+
   local result
-  result=$(graphql "mutation { issueCreate(input: { $input_fields }) { success issue { id identifier title url state { name } assignee { name } } } }")
+  result=$(curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: $api_key" \
+    --data "$payload" \
+    "$API_URL")
+
+  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+    local msg
+    msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown GraphQL error"')
+    json_error "$TOOL_NAME create" "$msg" "API_ERROR" "Check your query syntax and API key"
+  fi
 
   local success
   success=$(echo "$result" | jq -r '.data.issueCreate.success')
@@ -324,6 +413,7 @@ if [[ $# -lt 1 ]]; then
         {name: "comment", description: "Add a comment to an issue", usage: "linear-cli comment <ID> \"<body>\""},
         {name: "search", description: "Search issues by text", usage: "linear-cli search <query>"},
         {name: "create", description: "Create a new issue (auto-assigned to you)", usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"},
+        {name: "cancel", description: "Cancel an issue (set state to Canceled)", usage: "linear-cli cancel <ID>"},
         {name: "projects", description: "List all projects", usage: "linear-cli projects"},
         {name: "teams", description: "List all teams", usage: "linear-cli teams"},
         {name: "me", description: "Show current user info", usage: "linear-cli me"}
@@ -355,12 +445,17 @@ case "$CMD" in
     [[ $# -lt 2 ]] && json_error "$TOOL_NAME create" "Team key and title required" "MISSING_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"
     cmd_create "$@"
     ;;
+  cancel)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME cancel" "Issue ID required" "MISSING_ARG" "Usage: linear-cli cancel <ID>"
+    cmd_cancel "$1"
+    ;;
   help|--help|-h)
     cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
         {name: "issues", description: "List issues with optional filters", usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
         {name: "issue", description: "Get details for a specific issue", usage: "linear-cli issue <ID>"},
         {name: "search", description: "Search issues by text", usage: "linear-cli search <query>"},
         {name: "create", description: "Create a new issue", usage: "linear-cli create <team-key> \"<title>\""},
+        {name: "cancel", description: "Cancel an issue", usage: "linear-cli cancel <ID>"},
         {name: "me", description: "Show current user info", usage: "linear-cli me"}
     ]')"
     ;;
