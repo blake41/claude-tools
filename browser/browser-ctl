@@ -1167,6 +1167,55 @@ async function execTypeRef(page, args) {
   return { output: `${c.green}Typed into ${ref}:${c.reset} "${text}"`, data: { typed: text, ref } };
 }
 
+async function execSelect(page, args) {
+  const selector = args[0];
+  const value = args.slice(1).join(' ');
+  if (!selector || !value) throw new Error('Usage: select <selector> <value>');
+  await page.selectOption(selector, value, { timeout: 5000 });
+  return { output: `${c.green}Selected:${c.reset} "${value}" in ${selector}`, data: { selected: value, selector } };
+}
+
+async function execHover(page, args) {
+  const selector = args[0];
+  if (!selector) throw new Error('Usage: hover <selector>');
+  await page.hover(selector, { timeout: 5000 });
+  return { output: `${c.green}Hovered:${c.reset} ${selector}`, data: { hovered: selector } };
+}
+
+async function execPress(page, args) {
+  const key = args.join('+');
+  if (!key) throw new Error('Usage: press <key> (e.g., Enter, Escape, Tab, ArrowDown, Control+a)');
+  await page.keyboard.press(key);
+  return { output: `${c.green}Pressed:${c.reset} ${key}`, data: { key } };
+}
+
+async function execUpload(page, args) {
+  const selector = args[0];
+  const files = args.slice(1);
+  if (!selector || files.length === 0) throw new Error('Usage: upload <selector> <file1> [file2] ...');
+  await page.setInputFiles(selector, files, { timeout: 5000 });
+  const names = files.map(f => path.basename(f)).join(', ');
+  return { output: `${c.green}Uploaded:${c.reset} ${names} to ${selector}`, data: { files, selector } };
+}
+
+async function execBack(page, args) {
+  await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
+  return { output: `${c.green}Back to:${c.reset} ${page.url()}`, data: { url: page.url() } };
+}
+
+async function execForward(page, args) {
+  await page.goForward({ waitUntil: 'domcontentloaded', timeout: 10000 });
+  return { output: `${c.green}Forward to:${c.reset} ${page.url()}`, data: { url: page.url() } };
+}
+
+async function execEval(page, args) {
+  const expression = args.join(' ');
+  if (!expression) throw new Error('Usage: eval <javascript expression>');
+  const result = await page.evaluate(expression);
+  const output = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result ?? '');
+  return { output, data: { result } };
+}
+
 async function execGoto(page, args) {
   let url = args[0];
   if (!url) throw new Error('Usage: goto <url>');
@@ -1344,6 +1393,13 @@ const EXEC_DISPATCH = {
   click: execClick,
   'click-ref': execClickRef, clickref: execClickRef,
   type: execType,
+  select: execSelect,
+  hover: execHover,
+  press: execPress,
+  upload: execUpload,
+  back: execBack,
+  forward: execForward,
+  eval: execEval,
   'type-ref': execTypeRef, typeref: execTypeRef,
   goto: execGoto, go: execGoto,
   html: execHtml,
@@ -1600,6 +1656,97 @@ async function cmdType(args) {
     console.log(result.output);
   } catch (err) {
     console.error(`${c.red}Type failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdSelect(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execSelect(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Select failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdHover(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execHover(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Hover failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdPress(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execPress(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Press failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdUpload(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execUpload(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Upload failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdBack(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execBack(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Back failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdForward(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execForward(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Forward failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdEval(args) {
+  const { page, browser } = await connect();
+  try {
+    const result = await execEval(page, args);
+    console.log(result.output);
+  } catch (err) {
+    console.error(`${c.red}Eval failed: ${err.message}${c.reset}`);
     process.exit(1);
   } finally {
     await browser.close();
@@ -1882,11 +2029,18 @@ ${c.yellow}TEST FILE FORMAT (YAML)${c.reset}
 ${c.yellow}AVAILABLE STEPS${c.reset}
   goto: <url>                    Navigate to URL
   click: <selector>              Click element
+  select: { selector, value }    Select option in dropdown
   type: { selector, text }       Type into input
+  hover: <selector>              Hover over element
+  press: <key>                   Press key (Enter, Escape, Tab, etc.)
+  upload: { selector, files }    Upload files to input
   wait: <selector|number>        Wait for element or milliseconds
   sleep: <ms>                    Wait for milliseconds
   screenshot: [name]             Take screenshot
   reload:                        Reload page
+  back:                          Navigate back
+  forward:                       Navigate forward
+  eval: <expression>             Run JavaScript in page
 
 ${c.yellow}AVAILABLE ASSERTIONS${c.reset}
   visible: <selector>            Element is visible
@@ -2106,6 +2260,44 @@ async function runSteps(page, steps, verbose) {
         await page.fill(value.selector, value.text, { timeout: 10000 });
         break;
         
+      case 'select':
+        // { select: { selector: "#dropdown", value: "option1" } }
+        if (typeof value === 'object') {
+          await page.selectOption(value.selector, value.value, { timeout: 10000 });
+        } else {
+          throw new Error('select step requires { selector, value }');
+        }
+        break;
+
+      case 'hover':
+        await page.hover(value, { timeout: 10000 });
+        break;
+
+      case 'press':
+        await page.keyboard.press(value);
+        break;
+
+      case 'upload':
+        // { upload: { selector: "#file", files: ["path/to/file"] } }
+        if (typeof value === 'object') {
+          await page.setInputFiles(value.selector, value.files, { timeout: 10000 });
+        } else {
+          throw new Error('upload step requires { selector, files }');
+        }
+        break;
+
+      case 'back':
+        await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
+        break;
+
+      case 'forward':
+        await page.goForward({ waitUntil: 'domcontentloaded', timeout: 10000 });
+        break;
+
+      case 'eval':
+        await page.evaluate(value);
+        break;
+
       case 'wait':
         if (typeof value === 'number') {
           await page.waitForTimeout(value);
@@ -2332,15 +2524,33 @@ ${c.yellow}COMMANDS${c.reset}
       Click an element by snapshot ref (e.g., e5)
       Run 'snapshot' first to see available refs
       
+  ${c.green}select${c.reset} <selector> <value>
+      Select an option in a <select> dropdown by value
+
+  ${c.green}hover${c.reset} <selector>
+      Hover over an element (triggers tooltips, menus, hover states)
+
+  ${c.green}press${c.reset} <key>
+      Press a keyboard key (Enter, Escape, Tab, ArrowDown, Control+a)
+
   ${c.green}type${c.reset} <selector> <text>
       Type text into an input by CSS selector
-      
+
   ${c.green}type-ref${c.reset} <ref> <text>
       Type text into an input by snapshot ref (e.g., e5)
       Run 'snapshot' first to see available refs
-      
+
+  ${c.green}upload${c.reset} <selector> <file1> [file2] ...
+      Upload files to a file input element
+
   ${c.green}goto${c.reset} <url>
       Navigate to URL (supports relative paths like /accounts)
+
+  ${c.green}back${c.reset}
+      Navigate back in browser history
+
+  ${c.green}forward${c.reset}
+      Navigate forward in browser history
       
   ${c.green}html${c.reset} [selector]
       Get HTML content of page or element
@@ -2400,6 +2610,9 @@ ${c.yellow}DATA${c.reset}
 
   ${c.green}check${c.reset} <selector|ref:eN> <visible|hidden|enabled|disabled|checked>
       Boolean condition check on element
+
+  ${c.green}eval${c.reset} <expression>
+      Run JavaScript in the page context and print the result
 
 ${c.yellow}EXAMPLES${c.reset}
   browser-ctl screenshot --full
@@ -2472,6 +2685,27 @@ async function main() {
       break;
     case 'type':
       await cmdType(cmdArgs);
+      break;
+    case 'select':
+      await cmdSelect(cmdArgs);
+      break;
+    case 'hover':
+      await cmdHover(cmdArgs);
+      break;
+    case 'press':
+      await cmdPress(cmdArgs);
+      break;
+    case 'upload':
+      await cmdUpload(cmdArgs);
+      break;
+    case 'back':
+      await cmdBack(cmdArgs);
+      break;
+    case 'forward':
+      await cmdForward(cmdArgs);
+      break;
+    case 'eval':
+      await cmdEval(cmdArgs);
       break;
     case 'type-ref':
     case 'typeref':
