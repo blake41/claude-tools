@@ -168,43 +168,301 @@ resolve_issue_uuid() {
 
 cmd_cancel() {
   local issue_id="$1"
-  local issue_uuid
-  issue_uuid=$(resolve_issue_uuid "$issue_id")
+  # cancel is just a shortcut for update --state Canceled
+  cmd_update "$issue_id" --state "Canceled"
+}
 
-  # Get the "Canceled" state ID for this issue's team
-  local team_key="${issue_id%-*}"
-  local state_result
-  state_result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } }, name: { eq: \\\"Canceled\\\" } }) { nodes { id name } } }")
-  local cancel_state_id
-  cancel_state_id=$(echo "$state_result" | jq -r '.data.workflowStates.nodes[0].id // empty')
+# Execute a GraphQL mutation with proper variable escaping (like cmd_create)
+graphql_mutation() {
+  local query="$1"
+  local variables="$2"
+  local api_key
+  api_key=$(get_api_key)
 
-  if [[ -z "$cancel_state_id" ]]; then
-    # Try "Cancelled" (British spelling)
-    state_result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } }, name: { eq: \\\"Cancelled\\\" } }) { nodes { id name } } }")
-    cancel_state_id=$(echo "$state_result" | jq -r '.data.workflowStates.nodes[0].id // empty')
+  local payload
+  payload=$(jq -n --arg q "$query" --argjson vars "$variables" '{query: $q, variables: $vars}')
+
+  local result
+  result=$(curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: $api_key" \
+    --data "$payload" \
+    "$API_URL")
+
+  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+    local msg
+    msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown GraphQL error"')
+    json_error "$TOOL_NAME" "$msg" "API_ERROR" "Check your query and API key"
   fi
 
-  if [[ -z "$cancel_state_id" ]]; then
-    json_error "$TOOL_NAME cancel" "No 'Canceled' state found for team $team_key" "NOT_FOUND" "Check team workflow states"
+  echo "$result"
+}
+
+# Helper: call a resolve function, emit its error JSON if it fails.
+# Usage: try_resolve VAR resolve_fn arg1 arg2 ...
+# On success, sets VAR to the resolved value.
+# On failure, prints the error JSON to stdout and exits the script.
+try_resolve() {
+  local _var_name="$1"
+  shift
+  local _output
+  _output=$("$@" 2>&1) || {
+    # The subshell's json_error output is in _output — emit it
+    echo "$_output"
+    exit 1
+  }
+  eval "$_var_name=\$_output"
+}
+
+# Resolve a workflow state name to its UUID for a given team
+resolve_state_id() {
+  local team_key="$1"
+  local state_name="$2"
+
+  local result
+  result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } } }) { nodes { id name } } }")
+
+  # Case-insensitive match
+  local state_id
+  state_id=$(echo "$result" | jq -r --arg name "$state_name" \
+    '.data.workflowStates.nodes[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id' | head -1)
+
+  if [[ -z "$state_id" ]]; then
+    local available
+    available=$(echo "$result" | jq -r '[.data.workflowStates.nodes[].name] | join(", ")')
+    json_error "$TOOL_NAME update" "State '$state_name' not found for team $team_key" "NOT_FOUND" "Available states: $available"
+  fi
+  echo "$state_id"
+}
+
+# Resolve a label name to its UUID for a given team
+resolve_label_id() {
+  local team_key="$1"
+  local label_name="$2"
+
+  local result
+  result=$(graphql "{ issueLabels(filter: { team: { key: { eq: \\\"$team_key\\\" } } }, first: 100) { nodes { id name } } }")
+
+  local label_id
+  label_id=$(echo "$result" | jq -r --arg name "$label_name" \
+    '.data.issueLabels.nodes[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id' | head -1)
+
+  if [[ -z "$label_id" ]]; then
+    local available
+    available=$(echo "$result" | jq -r '[.data.issueLabels.nodes[].name] | join(", ")')
+    json_error "$TOOL_NAME update" "Label '$label_name' not found for team $team_key" "NOT_FOUND" "Available labels: $available"
+  fi
+  echo "$label_id"
+}
+
+# Resolve a user name/email to UUID
+resolve_user_id() {
+  local name="$1"
+
+  # "me" shortcut
+  if [[ "$name" == "me" ]]; then
+    get_my_id
+    return
   fi
 
   local result
-  result=$(graphql "mutation { issueUpdate(id: \\\"$issue_uuid\\\", input: { stateId: \\\"$cancel_state_id\\\" }) { success issue { id identifier title state { name } } } }")
+  result=$(graphql "{ users(filter: { displayName: { containsi: \\\"$name\\\" } }) { nodes { id name email } } }")
 
-  local success
-  success=$(echo "$result" | jq -r '.data.issueUpdate.success')
+  local user_id
+  user_id=$(echo "$result" | jq -r '.data.users.nodes[0].id // empty')
 
-  if [[ "$success" != "true" ]]; then
-    json_error "$TOOL_NAME cancel" "Failed to cancel issue" "API_ERROR" "Check the issue ID"
+  if [[ -z "$user_id" ]]; then
+    json_error "$TOOL_NAME update" "User '$name' not found" "NOT_FOUND" "Use display name or 'me'"
+  fi
+  echo "$user_id"
+}
+
+# Resolve a cycle (by number or "current") for a team
+resolve_cycle_id() {
+  local team_key="$1"
+  local cycle_ref="$2"
+
+  if [[ "$cycle_ref" == "current" ]]; then
+    local result
+    result=$(graphql "{ cycles(filter: { team: { key: { eq: \\\"$team_key\\\" } }, isActive: { eq: true } }, first: 1) { nodes { id number } } }")
+    local cycle_id
+    cycle_id=$(echo "$result" | jq -r '.data.cycles.nodes[0].id // empty')
+    if [[ -z "$cycle_id" ]]; then
+      json_error "$TOOL_NAME update" "No active cycle for team $team_key" "NOT_FOUND" "Run 'linear-cli cycles $team_key' to see available cycles"
+    fi
+    echo "$cycle_id"
+  elif [[ "$cycle_ref" =~ ^[0-9]+$ ]]; then
+    local result
+    result=$(graphql "{ cycles(filter: { team: { key: { eq: \\\"$team_key\\\" } }, number: { eq: $cycle_ref } }, first: 1) { nodes { id number } } }")
+    local cycle_id
+    cycle_id=$(echo "$result" | jq -r '.data.cycles.nodes[0].id // empty')
+    if [[ -z "$cycle_id" ]]; then
+      json_error "$TOOL_NAME update" "Cycle $cycle_ref not found for team $team_key" "NOT_FOUND" "Run 'linear-cli cycles $team_key' to see available cycles"
+    fi
+    echo "$cycle_id"
+  else
+    json_error "$TOOL_NAME update" "Invalid cycle ref: $cycle_ref" "INVALID_ARG" "Use a cycle number or 'current'"
+  fi
+}
+
+cmd_update() {
+  local issue_id="$1"
+  shift
+
+  local state="" assignee="" priority="" label_add="" label_rm="" cycle=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state|-s) state="$2"; shift 2 ;;
+      --assignee|-a) assignee="$2"; shift 2 ;;
+      --priority|-p) priority="$2"; shift 2 ;;
+      --label) label_add="$2"; shift 2 ;;
+      --remove-label) label_rm="$2"; shift 2 ;;
+      --cycle) cycle="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME update" "Unknown option: $1" "INVALID_ARG" \
+           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]" ;;
+    esac
+  done
+
+  local team_key="${issue_id%-*}"
+  local issue_uuid
+  try_resolve issue_uuid resolve_issue_uuid "$issue_id"
+
+  # Build input object
+  local input='{}'
+
+  if [[ -n "$state" ]]; then
+    local state_id
+    try_resolve state_id resolve_state_id "$team_key" "$state"
+    input=$(echo "$input" | jq --arg id "$state_id" '. + {stateId: $id}')
   fi
 
-  local issue_data
-  issue_data=$(echo "$result" | jq '.data.issueUpdate.issue')
+  if [[ -n "$assignee" ]]; then
+    local user_id
+    try_resolve user_id resolve_user_id "$assignee"
+    input=$(echo "$input" | jq --arg id "$user_id" '. + {assigneeId: $id}')
+  fi
+
+  if [[ -n "$priority" ]]; then
+    input=$(echo "$input" | jq --argjson pri "$priority" '. + {priority: $pri}')
+  fi
+
+  if [[ -n "$cycle" ]]; then
+    local cycle_id
+    try_resolve cycle_id resolve_cycle_id "$team_key" "$cycle"
+    input=$(echo "$input" | jq --arg id "$cycle_id" '. + {cycleId: $id}')
+  fi
+
+  # Handle label mutations separately (add/remove use different mutations)
+  if [[ -n "$label_add" ]]; then
+    local label_id
+    try_resolve label_id resolve_label_id "$team_key" "$label_add"
+    graphql_mutation \
+      'mutation AddLabel($issueId: String!, $labelId: String!) { issueAddLabel(id: $issueId, labelId: $labelId) { success } }' \
+      "$(jq -n --arg iid "$issue_uuid" --arg lid "$label_id" '{issueId: $iid, labelId: $lid}')"
+  fi
+
+  if [[ -n "$label_rm" ]]; then
+    local label_id
+    try_resolve label_id resolve_label_id "$team_key" "$label_rm"
+    graphql_mutation \
+      'mutation RemoveLabel($issueId: String!, $labelId: String!) { issueRemoveLabel(id: $issueId, labelId: $labelId) { success } }' \
+      "$(jq -n --arg iid "$issue_uuid" --arg lid "$label_id" '{issueId: $iid, labelId: $lid}')"
+  fi
+
+  # Apply main update if there are fields to change
+  if [[ "$input" != '{}' ]]; then
+    local result
+    result=$(graphql_mutation \
+      'mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier title state { name } priority assignee { name } labels { nodes { name } } } } }' \
+      "$(jq -n --arg id "$issue_uuid" --argjson input "$input" '{id: $id, input: $input}')")
+
+    local success
+    success=$(echo "$result" | jq -r '.data.issueUpdate.success')
+    if [[ "$success" != "true" ]]; then
+      json_error "$TOOL_NAME update" "Failed to update issue" "API_ERROR" "Check the issue ID and field values"
+    fi
+
+    local issue_data
+    issue_data=$(echo "$result" | jq '.data.issueUpdate.issue')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "linear-cli issue $issue_id" "View updated issue")")
+    json_ok "$TOOL_NAME update" "$issue_data" "$na"
+  else
+    # Label-only update: re-fetch the issue to show current state
+    cmd_issue "$issue_id"
+  fi
+}
+
+cmd_labels() {
+  local team_key="${1:-}"
+  [[ -z "$team_key" ]] && json_error "$TOOL_NAME labels" "Team key required" "MISSING_ARG" \
+    "Usage: linear-cli labels <team-key>"
+
+  local result
+  result=$(graphql "{ issueLabels(filter: { team: { key: { eq: \\\"$team_key\\\" } } }, first: 100) { nodes { id name color description } } }" \
+    | jq '.data.issueLabels.nodes')
 
   local na
   na=$(next_actions \
-      "$(next_action "linear-cli issue $issue_id" "View the canceled issue")")
-  json_ok "$TOOL_NAME cancel" "$issue_data" "$na"
+      "$(next_action "linear-cli issues --mine" "List your assigned issues")" \
+      "$(next_action "linear-cli update <ID> --label \"<name>\"" "Add a label to an issue")")
+  json_ok "$TOOL_NAME labels" "$result" "$na"
+}
+
+cmd_states() {
+  local team_key="${1:-}"
+  [[ -z "$team_key" ]] && json_error "$TOOL_NAME states" "Team key required" "MISSING_ARG" \
+    "Usage: linear-cli states <team-key>"
+
+  local result
+  result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } } }) { nodes { id name type position } } }" \
+    | jq '[.data.workflowStates.nodes | sort_by(.position) | .[] | {name, type}]')
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli update <ID> --state \"<name>\"" "Change an issue's state")")
+  json_ok "$TOOL_NAME states" "$result" "$na"
+}
+
+cmd_cycles() {
+  local team_key="${1:-}"
+  [[ -z "$team_key" ]] && json_error "$TOOL_NAME cycles" "Team key required" "MISSING_ARG" \
+    "Usage: linear-cli cycles <team-key>"
+
+  local result
+  result=$(graphql "{ cycles(filter: { team: { key: { eq: \\\"$team_key\\\" } } }, first: 10, orderBy: createdAt) { nodes { id number name startsAt endsAt progress { completed total } } } }" \
+    | jq '.data.cycles.nodes')
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli update <ID> --cycle current" "Add an issue to the current cycle")")
+  json_ok "$TOOL_NAME cycles" "$result" "$na"
+}
+
+cmd_comments() {
+  local issue_id="${1:-}"
+  [[ -z "$issue_id" ]] && json_error "$TOOL_NAME comments" "Issue ID required" "MISSING_ARG" \
+    "Usage: linear-cli comments <ID>"
+
+  local team_key="${issue_id%-*}"
+  local number="${issue_id##*-}"
+
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    json_error "$TOOL_NAME comments" "Invalid issue ID format. Expected: TEAM-123" "INVALID_ARG" "Use format TEAM-NUMBER"
+  fi
+
+  local result
+  result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { comments { nodes { id body createdAt user { name } } } } } }" \
+    | jq '.data.issues.nodes[0].comments.nodes // []')
+
+  local na
+  na=$(next_actions \
+      "$(next_action "linear-cli comment $issue_id \"<body>\"" "Add a comment")" \
+      "$(next_action "linear-cli issue $issue_id" "View issue details")")
+  json_ok "$TOOL_NAME comments" "$result" "$na"
 }
 
 cmd_search() {
@@ -408,15 +666,20 @@ cmd_issues() {
 # Main
 if [[ $# -lt 1 ]]; then
     cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
-        {name: "issues", description: "List issues with optional filters", usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
-        {name: "issue", description: "Get details for a specific issue", usage: "linear-cli issue <ID>"},
-        {name: "comment", description: "Add a comment to an issue", usage: "linear-cli comment <ID> \"<body>\""},
-        {name: "search", description: "Search issues by text", usage: "linear-cli search <query>"},
-        {name: "create", description: "Create a new issue (auto-assigned to you)", usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"},
-        {name: "cancel", description: "Cancel an issue (set state to Canceled)", usage: "linear-cli cancel <ID>"},
-        {name: "projects", description: "List all projects", usage: "linear-cli projects"},
-        {name: "teams", description: "List all teams", usage: "linear-cli teams"},
-        {name: "me", description: "Show current user info", usage: "linear-cli me"}
+        {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
+        {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
+        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]"},
+        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123]"},
+        {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
+        {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
+        {name: "search",   description: "Search issues by text",                usage: "linear-cli search <query>"},
+        {name: "cancel",   description: "Cancel an issue (shortcut for update --state Canceled)", usage: "linear-cli cancel <ID>"},
+        {name: "states",   description: "List workflow states for a team",       usage: "linear-cli states <team-key>"},
+        {name: "labels",   description: "List labels for a team",               usage: "linear-cli labels <team-key>"},
+        {name: "cycles",   description: "List cycles for a team",               usage: "linear-cli cycles <team-key>"},
+        {name: "projects", description: "List all projects",                     usage: "linear-cli projects"},
+        {name: "teams",    description: "List all teams",                        usage: "linear-cli teams"},
+        {name: "me",       description: "Show current user info",               usage: "linear-cli me"}
     ]')"
     exit 0
 fi
@@ -432,9 +695,18 @@ case "$CMD" in
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME issue" "Issue ID required" "MISSING_ARG" "Usage: linear-cli issue <ID>"
     cmd_issue "$1"
     ;;
+  update)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME update" "Issue ID required" "MISSING_ARG" \
+      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current]"
+    cmd_update "$@"
+    ;;
   comment)
     [[ $# -lt 2 ]] && json_error "$TOOL_NAME comment" "Issue ID and comment body required" "MISSING_ARG" "Usage: linear-cli comment <ID> \"<body>\""
     cmd_comment "$1" "$2"
+    ;;
+  comments)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME comments" "Issue ID required" "MISSING_ARG" "Usage: linear-cli comments <ID>"
+    cmd_comments "$1"
     ;;
   search)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME search" "Search query required" "MISSING_ARG" "Usage: linear-cli search <query>"
@@ -442,22 +714,28 @@ case "$CMD" in
     ;;
   issues) cmd_issues "$@" ;;
   create)
-    [[ $# -lt 2 ]] && json_error "$TOOL_NAME create" "Team key and title required" "MISSING_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"
+    [[ $# -lt 2 ]] && json_error "$TOOL_NAME create" "Team key and title required" "MISSING_ARG" \
+      "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123]"
     cmd_create "$@"
     ;;
   cancel)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME cancel" "Issue ID required" "MISSING_ARG" "Usage: linear-cli cancel <ID>"
     cmd_cancel "$1"
     ;;
+  states)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME states" "Team key required" "MISSING_ARG" "Usage: linear-cli states <team-key>"
+    cmd_states "$1"
+    ;;
+  labels)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME labels" "Team key required" "MISSING_ARG" "Usage: linear-cli labels <team-key>"
+    cmd_labels "$1"
+    ;;
+  cycles)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME cycles" "Team key required" "MISSING_ARG" "Usage: linear-cli cycles <team-key>"
+    cmd_cycles "$1"
+    ;;
   help|--help|-h)
-    cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
-        {name: "issues", description: "List issues with optional filters", usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
-        {name: "issue", description: "Get details for a specific issue", usage: "linear-cli issue <ID>"},
-        {name: "search", description: "Search issues by text", usage: "linear-cli search <query>"},
-        {name: "create", description: "Create a new issue", usage: "linear-cli create <team-key> \"<title>\""},
-        {name: "cancel", description: "Cancel an issue", usage: "linear-cli cancel <ID>"},
-        {name: "me", description: "Show current user info", usage: "linear-cli me"}
-    ]')"
+    cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[]')"
     ;;
   *)
     json_error "$TOOL_NAME" "Unknown command: $CMD" "INVALID_ARG" "Run 'linear-cli' with no args to see available commands"
