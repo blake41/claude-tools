@@ -1,8 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-source "$(dirname "$0")/render-common.sh"
-source "$(dirname "$0")/../cli-envelope.sh"
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+source "$SCRIPT_DIR/render-common.sh"
+source "$SCRIPT_DIR/../cli-envelope.sh"
 
 TOOL_NAME="render-services"
 

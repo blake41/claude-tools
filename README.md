@@ -15,6 +15,7 @@ tools/
 ├── infisical/            # Infisical API scripts
 ├── salesforce/           # Salesforce SOQL query scripts
 ├── linear/               # Linear issue tracking CLI
+├── notion/               # Notion task board CLI
 └── tmux/                 # Tmux session monitoring for AI agents
 ```
 
@@ -36,6 +37,8 @@ tools/
 | Salesforce config | Uses `sf` CLI auth |
 | Linear scripts | `~/.local/bin/linear-cli` |
 | Linear config | `~/.config/linear/api-key` |
+| Notion scripts | `~/.local/bin/notion-cc` |
+| Notion config | `~/.config/notion/api_token` or `.env` |
 | iMessage | `~/.local/bin/imsg` (via go install) |
 | tmux-monitor | `~/.local/bin/tmux-monitor` |
 | tmux-monitor deps | tmux, tmuxwatch, jq |
@@ -171,6 +174,36 @@ linear-cli create GTM "Fix login bug"
 linear-cli create GTM "Add feature" --description "Details" --priority 2
 ```
 
+### Notion CLI
+
+For task boards and agent work tracking:
+
+```bash
+# Setup
+notion-cc setup                            # Configure integration token
+
+# Page commands
+notion-cc get <url>                        # Get page details
+notion-cc update-status <url> "Working on tests"  # Update status property
+notion-cc set-blocked <url> [true|false]   # Set blocked checkbox
+notion-cc move <url> "Done"                # Move to status (e.g., Done, In Progress)
+
+# Comment commands
+notion-cc comments <url>                   # List all comments
+notion-cc comment <url> "Need clarification"  # Add a comment
+notion-cc wait-for-comment <url>           # BLOCK until new comment (polls every 5s)
+
+# Generic property update
+notion-cc update-property <url> "Priority" "High" select
+```
+
+**Agent workflow pattern**:
+1. Update status as you work: `notion-cc update-status <url> "Implementing feature X"`
+2. If blocked: `notion-cc set-blocked <url> true && notion-cc comment <url> "Question here"`
+3. Wait for response: `notion-cc wait-for-comment <url>` (blocks until user comments)
+4. Continue work: `notion-cc set-blocked <url> false`
+5. When done: `notion-cc move <url> "Done"`
+
 ### iMessage CLI
 
 ```bash
@@ -231,6 +264,9 @@ RENDER_API_KEY=rnd_xxxxx
 # Cloudflare
 CLOUDFLARE_ACCOUNT_ID=xxxxx
 CLOUDFLARE_API_TOKEN=xxxxx
+
+# Notion
+NOTION_API_TOKEN=secret_xxxxx
 
 # GitHub - uses gh CLI auth (run `gh auth login` if needed)
 ```

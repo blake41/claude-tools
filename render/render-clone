@@ -1,0 +1,408 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+source "$SCRIPT_DIR/render-common.sh"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="render-clone"
+
+# Clone an entire Render project (services + database) to a new staging project
+# pointing at a different git branch.
+#
+# Usage:
+#   render-clone project <source-project-id> --name <staging-name> --branch <git-branch> [--dry-run]
+#
+# What it does:
+#   1. Reads the source project's environment, services, and database config
+#   2. Creates a new project with a Staging environment
+#   3. Creates a new Postgres database (same plan/region)
+#   4. Clones each service with the new branch, autoDeploy off
+#   5. Copies env vars from source services, overriding DATABASE_URL with the new DB
+#
+# Env vars that differ per environment (DATABASE_URL, NEXTAUTH_URL, etc.) are
+# flagged in the output so you can update them.
+
+cmd_project() {
+    local source_project_id=""
+    local staging_name=""
+    local branch=""
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) staging_name="$2"; shift 2 ;;
+            --branch) branch="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            -*) json_error "$TOOL_NAME project" "Unknown option: $1" "BAD_ARG" "Usage: render-clone project <project-id> --name <name> --branch <branch> [--dry-run]" ;;
+            *)
+                if [[ -z "$source_project_id" ]]; then
+                    source_project_id="$1"; shift
+                else
+                    json_error "$TOOL_NAME project" "Unexpected argument: $1" "BAD_ARG" "Usage: render-clone project <project-id> --name <name> --branch <branch>"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$source_project_id" ]]; then
+        json_error "$TOOL_NAME project" "Source project ID required" "MISSING_ARG" "Usage: render-clone project <project-id> --name <name> --branch <branch>"
+    fi
+    if [[ -z "$staging_name" ]]; then
+        json_error "$TOOL_NAME project" "--name required" "MISSING_ARG" "Provide a name for the staging project, e.g. --name keystone-staging"
+    fi
+    if [[ -z "$branch" ]]; then
+        json_error "$TOOL_NAME project" "--branch required" "MISSING_ARG" "Provide the git branch to deploy from, e.g. --branch staging"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME project" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    # ── Step 1: Read source project ──
+    local project
+    project=$(render_api "/projects/$source_project_id")
+
+    local owner_id
+    owner_id=$(echo "$project" | jq -r '.owner.id')
+    local project_name
+    project_name=$(echo "$project" | jq -r '.name')
+
+    # Get source environment
+    local environments
+    environments=$(render_api "/environments?projectId=$source_project_id")
+    local source_env_id
+    source_env_id=$(echo "$environments" | jq -r '.[0].environment.id')
+
+    # Get services in source environment
+    local source_services
+    source_services=$(render_api "/services?ownerId=$owner_id&limit=50")
+    # Filter to services in this environment
+    source_services=$(echo "$source_services" | jq --arg eid "$source_env_id" '[.[] | .service | select(.environmentId == $eid)]')
+
+    # Get databases in source environment
+    local source_db_ids
+    source_db_ids=$(echo "$environments" | jq -r '.[0].environment.databasesIds // [] | .[]')
+
+    # ── Dry run: just show what would happen ──
+    if [[ "$dry_run" == true ]]; then
+        local plan
+        plan=$(jq -n \
+            --arg src_project "$project_name ($source_project_id)" \
+            --arg new_name "$staging_name" \
+            --arg branch "$branch" \
+            --argjson services "$(echo "$source_services" | jq '[.[] | {name, type, id}]')" \
+            --arg db_ids "$source_db_ids" \
+            '{
+                action: "clone_project",
+                source: $src_project,
+                target_name: $new_name,
+                target_branch: $branch,
+                services_to_clone: $services,
+                databases_to_clone: ($db_ids | split("\n") | map(select(. != ""))),
+                steps: [
+                    "1. Create project: \($new_name) with Staging environment",
+                    "2. Create Postgres database (same plan/region as source)",
+                    "3. Clone each service with branch: \($branch), autoDeploy: off",
+                    "4. Copy env vars (DATABASE_URL will use new database)",
+                    "5. Print summary with URLs and env vars to review"
+                ]
+            }')
+
+        local na
+        na=$(next_actions \
+            "$(next_action "render-clone project $source_project_id --name $staging_name --branch $branch" "Run clone (remove --dry-run)")")
+        json_ok "$TOOL_NAME project --dry-run" "$plan" "$na"
+        return
+    fi
+
+    # ── Step 2: Create staging project ──
+    local new_project
+    new_project=$(render_api_post "/projects" "$(jq -n \
+        --arg owner "$owner_id" \
+        --arg name "$staging_name" \
+        '{ownerId: $owner, name: $name, environments: [{name: "Staging"}]}')")
+
+    local new_project_id
+    new_project_id=$(echo "$new_project" | jq -r '.id')
+    local new_env_id
+    new_env_id=$(echo "$new_project" | jq -r '.environmentIds[0]')
+
+    if [[ -z "$new_project_id" || "$new_project_id" == "null" ]]; then
+        json_error "$TOOL_NAME project" "Failed to create project: $(echo "$new_project" | jq -r '.message // "unknown error"')" "CREATE_FAILED" "Check project name is unique"
+    fi
+
+    # ── Step 3: Create staging database ──
+    local new_db_id=""
+    local new_db_conn=""
+    if [[ -n "$source_db_ids" ]]; then
+        local first_db_id
+        first_db_id=$(echo "$source_db_ids" | head -1)
+
+        # Read source DB config
+        local source_db
+        source_db=$(render_api "/postgres/$first_db_id")
+
+        local db_plan db_region db_version
+        db_plan=$(echo "$source_db" | jq -r '.plan')
+        db_region=$(echo "$source_db" | jq -r '.region')
+        db_version=$(echo "$source_db" | jq -r '.version')
+
+        local new_db
+        new_db=$(render_api_post "/postgres" "$(jq -n \
+            --arg owner "$owner_id" \
+            --arg name "${staging_name}-db" \
+            --arg plan "$db_plan" \
+            --arg region "$db_region" \
+            --arg version "$db_version" \
+            --arg env_id "$new_env_id" \
+            '{ownerId: $owner, name: $name, plan: $plan, region: $region, version: $version, environmentId: $env_id}')")
+
+        new_db_id=$(echo "$new_db" | jq -r '.id')
+
+        if [[ -z "$new_db_id" || "$new_db_id" == "null" ]]; then
+            json_error "$TOOL_NAME project" "Failed to create database: $(echo "$new_db" | jq -r '.message // "unknown error"')" "DB_CREATE_FAILED" "Check database name is unique"
+        fi
+
+        # Wait for DB to be available and get connection string
+        echo "Waiting for database to initialize..." >&2
+        local attempts=0
+        while [[ $attempts -lt 30 ]]; do
+            local db_status
+            db_status=$(render_api "/postgres/$new_db_id" | jq -r '.status' 2>/dev/null || echo "pending")
+            if [[ "$db_status" == "available" ]]; then
+                break
+            fi
+            sleep 5
+            attempts=$((attempts + 1))
+        done
+
+        local conn_info
+        conn_info=$(render_api "/postgres/$new_db_id/connection-info")
+        new_db_conn=$(echo "$conn_info" | jq -r '.internalConnectionString')
+    fi
+
+    # ── Step 4: Clone services ──
+    local created_services="[]"
+    local env_var_warnings="[]"
+
+    while IFS= read -r service_json; do
+        local svc_name svc_type svc_repo svc_id
+        svc_name=$(echo "$service_json" | jq -r '.name')
+        svc_type=$(echo "$service_json" | jq -r '.type')
+        svc_repo=$(echo "$service_json" | jq -r '.repo')
+        svc_id=$(echo "$service_json" | jq -r '.id')
+
+        local new_svc_name="${svc_name}-staging"
+
+        # Build service creation payload
+        local svc_details
+        svc_details=$(echo "$service_json" | jq '{
+            env: .serviceDetails.env,
+            plan: .serviceDetails.plan,
+            region: .serviceDetails.region,
+            numInstances: .serviceDetails.numInstances,
+            envSpecificDetails: .serviceDetails.envSpecificDetails
+        }')
+
+        local create_payload
+        create_payload=$(jq -n \
+            --arg owner "$owner_id" \
+            --arg type "$svc_type" \
+            --arg name "$new_svc_name" \
+            --arg repo "$svc_repo" \
+            --arg branch "$branch" \
+            --arg env_id "$new_env_id" \
+            --argjson details "$svc_details" \
+            '{
+                ownerId: $owner,
+                type: $type,
+                name: $name,
+                repo: $repo,
+                branch: $branch,
+                autoDeploy: "no",
+                environmentId: $env_id,
+                serviceDetails: $details
+            }')
+
+        local new_service
+        new_service=$(render_api_post "/services" "$create_payload")
+        local new_svc_id
+        new_svc_id=$(echo "$new_service" | jq -r '.service.id // .id // empty')
+
+        if [[ -z "$new_svc_id" ]]; then
+            local err_msg
+            err_msg=$(echo "$new_service" | jq -r '.message // "unknown error"')
+            # Add to warnings but continue
+            env_var_warnings=$(echo "$env_var_warnings" | jq --arg name "$new_svc_name" --arg err "$err_msg" '. + [{service: $name, warning: $err}]')
+            continue
+        fi
+
+        # Copy env vars from source service, overriding DATABASE_URL
+        local source_env_vars
+        source_env_vars=$(render_api "/services/$svc_id/env-vars")
+
+        if [[ $(echo "$source_env_vars" | jq 'length') -gt 0 ]]; then
+            # Transform env vars: override DATABASE_URL if we have a new DB
+            local new_env_vars
+            if [[ -n "$new_db_conn" ]]; then
+                new_env_vars=$(echo "$source_env_vars" | jq --arg db_url "$new_db_conn" '[
+                    .[] | .envVar |
+                    if .key == "DATABASE_URL" then {key, value: $db_url}
+                    else {key, value}
+                    end
+                ]')
+            else
+                new_env_vars=$(echo "$source_env_vars" | jq '[.[] | .envVar | {key, value}]')
+            fi
+
+            render_api_put "/services/$new_svc_id/env-vars" "$new_env_vars" > /dev/null
+        fi
+
+        # Flag env vars that likely need manual update
+        local url_vars
+        url_vars=$(echo "$source_env_vars" | jq '[.[] | .envVar | select(.key | test("URL$|_URL$|_HOST$")) | .key]')
+        if [[ $(echo "$url_vars" | jq 'length') -gt 0 ]]; then
+            env_var_warnings=$(echo "$env_var_warnings" | jq --arg name "$new_svc_name" --argjson vars "$url_vars" '. + [{service: $name, review_env_vars: $vars, reason: "URL env vars may need staging-specific values"}]')
+        fi
+
+        local svc_url
+        svc_url=$(echo "$new_service" | jq -r '.service.serviceDetails.url // .serviceDetails.url // "pending"')
+
+        created_services=$(echo "$created_services" | jq --arg id "$new_svc_id" --arg name "$new_svc_name" --arg type "$svc_type" --arg url "$svc_url" \
+            '. + [{id: $id, name: $name, type: $type, url: $url}]')
+    done < <(echo "$source_services" | jq -c '.[]')
+
+    # ── Step 5: Build result ──
+    local result
+    result=$(jq -n \
+        --arg project_id "$new_project_id" \
+        --arg project_name "$staging_name" \
+        --arg env_id "$new_env_id" \
+        --arg branch "$branch" \
+        --arg db_id "$new_db_id" \
+        --arg db_conn "$new_db_conn" \
+        --argjson services "$created_services" \
+        --argjson warnings "$env_var_warnings" \
+        '{
+            project: {id: $project_id, name: $project_name, environment_id: $env_id},
+            branch: $branch,
+            database: (if $db_id != "" then {id: $db_id, connection_string: $db_conn} else null end),
+            services: $services,
+            env_var_warnings: $warnings,
+            auto_deploy: "off (trigger manually or enable with render API)"
+        }')
+
+    local first_svc_id
+    first_svc_id=$(echo "$created_services" | jq -r '.[0].id // empty')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $first_svc_id" "Check staging service details")" \
+        "$(next_action "render-logs $first_svc_id" "View staging service logs")" \
+        "$(next_action "render-clone teardown $new_project_id" "Tear down staging environment")")
+
+    json_ok "$TOOL_NAME project" "$result" "$na"
+}
+
+cmd_teardown() {
+    local project_id="${1:-}"
+    if [[ -z "$project_id" ]]; then
+        json_error "$TOOL_NAME teardown" "Project ID required" "MISSING_ARG" "Usage: render-clone teardown <project-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME teardown" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local owner_id
+    owner_id=$(load_workspace) || true
+
+    # Get environment and its resources
+    local environments
+    environments=$(render_api "/environments?projectId=$project_id")
+    local env_id
+    env_id=$(echo "$environments" | jq -r '.[0].environment.id // empty')
+
+    local deleted_resources="[]"
+
+    if [[ -n "$env_id" ]]; then
+        # Delete services in this environment
+        local services
+        services=$(render_api "/services?ownerId=$owner_id&limit=50")
+        local env_services
+        env_services=$(echo "$services" | jq --arg eid "$env_id" '[.[] | .service | select(.environmentId == $eid)]')
+
+        for svc in $(echo "$env_services" | jq -c '.[]'); do
+            local svc_id svc_name
+            svc_id=$(echo "$svc" | jq -r '.id')
+            svc_name=$(echo "$svc" | jq -r '.name')
+            render_api_delete "/services/$svc_id" > /dev/null 2>&1
+            deleted_resources=$(echo "$deleted_resources" | jq --arg type "service" --arg name "$svc_name" --arg id "$svc_id" '. + [{type: $type, name: $name, id: $id}]')
+        done
+
+        # Delete databases
+        local db_ids
+        db_ids=$(echo "$environments" | jq -r '.[0].environment.databasesIds // [] | .[]')
+        for db_id in $db_ids; do
+            render_api_delete "/postgres/$db_id" > /dev/null 2>&1
+            deleted_resources=$(echo "$deleted_resources" | jq --arg type "database" --arg id "$db_id" '. + [{type: $type, id: $id}]')
+        done
+    fi
+
+    # Delete the project
+    render_api_delete "/projects/$project_id" > /dev/null 2>&1
+    deleted_resources=$(echo "$deleted_resources" | jq --arg type "project" --arg id "$project_id" '. + [{type: $type, id: $id}]')
+
+    local result
+    result=$(jq -n --argjson deleted "$deleted_resources" '{deleted: $deleted}')
+
+    json_ok "$TOOL_NAME teardown" "$result" "$(next_actions)"
+}
+
+cmd_list_projects() {
+    load_api_key || json_error "$TOOL_NAME projects" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+    local owner_id
+    owner_id=$(load_workspace) || true
+
+    local url="/projects?limit=50"
+    if [[ -n "$owner_id" ]]; then
+        url="$url&ownerId=$owner_id"
+    fi
+
+    local raw
+    raw=$(render_api "$url")
+
+    local projects
+    projects=$(echo "$raw" | jq '[.[] | .project | {id, name}]')
+
+    local na
+    local first_id
+    first_id=$(echo "$projects" | jq -r '.[0].id // empty')
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-clone project $first_id --name my-staging --branch staging --dry-run" "Preview cloning first project")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME projects" "$projects" "$na"
+}
+
+case "${1:-}" in
+    project)
+        shift
+        cmd_project "$@"
+        ;;
+    teardown)
+        cmd_teardown "${2:-}"
+        ;;
+    projects)
+        cmd_list_projects
+        ;;
+    *)
+        cmd_tree "$TOOL_NAME" "Clone a Render project to create a staging environment" "$(jq -n '[
+            {name: "projects", description: "List all projects (find source project ID)", usage: "render-clone projects"},
+            {name: "project", description: "Clone project with all services + DB to staging", usage: "render-clone project <project-id> --name <staging-name> --branch <git-branch> [--dry-run]"},
+            {name: "teardown", description: "Delete a cloned staging project and all its resources", usage: "render-clone teardown <project-id>"}
+        ]')"
+        ;;
+esac

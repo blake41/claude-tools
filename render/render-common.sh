@@ -51,7 +51,7 @@ load_workspace() {
     return 1
 }
 
-# API helper
+# API helpers
 render_api() {
     local endpoint="$1"
     shift
@@ -59,4 +59,31 @@ render_api() {
         -H "Authorization: Bearer $RENDER_API_KEY" \
         -H "Accept: application/json" \
         "$@"
+}
+
+render_api_post() {
+    local endpoint="$1"
+    local data="$2"
+    curl -sS "https://api.render.com/v1$endpoint" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -X POST -d "$data"
+}
+
+render_api_put() {
+    local endpoint="$1"
+    local data="$2"
+    curl -sS "https://api.render.com/v1$endpoint" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -X PUT -d "$data"
+}
+
+render_api_delete() {
+    local endpoint="$1"
+    curl -sS "https://api.render.com/v1$endpoint" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -X DELETE
 }

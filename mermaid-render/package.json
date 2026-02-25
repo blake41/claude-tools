@@ -1,0 +1,11 @@
+{
+  "name": "mermaid-render",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "mermaid-render": "./cli.js"
+  },
+  "dependencies": {
+    "beautiful-mermaid": "latest"
+  }
+}
