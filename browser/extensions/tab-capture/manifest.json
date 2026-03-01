@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "browser-ctl Tab Capture",
+  "version": "1.0.0",
+  "description": "Tab capture recording for browser-ctl",
+  "permissions": [
+    "tabCapture",
+    "activeTab",
+    "offscreen"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  }
+}
