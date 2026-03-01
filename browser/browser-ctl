@@ -22,6 +22,7 @@ const path = require('path');
 const yaml = require('js-yaml');
 const http = require('http');
 const { spawn, execSync } = require('child_process');
+const Diff = require('diff');
 
 // Profile configuration (must match browser-open)
 const PROFILE_PORTS = {
@@ -76,6 +77,68 @@ const c = {
 // Ensure screenshot directory exists
 if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+}
+
+// Snapshot cache (for implicit diff baselines)
+const SNAPSHOT_CACHE_FILE = `/tmp/browser-ctl-snapshot-${CURRENT_PROFILE}.txt`;
+
+function readSnapshotCache() {
+  try {
+    if (fs.existsSync(SNAPSHOT_CACHE_FILE)) {
+      return fs.readFileSync(SNAPSHOT_CACHE_FILE, 'utf8');
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Recording state management
+const RECORDING_STATE_FILE = `/tmp/browser-ctl-recording-${CURRENT_PROFILE}.json`;
+const SCRIPT_DIR = path.dirname(fs.realpathSync(process.argv[1]));
+const TAB_CAPTURE_EXTENSION_DIR = path.join(SCRIPT_DIR, 'extensions', 'tab-capture');
+
+function readRecordingState() {
+  try {
+    if (fs.existsSync(RECORDING_STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(RECORDING_STATE_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return null;
+}
+
+function writeRecordingState(state) {
+  fs.writeFileSync(RECORDING_STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function clearRecordingState() {
+  try {
+    if (fs.existsSync(RECORDING_STATE_FILE)) {
+      fs.unlinkSync(RECORDING_STATE_FILE);
+    }
+  } catch (e) {}
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function cleanStaleRecording() {
+  const state = readRecordingState();
+  if (!state) return null;
+  if (state.pid && !isProcessAlive(state.pid)) {
+    // Stale recording - collector is dead
+    clearRecordingState();
+    // Clean up frames dir if it exists
+    if (state.framesDir && fs.existsSync(state.framesDir)) {
+      fs.rmSync(state.framesDir, { recursive: true, force: true });
+    }
+    return null;
+  }
+  return state;
 }
 
 // Headless mode management
@@ -1252,8 +1315,276 @@ async function execSnapshot(page, args) {
       eval(script);
       return window.__devBrowser_getAISnapshot();
     }, SNAPSHOT_SCRIPT);
+    try { fs.writeFileSync(SNAPSHOT_CACHE_FILE, yamlStr); } catch (e) {}
     return { output: yamlStr, data: yamlStr };
   }
+}
+
+function formatSnapshotDiff(oldText, newText, contextLines, fullDiff) {
+  const ctx = fullDiff ? Infinity : (contextLines || 3);
+  const patch = Diff.structuredPatch('baseline', 'current', oldText, newText, '', '', { context: ctx });
+
+  if (patch.hunks.length === 0) {
+    return { output: `${c.green}No changes detected${c.reset}`, changed: false, stats: { added: 0, removed: 0 } };
+  }
+
+  let added = 0;
+  let removed = 0;
+  const lines = [];
+
+  for (const hunk of patch.hunks) {
+    lines.push(`${c.cyan}@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@${c.reset}`);
+    for (const line of hunk.lines) {
+      if (line.startsWith('+')) {
+        lines.push(`${c.green}${line}${c.reset}`);
+        added++;
+      } else if (line.startsWith('-')) {
+        lines.push(`${c.red}${line}${c.reset}`);
+        removed++;
+      } else {
+        lines.push(line);
+      }
+    }
+  }
+
+  lines.push(`${c.dim}--- ${added} added, ${removed} removed ---${c.reset}`);
+  return { output: lines.join('\n'), changed: true, stats: { added, removed } };
+}
+
+async function execDiffSnapshot(page, args) {
+  let baselineFile = null;
+  let contextLines = 3;
+  let fullDiff = false;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--baseline' || args[i] === '-b') {
+      baselineFile = args[++i];
+    } else if (args[i] === '--context' || args[i] === '-C') {
+      contextLines = parseInt(args[++i]);
+    } else if (args[i] === '--full-diff') {
+      fullDiff = true;
+    }
+  }
+
+  let baseline;
+  if (baselineFile) {
+    if (!fs.existsSync(baselineFile)) throw new Error(`Baseline file not found: ${baselineFile}`);
+    baseline = fs.readFileSync(baselineFile, 'utf8');
+  } else {
+    baseline = readSnapshotCache();
+    if (!baseline) throw new Error('No baseline available. Run "browser-ctl snapshot" first, or pass --baseline FILE');
+  }
+
+  const freshResult = await execSnapshot(page, []);
+  const freshSnapshot = freshResult.data;
+
+  const diff = formatSnapshotDiff(baseline, freshSnapshot, contextLines, fullDiff);
+  return { output: diff.output, data: { changed: diff.changed, stats: diff.stats } };
+}
+
+async function execDiffScreenshot(page, args) {
+  let baselineFile = null;
+  let outputFile = null;
+  let threshold = 0.1;
+  let selector = null;
+  let fullPage = false;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--baseline' || args[i] === '-b') {
+      baselineFile = args[++i];
+    } else if (args[i] === '--output' || args[i] === '-o') {
+      outputFile = args[++i];
+    } else if (args[i] === '--threshold' || args[i] === '-t') {
+      threshold = parseFloat(args[++i]);
+    } else if (args[i] === '--selector' || args[i] === '-s') {
+      selector = args[++i];
+    } else if (args[i] === '--full' || args[i] === '-f') {
+      fullPage = true;
+    }
+  }
+
+  if (!baselineFile) throw new Error('Usage: diff screenshot --baseline FILE [--output FILE] [--threshold 0-1] [--selector SEL] [--full]');
+  if (!fs.existsSync(baselineFile)) throw new Error(`Baseline file not found: ${baselineFile}`);
+
+  // Check for ImageMagick compare
+  try {
+    execSync('which compare', { encoding: 'utf8', stdio: 'pipe' });
+  } catch (e) {
+    throw new Error('ImageMagick "compare" not found. Install with: brew install imagemagick');
+  }
+
+  // Take fresh screenshot
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  const tempScreenshot = path.join(SCREENSHOT_DIR, `diff-current-${timestamp}.png`);
+  const screenshotArgs = ['--output', tempScreenshot, '--no-resize'];
+  if (selector) screenshotArgs.push('--selector', selector);
+  if (fullPage) screenshotArgs.push('--full');
+  await execScreenshot(page, screenshotArgs);
+
+  // Output diff image path
+  outputFile = outputFile || path.join(SCREENSHOT_DIR, `diff-result-${timestamp}.png`);
+  const fuzzPercent = Math.round(threshold * 100);
+
+  // Run ImageMagick compare
+  let diffPixels = 0;
+  try {
+    const result = execSync(
+      `compare -metric AE -fuzz ${fuzzPercent}% "${baselineFile}" "${tempScreenshot}" "${outputFile}" 2>&1`,
+      { encoding: 'utf8', stdio: 'pipe' }
+    );
+    diffPixels = parseInt(result.trim()) || 0;
+  } catch (e) {
+    // Exit code 1 means images differ (normal), exit code 2 means error
+    if (e.status === 2) {
+      throw new Error(`ImageMagick compare failed: ${e.stderr || e.stdout || e.message}`);
+    }
+    // Exit code 1: images differ, pixel count is in stderr/stdout
+    const output = (e.stderr || e.stdout || '').trim();
+    diffPixels = parseInt(output) || 0;
+  }
+
+  // Get dimensions via sips
+  let width = 0, height = 0;
+  try {
+    const info = execSync(`sips -g pixelWidth -g pixelHeight "${tempScreenshot}" 2>/dev/null`, { encoding: 'utf8' });
+    width = parseInt(info.match(/pixelWidth:\s*(\d+)/)?.[1] || '0');
+    height = parseInt(info.match(/pixelHeight:\s*(\d+)/)?.[1] || '0');
+  } catch (e) {}
+
+  const totalPixels = width * height;
+  const percentage = totalPixels > 0 ? ((diffPixels / totalPixels) * 100).toFixed(2) : '0.00';
+  const changed = diffPixels > 0;
+
+  const lines = [];
+  if (changed) {
+    lines.push(`${c.yellow}Screenshots differ${c.reset}`);
+  } else {
+    lines.push(`${c.green}Screenshots match${c.reset}`);
+  }
+  lines.push(`${c.dim}Diff pixels:${c.reset} ${diffPixels} (${percentage}%)`);
+  lines.push(`${c.dim}Threshold:${c.reset} ${fuzzPercent}%`);
+  lines.push(`${c.dim}Diff image:${c.reset} ${outputFile}`);
+  lines.push(`${c.dim}Current:${c.reset} ${tempScreenshot}`);
+
+  return {
+    output: lines.join('\n'),
+    data: { changed, diffPixels, percentage: parseFloat(percentage), diffImage: outputFile, currentImage: tempScreenshot }
+  };
+}
+
+async function execDiffUrl(page, args) {
+  let urls = [];
+  let doScreenshot = false;
+  let fullPage = false;
+  let selector = null;
+  let contextLines = 3;
+  let fullDiff = false;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--screenshot' || args[i] === '--ss') {
+      doScreenshot = true;
+    } else if (args[i] === '--full' || args[i] === '-f') {
+      fullPage = true;
+    } else if (args[i] === '--selector' || args[i] === '-s') {
+      selector = args[++i];
+    } else if (args[i] === '--context' || args[i] === '-C') {
+      contextLines = parseInt(args[++i]);
+    } else if (args[i] === '--full-diff') {
+      fullDiff = true;
+    } else if (!args[i].startsWith('-')) {
+      urls.push(args[i]);
+    }
+  }
+
+  if (urls.length < 2) throw new Error('Usage: diff url <URL1> <URL2> [--screenshot] [--full] [--selector SEL] [--context N] [--full-diff]');
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  const outputParts = [];
+
+  // Navigate to URL1
+  await page.goto(urls[0], { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const snap1Result = await execSnapshot(page, []);
+  const snap1 = snap1Result.data;
+
+  let ss1Path = null;
+  if (doScreenshot) {
+    ss1Path = path.join(SCREENSHOT_DIR, `diff-url1-${timestamp}.png`);
+    const ssArgs = ['--output', ss1Path, '--no-resize'];
+    if (selector) ssArgs.push('--selector', selector);
+    if (fullPage) ssArgs.push('--full');
+    await execScreenshot(page, ssArgs);
+  }
+
+  // Navigate to URL2
+  await page.goto(urls[1], { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const snap2Result = await execSnapshot(page, []);
+  const snap2 = snap2Result.data;
+
+  let ss2Path = null;
+  if (doScreenshot) {
+    ss2Path = path.join(SCREENSHOT_DIR, `diff-url2-${timestamp}.png`);
+    const ssArgs = ['--output', ss2Path, '--no-resize'];
+    if (selector) ssArgs.push('--selector', selector);
+    if (fullPage) ssArgs.push('--full');
+    await execScreenshot(page, ssArgs);
+  }
+
+  // Diff snapshots
+  outputParts.push(`${c.cyan}--- Snapshot diff ---${c.reset}`);
+  outputParts.push(`${c.dim}URL1: ${urls[0]}${c.reset}`);
+  outputParts.push(`${c.dim}URL2: ${urls[1]}${c.reset}`);
+  const snapshotDiff = formatSnapshotDiff(snap1, snap2, contextLines, fullDiff);
+  outputParts.push(snapshotDiff.output);
+
+  // Optionally diff screenshots
+  let screenshotData = null;
+  if (doScreenshot && ss1Path && ss2Path) {
+    outputParts.push('');
+    outputParts.push(`${c.cyan}--- Screenshot diff ---${c.reset}`);
+
+    try {
+      execSync('which compare', { encoding: 'utf8', stdio: 'pipe' });
+
+      const diffImage = path.join(SCREENSHOT_DIR, `diff-url-result-${timestamp}.png`);
+      let diffPixels = 0;
+      try {
+        const result = execSync(
+          `compare -metric AE -fuzz 10% "${ss1Path}" "${ss2Path}" "${diffImage}" 2>&1`,
+          { encoding: 'utf8', stdio: 'pipe' }
+        );
+        diffPixels = parseInt(result.trim()) || 0;
+      } catch (e) {
+        if (e.status === 2) {
+          outputParts.push(`${c.red}ImageMagick compare failed: ${e.stderr || e.stdout || e.message}${c.reset}`);
+        } else {
+          diffPixels = parseInt((e.stderr || e.stdout || '').trim()) || 0;
+        }
+      }
+
+      let width = 0, height = 0;
+      try {
+        const info = execSync(`sips -g pixelWidth -g pixelHeight "${ss1Path}" 2>/dev/null`, { encoding: 'utf8' });
+        width = parseInt(info.match(/pixelWidth:\s*(\d+)/)?.[1] || '0');
+        height = parseInt(info.match(/pixelHeight:\s*(\d+)/)?.[1] || '0');
+      } catch (e) {}
+
+      const totalPixels = width * height;
+      const percentage = totalPixels > 0 ? ((diffPixels / totalPixels) * 100).toFixed(2) : '0.00';
+
+      outputParts.push(`${c.dim}Diff pixels:${c.reset} ${diffPixels} (${percentage}%)`);
+      outputParts.push(`${c.dim}Diff image:${c.reset} ${diffImage}`);
+      screenshotData = { diffPixels, percentage: parseFloat(percentage), diffImage, url1Image: ss1Path, url2Image: ss2Path };
+    } catch (e) {
+      outputParts.push(`${c.yellow}ImageMagick "compare" not found. Install with: brew install imagemagick${c.reset}`);
+      outputParts.push(`${c.dim}URL1 screenshot:${c.reset} ${ss1Path}`);
+      outputParts.push(`${c.dim}URL2 screenshot:${c.reset} ${ss2Path}`);
+    }
+  }
+
+  return {
+    output: outputParts.join('\n'),
+    data: { snapshotDiff: { changed: snapshotDiff.changed, stats: snapshotDiff.stats }, screenshot: screenshotData }
+  };
 }
 
 async function execUrl(page, args) {
@@ -1386,6 +1717,391 @@ async function execCheck(page, args) {
   return { output: String(result), data: { condition, result, selector: selectorOrRef } };
 }
 
+// Recording exec functions
+
+async function execRecordStart(page, args) {
+  // Parse args
+  let outputPath = null;
+  let mode = 'screencast';
+  let fps = 2;
+  let quality = 80;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--mode') {
+      mode = args[++i];
+      if (!['screencast', 'capture'].includes(mode)) {
+        throw new Error(`Unknown recording mode: ${mode}. Use 'screencast' or 'capture'.`);
+      }
+    } else if (args[i] === '--fps') {
+      fps = parseInt(args[++i]);
+      if (isNaN(fps) || fps < 1 || fps > 30) throw new Error('FPS must be between 1 and 30');
+    } else if (args[i] === '--quality') {
+      quality = parseInt(args[++i]);
+      if (isNaN(quality) || quality < 1 || quality > 100) throw new Error('Quality must be between 1 and 100');
+    } else if (!args[i].startsWith('-')) {
+      outputPath = args[i];
+    }
+  }
+
+  // Check for existing/stale recordings
+  const existing = cleanStaleRecording();
+  if (existing) {
+    throw new Error(`Recording already in progress (started ${existing.startedAt}). Use 'record stop' or 'record cancel'.`);
+  }
+
+  const timestamp = Date.now();
+  const defaultExt = mode === 'capture' ? 'webm' : 'mp4';
+  outputPath = outputPath || path.join(SCREENSHOT_DIR, `recording-${timestamp}.${defaultExt}`);
+  if (!path.isAbsolute(outputPath)) {
+    outputPath = path.resolve(outputPath);
+  }
+
+  const tabUrl = page.url();
+
+  if (mode === 'screencast') {
+    // Mode A: CDP Screencast via frame-collector daemon
+    const framesDir = path.join(SCREENSHOT_DIR, `frames-${timestamp}`);
+    fs.mkdirSync(framesDir, { recursive: true });
+
+    const state = {
+      mode: 'screencast',
+      startedAt: new Date().toISOString(),
+      outputPath,
+      framesDir,
+      fps,
+      quality,
+      frameCount: 0,
+      pid: null,
+      tabUrl,
+    };
+
+    writeRecordingState(state);
+
+    // Spawn detached frame-collector
+    const collectorPath = path.join(SCRIPT_DIR, 'frame-collector.js');
+    const collectorArgs = [
+      collectorPath,
+      '--port', String(CDP_PORT),
+      '--host', CDP_HOST,
+      '--fps', String(fps),
+      '--quality', String(quality),
+      '--frames-dir', framesDir,
+      '--state-file', RECORDING_STATE_FILE,
+    ];
+
+    const collector = spawn(process.execPath, collectorArgs, {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+
+    collector.unref();
+
+    // Update state with PID
+    state.pid = collector.pid;
+    writeRecordingState(state);
+
+    // Wait briefly for collector to start
+    await new Promise(r => setTimeout(r, 500));
+
+    // Verify collector is running
+    if (!isProcessAlive(collector.pid)) {
+      clearRecordingState();
+      fs.rmSync(framesDir, { recursive: true, force: true });
+      throw new Error('Frame collector failed to start. Check Chrome connection.');
+    }
+
+    const output = `${c.green}Recording started${c.reset} (screencast mode)\n` +
+      `${c.dim}FPS: ${fps}, Quality: ${quality}${c.reset}\n` +
+      `${c.dim}Output: ${outputPath}${c.reset}\n` +
+      `${c.dim}Tab: ${tabUrl}${c.reset}\n` +
+      `${c.dim}Use 'browser-ctl record stop' to finish${c.reset}`;
+    return { output, data: { mode, fps, quality, outputPath, pid: collector.pid } };
+
+  } else {
+    // Mode B: tabCapture extension
+    const state = {
+      mode: 'capture',
+      startedAt: new Date().toISOString(),
+      outputPath,
+      fps,
+      quality,
+      frameCount: 0,
+      pid: process.pid,
+      tabUrl,
+    };
+
+    // Find extension service worker target
+    const extensionTarget = await getExtensionTarget(CDP_PORT);
+    if (!extensionTarget) {
+      throw new Error(
+        'Tab capture extension not found. Ensure Chrome was started with:\n' +
+        `  browser-open  (which loads the extension automatically)\n` +
+        `Or manually add: --load-extension=${TAB_CAPTURE_EXTENSION_DIR}`
+      );
+    }
+
+    // Send start message to extension
+    const result = await sendExtensionMessage(CDP_PORT, extensionTarget, { action: 'startCapture' });
+    if (!result || !result.ok) {
+      throw new Error(`Extension start failed: ${result?.error || 'Unknown error'}`);
+    }
+
+    state.tabUrl = result.tabUrl || tabUrl;
+    writeRecordingState(state);
+
+    const output = `${c.green}Recording started${c.reset} (capture mode)\n` +
+      `${c.dim}Output: ${outputPath}${c.reset}\n` +
+      `${c.dim}Tab: ${state.tabUrl}${c.reset}\n` +
+      `${c.dim}Use 'browser-ctl record stop' to finish${c.reset}`;
+    return { output, data: { mode, outputPath } };
+  }
+}
+
+async function execRecordStop(page, args) {
+  const state = readRecordingState();
+  if (!state) {
+    throw new Error('No active recording. Use \'record start\' to begin.');
+  }
+
+  if (state.mode === 'screencast') {
+    // Kill frame collector
+    if (state.pid && isProcessAlive(state.pid)) {
+      try {
+        process.kill(state.pid, 'SIGTERM');
+      } catch (e) {}
+      // Wait for collector to finish
+      for (let i = 0; i < 20; i++) {
+        if (!isProcessAlive(state.pid)) break;
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+
+    // Re-read state to get final frame count
+    const finalState = readRecordingState() || state;
+    const frameCount = finalState.frameCount || 0;
+
+    if (frameCount === 0) {
+      clearRecordingState();
+      if (state.framesDir && fs.existsSync(state.framesDir)) {
+        fs.rmSync(state.framesDir, { recursive: true, force: true });
+      }
+      throw new Error('No frames captured. Recording may have failed.');
+    }
+
+    const outputPath = state.outputPath;
+    const fps = state.fps || 2;
+    let encoded = false;
+    let encodingMsg = '';
+
+    // Try to encode with ffmpeg
+    try {
+      execSync('which ffmpeg', { encoding: 'utf8' });
+      const ffmpegCmd = `ffmpeg -framerate ${fps} -i "${state.framesDir}/frame-%06d.jpg" -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 -y "${outputPath}" 2>&1`;
+      execSync(ffmpegCmd, { encoding: 'utf8', timeout: 120000 });
+      encoded = true;
+
+      // Clean up frames
+      fs.rmSync(state.framesDir, { recursive: true, force: true });
+      encodingMsg = `${c.green}Video saved:${c.reset} ${outputPath}`;
+    } catch (e) {
+      if (e.message && e.message.includes('which ffmpeg')) {
+        encodingMsg = `${c.yellow}ffmpeg not found.${c.reset} Frames saved to: ${state.framesDir}\n` +
+          `${c.dim}Install: brew install ffmpeg${c.reset}\n` +
+          `${c.dim}Then encode manually:${c.reset}\n` +
+          `  ffmpeg -framerate ${fps} -i "${state.framesDir}/frame-%06d.jpg" -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 -y "${outputPath}"`;
+      } else {
+        encodingMsg = `${c.red}ffmpeg encoding failed:${c.reset} ${e.message}\n` +
+          `${c.dim}Raw frames at: ${state.framesDir}${c.reset}`;
+      }
+    }
+
+    clearRecordingState();
+
+    const elapsed = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
+    const output = `${c.green}Recording stopped${c.reset}\n` +
+      `${c.dim}Duration: ${elapsed}s, Frames: ${frameCount}${c.reset}\n` +
+      encodingMsg;
+    return { output, data: { frames: frameCount, outputPath: encoded ? outputPath : state.framesDir, encoded } };
+
+  } else if (state.mode === 'capture') {
+    // Mode B: stop extension recording
+    const extensionTarget = await getExtensionTarget(CDP_PORT);
+    if (!extensionTarget) {
+      clearRecordingState();
+      throw new Error('Tab capture extension not found. Recording state cleared.');
+    }
+
+    const result = await sendExtensionMessage(CDP_PORT, extensionTarget, { action: 'stopCapture' });
+    if (!result || !result.ok) {
+      clearRecordingState();
+      throw new Error(`Extension stop failed: ${result?.error || 'Unknown error'}`);
+    }
+
+    // Write WebM data to disk
+    const webmData = Buffer.from(result.data, 'base64');
+    let finalPath = state.outputPath;
+
+    // If output is .mp4, try to convert
+    if (finalPath.endsWith('.mp4')) {
+      const webmPath = finalPath.replace(/\.mp4$/, '.webm');
+      fs.writeFileSync(webmPath, webmData);
+
+      try {
+        execSync('which ffmpeg', { encoding: 'utf8' });
+        execSync(`ffmpeg -i "${webmPath}" -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 -y "${finalPath}" 2>&1`, {
+          encoding: 'utf8', timeout: 120000,
+        });
+        fs.unlinkSync(webmPath);
+      } catch (e) {
+        // ffmpeg not available or failed; keep the webm
+        finalPath = webmPath;
+      }
+    } else {
+      // Write directly as webm
+      if (!finalPath.endsWith('.webm')) finalPath += '.webm';
+      fs.writeFileSync(finalPath, webmData);
+    }
+
+    clearRecordingState();
+
+    const elapsed = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
+    const sizeMB = (webmData.length / (1024 * 1024)).toFixed(1);
+    const output = `${c.green}Recording stopped${c.reset}\n` +
+      `${c.dim}Duration: ${elapsed}s, Size: ${sizeMB}MB${c.reset}\n` +
+      `${c.green}Video saved:${c.reset} ${finalPath}`;
+    return { output, data: { outputPath: finalPath, size: webmData.length } };
+
+  } else {
+    clearRecordingState();
+    throw new Error(`Unknown recording mode in state: ${state.mode}`);
+  }
+}
+
+async function execRecordStatus(page, args) {
+  const state = readRecordingState();
+  if (!state) {
+    return { output: `${c.dim}No active recording${c.reset}`, data: { recording: false } };
+  }
+
+  const elapsed = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+  const timeStr = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+
+  let alive = true;
+  if (state.mode === 'screencast' && state.pid) {
+    alive = isProcessAlive(state.pid);
+  }
+
+  // Re-read for latest frame count (collector updates this)
+  const freshState = readRecordingState() || state;
+  const frameCount = freshState.frameCount || 0;
+
+  const statusIcon = alive ? `${c.green}●${c.reset}` : `${c.red}●${c.reset}`;
+  const statusText = alive ? 'recording' : 'stopped (collector dead)';
+
+  const output = `${statusIcon} ${statusText}\n` +
+    `${c.dim}Mode: ${state.mode}${c.reset}\n` +
+    `${c.dim}Elapsed: ${timeStr}${c.reset}\n` +
+    (state.mode === 'screencast' ? `${c.dim}Frames: ${frameCount}${c.reset}\n` : '') +
+    `${c.dim}Output: ${state.outputPath}${c.reset}\n` +
+    `${c.dim}Tab: ${state.tabUrl || 'unknown'}${c.reset}`;
+  return { output, data: { recording: true, alive, mode: state.mode, elapsed, frameCount } };
+}
+
+async function execRecordCancel(page, args) {
+  const state = readRecordingState();
+  if (!state) {
+    return { output: `${c.dim}No active recording to cancel${c.reset}`, data: { cancelled: false } };
+  }
+
+  // Kill collector if screencast mode
+  if (state.mode === 'screencast' && state.pid && isProcessAlive(state.pid)) {
+    try {
+      process.kill(state.pid, 'SIGTERM');
+    } catch (e) {}
+  }
+
+  // Clean up frames directory
+  if (state.framesDir && fs.existsSync(state.framesDir)) {
+    fs.rmSync(state.framesDir, { recursive: true, force: true });
+  }
+
+  clearRecordingState();
+
+  const output = `${c.yellow}Recording cancelled${c.reset}\n${c.dim}Temporary files cleaned up${c.reset}`;
+  return { output, data: { cancelled: true } };
+}
+
+// Extension communication helpers for tab capture mode
+
+async function getExtensionTarget(port) {
+  return new Promise((resolve) => {
+    http.get(`http://${CDP_HOST}:${port}/json`, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const targets = JSON.parse(data);
+          const sw = targets.find(t =>
+            t.type === 'service_worker' &&
+            t.url && t.url.includes('tab-capture') &&
+            t.url.includes('service-worker')
+          );
+          resolve(sw || null);
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    }).on('error', () => {
+      resolve(null);
+    });
+  });
+}
+
+async function sendExtensionMessage(port, target, message) {
+  const CDP = require('chrome-remote-interface');
+  let client;
+  try {
+    client = await CDP({
+      target: target.webSocketDebuggerUrl || target.id,
+      port,
+      host: CDP_HOST,
+    });
+    const { Runtime } = client;
+    await Runtime.enable();
+
+    // Use chrome.runtime.sendMessage to communicate with the extension
+    const expr = `
+      new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(${JSON.stringify(message)}, (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(response);
+          }
+        });
+      })
+    `;
+
+    const result = await Runtime.evaluate({
+      expression: expr,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.text || 'Extension eval failed');
+    }
+
+    return result.result.value;
+  } finally {
+    if (client) {
+      try { await client.close(); } catch (e) {}
+    }
+  }
+}
+
 // Dispatch table for compound commands
 
 const EXEC_DISPATCH = {
@@ -1409,6 +2125,12 @@ const EXEC_DISPATCH = {
   storage: execStorage, text: execText,
   value: execValue, attr: execAttr,
   count: execCount, check: execCheck,
+  'record-start': execRecordStart,
+  'record-stop': execRecordStop,
+  'record-status': execRecordStatus,
+  'diff-snapshot': execDiffSnapshot,
+  'diff-screenshot': execDiffScreenshot,
+  'diff-url': execDiffUrl,
 };
 
 // Compound command: do
@@ -1940,6 +2662,186 @@ async function cmdCheck(args) {
     process.exit(1);
   } finally {
     await browser.close();
+  }
+}
+
+async function cmdRecord(args) {
+  const subcommand = args[0];
+  const subArgs = args.slice(1);
+
+  if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+    console.log(`
+${c.cyan}browser-ctl record${c.reset} - Video recording
+
+${c.yellow}USAGE${c.reset}
+  browser-ctl record start [output.mp4] [--mode screencast|capture] [--fps N] [--quality N]
+  browser-ctl record stop
+  browser-ctl record status
+  browser-ctl record cancel
+
+${c.yellow}MODES${c.reset}
+  ${c.green}screencast${c.reset}  (default) CDP Page.startScreencast - captures JPEG frames, encodes to MP4
+  ${c.green}capture${c.reset}     tabCapture extension - records via MediaRecorder, outputs WebM/MP4
+
+${c.yellow}OPTIONS${c.reset}
+  --fps N       Frames per second (default: 2, max: 30)
+  --quality N   JPEG quality 1-100 (default: 80, screencast mode only)
+
+${c.yellow}EXAMPLES${c.reset}
+  browser-ctl record start                          # Start screencast recording
+  browser-ctl record start demo.mp4 --fps 5         # Custom output and FPS
+  browser-ctl record start --mode capture            # Use tabCapture extension
+  browser-ctl record status                          # Check recording progress
+  browser-ctl record stop                            # Stop and encode video
+  browser-ctl record cancel                          # Cancel without saving
+`);
+    process.exit(0);
+  }
+
+  switch (subcommand) {
+    case 'start': {
+      const { page, browser } = await connect();
+      try {
+        const result = await execRecordStart(page, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Record start failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      } finally {
+        await browser.close();
+      }
+      break;
+    }
+    case 'stop': {
+      const { page, browser } = await connect();
+      try {
+        const result = await execRecordStop(page, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Record stop failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      } finally {
+        await browser.close();
+      }
+      break;
+    }
+    case 'status': {
+      // Does NOT need browser connection
+      try {
+        const result = await execRecordStatus(null, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Record status failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      }
+      break;
+    }
+    case 'cancel': {
+      // Does NOT need browser connection
+      try {
+        const result = await execRecordCancel(null, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Record cancel failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      }
+      break;
+    }
+    default:
+      console.error(`${c.red}Unknown record subcommand: ${subcommand}${c.reset}`);
+      console.error(`Use 'browser-ctl record --help' for usage`);
+      process.exit(1);
+  }
+}
+
+async function cmdDiff(args) {
+  const subcommand = args[0];
+  const subArgs = args.slice(1);
+
+  if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+    console.log(`
+${c.cyan}browser-ctl diff${c.reset} - Compare page states
+
+${c.yellow}USAGE${c.reset}
+  browser-ctl diff snapshot [--baseline FILE] [--context N] [--full-diff]
+  browser-ctl diff screenshot --baseline FILE [--output FILE] [--threshold 0-1] [--selector SEL] [--full]
+  browser-ctl diff url <URL1> <URL2> [--screenshot] [--full] [--selector SEL] [--context N] [--full-diff]
+
+${c.yellow}SUBCOMMANDS${c.reset}
+  ${c.green}snapshot${c.reset}     Diff current accessibility snapshot against baseline
+                 Uses cached snapshot from last 'snapshot' command if no --baseline
+  ${c.green}screenshot${c.reset}   Diff current screenshot against baseline image (requires ImageMagick)
+  ${c.green}url${c.reset}          Navigate two URLs and diff their snapshots (+ optional screenshots)
+
+${c.yellow}OPTIONS${c.reset}
+  --baseline, -b FILE   Baseline file to compare against
+  --context, -C N       Lines of context in diff (default: 3)
+  --full-diff           Show full diff without context collapsing
+  --output, -o FILE     Output path for diff image (screenshot only)
+  --threshold, -t N     Fuzz threshold 0-1 for pixel comparison (default: 0.1)
+  --selector, -s SEL    CSS selector to scope screenshot
+  --full, -f            Full page screenshot
+  --screenshot, --ss    Also compare screenshots (url subcommand)
+
+${c.yellow}EXAMPLES${c.reset}
+  browser-ctl snapshot                              # Create baseline
+  browser-ctl diff snapshot                         # Diff against cached baseline
+  browser-ctl diff snapshot --full-diff             # Full diff (no context collapse)
+  browser-ctl diff snapshot --baseline /tmp/b.txt   # Diff against specific file
+  browser-ctl diff screenshot -b /tmp/before.png    # Visual diff screenshots
+  browser-ctl diff url https://a.com https://b.com  # Compare two URLs
+  browser-ctl diff url https://a.com https://b.com --screenshot  # With visual diff
+  browser-ctl do snapshot , click-ref e3 , diff-snapshot  # Compound workflow
+`);
+    process.exit(0);
+  }
+
+  switch (subcommand) {
+    case 'snapshot':
+    case 'snap': {
+      const { page, browser } = await connect();
+      try {
+        const result = await execDiffSnapshot(page, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Diff snapshot failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      } finally {
+        await browser.close();
+      }
+      break;
+    }
+    case 'screenshot':
+    case 'ss': {
+      const { page, browser } = await connect();
+      try {
+        const result = await execDiffScreenshot(page, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Diff screenshot failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      } finally {
+        await browser.close();
+      }
+      break;
+    }
+    case 'url': {
+      const { page, browser } = await connect();
+      try {
+        const result = await execDiffUrl(page, subArgs);
+        console.log(result.output);
+      } catch (err) {
+        console.error(`${c.red}Diff url failed: ${err.message}${c.reset}`);
+        process.exit(1);
+      } finally {
+        await browser.close();
+      }
+      break;
+    }
+    default:
+      console.error(`${c.red}Unknown diff subcommand: ${subcommand}${c.reset}`);
+      console.error(`Use 'browser-ctl diff --help' for usage`);
+      process.exit(1);
   }
 }
 
@@ -2586,6 +3488,31 @@ ${c.yellow}COMMANDS${c.reset}
       --bail            Stop on first failure
       --filter=PATTERN  Only run tests matching pattern
 
+${c.yellow}RECORDING${c.reset}
+  ${c.green}record start${c.reset} [output.mp4] [--mode screencast|capture] [--fps N] [--quality N]
+      Start video recording of the browser tab
+      Modes: screencast (default, CDP frames) or capture (tabCapture extension)
+
+  ${c.green}record stop${c.reset}
+      Stop recording and encode video (MP4 via ffmpeg, or raw frames/WebM)
+
+  ${c.green}record status${c.reset}
+      Show recording progress (elapsed time, frame count)
+
+  ${c.green}record cancel${c.reset}
+      Cancel recording and clean up temporary files
+
+${c.yellow}DIFF${c.reset}
+  ${c.green}diff snapshot${c.reset} [--baseline FILE] [--context N] [--full-diff]
+      Diff current snapshot against baseline (cached or from file)
+      Uses last 'snapshot' result as implicit baseline
+
+  ${c.green}diff screenshot${c.reset} --baseline FILE [--output FILE] [--threshold 0-1] [--selector SEL] [--full]
+      Visual diff current screenshot against baseline (requires ImageMagick)
+
+  ${c.green}diff url${c.reset} <URL1> <URL2> [--screenshot] [--full] [--selector SEL] [--context N] [--full-diff]
+      Navigate two URLs and diff their snapshots (+ optional screenshots)
+
 ${c.yellow}COMPOUND${c.reset}
   ${c.green}do${c.reset} <cmd1> [args] , <cmd2> [args] , ...
       Run multiple commands in a single browser connection
@@ -2634,6 +3561,15 @@ ${c.yellow}EXAMPLES${c.reset}
   browser-ctl test tests/ --filter="login"     # Only run tests matching "login"
   browser-ctl do snapshot , click-ref e3 , snapshot  # Compound: single connection
   browser-ctl do goto /login , type "#email" me@test.com , click "#submit"
+  browser-ctl record start                          # Start recording (screencast)
+  browser-ctl record start demo.mp4 --fps 5         # Custom output and FPS
+  browser-ctl record status                         # Check progress
+  browser-ctl record stop                           # Stop and encode to MP4
+  browser-ctl diff snapshot                         # Diff against last snapshot
+  browser-ctl diff snapshot --full-diff             # Full diff (no context collapse)
+  browser-ctl diff screenshot -b /tmp/before.png    # Visual diff screenshots
+  browser-ctl diff url https://a.com https://b.com  # Compare two URLs
+  browser-ctl do snapshot , click-ref e3 , diff-snapshot  # Compound: snapshot-act-diff
   browser-ctl storage get session blueprint_wizard_cache
   browser-ctl storage keys local
   browser-ctl text "h1"                        # Get element text content
@@ -2745,6 +3681,12 @@ async function main() {
       break;
     case 'do':
       await cmdDo(cmdArgs);
+      break;
+    case 'record':
+      await cmdRecord(cmdArgs);
+      break;
+    case 'diff':
+      await cmdDiff(cmdArgs);
       break;
     case 'storage':
       await cmdStorage(cmdArgs);
