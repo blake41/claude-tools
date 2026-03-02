@@ -1,0 +1,174 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+source "$SCRIPT_DIR/render-common.sh"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="render-envgroups"
+
+cmd_list() {
+    load_api_key || json_error "$TOOL_NAME list" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+    local owner_id
+    owner_id=$(load_workspace) || true
+
+    local url="/env-groups?limit=50"
+    if [[ -n "$owner_id" ]]; then
+        url="$url&ownerId=$owner_id"
+    fi
+
+    local raw
+    raw=$(render_api "$url")
+
+    local groups
+    groups=$(echo "$raw" | jq '[.[] | .envGroup | {id, name, varCount: (.envVars | length), linkedServices: [.serviceLinks[] | .name]}]')
+
+    local na
+    local first_id
+    first_id=$(echo "$groups" | jq -r '.[0].id // empty')
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-envgroups get $first_id" "Get details for first env group")" \
+            "$(next_action "render-envgroups vars $first_id" "List vars for first env group")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME list" "$groups" "$na"
+}
+
+cmd_get() {
+    local group_id="${1:-}"
+    if [[ -z "$group_id" ]]; then
+        json_error "$TOOL_NAME get" "Env group ID required" "MISSING_ARG" "Usage: render-envgroups get <env-group-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME get" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/env-groups/$group_id")
+
+    local result
+    result=$(echo "$raw" | jq '{
+        id, name,
+        vars: [.envVars[] | {key: .key, value: (if .value then (.value[:4] + "...") else "(secret)" end)}],
+        linkedServices: [.serviceLinks[] | {id: .id, name: .name, type: .type}],
+        createdAt, updatedAt
+    }')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-envgroups vars $group_id" "List vars (masked)")" \
+        "$(next_action "render-envgroups set $group_id KEY VALUE" "Set a variable")" \
+        "$(next_action "render-envgroups rm $group_id KEY" "Remove a variable")")
+
+    json_ok "$TOOL_NAME get" "$result" "$na"
+}
+
+cmd_vars() {
+    local group_id="${1:-}"
+    if [[ -z "$group_id" ]]; then
+        json_error "$TOOL_NAME vars" "Env group ID required" "MISSING_ARG" "Usage: render-envgroups vars <env-group-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME vars" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/env-groups/$group_id")
+
+    local vars
+    vars=$(echo "$raw" | jq '[.envVars[] | {key: .key, value: (if .value then (.value[:4] + "...") else "(secret)" end)}]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-envgroups set $group_id KEY VALUE" "Set a variable")" \
+        "$(next_action "render-envgroups rm $group_id KEY" "Remove a variable")" \
+        "$(next_action "render-envgroups get $group_id" "View full group details")")
+
+    json_ok "$TOOL_NAME vars" "$vars" "$na"
+}
+
+cmd_set() {
+    local group_id="${1:-}"
+    local key="${2:-}"
+    local value="${3:-}"
+    if [[ -z "$group_id" || -z "$key" || -z "$value" ]]; then
+        json_error "$TOOL_NAME set" "Env group ID, key, and value required" "MISSING_ARG" \
+            "Usage: render-envgroups set <env-group-id> <KEY> <VALUE>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME set" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    # PUT /v1/env-groups/{id}/env-vars/{key} — adds or updates a single var
+    local result
+    result=$(curl -sS "https://api.render.com/v1/env-groups/$group_id/env-vars/$key" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -X PUT -d "{\"value\":\"$value\"}")
+
+    # Verify the key is in the response
+    local found
+    found=$(echo "$result" | jq --arg k "$key" '[.envVars[] | select(.key == $k)] | length')
+
+    if [[ "$found" == "0" ]]; then
+        json_error "$TOOL_NAME set" "Variable not found in response" "SET_FAILED" "Check env group ID and try again"
+    fi
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-envgroups vars $group_id" "Verify all vars")" \
+        "$(next_action "render-envgroups get $group_id" "View group details")")
+
+    json_ok "$TOOL_NAME set" "$(jq -n --arg key "$key" '{key: $key, updated: true}')" "$na"
+}
+
+cmd_rm() {
+    local group_id="${1:-}"
+    local key="${2:-}"
+    if [[ -z "$group_id" || -z "$key" ]]; then
+        json_error "$TOOL_NAME rm" "Env group ID and key required" "MISSING_ARG" \
+            "Usage: render-envgroups rm <env-group-id> <KEY>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME rm" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    # DELETE /v1/env-groups/{id}/env-vars/{key}
+    render_api_delete "/env-groups/$group_id/env-vars/$key"
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-envgroups vars $group_id" "Verify remaining vars")" \
+        "$(next_action "render-envgroups get $group_id" "View group details")")
+
+    json_ok "$TOOL_NAME rm" "$(jq -n --arg key "$key" '{key: $key, removed: true}')" "$na"
+}
+
+case "${1:-}" in
+    list)
+        cmd_list
+        ;;
+    get)
+        cmd_get "${2:-}"
+        ;;
+    vars)
+        cmd_vars "${2:-}"
+        ;;
+    set)
+        shift; cmd_set "$@"
+        ;;
+    rm)
+        shift; cmd_rm "$@"
+        ;;
+    *)
+        cmd_tree "$TOOL_NAME" "Render.com environment group management" "$(jq -n '[
+            {name: "list", description: "List all environment groups", usage: "render-envgroups list"},
+            {name: "get", description: "Get env group details", usage: "render-envgroups get <env-group-id>"},
+            {name: "vars", description: "List variables (masked)", usage: "render-envgroups vars <env-group-id>"},
+            {name: "set", description: "Add or update a variable", usage: "render-envgroups set <env-group-id> <KEY> <VALUE>"},
+            {name: "rm", description: "Remove a variable", usage: "render-envgroups rm <env-group-id> <KEY>"}
+        ]')"
+        ;;
+esac
