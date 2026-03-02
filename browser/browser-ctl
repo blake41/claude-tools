@@ -57,7 +57,7 @@ function getHeadlessFromArgs() {
 
 const CURRENT_PROFILE = getProfileFromArgs();
 const HEADLESS_MODE = getHeadlessFromArgs();
-const CDP_PORT = PROFILE_PORTS[CURRENT_PROFILE] || process.env.CDP_PORT || 9222;
+const CDP_PORT = process.env.CDP_PORT || PROFILE_PORTS[CURRENT_PROFILE] || 9222;
 const CDP_HOST = process.env.CDP_HOST || 'localhost';
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || '/tmp/browser-ctl';
 const PROFILE_DIR = path.join(process.env.HOME, '.chrome-dev-profiles', CURRENT_PROFILE);
@@ -1075,6 +1075,37 @@ const SNAPSHOT_SCRIPT = `
 })();
 `;
 
+// Read DevToolsActivePort file to get direct WebSocket URL (Chrome 144+ / Electron)
+function readDevToolsActivePort(userDataDir) {
+  const filePath = path.join(userDataDir, 'DevToolsActivePort');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8').trim();
+    const lines = content.split('\n');
+    if (lines.length < 2) return null;
+    const port = parseInt(lines[0].trim(), 10);
+    const wsPath = lines[1].trim();
+    if (isNaN(port) || port <= 0 || port > 65535 || !wsPath) return null;
+    return { port, wsPath };
+  } catch { return null; }
+}
+
+// Search common Electron app data dirs for DevToolsActivePort on the target port
+function findDevToolsActivePortForPort(targetPort) {
+  const home = process.env.HOME || '';
+  const appSupport = path.join(home, 'Library', 'Application Support');
+  try {
+    const dirs = fs.readdirSync(appSupport);
+    for (const dir of dirs) {
+      const info = readDevToolsActivePort(path.join(appSupport, dir));
+      if (info && info.port === targetPort) {
+        return info;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 async function connect() {
   // If headless mode requested, ensure headless Chrome is running
   if (HEADLESS_MODE) {
@@ -1084,11 +1115,12 @@ async function connect() {
     }
   }
 
+  const port = parseInt(CDP_PORT, 10) || 9222;
+
   try {
-    const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
+    const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${port}`);
     const contexts = browser.contexts();
     if (contexts.length === 0) {
-      // In headless mode, create a new context if none exists
       if (HEADLESS_MODE) {
         const context = await browser.newContext();
         const page = await context.newPage();
@@ -1099,7 +1131,6 @@ async function connect() {
     }
     const pages = contexts[0].pages();
     if (pages.length === 0) {
-      // In headless mode, create a new page if none exists
       if (HEADLESS_MODE) {
         const page = await contexts[0].newPage();
         return { browser, page, contexts };
@@ -1109,8 +1140,32 @@ async function connect() {
     }
     return { browser, page: pages[0], contexts };
   } catch (err) {
+    // HTTP discovery failed — try direct WebSocket via DevToolsActivePort
+    // (Chrome 144+ and Electron apps use WebSocket-only CDP servers)
+    const activePort = findDevToolsActivePortForPort(port);
+    if (activePort) {
+      try {
+        const wsUrl = `ws://${CDP_HOST}:${activePort.port}${activePort.wsPath}`;
+        console.error(`${c.dim}HTTP discovery failed, trying direct WebSocket...${c.reset}`);
+        const browser = await chromium.connectOverCDP(wsUrl);
+        const contexts = browser.contexts();
+        if (contexts.length === 0) {
+          console.error(`${c.red}Connected via WebSocket but no contexts found${c.reset}`);
+          process.exit(1);
+        }
+        const allPages = contexts.flatMap(ctx => ctx.pages()).filter(p => p.url());
+        if (allPages.length === 0) {
+          console.error(`${c.red}Connected via WebSocket but no pages found${c.reset}`);
+          process.exit(1);
+        }
+        return { browser, page: allPages[0], contexts };
+      } catch (wsErr) {
+        console.error(`${c.red}WebSocket fallback also failed: ${wsErr.message}${c.reset}`);
+      }
+    }
+
     if (err.message.includes('ECONNREFUSED')) {
-      console.error(`${c.red}Cannot connect to Chrome on ${CDP_HOST}:${CDP_PORT}${c.reset}`);
+      console.error(`${c.red}Cannot connect to Chrome on ${CDP_HOST}:${port}${c.reset}`);
       if (HEADLESS_MODE) {
         console.error(`${c.yellow}Headless Chrome may have failed to start${c.reset}`);
       } else {
