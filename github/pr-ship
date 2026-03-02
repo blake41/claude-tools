@@ -20,7 +20,14 @@ WORKFLOW
   1. Creates PR with --fill (title/body from commits)
   2. Waits for CI checks to pass
   3. Rebases and merges when green
-  4. Runs finish-pr to cleanup local branch
+  4. Cleanup: removes worktree + branch (worktree) or runs finish-pr (normal)
+
+WORKTREE SUPPORT
+  When run from a git worktree, pr-ship will:
+  - Merge the PR on GitHub
+  - Remove the worktree directory
+  - Delete the local and remote branch
+  (You'll be moved to the main worktree's directory)
 
 EXAMPLES
   pr-ship                    # Full workflow
@@ -172,25 +179,97 @@ if [[ $ELAPSED -ge $MAX_WAIT ]]; then
   exit 1
 fi
 
+# Detect worktree context
+IN_WORKTREE=false
+WORKTREE_DIR=""
+MAIN_WORKTREE=""
+if [[ "$(git rev-parse --git-dir)" == *".git/worktrees/"* ]]; then
+  IN_WORKTREE=true
+  WORKTREE_DIR="$(git rev-parse --show-toplevel)"
+  MAIN_WORKTREE="$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)"
+fi
+
 # Step 3: Merge
 if [[ "$DO_MERGE" == "true" ]]; then
   info "Rebasing and merging PR #$PR_NUMBER..."
-  
-  if gh pr merge "$PR_NUMBER" --rebase --delete-branch; then
+
+  MERGE_OUTPUT=""
+  MERGE_EXIT=0
+  MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" --rebase --delete-branch 2>&1) || MERGE_EXIT=$?
+
+  # Always verify the actual merge state on GitHub regardless of exit code
+  # gh can exit non-zero if the merge succeeded but branch deletion failed
+  PR_MERGED=false
+  ACTUAL_STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+  if [[ "$ACTUAL_STATE" == "MERGED" ]]; then
+    PR_MERGED=true
+  fi
+
+  if [[ "$PR_MERGED" == "true" ]]; then
     success "PR #$PR_NUMBER merged successfully!"
-    
-    # Step 4: Run finish-pr if available
+
+    # Report if gh had a non-zero exit despite merge succeeding
+    if [[ $MERGE_EXIT -ne 0 ]]; then
+      warn "gh pr merge exited with code $MERGE_EXIT (merge succeeded, but branch cleanup may have had issues)"
+      [[ -n "$MERGE_OUTPUT" ]] && echo "  $MERGE_OUTPUT"
+    fi
+  else
+    error "Failed to merge PR #$PR_NUMBER"
+    [[ -n "$MERGE_OUTPUT" ]] && echo "  $MERGE_OUTPUT"
+    exit 1
+  fi
+
+  # Step 4: Cleanup
+  if [[ "$IN_WORKTREE" == "true" ]]; then
+    info "Running in worktree: $WORKTREE_DIR"
+    info "Cleaning up worktree and branch..."
+
+    CLEANUP_FAILED=false
+
+    # Move to main worktree before removing this one
+    cd "$MAIN_WORKTREE"
+
+    # Remove the worktree
+    if git worktree remove "$WORKTREE_DIR" --force 2>/dev/null; then
+      success "Removed worktree: $WORKTREE_DIR"
+    else
+      warn "Could not remove worktree: $WORKTREE_DIR"
+      warn "You may need to manually run: git worktree remove '$WORKTREE_DIR' --force"
+      CLEANUP_FAILED=true
+    fi
+
+    # Delete local branch (remote branch already deleted by --delete-branch)
+    if git branch -D "$BRANCH" 2>/dev/null; then
+      success "Deleted local branch: $BRANCH"
+    else
+      # Branch may already be gone if worktree removal cleaned it up
+      if git show-ref --verify --quiet "refs/heads/$BRANCH" 2>/dev/null; then
+        warn "Could not delete local branch: $BRANCH"
+        CLEANUP_FAILED=true
+      fi
+    fi
+
+    # Fetch and prune to clean up remote tracking refs
+    git fetch origin --prune 2>/dev/null || true
+
+    if [[ "$CLEANUP_FAILED" == "true" ]]; then
+      warn "Some cleanup steps had issues (see above), but PR is merged."
+    else
+      success "All clean! Now in: $MAIN_WORKTREE"
+    fi
+  else
+    # Normal (non-worktree) flow: use finish-pr
     if command -v finish-pr &> /dev/null; then
       info "Running finish-pr to cleanup..."
-      finish-pr
-      success "All done! 🚀"
+      if finish-pr; then
+        success "All done!"
+      else
+        warn "finish-pr had issues, but PR #$PR_NUMBER is merged."
+      fi
     else
       warn "finish-pr not found, skipping local cleanup"
       info "You may want to: git checkout main && git pull"
     fi
-  else
-    error "Failed to merge PR"
-    exit 1
   fi
 else
   success "PR #$PR_NUMBER is ready to merge (--no-merge specified)"

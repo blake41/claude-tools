@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+finish-pr: After merging a PR on GitHub, switch to the default branch, pull latest, and delete the current branch locally and on the remote.
+
+Usage:
+  finish-pr [options]
+
+Options:
+      --no-force         Don't force delete local branch (fail if not fully merged)
+      --no-remote        Skip deleting the remote branch
+  -r, --remote <name>    Git remote name (default: origin)
+  -b, --base <branch>    Default base branch (auto-detected if omitted)
+  -h, --help             Show this help and exit
+
+Worktree support:
+  When run from a git worktree, finish-pr will remove the worktree and delete
+  the branch instead of trying to checkout the base branch (which would fail
+  since it's checked out in the main worktree).
+
+Config file (.finish-pr.conf in repo root):
+  WORKING_BRANCH=<branch>   After pulling base, checkout this branch and rebase
+  FORCE_DEFAULT=0           Override default force delete behavior
+EOF
+}
+
+FORCE_DELETE=1  # Default to force delete
+NO_REMOTE=0
+REMOTE="origin"
+BASE_BRANCH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-force)
+      FORCE_DELETE=0
+      shift
+      ;;
+    --no-remote)
+      NO_REMOTE=1
+      shift
+      ;;
+    -r|--remote)
+      REMOTE="${2:-origin}"
+      shift 2
+      ;;
+    -b|--base)
+      BASE_BRANCH="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -f|--force)
+      # Keep for backwards compatibility, but it's now the default
+      FORCE_DELETE=1
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "git is required but not found in PATH" >&2
+  exit 1
+fi
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Not inside a Git repository" >&2
+  exit 1
+fi
+
+# Get the repo/worktree root
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Load config file if present
+CONFIG_FILE="${REPO_ROOT}/.finish-pr.conf"
+WORKING_BRANCH=""
+if [[ -f "${CONFIG_FILE}" ]]; then
+  # Source the config file (safe since we control its location)
+  # shellcheck source=/dev/null
+  source "${CONFIG_FILE}"
+  # Allow config to override force default
+  if [[ -n "${FORCE_DEFAULT:-}" ]]; then
+    FORCE_DELETE="${FORCE_DEFAULT}"
+  fi
+fi
+
+current_branch=$(git branch --show-current 2>/dev/null || true)
+if [[ -z "${current_branch}" ]]; then
+  echo "Detached HEAD state detected; cannot determine current branch to delete" >&2
+  exit 1
+fi
+
+# Determine base branch if not provided
+if [[ -z "${BASE_BRANCH}" ]]; then
+  if head_ref=$(git symbolic-ref --quiet --short "refs/remotes/${REMOTE}/HEAD" 2>/dev/null || true); then
+    if [[ -n "${head_ref}" ]]; then
+      BASE_BRANCH="${head_ref#${REMOTE}/}"
+    fi
+  fi
+fi
+
+if [[ -z "${BASE_BRANCH}" ]]; then
+  BASE_BRANCH=$(git remote show "${REMOTE}" 2>/dev/null | sed -n '/HEAD branch/s/.*: //p' || true)
+fi
+
+if [[ -z "${BASE_BRANCH}" ]]; then
+  if git show-ref --verify --quiet "refs/heads/main" || git show-ref --verify --quiet "refs/remotes/${REMOTE}/main"; then
+    BASE_BRANCH="main"
+  elif git show-ref --verify --quiet "refs/heads/master" || git show-ref --verify --quiet "refs/remotes/${REMOTE}/master"; then
+    BASE_BRANCH="master"
+  else
+    echo "Unable to auto-detect default branch. Provide with -b/--base." >&2
+    exit 1
+  fi
+fi
+
+if ! git diff-index --quiet HEAD --; then
+  echo "Working tree has uncommitted changes. Commit or stash before proceeding." >&2
+  exit 1
+fi
+
+# Detect if we're inside a git worktree
+IN_WORKTREE=false
+WORKTREE_DIR=""
+MAIN_WORKTREE=""
+if [[ "$(git rev-parse --git-dir)" == *".git/worktrees/"* ]]; then
+  IN_WORKTREE=true
+  WORKTREE_DIR="$(git rev-parse --show-toplevel)"
+  MAIN_WORKTREE="$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)"
+fi
+
+if [[ "${IN_WORKTREE}" == "true" ]]; then
+  echo "Detected worktree: ${WORKTREE_DIR}"
+  echo "Main worktree: ${MAIN_WORKTREE}"
+
+  # In a worktree, we can't checkout the base branch (it's in the main worktree).
+  # Instead: remove the worktree and delete the branch.
+  git fetch "${REMOTE}" --prune
+
+  # Delete remote branch if it exists
+  if [[ ${NO_REMOTE} -ne 1 ]]; then
+    if git ls-remote --exit-code --heads "${REMOTE}" "${current_branch}" >/dev/null 2>&1; then
+      echo "Deleting remote branch ${REMOTE}/${current_branch}..."
+      git push "${REMOTE}" --delete "${current_branch}" || true
+    else
+      echo "Remote branch ${REMOTE}/${current_branch} not found (likely already deleted)."
+    fi
+  fi
+
+  # Move to main worktree, then remove this worktree and branch
+  cd "${MAIN_WORKTREE}"
+
+  if git worktree remove "${WORKTREE_DIR}" --force 2>/dev/null; then
+    echo "Removed worktree: ${WORKTREE_DIR}"
+  else
+    echo "Warning: Could not remove worktree. Run manually: git worktree remove '${WORKTREE_DIR}' --force" >&2
+  fi
+
+  if git show-ref --verify --quiet "refs/heads/${current_branch}" 2>/dev/null; then
+    echo "Deleting local branch ${current_branch}..."
+    if [[ ${FORCE_DELETE} -eq 1 ]]; then
+      git branch -D "${current_branch}"
+    else
+      git branch -d "${current_branch}" || echo "Local delete failed (branch not fully merged)." >&2
+    fi
+  fi
+
+  echo "Done. Worktree removed. Now in: ${MAIN_WORKTREE}"
+elif [[ "${current_branch}" == "${BASE_BRANCH}" ]]; then
+  echo "Already on ${BASE_BRANCH}. Pulling latest..."
+  git fetch "${REMOTE}" --prune
+  git pull --ff-only "${REMOTE}" "${BASE_BRANCH}"
+  echo "Nothing to delete; you are on the base branch."
+else
+  echo "Switching to ${BASE_BRANCH}..."
+  git fetch "${REMOTE}" --prune
+  git checkout "${BASE_BRANCH}"
+  git pull --ff-only "${REMOTE}" "${BASE_BRANCH}"
+
+  echo "Deleting local branch ${current_branch}..."
+  if [[ ${FORCE_DELETE} -eq 1 ]]; then
+    git branch -D "${current_branch}"
+  else
+    if ! git branch -d "${current_branch}"; then
+      echo "Local delete failed (branch not fully merged). Re-run with -f/--force to override." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ ${NO_REMOTE} -eq 1 ]]; then
+    echo "Skipping remote branch deletion by request."
+  else
+    if git ls-remote --exit-code --heads "${REMOTE}" "${current_branch}" >/dev/null 2>&1; then
+      echo "Deleting remote branch ${REMOTE}/${current_branch}..."
+      # If this fails (e.g., already deleted by GitHub), continue.
+      git push "${REMOTE}" --delete "${current_branch}" || true
+    else
+      echo "Remote branch ${REMOTE}/${current_branch} not found (likely already deleted)."
+    fi
+  fi
+fi
+
+# If WORKING_BRANCH is configured and we're NOT in a worktree, checkout and rebase
+if [[ "${IN_WORKTREE}" == "false" ]]; then
+  if [[ -n "${WORKING_BRANCH:-}" ]]; then
+    echo ""
+    echo "Switching to working branch ${WORKING_BRANCH}..."
+    if git show-ref --verify --quiet "refs/heads/${WORKING_BRANCH}"; then
+      git checkout "${WORKING_BRANCH}"
+      echo "Rebasing ${WORKING_BRANCH} onto ${BASE_BRANCH}..."
+      git rebase "${BASE_BRANCH}"
+      echo "Done. Now on ${WORKING_BRANCH}, rebased onto ${BASE_BRANCH}."
+    else
+      echo "Warning: Working branch ${WORKING_BRANCH} not found locally. Staying on ${BASE_BRANCH}."
+    fi
+  elif [[ "${current_branch}" != "${BASE_BRANCH}" ]]; then
+    echo "Done. Now on ${BASE_BRANCH} with latest changes pulled."
+  fi
+fi
