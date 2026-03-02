@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BEAM_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")" && pwd)"
+WEB_DIR="$BEAM_DIR/web"
+
+usage() {
+  echo "Usage: beam <breadboard.md>"
+  echo ""
+  echo "Renders a breadboard markdown file as a TLDraw canvas."
+  exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+FILE="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+if [[ ! -f "$FILE" ]]; then
+  echo "Error: File not found: $1"
+  exit 1
+fi
+
+# Build web if dist doesn't exist
+if [[ ! -d "$WEB_DIR/dist" ]]; then
+  echo "Building web app..."
+  (cd "$WEB_DIR" && bun run build)
+fi
+
+echo "Starting beam server..."
+echo "File: $FILE"
+echo ""
+
+# Start server, open browser after short delay
+(sleep 1 && open "http://localhost:5555") &
+
+exec bun "$BEAM_DIR/server.ts" "$FILE"
