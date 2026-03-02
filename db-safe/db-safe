@@ -1,0 +1,131 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="db-safe"
+
+# Find .db-safe.json by walking up from cwd
+find_config() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.db-safe.json" ]]; then
+      echo "$dir/.db-safe.json"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+cmd_help() {
+  cat <<'HELP'
+db-safe: Safe database CLI for AI agent workflows
+
+USAGE
+  db-safe <command> <environment> "<query>"
+
+COMMANDS
+  read <env> "<query>"     Execute a Prisma read query (agent-safe)
+  write <env> "<query>"    Execute a Prisma write query (requires human TTY)
+  sql <env> "<sql>"        Execute raw SQL read (agent-safe)
+  sql:write <env> "<sql>"  Execute raw SQL write (requires human TTY)
+  help                     Show this help
+
+ENVIRONMENTS
+  Defined in .db-safe.json in your project root.
+
+EXAMPLES
+  db-safe sql staging "SELECT count(*) FROM accounts"
+  db-safe read staging "prisma.account.findMany({ take: 5 })"
+  db-safe sql:write production "UPDATE accounts SET segment = 'enterprise' WHERE account_id = '001xxx'"
+
+CONFIG
+  Create .db-safe.json in your project root:
+  {
+    "environments": {
+      "staging":    { "url": "$DATABASE_URL", "label": "Staging" },
+      "production": { "url": "$DATABASE_URL_PROD", "label": "Production" }
+    }
+  }
+
+  URLs can reference environment variables with $VAR_NAME.
+
+SAFETY
+  - Read operations execute immediately (agent-safe)
+  - Write operations require interactive TTY + typing "yes"
+  - Prisma writes have middleware defense-in-depth
+HELP
+}
+
+# Validate args
+case "${1:-}" in
+  help|--help|-h)
+    cmd_help
+    exit 0
+    ;;
+  read|write|sql|sql:write)
+    ;;
+  "")
+    cmd_tree "$TOOL_NAME" "Safe database CLI for AI agent workflows" "$(jq -n '[
+      {"name": "read",      "description": "Prisma read query (agent-safe)",      "usage": "db-safe read <env> \"<query>\""},
+      {"name": "write",     "description": "Prisma write query (requires human)", "usage": "db-safe write <env> \"<query>\""},
+      {"name": "sql",       "description": "Raw SQL read (agent-safe)",           "usage": "db-safe sql <env> \"<sql>\""},
+      {"name": "sql:write", "description": "Raw SQL write (requires human)",      "usage": "db-safe sql:write <env> \"<sql>\""},
+      {"name": "help",      "description": "Show detailed help",                  "usage": "db-safe help"}
+    ]')"
+    exit 0
+    ;;
+  *)
+    json_error "$TOOL_NAME" "Unknown command: $1" "UNKNOWN_CMD" "Run 'db-safe help' for usage"
+    ;;
+esac
+
+COMMAND="$1"
+ENV="${2:-}"
+QUERY="${3:-}"
+
+if [[ -z "$ENV" || -z "$QUERY" ]]; then
+  json_error "$TOOL_NAME" "Missing arguments. Usage: db-safe $COMMAND <env> \"<query>\"" "MISSING_ARGS" "Run 'db-safe help' for usage"
+fi
+
+# Find config
+CONFIG_FILE=$(find_config) || {
+  json_error "$TOOL_NAME" "No .db-safe.json found in current directory or parents" "NO_CONFIG" "Create .db-safe.json in your project root. Run 'db-safe help' for format."
+}
+
+# Load .env from the project root (same directory as .db-safe.json)
+PROJECT_DIR="$(dirname "$CONFIG_FILE")"
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+  set -a
+  source "$PROJECT_DIR/.env"
+  set +a
+fi
+
+# Map command to execute.ts mode
+case "$COMMAND" in
+  read)      MODE="prisma-read" ;;
+  write)     MODE="prisma-write" ;;
+  sql)       MODE="sql-read" ;;
+  sql:write) MODE="sql-write" ;;
+esac
+
+# Delegate to bun via env vars (avoids sandbox issues with argv)
+export DB_SAFE_MODE="$MODE"
+export DB_SAFE_ENV="$ENV"
+export DB_SAFE_QUERY="$QUERY"
+export DB_SAFE_CONFIG="$CONFIG_FILE"
+
+# Use a static temp dir so Claude Code sandbox can whitelist it
+export BUN_TMPDIR="/tmp/bun-db-safe"
+mkdir -p "$BUN_TMPDIR"
+
+# Use bun -e to avoid module graph cache writes that the sandbox blocks.
+# bun <file> with node_modules imports triggers tempdir writes; bun -e does not.
+EXECUTE_JS="$SCRIPT_DIR/execute.js"
+if [[ ! -f "$EXECUTE_JS" ]] || [[ "$SCRIPT_DIR/execute.ts" -nt "$EXECUTE_JS" ]]; then
+  bun build "$SCRIPT_DIR/execute.ts" --outfile "$EXECUTE_JS" --target bun 2>/dev/null
+fi
+exec bun -e "$(cat "$EXECUTE_JS")"
