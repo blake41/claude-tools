@@ -21,6 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 const http = require('http');
+const net = require('net');
 const { spawn, execSync } = require('child_process');
 const Diff = require('diff');
 
@@ -143,6 +144,10 @@ function cleanStaleRecording() {
 
 // Headless mode management
 const HEADLESS_PID_FILE = `/tmp/browser-ctl-headless-${CURRENT_PROFILE}.pid`;
+
+// Server mode paths
+const SERVER_SOCKET_PATH = `/tmp/browser-ctl-server-${CURRENT_PROFILE}.sock`;
+const SERVER_PID_FILE = `/tmp/browser-ctl-server-${CURRENT_PROFILE}.pid`;
 
 // Check if Chrome is running on the port
 async function isChromeRunning() {
@@ -1145,7 +1150,7 @@ async function connect() {
     const activePort = findDevToolsActivePortForPort(port);
     if (activePort) {
       try {
-        const wsUrl = `ws://${CDP_HOST}:${activePort.port}${activePort.wsPath}`;
+        const wsUrl = `ws://127.0.0.1:${activePort.port}${activePort.wsPath}`;
         console.error(`${c.dim}HTTP discovery failed, trying direct WebSocket...${c.reset}`);
         const browser = await chromium.connectOverCDP(wsUrl);
         const contexts = browser.contexts();
@@ -2157,6 +2162,38 @@ async function sendExtensionMessage(port, target, message) {
   }
 }
 
+// exec* wrappers for tabs commands (used by server dispatch)
+
+async function execTabs(page, args, { contexts } = {}) {
+  if (!contexts) return { output: `${c.red}No contexts available${c.reset}`, data: {} };
+  const allPages = contexts.flatMap(ctx => ctx.pages());
+  const lines = [`${c.cyan}Open tabs (${allPages.length}):${c.reset}`];
+  for (let i = 0; i < allPages.length; i++) {
+    const p = allPages[i];
+    const title = await p.title();
+    lines.push(`  ${i}: ${title || '(no title)'}`);
+    lines.push(`     ${c.dim}${p.url()}${c.reset}`);
+  }
+  return { output: lines.join('\n'), data: { count: allPages.length } };
+}
+
+async function execTab(page, args, { contexts, setPage } = {}) {
+  if (!contexts) return { output: `${c.red}No contexts available${c.reset}`, data: {} };
+  const index = parseInt(args[0]);
+  if (isNaN(index)) {
+    throw new Error('Usage: browser-ctl tab <index>');
+  }
+  const allPages = contexts.flatMap(ctx => ctx.pages());
+  if (index < 0 || index >= allPages.length) {
+    throw new Error(`Invalid tab index: ${index}`);
+  }
+  const targetPage = allPages[index];
+  await targetPage.bringToFront();
+  if (setPage) setPage(targetPage);
+  const title = await targetPage.title();
+  return { output: `${c.green}Switched to tab ${index}:${c.reset} ${title}`, data: { index, title } };
+}
+
 // Dispatch table for compound commands
 
 const EXEC_DISPATCH = {
@@ -2180,9 +2217,11 @@ const EXEC_DISPATCH = {
   storage: execStorage, text: execText,
   value: execValue, attr: execAttr,
   count: execCount, check: execCheck,
+  tabs: execTabs, tab: execTab,
   'record-start': execRecordStart,
   'record-stop': execRecordStop,
   'record-status': execRecordStatus,
+  'record-cancel': execRecordCancel,
   'diff-snapshot': execDiffSnapshot,
   'diff-screenshot': execDiffScreenshot,
   'diff-url': execDiffUrl,
@@ -3449,6 +3488,294 @@ function escapeXml(str) {
     .replace(/'/g, '&apos;');
 }
 
+// ─── Server mode ───────────────────────────────────────────────────
+
+// Commands that should never be dispatched through the server
+const SERVER_SKIP_COMMANDS = new Set([
+  'serve', 'logs', 'log', 'record', 'test', '--help', '-h'
+]);
+
+// Try to dispatch a command to a running server. Returns null if no server.
+async function tryServerDispatch(command, cmdArgs) {
+  if (SERVER_SKIP_COMMANDS.has(command)) return null;
+  if (!fs.existsSync(SERVER_SOCKET_PATH)) return null;
+
+  // Check if PID is alive (detect stale socket)
+  if (fs.existsSync(SERVER_PID_FILE)) {
+    try {
+      const pid = parseInt(fs.readFileSync(SERVER_PID_FILE, 'utf8').trim(), 10);
+      if (!isProcessAlive(pid)) {
+        // Stale socket — clean up and fall through
+        try { fs.unlinkSync(SERVER_SOCKET_PATH); } catch (e) {}
+        try { fs.unlinkSync(SERVER_PID_FILE); } catch (e) {}
+        return null;
+      }
+    } catch (e) {
+      return null;
+    }
+  }
+
+  return new Promise((resolve) => {
+    const client = net.createConnection(SERVER_SOCKET_PATH, () => {
+      client.write(JSON.stringify({ command, args: cmdArgs }) + '\n');
+    });
+
+    let data = '';
+    client.on('data', (chunk) => { data += chunk; });
+    client.on('end', () => {
+      try {
+        resolve(JSON.parse(data));
+      } catch (e) {
+        resolve(null); // Malformed response — fall through to direct connect
+      }
+    });
+    client.on('error', () => {
+      resolve(null); // Connection refused — server not running, fall through
+    });
+
+    // Timeout after 30s for long-running commands
+    client.setTimeout(30000, () => {
+      client.destroy();
+      resolve(null);
+    });
+  });
+}
+
+// Server daemon
+async function cmdServe(args) {
+  // Handle --stop
+  if (args.includes('--stop')) {
+    if (fs.existsSync(SERVER_PID_FILE)) {
+      try {
+        const pid = parseInt(fs.readFileSync(SERVER_PID_FILE, 'utf8').trim(), 10);
+        if (isProcessAlive(pid)) {
+          process.kill(pid, 'SIGTERM');
+          console.log(`${c.green}Server stopped${c.reset} (pid ${pid})`);
+        } else {
+          console.log(`${c.dim}Server not running (stale PID file)${c.reset}`);
+        }
+      } catch (e) {
+        console.log(`${c.dim}Server not running${c.reset}`);
+      }
+      try { fs.unlinkSync(SERVER_PID_FILE); } catch (e) {}
+      try { fs.unlinkSync(SERVER_SOCKET_PATH); } catch (e) {}
+    } else {
+      console.log(`${c.dim}Server not running${c.reset}`);
+    }
+    return;
+  }
+
+  // Handle --status
+  if (args.includes('--status')) {
+    if (fs.existsSync(SERVER_PID_FILE)) {
+      try {
+        const pid = parseInt(fs.readFileSync(SERVER_PID_FILE, 'utf8').trim(), 10);
+        if (isProcessAlive(pid)) {
+          console.log(`${c.green}Server running${c.reset} (pid ${pid}, profile: ${CURRENT_PROFILE})`);
+          console.log(`${c.dim}Socket: ${SERVER_SOCKET_PATH}${c.reset}`);
+          return;
+        }
+      } catch (e) {}
+    }
+    console.log(`${c.dim}Server not running${c.reset} (profile: ${CURRENT_PROFILE})`);
+    return;
+  }
+
+  // Handle --daemon (fork and detach)
+  if (args.includes('--daemon')) {
+    const filteredArgs = process.argv.slice(2).filter(a => a !== '--daemon');
+    const child = spawn(process.argv[0], [process.argv[1], ...filteredArgs], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    // Wait briefly for the server to write its PID file
+    await new Promise(r => setTimeout(r, 500));
+    if (fs.existsSync(SERVER_PID_FILE)) {
+      const pid = fs.readFileSync(SERVER_PID_FILE, 'utf8').trim();
+      console.log(`${c.green}Server started in background${c.reset} (pid ${pid})`);
+    } else {
+      console.log(`${c.green}Server starting in background...${c.reset}`);
+    }
+    return;
+  }
+
+  // Clean up stale socket
+  if (fs.existsSync(SERVER_SOCKET_PATH)) {
+    if (fs.existsSync(SERVER_PID_FILE)) {
+      try {
+        const pid = parseInt(fs.readFileSync(SERVER_PID_FILE, 'utf8').trim(), 10);
+        if (isProcessAlive(pid)) {
+          console.error(`${c.red}Server already running${c.reset} (pid ${pid})`);
+          console.error(`Use 'browser-ctl serve --stop' to stop it first`);
+          process.exit(1);
+        }
+      } catch (e) {}
+    }
+    try { fs.unlinkSync(SERVER_SOCKET_PATH); } catch (e) {}
+  }
+
+  // Connect to Chrome
+  let browser, page, contexts;
+  try {
+    const conn = await connect();
+    browser = conn.browser;
+    page = conn.page;
+    contexts = conn.contexts;
+  } catch (err) {
+    console.error(`${c.red}Failed to connect to Chrome: ${err.message}${c.reset}`);
+    process.exit(1);
+  }
+
+  // Write PID file
+  fs.writeFileSync(SERVER_PID_FILE, String(process.pid));
+
+  // Request queue for serialization
+  let processing = false;
+  const queue = [];
+
+  function setPage(newPage) {
+    page = newPage;
+  }
+
+  async function processQueue() {
+    if (processing) return;
+    processing = true;
+    while (queue.length > 0) {
+      const { req, socket } = queue.shift();
+      let response;
+      try {
+        // Health check — reconnect if page is closed
+        try {
+          if (page.isClosed()) {
+            console.error(`${c.dim}Page closed, reconnecting...${c.reset}`);
+            const conn = await connect();
+            browser = conn.browser;
+            page = conn.page;
+            contexts = conn.contexts;
+          }
+        } catch (e) {
+          console.error(`${c.dim}Connection check failed, reconnecting...${c.reset}`);
+          try {
+            const conn = await connect();
+            browser = conn.browser;
+            page = conn.page;
+            contexts = conn.contexts;
+          } catch (reconnErr) {
+            response = { ok: false, error: `Reconnect failed: ${reconnErr.message}` };
+            try { socket.end(JSON.stringify(response) + '\n'); } catch (e) {}
+            continue;
+          }
+        }
+
+        const { command, args: cmdArgs = [] } = req;
+
+        // Handle compound 'do' command
+        if (command === 'do') {
+          const steps = parseDoSteps(cmdArgs);
+          const results = [];
+          for (const [cmd, ...stepArgs] of steps) {
+            const execFn = EXEC_DISPATCH[cmd];
+            if (!execFn) throw new Error(`Unknown command: "${cmd}"`);
+            const result = await execFn(page, stepArgs, { contexts, setPage });
+            results.push({ command: cmd, ...result });
+          }
+          const output = results.map(r => r.output).filter(Boolean).join('\n---\n');
+          response = { ok: true, output, data: results.map(r => r.data) };
+        }
+        // Handle diff subcommands
+        else if (command === 'diff') {
+          const subcommand = cmdArgs[0];
+          const subArgs = cmdArgs.slice(1);
+          const diffMap = {
+            snapshot: execDiffSnapshot, snap: execDiffSnapshot,
+            screenshot: execDiffScreenshot, ss: execDiffScreenshot,
+            url: execDiffUrl,
+          };
+          const execFn = diffMap[subcommand];
+          if (!execFn) throw new Error(`Unknown diff subcommand: ${subcommand}`);
+          const result = await execFn(page, subArgs);
+          response = { ok: true, output: result.output, data: result.data };
+        }
+        // Handle record subcommands
+        else if (command === 'record') {
+          // record commands go through the server too
+          const subcommand = cmdArgs[0];
+          const subArgs = cmdArgs.slice(1);
+          const recordMap = {
+            start: execRecordStart, stop: execRecordStop,
+            status: execRecordStatus, cancel: execRecordCancel,
+          };
+          const execFn = recordMap[subcommand];
+          if (!execFn) throw new Error(`Unknown record subcommand: ${subcommand}`);
+          const result = await execFn(page, subArgs);
+          response = { ok: true, output: result.output, data: result.data };
+        }
+        // Standard dispatch
+        else {
+          const execFn = EXEC_DISPATCH[command];
+          if (!execFn) {
+            response = { ok: false, error: `Unknown command: ${command}` };
+          } else {
+            const result = await execFn(page, cmdArgs, { contexts, setPage });
+            response = { ok: true, output: result.output, data: result.data };
+          }
+        }
+      } catch (err) {
+        response = { ok: false, error: err.message };
+      }
+      try {
+        socket.end(JSON.stringify(response) + '\n');
+      } catch (e) {
+        // Client disconnected
+      }
+    }
+    processing = false;
+  }
+
+  // Start Unix socket server
+  const server = net.createServer((socket) => {
+    let data = '';
+    socket.on('data', (chunk) => {
+      data += chunk;
+      const newlineIdx = data.indexOf('\n');
+      if (newlineIdx !== -1) {
+        const line = data.slice(0, newlineIdx);
+        data = data.slice(newlineIdx + 1);
+        try {
+          const req = JSON.parse(line);
+          queue.push({ req, socket });
+          processQueue();
+        } catch (e) {
+          socket.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }) + '\n');
+        }
+      }
+    });
+    socket.on('error', () => {}); // Ignore client errors
+  });
+
+  server.listen(SERVER_SOCKET_PATH, () => {
+    console.log(`${c.green}Server listening${c.reset} (profile: ${CURRENT_PROFILE}, pid: ${process.pid})`);
+    console.log(`${c.dim}Socket: ${SERVER_SOCKET_PATH}${c.reset}`);
+  });
+
+  // Graceful shutdown
+  function shutdown() {
+    console.log(`\n${c.dim}Server shutting down...${c.reset}`);
+    server.close();
+    try { fs.unlinkSync(SERVER_SOCKET_PATH); } catch (e) {}
+    try { fs.unlinkSync(SERVER_PID_FILE); } catch (e) {}
+    try { browser.close(); } catch (e) {}
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  // Keep process alive
+  // The net server already keeps the event loop running
+}
+
 // Help
 function showHelp() {
   console.log(`
@@ -3574,6 +3901,14 @@ ${c.yellow}COMPOUND${c.reset}
       Separate commands with , or --then
       --json    Output all results as JSON array
 
+${c.yellow}SERVER${c.reset}
+  ${c.green}serve${c.reset}              Start persistent server (foreground)
+  ${c.green}serve --daemon${c.reset}     Start persistent server (background)
+  ${c.green}serve --stop${c.reset}       Stop running server
+  ${c.green}serve --status${c.reset}     Check if server is running
+      Holds a warm CDP connection. Other commands auto-dispatch
+      through the server when running, eliminating reconnect overhead.
+
 ${c.yellow}DATA${c.reset}
   ${c.green}storage${c.reset} <get|set|keys|clear> <local|session> [key] [value]
       Read/write localStorage or sessionStorage
@@ -3657,7 +3992,18 @@ async function main() {
     showHelp();
     process.exit(0);
   }
-  
+
+  // Try server dispatch before falling through to direct connect
+  const serverResult = await tryServerDispatch(command, cmdArgs);
+  if (serverResult !== null) {
+    if (!serverResult.ok) {
+      console.error(`${c.red}${serverResult.error}${c.reset}`);
+      process.exit(1);
+    }
+    if (serverResult.output) console.log(serverResult.output);
+    process.exit(0);
+  }
+
   switch (command) {
     case 'screenshot':
     case 'ss':
@@ -3760,6 +4106,9 @@ async function main() {
       break;
     case 'check':
       await cmdCheck(cmdArgs);
+      break;
+    case 'serve':
+      await cmdServe(cmdArgs);
       break;
     default:
       console.error(`${c.red}Unknown command: ${command}${c.reset}`);
