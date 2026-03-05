@@ -1,0 +1,142 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+source "$SCRIPT_DIR/render-common.sh"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="render-postgres"
+
+cmd_list() {
+    load_api_key || json_error "$TOOL_NAME list" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+    local owner_id
+    owner_id=$(load_workspace) || true
+
+    local url="/postgres?limit=50"
+    if [[ -n "$owner_id" ]]; then
+        url="$url&ownerId=$owner_id"
+    fi
+
+    local raw
+    raw=$(render_api "$url")
+
+    local databases
+    databases=$(echo "$raw" | jq '[.[] | .postgres // . | {id, name, status, plan, region, version, createdAt}]' 2>/dev/null || echo "$raw")
+
+    local na
+    local first_id
+    first_id=$(echo "$databases" | jq -r '.[0].id // empty')
+    if [[ -n "$first_id" ]]; then
+        na=$(next_actions \
+            "$(next_action "render-postgres get $first_id" "Get details for first database")" \
+            "$(next_action "render-postgres conn $first_id" "Get connection info")")
+    else
+        na=$(next_actions)
+    fi
+
+    json_ok "$TOOL_NAME list" "$databases" "$na"
+}
+
+cmd_get() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME get" "Database ID required" "MISSING_ARG" "Usage: render-postgres get <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME get" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api "/postgres/$db_id")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres conn $db_id" "Get connection strings")" \
+        "$(next_action "render-postgres suspend $db_id" "Suspend database")" \
+        "$(next_action "render-postgres resume $db_id" "Resume database")")
+
+    json_ok "$TOOL_NAME get" "$result" "$na"
+}
+
+cmd_conn() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME conn" "Database ID required" "MISSING_ARG" "Usage: render-postgres conn <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME conn" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api "/postgres/$db_id/connection-info")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres get $db_id" "View database details")")
+
+    json_ok "$TOOL_NAME conn" "$result" "$na"
+}
+
+cmd_suspend() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME suspend" "Database ID required" "MISSING_ARG" "Usage: render-postgres suspend <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME suspend" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/postgres/$db_id/suspend" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres resume $db_id" "Resume the database")" \
+        "$(next_action "render-postgres get $db_id" "Check database status")")
+
+    json_ok "$TOOL_NAME suspend" "$(jq -n --arg id "$db_id" '{id: $id, suspended: true}')" "$na"
+}
+
+cmd_resume() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME resume" "Database ID required" "MISSING_ARG" "Usage: render-postgres resume <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME resume" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/postgres/$db_id/resume" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres get $db_id" "Check database status")")
+
+    json_ok "$TOOL_NAME resume" "$(jq -n --arg id "$db_id" '{id: $id, resumed: true}')" "$na"
+}
+
+case "${1:-}" in
+    list)
+        cmd_list
+        ;;
+    get)
+        cmd_get "${2:-}"
+        ;;
+    conn)
+        cmd_conn "${2:-}"
+        ;;
+    suspend)
+        cmd_suspend "${2:-}"
+        ;;
+    resume)
+        cmd_resume "${2:-}"
+        ;;
+    *)
+        cmd_tree "$TOOL_NAME" "Render.com Postgres database management" "$(jq -n '[
+            {name: "list", description: "List all Postgres databases", usage: "render-postgres list"},
+            {name: "get", description: "Get database details", usage: "render-postgres get <database-id>"},
+            {name: "conn", description: "Get connection strings and credentials", usage: "render-postgres conn <database-id>"},
+            {name: "suspend", description: "Suspend a database", usage: "render-postgres suspend <database-id>"},
+            {name: "resume", description: "Resume a suspended database", usage: "render-postgres resume <database-id>"}
+        ]')"
+        ;;
+esac

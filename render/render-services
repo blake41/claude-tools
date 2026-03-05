@@ -115,6 +115,226 @@ cmd_env() {
     json_ok "$TOOL_NAME env" "$env_vars" "$na"
 }
 
+cmd_deploy() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME deploy" "Service ID required" "MISSING_ARG" "Usage: render-services deploy <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME deploy" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/deploys" '{}')
+
+    local deploy
+    deploy=$(echo "$result" | jq '{id: .id, status: .status, trigger: .trigger, createdAt: .createdAt}')
+
+    local deploy_id
+    deploy_id=$(echo "$result" | jq -r '.id // empty')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services deploys $service_id" "Check deploy status")" \
+        "$(next_action "render-logs $service_id --type build" "View build logs")" \
+        "$(next_action "render-services deploy-cancel $service_id $deploy_id" "Cancel this deploy")")
+
+    json_ok "$TOOL_NAME deploy" "$deploy" "$na"
+}
+
+cmd_deploy_cancel() {
+    local service_id="${1:-}"
+    local deploy_id="${2:-}"
+    if [[ -z "$service_id" || -z "$deploy_id" ]]; then
+        json_error "$TOOL_NAME deploy-cancel" "Service ID and deploy ID required" "MISSING_ARG" \
+            "Usage: render-services deploy-cancel <service-id> <deploy-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME deploy-cancel" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/deploys/$deploy_id/cancel" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services deploys $service_id" "Check deploy status")" \
+        "$(next_action "render-services get $service_id" "View service details")")
+
+    json_ok "$TOOL_NAME deploy-cancel" "$(jq -n --arg id "$deploy_id" '{id: $id, cancelled: true}')" "$na"
+}
+
+cmd_restart() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME restart" "Service ID required" "MISSING_ARG" "Usage: render-services restart <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME restart" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/restart" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $service_id" "Check service status")" \
+        "$(next_action "render-logs $service_id" "View logs")")
+
+    json_ok "$TOOL_NAME restart" "$(jq -n --arg id "$service_id" '{id: $id, restarted: true}')" "$na"
+}
+
+cmd_suspend() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME suspend" "Service ID required" "MISSING_ARG" "Usage: render-services suspend <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME suspend" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/suspend" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services resume $service_id" "Resume the service")" \
+        "$(next_action "render-services get $service_id" "Check service status")")
+
+    json_ok "$TOOL_NAME suspend" "$(jq -n --arg id "$service_id" '{id: $id, suspended: true}')" "$na"
+}
+
+cmd_resume() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME resume" "Service ID required" "MISSING_ARG" "Usage: render-services resume <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME resume" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/resume" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $service_id" "Check service status")" \
+        "$(next_action "render-logs $service_id" "View logs")")
+
+    json_ok "$TOOL_NAME resume" "$(jq -n --arg id "$service_id" '{id: $id, resumed: true}')" "$na"
+}
+
+cmd_events() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME events" "Service ID required" "MISSING_ARG" "Usage: render-services events <service-id> [--limit N]"
+    fi
+    shift
+    local limit=20
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --limit) limit="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    load_api_key || json_error "$TOOL_NAME events" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/services/$service_id/events?limit=$limit")
+
+    local events
+    events=$(echo "$raw" | jq '[.[] | .event // . | {id, type, timestamp, details}]' 2>/dev/null || echo "$raw")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $service_id" "View service details")" \
+        "$(next_action "render-services deploys $service_id" "View recent deploys")" \
+        "$(next_action "render-logs $service_id" "View logs")")
+
+    json_ok "$TOOL_NAME events" "$events" "$na"
+}
+
+cmd_scale() {
+    local service_id="${1:-}"
+    local num_instances="${2:-}"
+    if [[ -z "$service_id" || -z "$num_instances" ]]; then
+        json_error "$TOOL_NAME scale" "Service ID and instance count required" "MISSING_ARG" \
+            "Usage: render-services scale <service-id> <num-instances>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME scale" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/scale" "{\"numInstances\":$num_instances}")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $service_id" "Check service status")" \
+        "$(next_action "render-services instances $service_id" "View running instances")")
+
+    json_ok "$TOOL_NAME scale" "$(jq -n --arg id "$service_id" --argjson n "$num_instances" '{id: $id, numInstances: $n, scaled: true}')" "$na"
+}
+
+cmd_instances() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME instances" "Service ID required" "MISSING_ARG" "Usage: render-services instances <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME instances" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/services/$service_id/instances")
+
+    local instances
+    instances=$(echo "$raw" | jq '[.[] | .instance // . | {id, status, createdAt, updatedAt}]' 2>/dev/null || echo "$raw")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services scale $service_id N" "Scale instances")" \
+        "$(next_action "render-services get $service_id" "View service details")")
+
+    json_ok "$TOOL_NAME instances" "$instances" "$na"
+}
+
+cmd_rollback() {
+    local service_id="${1:-}"
+    local deploy_id="${2:-}"
+    if [[ -z "$service_id" || -z "$deploy_id" ]]; then
+        json_error "$TOOL_NAME rollback" "Service ID and deploy ID required" "MISSING_ARG" \
+            "Usage: render-services rollback <service-id> <deploy-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME rollback" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/services/$service_id/rollback" "{\"deployId\":\"$deploy_id\"}")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services deploys $service_id" "Check deploy status")" \
+        "$(next_action "render-logs $service_id" "View logs")")
+
+    json_ok "$TOOL_NAME rollback" "$result" "$na"
+}
+
+cmd_custom_domains() {
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME custom-domains" "Service ID required" "MISSING_ARG" "Usage: render-services custom-domains <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME custom-domains" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/services/$service_id/custom-domains")
+
+    local domains
+    domains=$(echo "$raw" | jq '[.[] | .customDomain // . | {id, name, domainType, verificationStatus, createdAt}]' 2>/dev/null || echo "$raw")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-services get $service_id" "View service details")")
+
+    json_ok "$TOOL_NAME custom-domains" "$domains" "$na"
+}
+
 cmd_env_set() {
     local service_id="${1:-}"
     local key="${2:-}"
@@ -147,6 +367,36 @@ case "${1:-}" in
     deploys)
         shift; cmd_deploys "$@"
         ;;
+    deploy)
+        cmd_deploy "${2:-}"
+        ;;
+    deploy-cancel)
+        shift; cmd_deploy_cancel "$@"
+        ;;
+    restart)
+        cmd_restart "${2:-}"
+        ;;
+    suspend)
+        cmd_suspend "${2:-}"
+        ;;
+    resume)
+        cmd_resume "${2:-}"
+        ;;
+    events)
+        shift; cmd_events "$@"
+        ;;
+    scale)
+        shift; cmd_scale "$@"
+        ;;
+    instances)
+        cmd_instances "${2:-}"
+        ;;
+    rollback)
+        shift; cmd_rollback "$@"
+        ;;
+    custom-domains)
+        cmd_custom_domains "${2:-}"
+        ;;
     env)
         cmd_env "${2:-}"
         ;;
@@ -157,7 +407,17 @@ case "${1:-}" in
         cmd_tree "$TOOL_NAME" "Render.com service management" "$(jq -n '[
             {name: "list", description: "List all services", usage: "render-services list"},
             {name: "get", description: "Get service details", usage: "render-services get <service-id>"},
+            {name: "deploy", description: "Trigger a deploy", usage: "render-services deploy <service-id>"},
+            {name: "deploy-cancel", description: "Cancel a running deploy", usage: "render-services deploy-cancel <service-id> <deploy-id>"},
             {name: "deploys", description: "List recent deploys", usage: "render-services deploys <service-id> [--limit N]"},
+            {name: "restart", description: "Restart a service", usage: "render-services restart <service-id>"},
+            {name: "suspend", description: "Suspend a service", usage: "render-services suspend <service-id>"},
+            {name: "resume", description: "Resume a suspended service", usage: "render-services resume <service-id>"},
+            {name: "events", description: "View service event history", usage: "render-services events <service-id> [--limit N]"},
+            {name: "scale", description: "Scale service instances", usage: "render-services scale <service-id> <num-instances>"},
+            {name: "instances", description: "List running instances", usage: "render-services instances <service-id>"},
+            {name: "rollback", description: "Rollback to a previous deploy", usage: "render-services rollback <service-id> <deploy-id>"},
+            {name: "custom-domains", description: "List custom domains", usage: "render-services custom-domains <service-id>"},
             {name: "env", description: "List environment variables (masked)", usage: "render-services env <service-id>"},
             {name: "env-set", description: "Set an environment variable", usage: "render-services env-set <service-id> <KEY> <VALUE>"}
         ]')"
