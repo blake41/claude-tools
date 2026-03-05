@@ -71,8 +71,16 @@ cmd_deploys() {
     local raw
     raw=$(render_api "/services/$service_id/deploys?limit=$limit")
 
+    # Check for API error (non-array response)
+    if ! echo "$raw" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        local msg
+        msg=$(echo "$raw" | jq -r '.message // "Unknown error"' 2>/dev/null || echo "$raw")
+        json_error "$TOOL_NAME deploys" "$msg" "API_ERROR" "Check the service ID: render-services list"
+        return
+    fi
+
     local deploys
-    deploys=$(echo "$raw" | jq '[.[] | .deploy | {
+    deploys=$(echo "$raw" | jq '[.[] | (.deploy // .) | {
         id, status,
         trigger: (.trigger // "unknown"),
         commit: (.commit // {}),
