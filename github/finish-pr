@@ -177,13 +177,13 @@ if [[ "${IN_WORKTREE}" == "true" ]]; then
 elif [[ "${current_branch}" == "${BASE_BRANCH}" ]]; then
   echo "Already on ${BASE_BRANCH}. Pulling latest..."
   git fetch "${REMOTE}" --prune
-  git pull --ff-only "${REMOTE}" "${BASE_BRANCH}"
+  git pull --rebase "${REMOTE}" "${BASE_BRANCH}"
   echo "Nothing to delete; you are on the base branch."
 else
   echo "Switching to ${BASE_BRANCH}..."
   git fetch "${REMOTE}" --prune
   git checkout "${BASE_BRANCH}"
-  git pull --ff-only "${REMOTE}" "${BASE_BRANCH}"
+  git pull --rebase "${REMOTE}" "${BASE_BRANCH}"
 
   echo "Deleting local branch ${current_branch}..."
   if [[ ${FORCE_DELETE} -eq 1 ]]; then
