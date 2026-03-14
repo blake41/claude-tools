@@ -7,6 +7,8 @@ import { homedir } from "os";
 import Anthropic from "@anthropic-ai/sdk";
 import PQueue from "p-queue";
 import db from "./db.js";
+import { config } from "./config.js";
+import chatRouter, { SYSTEM_PROMPT, tools, executeSql, parseResult } from "./chat.js";
 
 function cleanXmlNoise(text: string): string {
   return text
@@ -19,10 +21,11 @@ function cleanXmlNoise(text: string): string {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = 5198;
+const PORT = config.port;
 
 app.use(cors());
 app.use(express.json());
+app.use(chatRouter);
 
 // Serve static frontend in production
 app.use(express.static(join(__dirname, "..", "dist", "web")));
@@ -56,6 +59,10 @@ const getTagByName = db.prepare(`SELECT * FROM tags WHERE name = ?`);
 const updateTag = db.prepare(`
   UPDATE tags SET name = COALESCE(?, name), color = COALESCE(?, color) WHERE id = ?
 `);
+
+const insertAuditLog = db.prepare(
+  `INSERT INTO audit_log (action, entity_type, entity_id, details, created_at) VALUES (?, ?, ?, ?, datetime('now'))`
+);
 
 const getTagsForSession = db.prepare(`
   SELECT t.* FROM tags t JOIN session_tags st ON t.id = st.tag_id WHERE st.session_id = ?
@@ -117,25 +124,40 @@ const getMessages = db.prepare(`
   ORDER BY sequence ASC
 `);
 
-const searchMessages = db.prepare(`
-  SELECT m.session_id, m.role, m.content, m.timestamp, m.sequence,
-         s.title, s.started_at, s.git_branch
-  FROM messages m
+const searchMessagesFts = db.prepare(`
+  SELECT m.session_id, m.role, m.timestamp, m.sequence,
+         snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 24) as snippet,
+         s.title, s.started_at, s.git_branch,
+         rank
+  FROM messages_fts
+  JOIN messages m ON m.id = messages_fts.rowid
   JOIN sessions s ON m.session_id = s.id
-  WHERE m.content LIKE ?
-  ORDER BY m.timestamp DESC
-  LIMIT 100
+  WHERE messages_fts MATCH ?
+  ORDER BY rank
+  LIMIT 200
 `);
 
-const searchMessagesInWorkspace = db.prepare(`
-  SELECT m.session_id, m.role, m.content, m.timestamp, m.sequence,
-         s.title, s.started_at, s.git_branch
-  FROM messages m
+const searchMessagesFtsInWorkspace = db.prepare(`
+  SELECT m.session_id, m.role, m.timestamp, m.sequence,
+         snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 24) as snippet,
+         s.title, s.started_at, s.git_branch,
+         rank
+  FROM messages_fts
+  JOIN messages m ON m.id = messages_fts.rowid
   JOIN sessions s ON m.session_id = s.id
-  WHERE s.workspace_id = ? AND m.content LIKE ?
-  ORDER BY m.timestamp DESC
-  LIMIT 100
+  WHERE s.workspace_id = ? AND messages_fts MATCH ?
+  ORDER BY rank
+  LIMIT 200
 `);
+
+/** Convert user query to FTS5 query — wraps words in double quotes for phrase-like matching */
+function toFtsQuery(query: string): string {
+  // Escape double quotes, wrap each word in quotes for prefix matching
+  const words = query.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '""';
+  // Use AND between terms for better precision
+  return words.map(w => `"${w.replace(/"/g, '""')}"`).join(' AND ');
+}
 
 // ── Summarization Prepared Statements ─────────────────────────────
 
@@ -166,7 +188,7 @@ let summarizeQueue: PQueue | null = null;
 async function runSummarization(
   sessionIds: Array<{ id: string; title: string }>
 ) {
-  const queue = new PQueue({ concurrency: 5 });
+  const queue = new PQueue({ concurrency: config.summaryConcurrency });
   summarizeQueue = queue;
 
   const tasks = sessionIds.map((s) => {
@@ -198,8 +220,8 @@ async function runSummarization(
         const truncated = transcript.slice(0, 32000);
 
         const response = await anthropic.messages.create({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 200,
+          model: config.summaryModel,
+          max_tokens: config.summaryMaxTokens,
           messages: [
             {
               role: "user",
@@ -289,6 +311,34 @@ app.get("/api/sessions", (req, res) => {
   });
 });
 
+app.post("/api/sessions/bulk", (req, res) => {
+  const { ids } = req.body as { ids: string[] };
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    res.status(400).json({ error: "ids array is required" });
+    return;
+  }
+
+  const placeholders = ids.map(() => "?").join(",");
+  const bulkQuery = db.prepare(`
+    SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title,
+           s.message_count, s.user_message_count, s.summary,
+           w.display_name as workspace_name, w.path as workspace_path
+    FROM sessions s
+    JOIN workspaces w ON s.workspace_id = w.id
+    WHERE s.id IN (${placeholders})
+    ORDER BY s.started_at DESC
+  `);
+
+  const sessions = bulkQuery.all(...ids);
+  const enriched = (sessions as Array<Record<string, unknown>>).map((s) => ({
+    ...s,
+    tags: getTagsForSession.all(s.id as string),
+    files_changed: changedFilesForSession.all(s.id as string),
+  }));
+
+  res.json({ sessions: enriched });
+});
+
 app.get("/api/sessions/:id", (req, res) => {
   const session = getSession.get(req.params.id);
   if (!session) {
@@ -307,24 +357,34 @@ app.get("/api/sessions/:id", (req, res) => {
 app.get("/api/search", (req, res) => {
   const query = req.query.q as string;
   if (!query || query.length < 2) {
-    res.json({ results: [] });
+    res.json({ results: [], total_sessions: 0, total_matches: 0 });
     return;
   }
 
-  const pattern = `%${query}%`;
+  const ftsQuery = toFtsQuery(query);
   const workspaceId = req.query.workspace
     ? Number(req.query.workspace)
     : null;
+  const maxMatchesPerSession = 3;
 
-  const results = workspaceId
-    ? searchMessagesInWorkspace.all(workspaceId, pattern)
-    : searchMessages.all(pattern);
+  let results: unknown[];
+  try {
+    results = workspaceId
+      ? searchMessagesFtsInWorkspace.all(workspaceId, ftsQuery)
+      : searchMessagesFts.all(ftsQuery);
+  } catch {
+    // FTS query syntax error — fall back to empty
+    res.json({ results: [], total_sessions: 0, total_matches: 0 });
+    return;
+  }
 
-  // Group by session
+  // Group by session, cap displayed matches at 3
   const grouped = new Map<
     string,
-    { session_id: string; title: string; started_at: string; git_branch: string; matches: unknown[] }
+    { session_id: string; title: string; started_at: string; git_branch: string; matches: Array<{ role: string; snippet: string; timestamp: string; sequence: number }>; match_count: number }
   >();
+
+  let totalMatches = 0;
 
   for (const row of results as Array<{
     session_id: string;
@@ -332,7 +392,7 @@ app.get("/api/search", (req, res) => {
     started_at: string;
     git_branch: string;
     role: string;
-    content: string;
+    snippet: string;
     timestamp: string;
     sequence: number;
   }>) {
@@ -343,19 +403,28 @@ app.get("/api/search", (req, res) => {
         started_at: row.started_at,
         git_branch: row.git_branch,
         matches: [],
+        match_count: 0,
       });
     }
-    const cleaned = cleanXmlNoise(row.content);
-    if (!cleaned) continue;
-    grouped.get(row.session_id)!.matches.push({
-      role: row.role,
-      content: cleaned.slice(0, 300),
-      timestamp: row.timestamp,
-      sequence: row.sequence,
-    });
+    const entry = grouped.get(row.session_id)!;
+    entry.match_count++;
+    totalMatches++;
+    // Only include first N snippets for display
+    if (entry.matches.length < maxMatchesPerSession) {
+      entry.matches.push({
+        role: row.role,
+        snippet: row.snippet,
+        timestamp: row.timestamp,
+        sequence: row.sequence,
+      });
+    }
   }
 
-  res.json({ results: Array.from(grouped.values()) });
+  res.json({
+    results: Array.from(grouped.values()),
+    total_sessions: grouped.size,
+    total_matches: totalMatches,
+  });
 });
 
 // ── Tag Routes ────────────────────────────────────────────────────
@@ -375,6 +444,7 @@ app.post("/api/tags", (req, res) => {
     const now = new Date().toISOString();
     const result = createTag.run(name.trim(), color || "#58a6ff", description || null, now);
     const tag = getTagById.get(result.lastInsertRowid);
+    insertAuditLog.run("create_tag", "tag", String(result.lastInsertRowid), JSON.stringify({ name: name.trim(), color: color || "#58a6ff" }));
     res.status(201).json(tag);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -415,6 +485,7 @@ app.delete("/api/tags/:id", (req, res) => {
   const tagId = Number(req.params.id);
   deleteTagSessions.run(tagId);
   deleteTag.run(tagId);
+  insertAuditLog.run("delete_tag", "tag", String(tagId), null);
   res.json({ ok: true });
 });
 
@@ -440,12 +511,14 @@ app.post("/api/sessions/:id/tags", (req, res) => {
 
   const now = new Date().toISOString();
   addSessionTag.run(sessionId, tag_id, now);
-  const tag = getTagById.get(tag_id);
+  const tag = getTagById.get(tag_id) as { id: number; name: string } | undefined;
+  insertAuditLog.run("add_tag", "session", sessionId, JSON.stringify({ tag_id, tag_name: tag?.name }));
   res.json(tag);
 });
 
 app.delete("/api/sessions/:id/tags/:tagId", (req, res) => {
   removeSessionTag.run(req.params.id, Number(req.params.tagId));
+  insertAuditLog.run("remove_tag", "session", req.params.id, JSON.stringify({ tag_id: Number(req.params.tagId) }));
   res.json({ ok: true });
 });
 
@@ -464,6 +537,200 @@ app.get("/api/tags/:id/sessions", (req, res) => {
     files_changed: changedFilesForSession.all(s.id as string),
   }));
   res.json({ tag, sessions: enriched });
+});
+
+app.get("/api/tags/by-name/:name", (req, res) => {
+  const tag = getTagByName.get(req.params.name);
+  if (!tag) {
+    res.status(404).json({ error: "Tag not found" });
+    return;
+  }
+  res.json(tag);
+});
+
+app.get("/api/tags/by-name/:name/sessions", (req, res) => {
+  const tag = getTagByName.get(req.params.name) as { id: number } | undefined;
+  if (!tag) {
+    res.status(404).json({ error: "Tag not found" });
+    return;
+  }
+  const sessions = getSessionsForTag.all(tag.id);
+  const enriched = (sessions as Array<Record<string, unknown>>).map((s) => ({
+    ...s,
+    tags: getTagsForSession.all(s.id as string),
+    files_changed: changedFilesForSession.all(s.id as string),
+  }));
+  res.json({ tag, sessions: enriched });
+});
+
+// ── Saved Search Prepared Statements ────────────────────────────────
+
+const listSavedSearches = db.prepare(`
+  SELECT ss.*, t.name as tag_name, t.color as tag_color
+  FROM saved_searches ss
+  JOIN tags t ON ss.tag_id = t.id
+  ORDER BY ss.last_run_at DESC
+`);
+
+const getSavedSearch = db.prepare(`SELECT * FROM saved_searches WHERE id = ?`);
+const getSavedSearchByTagId = db.prepare(`SELECT * FROM saved_searches WHERE tag_id = ?`);
+
+const createSavedSearch = db.prepare(`
+  INSERT INTO saved_searches (tag_id, query_text, created_at) VALUES (?, ?, ?)
+`);
+
+const deleteSavedSearch = db.prepare(`DELETE FROM saved_searches WHERE id = ?`);
+
+const updateSavedSearchRun = db.prepare(`
+  UPDATE saved_searches SET last_run_at = ?, last_run_count = ? WHERE id = ?
+`);
+
+const clearSessionTagsForTag = db.prepare(`DELETE FROM session_tags WHERE tag_id = ?`);
+
+// ── Saved Search Routes ────────────────────────────────────────────
+
+app.get("/api/saved-searches", (_req, res) => {
+  const searches = listSavedSearches.all();
+  res.json(searches);
+});
+
+app.post("/api/saved-searches", (req, res) => {
+  const { tag_id, tag_name, tag_color, query_text } = req.body;
+
+  if (!query_text || typeof query_text !== "string" || !query_text.trim()) {
+    res.status(400).json({ error: "query_text is required" });
+    return;
+  }
+
+  let resolvedTagId = tag_id;
+
+  // Create tag if needed
+  if (!resolvedTagId && tag_name) {
+    let existing = getTagByName.get(tag_name.trim()) as { id: number } | undefined;
+    if (!existing) {
+      const now = new Date().toISOString();
+      const result = createTag.run(tag_name.trim(), tag_color || "#58a6ff", null, now);
+      existing = getTagById.get(result.lastInsertRowid) as { id: number };
+    }
+    resolvedTagId = existing!.id;
+  }
+
+  if (!resolvedTagId) {
+    res.status(400).json({ error: "tag_id or tag_name is required" });
+    return;
+  }
+
+  // Check if tag already has a saved search
+  const existingSearch = getSavedSearchByTagId.get(resolvedTagId);
+  if (existingSearch) {
+    res.status(409).json({ error: "This tag already has a saved search" });
+    return;
+  }
+
+  try {
+    const now = new Date().toISOString();
+    const result = createSavedSearch.run(resolvedTagId, query_text.trim(), now);
+    const search = getSavedSearch.get(result.lastInsertRowid);
+    insertAuditLog.run("create_saved_search", "saved_search", String(result.lastInsertRowid), JSON.stringify({ tag_id: resolvedTagId, query_text: query_text.trim() }));
+    res.status(201).json(search);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.delete("/api/saved-searches/:id", (req, res) => {
+  const id = Number(req.params.id);
+  deleteSavedSearch.run(id);
+  insertAuditLog.run("delete_saved_search", "saved_search", String(id), null);
+  res.json({ ok: true });
+});
+
+app.post("/api/saved-searches/:id/run", async (req, res) => {
+  const id = Number(req.params.id);
+  const search = getSavedSearch.get(id) as { id: number; tag_id: number; query_text: string } | undefined;
+
+  if (!search) {
+    res.status(404).json({ error: "Saved search not found" });
+    return;
+  }
+
+  try {
+    // Build messages for the AI call
+    let anthropicMessages: Anthropic.Messages.MessageParam[] = [
+      { role: "user", content: search.query_text },
+    ];
+
+    const maxIterations = config.chatMaxToolIterations;
+    let fullText = "";
+
+    for (let i = 0; i < maxIterations; i++) {
+      const response = await anthropic.messages.create({
+        model: config.chatModel,
+        max_tokens: config.chatMaxTokens,
+        system: SYSTEM_PROMPT,
+        tools,
+        messages: anthropicMessages,
+      });
+
+      // Collect text and tool uses
+      const toolUses: Anthropic.Messages.ToolUseBlock[] = [];
+      for (const block of response.content) {
+        if (block.type === "text") {
+          fullText += block.text;
+        } else if (block.type === "tool_use") {
+          toolUses.push(block);
+        }
+      }
+
+      if (toolUses.length === 0) break;
+
+      // Execute tool calls
+      anthropicMessages = [
+        ...anthropicMessages,
+        { role: "assistant" as const, content: response.content },
+      ];
+
+      const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
+      for (const toolUse of toolUses) {
+        const input = toolUse.input as { query: string; params?: unknown[] };
+        const result = executeSql(input.query, input.params || []);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(result),
+        });
+      }
+
+      anthropicMessages.push({
+        role: "user" as const,
+        content: toolResults,
+      });
+    }
+
+    // Parse result to get session_ids
+    const result = parseResult(fullText);
+    const sessionIds = result?.session_ids || [];
+
+    // Clear existing session_tags for this tag, then re-add
+    const updateTagMembership = db.transaction(() => {
+      clearSessionTagsForTag.run(search.tag_id);
+      const now = new Date().toISOString();
+      for (const sessionId of sessionIds) {
+        addSessionTag.run(sessionId, search.tag_id, now);
+      }
+      updateSavedSearchRun.run(now, sessionIds.length, search.id);
+    });
+    updateTagMembership();
+
+    insertAuditLog.run("run_saved_search", "saved_search", String(id), JSON.stringify({ count: sessionIds.length }));
+
+    res.json({ session_ids: sessionIds, count: sessionIds.length });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("Saved search run error:", msg);
+    res.status(500).json({ error: msg });
+  }
 });
 
 // ── File Endpoints ──────────────────────────────────────────────────
@@ -643,6 +910,32 @@ app.delete("/api/workspaces/:id/summarize", (_req, res) => {
     }
   }
   res.json({ ok: true });
+});
+
+// ── Re-ingest Endpoint ────────────────────────────────────────────────
+
+import { runIngestion } from "./ingest.js";
+import type { IngestProgress } from "./ingest.js";
+
+let ingestProgress: IngestProgress | null = null;
+
+app.post("/api/ingest", async (req, res) => {
+  if (ingestProgress?.running) {
+    res.status(409).json({ error: "Ingestion already running" });
+    return;
+  }
+
+  // Start ingestion in background
+  ingestProgress = { total: 0, ingested: 0, skipped: 0, running: true };
+  runIngestion({ all: true }, (p) => { ingestProgress = p; })
+    .then((final) => { ingestProgress = { ...final, running: false }; })
+    .catch(() => { ingestProgress = { ...ingestProgress!, running: false }; });
+
+  res.status(202).json({ message: "Ingestion started" });
+});
+
+app.get("/api/ingest/status", (_req, res) => {
+  res.json(ingestProgress || { running: false });
 });
 
 // SPA fallback — serve index.html for non-API routes

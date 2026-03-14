@@ -53,6 +53,7 @@ export interface SearchResult {
   session_id: string;
   session_title: string | null;
   started_at: string;
+  match_count: number;
   matches: Array<{
     message_id: number;
     role: "user" | "assistant";
@@ -75,4 +76,34 @@ export interface FileSearchResult {
   operation: string;
   session_count: number;
   last_seen: string;
+}
+
+export interface SavedSearch {
+  id: number;
+  tag_id: number;
+  query_text: string;
+  last_run_at: string | null;
+  last_run_count: number | null;
+  created_at: string;
+  tag_name?: string;
+  tag_color?: string;
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  result?: ChatResult;
+  queries?: string[];
+}
+
+export interface ChatResult {
+  session_ids: string[];
+  action?: {
+    type: string;
+    tag_name?: string;
+    tag_color?: string;
+    tag_id?: number;
+  };
+  explanation?: string;
+  queries?: string[];
 }

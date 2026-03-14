@@ -17,11 +17,35 @@ function formatDate(dateStr: string): string {
   });
 }
 
+/** Render snippet HTML with <mark> highlights from FTS5 snippet() */
+function SnippetText({ snippet }: { snippet: string }) {
+  // Server sends ‹mark› and ‹/mark› as highlight delimiters (avoids HTML injection)
+  const parts = snippet.split(/‹\/?mark›/);
+  if (parts.length === 1) {
+    return <span>{snippet}</span>;
+  }
+  // Odd-indexed parts are highlighted
+  return (
+    <span>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <mark key={i} className="bg-accent-orange/20 text-text rounded-sm px-0.5">{part}</mark>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </span>
+  );
+}
+
 export default function Search({ onClose, onNavigate }: SearchProps) {
   const [query, setQuery] = useState("");
   const [tab, setTab] = useState<SearchTab>("messages");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [fileResults, setFileResults] = useState<FileSearchResult[]>([]);
+  const [totalSessions, setTotalSessions] = useState(0);
+  const [totalMatches, setTotalMatches] = useState(0);
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -37,6 +61,8 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     if (query.trim().length < 2) {
       setResults([]);
       setFileResults([]);
+      setTotalSessions(0);
+      setTotalMatches(0);
       setSearched(false);
       return;
     }
@@ -44,6 +70,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     debounceRef.current = setTimeout(() => {
       setLoading(true);
       setSearched(true);
+      setExpandedSessions(new Set());
 
       if (tab === "messages") {
         fetch(`/api/search?q=${encodeURIComponent(query.trim())}`)
@@ -53,14 +80,17 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
               session_id: r.session_id,
               session_title: r.title,
               started_at: r.started_at,
+              match_count: r.match_count ?? 0,
               matches: (r.matches as Array<Record<string, unknown>> || []).map((m) => ({
                 message_id: m.sequence,
                 role: m.role,
-                snippet: m.content,
+                snippet: m.snippet,
                 sequence: m.sequence,
               })),
             }));
             setResults(mapped as SearchResult[]);
+            setTotalSessions(data.total_sessions || 0);
+            setTotalMatches(data.total_matches || 0);
           })
           .catch(() => setResults([]))
           .finally(() => setLoading(false));
@@ -87,9 +117,19 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     setSearched(false);
   };
 
+  const toggleExpanded = (sessionId: string) => {
+    setExpandedSessions(prev => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  };
+
   return (
     <div className="fixed inset-0 bg-bg z-[100] flex flex-col" onClick={onClose}>
       <div className="w-full h-full bg-bg flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        {/* Search input */}
         <div className="flex items-center gap-3.5 px-8 py-5 border-b border-border bg-bg-card">
           <svg className="text-text-secondary shrink-0" width="18" height="18" viewBox="0 0 16 16" fill="none">
             <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
@@ -109,21 +149,36 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
           <kbd className="font-mono text-[10px] px-1.5 py-0.5 bg-white/6 border border-border rounded-sm text-text-dim">Esc</kbd>
         </div>
 
-        <div className="flex px-8 border-b border-border bg-bg-card">
-          <button
-            className={`px-5 py-2.5 text-[13px] font-medium border-b-2 transition-all hover:text-text ${tab === "messages" ? "text-accent-blue border-b-accent-blue" : "text-text-secondary border-b-transparent"}`}
-            onClick={() => handleTabChange("messages")}
-          >
-            Messages
-          </button>
-          <button
-            className={`px-5 py-2.5 text-[13px] font-medium border-b-2 transition-all hover:text-text ${tab === "files" ? "text-accent-blue border-b-accent-blue" : "text-text-secondary border-b-transparent"}`}
-            onClick={() => handleTabChange("files")}
-          >
-            Files
-          </button>
+        {/* Tabs + result count */}
+        <div className="flex items-center justify-between px-8 border-b border-border bg-bg-card">
+          <div className="flex">
+            <button
+              className={`px-5 py-2.5 text-[13px] font-medium border-b-2 transition-all hover:text-text ${tab === "messages" ? "text-accent-blue border-b-accent-blue" : "text-text-secondary border-b-transparent"}`}
+              onClick={() => handleTabChange("messages")}
+            >
+              Messages
+            </button>
+            <button
+              className={`px-5 py-2.5 text-[13px] font-medium border-b-2 transition-all hover:text-text ${tab === "files" ? "text-accent-blue border-b-accent-blue" : "text-text-secondary border-b-transparent"}`}
+              onClick={() => handleTabChange("files")}
+            >
+              Files
+            </button>
+          </div>
+          {/* Result count */}
+          {!loading && searched && tab === "messages" && results.length > 0 && (
+            <span className="text-[11px] text-text-dim">
+              {totalMatches} match{totalMatches !== 1 ? "es" : ""} in {totalSessions} session{totalSessions !== 1 ? "s" : ""}
+            </span>
+          )}
+          {!loading && searched && tab === "files" && fileResults.length > 0 && (
+            <span className="text-[11px] text-text-dim">
+              {fileResults.length} file{fileResults.length !== 1 ? "s" : ""}
+            </span>
+          )}
         </div>
 
+        {/* Results */}
         <div className="flex-1 overflow-y-auto px-8 py-4">
           {loading && (
             <div className="flex items-center justify-center gap-2 p-6 text-[13px] text-text-secondary">
@@ -140,33 +195,60 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
             <div className="flex items-center justify-center gap-2 p-6 text-[13px] text-text-secondary">No files found matching &quot;{query}&quot;</div>
           )}
 
+          {/* Message results — grouped by session */}
           {!loading && tab === "messages" &&
-            results.map((result) => (
-              <div key={result.session_id} className="mb-1">
-                <button
-                  className="flex items-center justify-between w-full px-3 py-2 rounded-md transition-[background] duration-100 hover:bg-white/5"
-                  onClick={() => onNavigate(`/session/${result.session_id}?msg=${result.matches[0]?.sequence ?? 0}`)}
-                >
-                  <span className="text-[13px] font-medium text-text">
-                    {result.session_title || "Untitled session"}
-                  </span>
-                  <span className="text-[11px] font-mono text-text-dim">{formatDate(result.started_at)}</span>
-                </button>
-                {result.matches.map((match, i) => (
+            results.map((result) => {
+              const hiddenCount = result.match_count - result.matches.length;
+              const isExpanded = expandedSessions.has(result.session_id);
+              return (
+                <div key={result.session_id} className="mb-3">
+                  {/* Session header */}
                   <button
-                    key={i}
-                    className="flex items-start gap-2 w-full px-3 pl-6 py-1.5 rounded transition-[background] duration-100 hover:bg-white/4"
-                    onClick={() => onNavigate(`/session/${result.session_id}?msg=${match.sequence}`)}
+                    className="flex items-center justify-between w-full px-3 py-2 rounded-lg transition-[background] duration-100 hover:bg-white/5 group"
+                    onClick={() => onNavigate(`/session/${result.session_id}?msg=${result.matches[0]?.sequence ?? 0}`)}
                   >
-                    <span className={`text-[10px] font-semibold uppercase tracking-wide shrink-0 pt-0.5 ${match.role === "user" ? "text-accent-blue" : "text-accent-green"}`}>
-                      {match.role === "user" ? "You" : "Claude"}
-                    </span>
-                    <span className="text-xs text-text-secondary overflow-hidden line-clamp-2">{match.snippet}</span>
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span className="text-[14px] font-semibold text-text truncate">
+                        {result.session_title || "Untitled session"}
+                      </span>
+                      <span className="shrink-0 text-[10px] font-medium text-text-dim bg-white/6 rounded-full px-2 py-0.5">
+                        {result.match_count} match{result.match_count !== 1 ? "es" : ""}
+                      </span>
+                    </div>
+                    <span className="text-[11px] font-mono text-text-dim shrink-0 ml-3">{formatDate(result.started_at)}</span>
                   </button>
-                ))}
-              </div>
-            ))}
 
+                  {/* Match snippets with left border for grouping */}
+                  <div className="ml-3 border-l-2 border-white/8 pl-3">
+                    {result.matches.map((match, i) => (
+                      <button
+                        key={i}
+                        className="flex items-start gap-2.5 w-full px-2 py-1.5 rounded transition-[background] duration-100 hover:bg-white/4 text-left"
+                        onClick={() => onNavigate(`/session/${result.session_id}?msg=${match.sequence}`)}
+                      >
+                        <span className={`text-[10px] font-semibold uppercase tracking-wide shrink-0 mt-0.5 w-[42px] ${match.role === "user" ? "text-accent-blue" : "text-claude-text"}`}>
+                          {match.role === "user" ? "You" : "Claude"}
+                        </span>
+                        <span className="text-[12px] text-text-secondary leading-relaxed line-clamp-2">
+                          <SnippetText snippet={match.snippet} />
+                        </span>
+                      </button>
+                    ))}
+                    {/* +N more matches */}
+                    {hiddenCount > 0 && !isExpanded && (
+                      <button
+                        className="px-2 py-1 text-[11px] text-accent-blue hover:text-text transition-colors"
+                        onClick={(e) => { e.stopPropagation(); toggleExpanded(result.session_id); }}
+                      >
+                        +{hiddenCount} more match{hiddenCount !== 1 ? "es" : ""}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+
+          {/* File results */}
           {!loading && tab === "files" && fileResults.length > 0 && (() => {
             const cats = categorizeFileRefs(fileResults.map(f => ({ ...f, file_path: f.file_path })));
             const sections: Array<{ key: string; label: string; cls: string; files: FileSearchResult[] }> = [];
