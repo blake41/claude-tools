@@ -343,6 +343,49 @@ cmd_custom_domains() {
     json_ok "$TOOL_NAME custom-domains" "$domains" "$na"
 }
 
+cmd_pre_deploy() {
+    local service_id="${1:-}"
+    local command="${2:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME pre-deploy" "Service ID required" "MISSING_ARG" \
+            "Usage: render-services pre-deploy <service-id> [command]"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME pre-deploy" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    if [[ -z "$command" ]]; then
+        # GET mode: show current pre-deploy command
+        local result
+        result=$(render_api "/services/$service_id")
+        local current
+        current=$(echo "$result" | jq -r '.serviceDetails.envSpecificDetails.preDeployCommand // "(not set)"')
+
+        local na
+        na=$(next_actions \
+            "$(next_action "render-services pre-deploy $service_id \"bun run migrate\"" "Set pre-deploy command")" \
+            "$(next_action "render-services get $service_id" "View service details")")
+
+        json_ok "$TOOL_NAME pre-deploy" "$(jq -n --arg cmd "$current" '{preDeployCommand: $cmd}')" "$na"
+    else
+        # SET mode: update pre-deploy command via PATCH
+        local result
+        result=$(curl -sS -X PATCH "https://api.render.com/v1/services/$service_id" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg cmd "$command" '{serviceDetails: {preDeployCommand: $cmd}}')")
+
+        local actual
+        actual=$(echo "$result" | jq -r '.serviceDetails.envSpecificDetails.preDeployCommand // "(not set)"')
+
+        local na
+        na=$(next_actions \
+            "$(next_action "render-services pre-deploy $service_id" "Verify pre-deploy command")" \
+            "$(next_action "render-services deploy $service_id" "Deploy to run it")")
+
+        json_ok "$TOOL_NAME pre-deploy" "$(jq -n --arg cmd "$actual" '{preDeployCommand: $cmd, updated: true}')" "$na"
+    fi
+}
+
 cmd_env_set() {
     local service_id="${1:-}"
     local key="${2:-}"
@@ -354,8 +397,18 @@ cmd_env_set() {
 
     load_api_key || json_error "$TOOL_NAME env-set" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
 
+    # SAFE: GET existing vars, merge the new one, PUT the full list back.
+    # Render PUT /env-vars REPLACES ALL vars — sending only the new var deletes everything else.
+    local existing
+    existing=$(render_api "/services/$service_id/env-vars")
+
+    # Build merged list: existing vars (minus the key being set) + the new key
+    local merged
+    merged=$(echo "$existing" | jq --arg key "$key" --arg value "$value" \
+        '[.[] | .envVar | {key, value}] | map(select(.key != $key)) + [{key: $key, value: $value}]')
+
     local result
-    result=$(render_api_put "/services/$service_id/env-vars" "[{\"key\":\"$key\",\"value\":\"$value\"}]")
+    result=$(render_api_put "/services/$service_id/env-vars" "$merged")
 
     local na
     na=$(next_actions \
@@ -411,6 +464,9 @@ case "${1:-}" in
     env-set)
         shift; cmd_env_set "$@"
         ;;
+    pre-deploy)
+        shift; cmd_pre_deploy "$@"
+        ;;
     *)
         cmd_tree "$TOOL_NAME" "Render.com service management" "$(jq -n '[
             {name: "list", description: "List all services", usage: "render-services list"},
@@ -427,7 +483,8 @@ case "${1:-}" in
             {name: "rollback", description: "Rollback to a previous deploy", usage: "render-services rollback <service-id> <deploy-id>"},
             {name: "custom-domains", description: "List custom domains", usage: "render-services custom-domains <service-id>"},
             {name: "env", description: "List environment variables (masked)", usage: "render-services env <service-id>"},
-            {name: "env-set", description: "Set an environment variable", usage: "render-services env-set <service-id> <KEY> <VALUE>"}
+            {name: "env-set", description: "Set an environment variable", usage: "render-services env-set <service-id> <KEY> <VALUE>"},
+            {name: "pre-deploy", description: "Get or set pre-deploy command", usage: "render-services pre-deploy <service-id> [command]"}
         ]')"
         ;;
 esac
