@@ -15,8 +15,14 @@ const DEFAULT_WORKSPACES = new Set([
   "/Users/blake/Documents/Development/clay/slack-project-v4-prototype",
 ]);
 
-const ingestAll = process.argv.includes("--all");
-const forceReingest = process.argv.includes("--force");
+// ── Types ─────────────────────────────────────────────────────────
+
+export interface IngestProgress {
+  total: number;
+  ingested: number;
+  skipped: number;
+  running: boolean;
+}
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -114,6 +120,11 @@ const insertFile = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?)
 `);
 
+const insertToolCall = db.prepare(`
+  INSERT INTO tool_calls (session_id, tool_name, input_summary, timestamp, sequence)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
 const updateSessionCounts = db.prepare(`
   UPDATE sessions SET
     message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?),
@@ -122,6 +133,7 @@ const updateSessionCounts = db.prepare(`
 `);
 
 const deleteSessionFiles = db.prepare(`DELETE FROM session_files WHERE session_id = ?`);
+const deleteSessionToolCalls = db.prepare(`DELETE FROM tool_calls WHERE session_id = ?`);
 const deleteSessionMessages = db.prepare(`DELETE FROM messages WHERE session_id = ?`);
 const deleteSessionTags = db.prepare(`DELETE FROM session_tags WHERE session_id = ?`);
 const deleteSession = db.prepare(`DELETE FROM sessions WHERE id = ?`);
@@ -147,7 +159,8 @@ function getOrCreateWorkspace(
 
 function ingestSession(
   jsonlPath: string,
-  workspaceId: number
+  workspaceId: number,
+  forceReingest: boolean
 ): boolean {
   const sessionId = basename(jsonlPath, ".jsonl");
 
@@ -156,9 +169,10 @@ function ingestSession(
   // In force mode, delete existing data first
   if (alreadyExists && forceReingest) {
     const deleteTx = db.transaction(() => {
+      deleteSessionToolCalls.run(sessionId);
       deleteSessionFiles.run(sessionId);
       deleteSessionMessages.run(sessionId);
-      deleteSessionTags.run(sessionId);
+      // Preserve session_tags — tags are user data, not derived from JSONL
       deleteSession.run(sessionId);
     });
     deleteTx();
@@ -174,7 +188,7 @@ function ingestSession(
     return false;
   }
 
-  const { header, messages, files } = result;
+  const { header, messages, files, toolCalls } = result;
   if (messages.length === 0) return false;
 
   const userMessages = messages.filter((m) => m.role === "user");
@@ -218,6 +232,16 @@ function ingestSession(
       );
     }
 
+    for (const tc of toolCalls) {
+      insertToolCall.run(
+        sessionId,
+        tc.toolName,
+        tc.inputSummary,
+        tc.timestamp,
+        tc.sequence
+      );
+    }
+
     // Ingest subagent sessions — merge their messages/files into the parent
     const subagentDir = join(
       jsonlPath.replace(/\.jsonl$/, ""),
@@ -233,7 +257,7 @@ function ingestSession(
         subagentFiles = [];
       }
 
-      let seqOffset = messages.length + files.length;
+      let seqOffset = messages.length + files.length + toolCalls.length;
       for (const sf of subagentFiles) {
         try {
           const subResult = stripSession(join(subagentDir, sf));
@@ -257,7 +281,16 @@ function ingestSession(
               seqOffset + file.sequence
             );
           }
-          seqOffset += subResult.messages.length + subResult.files.length;
+          for (const tc of subResult.toolCalls) {
+            insertToolCall.run(
+              sessionId,
+              tc.toolName,
+              tc.inputSummary,
+              tc.timestamp,
+              seqOffset + tc.sequence
+            );
+          }
+          seqOffset += subResult.messages.length + subResult.files.length + subResult.toolCalls.length;
         } catch {
           // skip broken subagent files
         }
@@ -276,10 +309,15 @@ function ingestSession(
   return true;
 }
 
-function main() {
+export async function runIngestion(
+  options: { all?: boolean; force?: boolean } = {},
+  onProgress?: (progress: IngestProgress) => void
+): Promise<IngestProgress> {
+  const ingestAll = !!options.all;
+  const forceReingest = !!options.force;
+
   if (!existsSync(CLAUDE_PROJECTS_DIR)) {
-    console.error(`Claude projects directory not found: ${CLAUDE_PROJECTS_DIR}`);
-    process.exit(1);
+    throw new Error(`Claude projects directory not found: ${CLAUDE_PROJECTS_DIR}`);
   }
 
   const projectDirs = readdirSync(CLAUDE_PROJECTS_DIR).filter((d) => {
@@ -299,13 +337,13 @@ function main() {
     console.log(`Filtering to default workspaces (use --all to ingest everything)`);
   }
 
-  let totalIngested = 0;
-  let totalSkipped = 0;
+  // Count total JSONL files for progress reporting
+  let totalFiles = 0;
+  const workspaceDirs: Array<{ dirName: string; jsonlFiles: string[]; workspacePath: string; workspaceId: number }> = [];
 
   for (const dirName of projectDirs) {
     const projectDir = join(CLAUDE_PROJECTS_DIR, dirName);
 
-    // Find .jsonl files (not directories — those are subagent sessions)
     let jsonlFiles: string[];
     try {
       jsonlFiles = readdirSync(projectDir).filter(
@@ -320,7 +358,6 @@ function main() {
     // Resolve workspace path from first session's cwd, falling back to dir name decode
     let workspacePath: string | null = null;
 
-    // Try to get cwd from first session file
     for (const f of jsonlFiles.slice(0, 3)) {
       try {
         const { header } = stripSession(join(projectDir, f));
@@ -348,17 +385,32 @@ function main() {
     }
 
     const workspaceId = getOrCreateWorkspace(workspacePath, dirName);
+    totalFiles += jsonlFiles.length;
+    workspaceDirs.push({ dirName, jsonlFiles, workspacePath, workspaceId });
+  }
+
+  let totalIngested = 0;
+  let totalSkipped = 0;
+
+  const progress: IngestProgress = { total: totalFiles, ingested: 0, skipped: 0, running: true };
+  onProgress?.(progress);
+
+  for (const { dirName, jsonlFiles, workspacePath, workspaceId } of workspaceDirs) {
+    const projectDir = join(CLAUDE_PROJECTS_DIR, dirName);
     let dirIngested = 0;
 
     for (const f of jsonlFiles) {
       const fullPath = join(projectDir, f);
-      const ingested = ingestSession(fullPath, workspaceId);
+      const ingested = ingestSession(fullPath, workspaceId, forceReingest);
       if (ingested) {
         dirIngested++;
         totalIngested++;
+        progress.ingested = totalIngested;
       } else {
         totalSkipped++;
+        progress.skipped = totalSkipped;
       }
+      onProgress?.(progress);
     }
 
     if (dirIngested > 0) {
@@ -372,6 +424,26 @@ function main() {
   console.log(
     `\nDone. Ingested ${totalIngested} new sessions, skipped ${totalSkipped}.`
   );
+
+  return { total: totalFiles, ingested: totalIngested, skipped: totalSkipped, running: false };
 }
 
-main();
+// ── CLI Entry Point ───────────────────────────────────────────────
+
+const isDirectRun = process.argv[1] &&
+  (process.argv[1].endsWith("/ingest.ts") || process.argv[1].endsWith("/ingest.js"));
+
+if (isDirectRun) {
+  const options = {
+    all: process.argv.includes("--all"),
+    force: process.argv.includes("--force"),
+  };
+  runIngestion(options)
+    .then((result) => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}

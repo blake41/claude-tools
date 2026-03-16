@@ -378,38 +378,27 @@ app.get("/api/search", (req, res) => {
     return;
   }
 
-  // Group by session, cap displayed matches at 3
-  const grouped = new Map<
+  // Group matches by session
+  const matchesBySession = new Map<
     string,
-    { session_id: string; title: string; started_at: string; git_branch: string; matches: Array<{ role: string; snippet: string; timestamp: string; sequence: number }>; match_count: number }
+    { matches: Array<{ role: string; snippet: string; timestamp: string; sequence: number }>; match_count: number }
   >();
 
   let totalMatches = 0;
 
   for (const row of results as Array<{
     session_id: string;
-    title: string;
-    started_at: string;
-    git_branch: string;
     role: string;
     snippet: string;
     timestamp: string;
     sequence: number;
   }>) {
-    if (!grouped.has(row.session_id)) {
-      grouped.set(row.session_id, {
-        session_id: row.session_id,
-        title: row.title,
-        started_at: row.started_at,
-        git_branch: row.git_branch,
-        matches: [],
-        match_count: 0,
-      });
+    if (!matchesBySession.has(row.session_id)) {
+      matchesBySession.set(row.session_id, { matches: [], match_count: 0 });
     }
-    const entry = grouped.get(row.session_id)!;
+    const entry = matchesBySession.get(row.session_id)!;
     entry.match_count++;
     totalMatches++;
-    // Only include first N snippets for display
     if (entry.matches.length < maxMatchesPerSession) {
       entry.matches.push({
         role: row.role,
@@ -420,9 +409,22 @@ app.get("/api/search", (req, res) => {
     }
   }
 
+  // Enrich with full session data (summary, tags, files)
+  const enriched = Array.from(matchesBySession.entries()).map(([sessionId, { matches, match_count }]) => {
+    const session = getSession.get(sessionId) as Record<string, unknown> | undefined;
+    if (!session) return null;
+    return {
+      ...session,
+      tags: getTagsForSession.all(sessionId),
+      files_changed: changedFilesForSession.all(sessionId),
+      matches,
+      match_count,
+    };
+  }).filter(Boolean);
+
   res.json({
-    results: Array.from(grouped.values()),
-    total_sessions: grouped.size,
+    results: enriched,
+    total_sessions: matchesBySession.size,
     total_matches: totalMatches,
   });
 });

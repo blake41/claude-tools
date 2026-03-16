@@ -25,6 +25,13 @@ export interface FileReference {
   sequence: number;
 }
 
+export interface ToolCall {
+  toolName: string;
+  inputSummary: string;
+  timestamp: string | null;
+  sequence: number;
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -129,6 +136,36 @@ function hasOnlyToolResults(content: string | ContentBlock[]): boolean {
 
 const FILE_TOOL_NAMES = new Set(["Write", "Edit", "Read", "write", "edit", "read"]);
 
+function summarizeToolInput(toolName: string, input: Record<string, unknown>): string {
+  switch (toolName) {
+    case "Bash":
+      return String(input.command || "").slice(0, 500);
+    case "Read":
+    case "Edit":
+    case "Write":
+    case "read":
+    case "edit":
+    case "write":
+      return String(input.file_path || "");
+    case "Grep":
+    case "Glob":
+    case "grep":
+    case "glob":
+      return String(input.pattern || "");
+    case "Agent":
+    case "agent":
+      return String(input.description || input.prompt || "").slice(0, 200);
+    case "ToolSearch":
+      return String(input.query || "");
+    default:
+      try {
+        return JSON.stringify(input).slice(0, 300);
+      } catch {
+        return "";
+      }
+  }
+}
+
 function extractFileName(filePath: string): string {
   const parts = filePath.split("/");
   return parts[parts.length - 1] || filePath;
@@ -138,6 +175,7 @@ export function stripSession(jsonlPath: string): {
   header: SessionHeader;
   messages: StrippedMessage[];
   files: FileReference[];
+  toolCalls: ToolCall[];
 } {
   const raw = readFileSync(jsonlPath, "utf-8");
   const lines = raw.split("\n");
@@ -176,26 +214,40 @@ export function stripSession(jsonlPath: string): {
     }
   }
 
-  // ── Extract file references from tool_use blocks ──
+  // ── Extract file references and tool calls from tool_use blocks ──
   const fileMap = new Map<string, FileReference>(); // key: "filePath|operation"
   let fileSeq = 0;
+  const toolCalls: ToolCall[] = [];
+  let toolSeq = 0;
 
   for (const m of msgs) {
     if (m.type === "assistant" && Array.isArray(m.message?.content)) {
       for (const block of m.message!.content as ContentBlock[]) {
-        if (block.type === "tool_use" && block.name && FILE_TOOL_NAMES.has(block.name)) {
-          const filePath = block.input?.file_path;
-          if (!filePath || typeof filePath !== "string") continue;
-          const operation = block.name.toLowerCase() as "write" | "edit" | "read";
-          const key = `${filePath}|${operation}`;
-          if (!fileMap.has(key)) {
-            fileMap.set(key, {
-              filePath,
-              fileName: extractFileName(filePath),
-              operation,
-              timestamp: m.timestamp || null,
-              sequence: fileSeq++,
-            });
+        if (block.type === "tool_use" && block.name) {
+          // Extract tool call
+          const input = (block.input || {}) as Record<string, unknown>;
+          toolCalls.push({
+            toolName: block.name,
+            inputSummary: summarizeToolInput(block.name, input),
+            timestamp: m.timestamp || null,
+            sequence: toolSeq++,
+          });
+
+          // Extract file reference (existing logic)
+          if (FILE_TOOL_NAMES.has(block.name)) {
+            const filePath = block.input?.file_path;
+            if (!filePath || typeof filePath !== "string") continue;
+            const operation = block.name.toLowerCase() as "write" | "edit" | "read";
+            const key = `${filePath}|${operation}`;
+            if (!fileMap.has(key)) {
+              fileMap.set(key, {
+                filePath,
+                fileName: extractFileName(filePath),
+                operation,
+                timestamp: m.timestamp || null,
+                sequence: fileSeq++,
+              });
+            }
           }
         }
       }
@@ -259,5 +311,5 @@ export function stripSession(jsonlPath: string): {
     }
   }
 
-  return { header, messages, files };
+  return { header, messages, files, toolCalls };
 }

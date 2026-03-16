@@ -12,6 +12,23 @@ function basename(path: string): string {
   return path.split("/").pop() || path;
 }
 
+/** Parse summary into clean bullet points, stripping markdown noise */
+const MAX_BULLETS = 4;
+
+function parseSummaryBullets(raw: string): string[] {
+  return raw
+    .split('\n')
+    .map(l => l.trim())
+    // Drop markdown headings, table separators, empty lines, bold-only lines
+    .filter(l => l && !l.match(/^#{1,4}\s/) && !l.match(/^\|?[-:|\s]+\|?$/) && !l.match(/^\*\*.*\*\*:?\s*$/))
+    // Collapse table rows
+    .map(l => l.startsWith('|') ? l.replace(/^\||\|$/g, '').split('|').map(c => c.trim()).filter(Boolean).join(' — ') : l)
+    // Strip bullet markers and bold
+    .map(l => l.replace(/^[-•*]\s*/, '').replace(/\*\*/g, ''))
+    .filter(l => l.length > 0)
+    .slice(0, MAX_BULLETS);
+}
+
 function formatTime(dateStr: string): string {
   return new Date(dateStr).toLocaleTimeString("en-US", {
     hour: "numeric",
@@ -125,7 +142,7 @@ function InlineTagAdder({ sessionId, tags, onTagsChange }: {
           style={{ background: `${tag.color}26`, color: tag.color }}
         >
           <Link
-            to={`/tag/${tag.id}`}
+            to={`/tag/${encodeURIComponent(tag.name)}`}
             className="no-underline hover:underline"
             style={{ color: "inherit" }}
             onClick={e => e.stopPropagation()}
@@ -268,24 +285,45 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
         className="session-row-card block w-full text-left bg-bg-card border border-border rounded-lg px-4 py-3.5 transition-all hover:border-accent-blue hover:bg-[rgba(22,27,34,0.8)]"
         onClick={() => navigate(`/session/${session.id}`)}
       >
-        <div className="flex items-center gap-2.5 text-xs">
+        {/* Meta row: date, duration, session ID, branch */}
+        <div className="flex items-center gap-2.5 text-xs flex-wrap">
           <span className="font-mono text-xs text-text-secondary">
             {formatDate(session.started_at)}{" "}
             {formatTime(session.started_at)}
-            {session.ended_at && ` - ${formatTime(session.ended_at)}`}
+            {session.ended_at && ` – ${formatTime(session.ended_at)}`}
           </span>
           {session.ended_at && (
             <span className="text-text-dim text-[11px]">{duration(session.started_at, session.ended_at)}</span>
           )}
+          <button
+            className="group/sid inline-flex items-center gap-0.5 font-mono text-[10px] text-text-dim/40 transition-colors hover:text-text-secondary"
+            onClick={e => { e.stopPropagation(); navigator.clipboard.writeText(session.id); }}
+            title="Copy session ID"
+          >
+            <span>{session.id.slice(0, 8)}</span>
+            <svg className="opacity-0 group-hover/sid:opacity-100 transition-opacity shrink-0" width="10" height="10" viewBox="0 0 16 16" fill="none">
+              <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+              <path d="M3 11V3.5A1.5 1.5 0 014.5 2H10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+          </button>
           {session.git_branch && <span className="inline-block px-2 py-px rounded-full font-mono text-[11px] bg-accent-purple/12 text-accent-purple whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px]">{session.git_branch}</span>}
         </div>
-        <div className="mt-1.5 text-sm font-medium text-text line-clamp-2">
-          {session.title || "Untitled session"}
-        </div>
-        <div className="flex items-center gap-2.5 mt-1.5">
-          <span className="text-xs text-text-dim">
+
+        {/* Summary as bullet list, or message count fallback */}
+        {session.summary ? (
+          <ul className="mt-2 text-[12px] leading-[1.6] text-text-secondary pl-4 list-disc space-y-0.5">
+            {parseSummaryBullets(session.summary).map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+          </ul>
+        ) : (
+          <div className="mt-1.5 text-[11px] text-text-dim">
             {session.message_count} messages, {session.user_message_count} from you
-          </span>
+          </div>
+        )}
+
+        {/* Tags */}
+        <div className="flex items-center gap-1.5 mt-2">
           {onTagsChange ? (
             <InlineTagAdder
               sessionId={session.id}
@@ -300,7 +338,7 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
                 style={{ background: `${t.color}26`, color: t.color }}
               >
                 <Link
-                  to={`/tag/${t.id}`}
+                  to={`/tag/${encodeURIComponent(t.name)}`}
                   className="no-underline hover:underline"
                   style={{ color: "inherit" }}
                   onClick={e => e.stopPropagation()}
@@ -309,24 +347,6 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
             ))
           )}
         </div>
-        <button
-          className="group/sid flex items-center gap-1 font-mono text-[10px] text-text-dim/50 mt-0.5 transition-colors hover:text-text-secondary"
-          onClick={e => { e.stopPropagation(); navigator.clipboard.writeText(session.id); }}
-          title="Copy session ID"
-        >
-          <span>{session.id}</span>
-          <svg className="opacity-0 group-hover/sid:opacity-100 transition-opacity shrink-0" width="10" height="10" viewBox="0 0 16 16" fill="none">
-            <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
-            <path d="M3 11V3.5A1.5 1.5 0 014.5 2H10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-          </svg>
-        </button>
-        {session.summary && (
-          <div className="mt-2.5 text-[12px] leading-[1.6] text-text-secondary bg-accent-blue/5 border-l-2 border-accent-blue/30 rounded-r px-3 py-2">
-            {session.summary.split('\n').filter(l => l.trim()).map((line, i) => (
-              <div key={i} className={i > 0 ? "mt-0.5" : ""}>{line.trim().replace(/^[-•]\s*/, '• ')}</div>
-            ))}
-          </div>
-        )}
       </button>
       <div className={`session-row-files${!session.files_changed?.length ? " session-row-files--empty" : ""}`}>
         <FileCategoryPills files={session.files_changed || []} />

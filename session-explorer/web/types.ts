@@ -49,17 +49,18 @@ export interface SessionDetail extends SessionSummary {
   tags?: Tag[];
 }
 
-export interface SearchResult {
-  session_id: string;
-  session_title: string | null;
-  started_at: string;
+export interface SearchMatch {
+  role: "user" | "assistant";
+  snippet: string;
+  timestamp: string;
+  sequence: number;
+}
+
+export interface SearchResult extends SessionSummary {
   match_count: number;
-  matches: Array<{
-    message_id: number;
-    role: "user" | "assistant";
-    snippet: string;
-    sequence: number;
-  }>;
+  matches: SearchMatch[];
+  workspace_name?: string;
+  workspace_path?: string;
 }
 
 export interface FileReference {

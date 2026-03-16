@@ -79,7 +79,54 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_files_path ON session_files(file_path);
   CREATE INDEX IF NOT EXISTS idx_files_session ON session_files(session_id);
   CREATE INDEX IF NOT EXISTS idx_files_name ON session_files(file_name);
+
+  CREATE TABLE IF NOT EXISTS tool_calls (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT REFERENCES sessions(id),
+    tool_name TEXT NOT NULL,
+    input_summary TEXT,
+    timestamp TEXT,
+    sequence INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+  CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(tool_name);
+
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    details TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS saved_searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    query_text TEXT NOT NULL,
+    last_run_at TEXT,
+    last_run_count INTEGER,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id'
+  );
+
+  CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+  END;
 `);
+
+// Rebuild FTS index to cover any data ingested before FTS5 was added
+db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`);
 
 export default db;
 export { DB_PATH };

@@ -247,13 +247,33 @@ button {
   background: rgba(255, 255, 255, 0.18);
 }
 
+/* ---- Session rows container (continuous vertical separator) ---- */
+.session-rows {
+  position: relative;
+}
+
+.session-rows::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 240px;
+  width: 1px;
+  background: rgba(48, 54, 61, 0.6);
+  pointer-events: none;
+}
+
 /* ---- Session row grid (card + files side panel) ---- */
 .session-row {
   display: grid;
   grid-template-columns: 1fr 240px;
   gap: 0 0;
   align-items: stretch;
-  margin-bottom: 2px;
+  border-top: 1px solid var(--color-border);
+}
+
+.session-row:first-child {
+  border-top: none;
 }
 
 .session-row-card {
@@ -263,22 +283,73 @@ button {
 .session-row-files {
   min-width: 0;
   padding: 0 0 0 16px;
-  border-left: 1px solid rgba(48, 54, 61, 0.6);
   display: flex;
   align-items: center;
 }
 
-/* Dim the border when no files */
-.session-row-files--empty {
-  border-left-color: transparent;
-}
-
 @media (max-width: 900px) {
+  .session-rows::after {
+    display: none;
+  }
   .session-row {
     grid-template-columns: 1fr;
   }
   .session-row-files {
-    border-left: none;
+    padding: 4px 0;
+  }
+}
+
+/* ---- Search results grid (mirrors session-row layout) ---- */
+.search-results {
+  position: relative;
+}
+
+.search-results::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 220px;
+  width: 1px;
+  background: rgba(48, 54, 61, 0.6);
+  pointer-events: none;
+}
+
+.search-result-row {
+  display: grid;
+  grid-template-columns: 1fr 220px;
+  gap: 0;
+  align-items: stretch;
+  border-top: 1px solid var(--color-border);
+}
+
+.search-result-row:first-child {
+  border-top: none;
+}
+
+.search-result-card {
+  min-width: 0;
+}
+
+.search-result-files {
+  min-width: 0;
+  padding: 12px 0 12px 16px;
+  display: flex;
+  align-items: flex-start;
+}
+
+.search-result-files--empty {
+  padding: 0;
+}
+
+@media (max-width: 900px) {
+  .search-results::after {
+    display: none;
+  }
+  .search-result-row {
+    grid-template-columns: 1fr;
+  }
+  .search-result-files {
     padding: 4px 0;
   }
 }

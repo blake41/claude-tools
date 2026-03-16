@@ -233,13 +233,15 @@ export default function SessionList({ workspace }: SessionListProps) {
         {Array.from(grouped.entries()).map(([label, items]) => (
           <div key={label} className="mb-6">
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-text-dim pb-2 border-b border-border mb-2">{label}</h3>
-            {items.map((session) => (
-              <SessionCard
-                key={session.id}
-                session={session}
-                onTagsChange={handleTagsChange}
-              />
-            ))}
+            <div className="session-rows">
+              {items.map((session) => (
+                <SessionCard
+                  key={session.id}
+                  session={session}
+                  onTagsChange={handleTagsChange}
+                />
+              ))}
+            </div>
           </div>
         ))}
       </div>

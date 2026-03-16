@@ -5,6 +5,7 @@ import SessionList from "./components/SessionList";
 import SessionDetail from "./components/SessionDetail";
 import Search from "./components/Search";
 import SessionCard from "./components/SessionCard";
+import AskView from "./components/AskView";
 import type { Workspace, Tag, SessionSummary } from "./types";
 
 function Dashboard({ workspaces }: { workspaces: Workspace[] }) {
@@ -65,7 +66,7 @@ const PRESET_COLORS = [
 ];
 
 function TagView() {
-  const { id } = useParams<{ id: string }>();
+  const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
   const [tag, setTag] = useState<Tag | null>(null);
   const [sessions, setSessions] = useState<(SessionSummary & { workspace_name?: string })[]>([]);
@@ -86,7 +87,7 @@ function TagView() {
   }, [colorPickerOpen]);
 
   function updateTagColor(color: string) {
-    fetch(`/api/tags/${id}`, {
+    fetch(`/api/tags/${tag?.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ color }),
@@ -101,7 +102,7 @@ function TagView() {
 
   useEffect(() => {
     setLoading(true);
-    fetch(`/api/tags/${id}/sessions`)
+    fetch(`/api/tags/by-name/${encodeURIComponent(name!)}/sessions`)
       .then((r) => r.json())
       .then((data: { tag: Tag; sessions: (SessionSummary & { workspace_name?: string })[] }) => {
         setTag(data.tag);
@@ -109,7 +110,7 @@ function TagView() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [id]);
+  }, [name]);
 
   if (loading) {
     return (
@@ -172,9 +173,11 @@ function TagView() {
         {Array.from(byWorkspace.entries()).map(([workspace, items]) => (
           <div key={workspace} className="mb-6">
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-text-dim pb-2 border-b border-border mb-2">{workspace}</h3>
-            {items.map((session) => (
-              <SessionCard key={session.id} session={session} />
-            ))}
+            <div className="session-rows">
+              {items.map((session) => (
+                <SessionCard key={session.id} session={session} />
+              ))}
+            </div>
           </div>
         ))}
       </div>
@@ -290,6 +293,7 @@ function FileView() {
   );
 }
 
+
 export default function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
@@ -345,8 +349,9 @@ export default function App() {
           <Route path="/" element={<Dashboard workspaces={workspaces} />} />
           <Route path="/workspace/:id" element={<WorkspaceView workspaces={workspaces} />} />
           <Route path="/session/:id" element={<SessionView />} />
-          <Route path="/tag/:id" element={<TagView />} />
+          <Route path="/tag/:name" element={<TagView />} />
           <Route path="/file" element={<FileView />} />
+          <Route path="/ask" element={<AskView />} />
         </Routes>
       </main>
     </div>
