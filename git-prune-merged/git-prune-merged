@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# git-prune-merged - Clean up branches and worktrees already in master (rebase-aware)
+# Uses git cherry (patch-id comparison) instead of --merged (SHA comparison)
+
+set -euo pipefail
+
+PROTECTED="master main develop staging production release"
+
+usage() {
+  cat <<'EOF'
+Usage: git prune-merged <command> [options]
+
+Commands:
+  branches    List (or delete) local branches fully merged into base
+  worktrees   List (or delete) worktrees whose branches are fully merged
+
+Options:
+  --delete    Actually delete (default is dry-run)
+  --base REF  Compare against this branch (default: master)
+
+Examples:
+  git prune-merged branches              # dry-run: show merged branches
+  git prune-merged branches --delete     # delete them
+  git prune-merged worktrees             # dry-run: show merged worktrees
+  git prune-merged worktrees --delete    # remove them and their branches
+EOF
+  exit 1
+}
+
+is_protected() {
+  local branch="$1"
+  for p in $PROTECTED; do
+    [[ "$branch" == "$p" ]] && return 0
+  done
+  return 1
+}
+
+current_branch() {
+  git symbolic-ref --short HEAD 2>/dev/null || echo ""
+}
+
+# Check if all commits on branch are in base (all lines start with -)
+is_fully_merged() {
+  local base="$1" branch="$2"
+  # If cherry produces no output, branch has no unique commits (same as base)
+  local output
+  output=$(git cherry "$base" "$branch" 2>/dev/null) || return 1
+  [[ -z "$output" ]] && return 0
+  # If any line starts with +, branch has unmerged commits
+  ! echo "$output" | grep -q '^\+'
+}
+
+cmd_branches() {
+  local base="master" delete=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delete) delete=true; shift ;;
+      --base) base="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  local current
+  current=$(current_branch)
+  local found=0
+
+  for branch in $(git for-each-ref --format='%(refname:short)' refs/heads/); do
+    is_protected "$branch" && continue
+    [[ "$branch" == "$current" ]] && continue
+
+    if is_fully_merged "$base" "$branch"; then
+      found=1
+      local sha
+      sha=$(git rev-parse --short "$branch")
+      if $delete; then
+        git branch -D "$branch" >/dev/null 2>&1
+        echo "  deleted  $branch (was $sha)"
+      else
+        echo "  merged   $branch ($sha)"
+      fi
+    fi
+  done
+
+  if [[ $found -eq 0 ]]; then
+    echo "No merged branches found."
+  elif ! $delete; then
+    echo ""
+    echo "Run with --delete to remove these branches."
+  fi
+}
+
+cmd_worktrees() {
+  local base="master" delete=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delete) delete=true; shift ;;
+      --base) base="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  local found=0
+
+  # Parse worktree list (skip the main worktree — first entry)
+  local first=true
+  local wt_path="" wt_branch=""
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^worktree\ (.+) ]]; then
+      # Process previous worktree (if any)
+      if [[ -n "$wt_path" && -n "$wt_branch" ]]; then
+        _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" && found=1
+      fi
+      wt_path="${BASH_REMATCH[1]}"
+      wt_branch=""
+      if $first; then
+        # Skip main worktree
+        first=false
+        wt_path=""
+      fi
+    elif [[ "$line" =~ ^branch\ refs/heads/(.+) ]]; then
+      wt_branch="${BASH_REMATCH[1]}"
+    elif [[ "$line" == "locked" ]]; then
+      # Skip locked worktrees
+      wt_path=""
+      wt_branch=""
+    fi
+  done < <(git worktree list --porcelain)
+
+  # Process last entry
+  if [[ -n "$wt_path" && -n "$wt_branch" ]]; then
+    _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" && found=1
+  fi
+
+  if [[ $found -eq 0 ]]; then
+    echo "No merged worktrees found."
+  elif ! $delete; then
+    echo ""
+    echo "Run with --delete to remove these worktrees and their branches."
+  fi
+}
+
+_check_worktree() {
+  local base="$1" wt_path="$2" wt_branch="$3" delete="$4"
+
+  is_protected "$wt_branch" && return 1
+
+  if ! is_fully_merged "$base" "$wt_branch"; then
+    return 1
+  fi
+
+  # Check for uncommitted changes
+  if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
+    echo "  DIRTY    $wt_path ($wt_branch) — has uncommitted changes, skipping"
+    return 0
+  fi
+
+  # Check for active processes
+  if lsof +D "$wt_path" >/dev/null 2>&1; then
+    echo "  IN USE   $wt_path ($wt_branch) — processes running, skipping"
+    return 0
+  fi
+
+  local sha
+  sha=$(git rev-parse --short "$wt_branch")
+
+  if $delete; then
+    if git worktree remove "$wt_path" 2>&1; then
+      git branch -D "$wt_branch" >/dev/null 2>&1
+      echo "  removed  $wt_path ($wt_branch, was $sha)"
+    else
+      echo "  FAILED   $wt_path ($wt_branch) — could not remove worktree, skipping"
+    fi
+  else
+    echo "  merged   $wt_path ($wt_branch, $sha)"
+  fi
+
+  return 0
+}
+
+# --- Main ---
+
+[[ $# -lt 1 ]] && usage
+
+command="$1"; shift
+
+case "$command" in
+  branches)  cmd_branches "$@" ;;
+  worktrees) cmd_worktrees "$@" ;;
+  -h|--help) usage ;;
+  *)         echo "Unknown command: $command"; usage ;;
+esac
