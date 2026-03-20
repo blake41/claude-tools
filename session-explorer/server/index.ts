@@ -165,6 +165,10 @@ const getUnsummarizedSessions = db.prepare(`
   SELECT id, title FROM sessions WHERE workspace_id = ? AND summary IS NULL AND message_count > 0
 `);
 
+const getAllUnsummarizedSessions = db.prepare(`
+  SELECT id, title FROM sessions WHERE summary IS NULL AND message_count > 0
+`);
+
 const updateSessionSummary = db.prepare(`
   UPDATE sessions SET summary = ? WHERE id = ?
 `);
@@ -947,4 +951,42 @@ app.get("*", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Session Explorer API running on http://localhost:${PORT}`);
+
+  // ── Auto-ingest + auto-summarize polling ─────────────────────────
+  setInterval(async () => {
+    // Skip if ingestion or summarization is already running (manual or auto)
+    if (ingestProgress?.running || activeJob?.running) return;
+
+    try {
+      // Run incremental ingestion
+      ingestProgress = { total: 0, ingested: 0, skipped: 0, running: true };
+      const final = await runIngestion({ all: false }, (p) => { ingestProgress = p; });
+      ingestProgress = { ...final, running: false };
+
+      // After ingestion, auto-summarize any unsummarized sessions
+      if (activeJob?.running) return;
+
+      const unsummarized = getAllUnsummarizedSessions.all() as Array<{ id: string; title: string }>;
+      if (unsummarized.length === 0) return;
+
+      console.log(`[auto-ingest] Found ${unsummarized.length} unsummarized session(s), starting summarization`);
+
+      activeJob = {
+        workspaceId: 0, // all workspaces
+        total: unsummarized.length,
+        completed: 0,
+        failed: 0,
+        running: true,
+        cancelled: false,
+        errors: [],
+      };
+
+      await runSummarization(unsummarized);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[auto-ingest] Error:", msg);
+      // Reset state so next tick can run
+      if (ingestProgress?.running) ingestProgress = { ...ingestProgress, running: false };
+    }
+  }, config.autoIngestIntervalMs);
 });

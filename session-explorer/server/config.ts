@@ -16,6 +16,9 @@ export const config = {
   summaryConcurrency: 5,
   summaryMaxTokens: 300,
 
+  // Auto-ingest polling
+  autoIngestIntervalMs: 60_000,
+
   // Pagination
   defaultPageSize: 50,
   searchResultLimit: 100,
