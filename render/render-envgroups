@@ -125,6 +125,52 @@ cmd_set() {
     json_ok "$TOOL_NAME set" "$(jq -n --arg key "$key" '{key: $key, updated: true}')" "$na"
 }
 
+cmd_link() {
+    local group_id="${1:-}"
+    local service_id="${2:-}"
+    if [[ -z "$group_id" || -z "$service_id" ]]; then
+        json_error "$TOOL_NAME link" "Env group ID and service ID required" "MISSING_ARG" \
+            "Usage: render-envgroups link <env-group-id> <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME link" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    # POST /v1/env-groups/{envGroupId}/services/{serviceId}
+    local result
+    result=$(render_api_post "/env-groups/$group_id/services/$service_id" '{}')
+
+    local linked_count
+    linked_count=$(echo "$result" | jq '[.serviceLinks // [] | length] | .[0]')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-envgroups get $group_id" "View group details")" \
+        "$(next_action "render-envgroups unlink $group_id $service_id" "Unlink this service")")
+
+    json_ok "$TOOL_NAME link" "$(jq -n --arg gid "$group_id" --arg sid "$service_id" '{envGroupId: $gid, serviceId: $sid, linked: true}')" "$na"
+}
+
+cmd_unlink() {
+    local group_id="${1:-}"
+    local service_id="${2:-}"
+    if [[ -z "$group_id" || -z "$service_id" ]]; then
+        json_error "$TOOL_NAME unlink" "Env group ID and service ID required" "MISSING_ARG" \
+            "Usage: render-envgroups unlink <env-group-id> <service-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME unlink" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    # DELETE /v1/env-groups/{envGroupId}/services/{serviceId}
+    render_api_delete "/env-groups/$group_id/services/$service_id" > /dev/null
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-envgroups get $group_id" "View group details")" \
+        "$(next_action "render-envgroups link $group_id $service_id" "Re-link this service")")
+
+    json_ok "$TOOL_NAME unlink" "$(jq -n --arg gid "$group_id" --arg sid "$service_id" '{envGroupId: $gid, serviceId: $sid, unlinked: true}')" "$na"
+}
+
 cmd_rm() {
     local group_id="${1:-}"
     local key="${2:-}"
@@ -162,13 +208,21 @@ case "${1:-}" in
     rm)
         shift; cmd_rm "$@"
         ;;
+    link)
+        shift; cmd_link "$@"
+        ;;
+    unlink)
+        shift; cmd_unlink "$@"
+        ;;
     *)
         cmd_tree "$TOOL_NAME" "Render.com environment group management" "$(jq -n '[
             {name: "list", description: "List all environment groups", usage: "render-envgroups list"},
             {name: "get", description: "Get env group details", usage: "render-envgroups get <env-group-id>"},
             {name: "vars", description: "List variables (masked)", usage: "render-envgroups vars <env-group-id>"},
             {name: "set", description: "Add or update a variable", usage: "render-envgroups set <env-group-id> <KEY> <VALUE>"},
-            {name: "rm", description: "Remove a variable", usage: "render-envgroups rm <env-group-id> <KEY>"}
+            {name: "rm", description: "Remove a variable", usage: "render-envgroups rm <env-group-id> <KEY>"},
+            {name: "link", description: "Link env group to a service", usage: "render-envgroups link <env-group-id> <service-id>"},
+            {name: "unlink", description: "Unlink env group from a service", usage: "render-envgroups unlink <env-group-id> <service-id>"}
         ]')"
         ;;
 esac
