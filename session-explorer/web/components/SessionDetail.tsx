@@ -31,17 +31,7 @@ function duration(start: string, end: string | null): string {
   return rem > 0 ? `${hrs}h ${rem}m` : `${hrs} hours`;
 }
 
-/** Parse summary into clean bullet points, stripping markdown noise */
-function parseSummaryBullets(raw: string): string[] {
-  return raw
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.match(/^#{1,4}\s/) && !l.match(/^\|?[-:|\s]+\|?$/) && !l.match(/^\*\*.*\*\*:?\s*$/))
-    .map(l => l.startsWith('|') ? l.replace(/^\||\|$/g, '').split('|').map(c => c.trim()).filter(Boolean).join(' — ') : l)
-    .map(l => l.replace(/^[-•*]\s*/, '').replace(/\*\*/g, ''))
-    .filter(l => l.length > 0)
-    .slice(0, 4);
-}
+import { parseSummaryBullets } from "../summaryUtils";
 
 function renderMarkdown(text: string): string {
   let html = escapeHtml(text);

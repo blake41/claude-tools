@@ -987,7 +987,7 @@ app.get("/api/ingest/status", (_req, res) => {
 });
 
 // ── Open file in default app ──────────────────────────────────────
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 
 app.post("/api/open-file", (req, res) => {
   const { path: filePath } = req.body as { path?: string };
@@ -995,7 +995,13 @@ app.post("/api/open-file", (req, res) => {
     res.status(400).json({ error: "path is required" });
     return;
   }
-  exec(`open ${JSON.stringify(filePath)}`, (err) => {
+  // Validate path is absolute and exists as a regular file
+  if (!filePath.startsWith("/") || !existsSync(filePath)) {
+    res.status(404).json({ error: "File not found" });
+    return;
+  }
+  // Use execFile to avoid shell injection — passes path as argument, not through shell
+  execFile("open", [filePath], (err) => {
     if (err) {
       res.status(500).json({ error: err.message });
     } else {

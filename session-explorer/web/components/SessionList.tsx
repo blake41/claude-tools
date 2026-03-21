@@ -193,6 +193,9 @@ export default function SessionList({ workspace }: SessionListProps) {
   };
 
   const [activeFilters, setActiveFilters] = useState<Set<FileFilter>>(new Set());
+  const [branchFilter, setBranchFilter] = useState("all");
+  const [tagFilter, setTagFilter] = useState("all");
+  const [hasSummary, setHasSummary] = useState(false);
 
   const toggleFilter = (f: FileFilter) => {
     setActiveFilters(prev => {
@@ -202,18 +205,45 @@ export default function SessionList({ workspace }: SessionListProps) {
     });
   };
 
-  const filteredSessions = useMemo(() => {
-    if (activeFilters.size === 0) return sessions;
-    return sessions.filter(s => {
-      const files = s.files_changed || [];
-      if (files.length === 0) return false;
-      const cats = categorizeFiles(files);
-      for (const f of activeFilters) {
-        if (cats[f].length > 0) return true;
+  const branches = useMemo(() =>
+    [...new Set(sessions.map(s => s.git_branch).filter(Boolean) as string[])].sort(),
+    [sessions]
+  );
+
+  const allTags = useMemo(() => {
+    const tagMap = new Map<number, { id: number; name: string; color: string }>();
+    for (const s of sessions) {
+      for (const t of s.tags || []) {
+        if (!tagMap.has(t.id)) tagMap.set(t.id, t);
       }
-      return false;
+    }
+    return [...tagMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [sessions]);
+
+  const filteredSessions = useMemo(() => {
+    return sessions.filter(s => {
+      // File type filter
+      if (activeFilters.size > 0) {
+        const files = s.files_changed || [];
+        if (files.length === 0) return false;
+        const cats = categorizeFiles(files);
+        let hasMatch = false;
+        for (const f of activeFilters) {
+          if (cats[f].length > 0) { hasMatch = true; break; }
+        }
+        if (!hasMatch) return false;
+      }
+      // Branch filter
+      if (branchFilter !== "all" && (s.git_branch || "") !== branchFilter) return false;
+      // Tag filter
+      if (tagFilter !== "all" && !(s.tags || []).some(t => t.name === tagFilter)) return false;
+      // Has summary filter
+      if (hasSummary && !s.summary) return false;
+      return true;
     });
-  }, [sessions, activeFilters]);
+  }, [sessions, activeFilters, branchFilter, tagFilter, hasSummary]);
+
+  const anyFilterActive = activeFilters.size > 0 || branchFilter !== "all" || tagFilter !== "all" || hasSummary;
 
   const grouped = groupByDate(filteredSessions);
 
@@ -251,7 +281,7 @@ export default function SessionList({ workspace }: SessionListProps) {
             </span>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {(["code", "docs", "viz"] as const).map(f => (
             <button
               key={f}
@@ -267,7 +297,36 @@ export default function SessionList({ workspace }: SessionListProps) {
               {f}
             </button>
           ))}
-          {activeFilters.size > 0 && (
+          <span className="w-px h-4 bg-border mx-1" />
+          <button
+            className={`filter-chip ${hasSummary ? "active" : ""}`}
+            onClick={() => setHasSummary(!hasSummary)}
+          >
+            Has summary
+          </button>
+          {branches.length > 1 && (
+            <select
+              value={branchFilter}
+              onChange={(e) => setBranchFilter(e.target.value)}
+              className="filter-chip"
+              style={{ color: branchFilter !== "all" ? "var(--accent-blue)" : undefined }}
+            >
+              <option value="all">All branches</option>
+              {branches.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          )}
+          {allTags.length > 0 && (
+            <select
+              value={tagFilter}
+              onChange={(e) => setTagFilter(e.target.value)}
+              className="filter-chip"
+              style={{ color: tagFilter !== "all" ? "var(--accent-blue)" : undefined }}
+            >
+              <option value="all">All tags</option>
+              {allTags.map(t => <option key={t.id} value={t.name}>{t.name}</option>)}
+            </select>
+          )}
+          {anyFilterActive && (
             <span className="text-[11px] text-text-dim ml-1">
               {filteredSessions.length} of {sessions.length}
             </span>
