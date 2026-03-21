@@ -320,6 +320,13 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
             </svg>
           </button>
           {session.git_branch && <span className="inline-block px-2 py-px rounded-full font-mono text-[11px] bg-accent-purple/12 text-accent-purple whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px]">{session.git_branch}</span>}
+          {onTagsChange && (
+            <InlineTagAdder
+              sessionId={session.id}
+              tags={session.tags || []}
+              onTagsChange={(newTags) => onTagsChange(session.id, newTags)}
+            />
+          )}
         </div>
 
         {/* Summary as bullet list, or message count fallback */}
@@ -337,13 +344,7 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
 
         {/* Tags */}
         <div className="flex items-center gap-1.5 mt-2">
-          {onTagsChange ? (
-            <InlineTagAdder
-              sessionId={session.id}
-              tags={session.tags || []}
-              onTagsChange={(newTags) => onTagsChange(session.id, newTags)}
-            />
-          ) : (
+          {!onTagsChange && (
             session.tags && session.tags.map((t) => (
               <span
                 key={t.id}
