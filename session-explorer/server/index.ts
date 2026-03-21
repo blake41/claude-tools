@@ -125,7 +125,7 @@ const getMessages = db.prepare(`
 `);
 
 const searchMessagesFts = db.prepare(`
-  SELECT m.session_id, m.role, m.timestamp, m.sequence,
+  SELECT m.session_id, m.role, m.message_type, m.timestamp, m.sequence,
          snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 24) as snippet,
          s.title, s.started_at, s.git_branch,
          rank
@@ -138,7 +138,7 @@ const searchMessagesFts = db.prepare(`
 `);
 
 const searchMessagesFtsInWorkspace = db.prepare(`
-  SELECT m.session_id, m.role, m.timestamp, m.sequence,
+  SELECT m.session_id, m.role, m.message_type, m.timestamp, m.sequence,
          snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 24) as snippet,
          s.title, s.started_at, s.git_branch,
          rank
@@ -229,18 +229,19 @@ async function runSummarization(
           messages: [
             {
               role: "user",
-              content: `Summarize this coding session as 2-4 bullet points. Each bullet should be one short line.
+              content: `Summarize this coding session as 2-3 bullet points. MAX 12 words per bullet.
 
-Format:
-- Built/Fixed/Added [concrete thing] in [file or area]
-- Decided [specific decision or approach]
-- Produced [specific output or result]
+Format — output ONLY bullets, nothing else:
+- Verb + what + where (e.g. "Added auto-ingest polling to session-explorer server")
+- Verb + what (e.g. "Fixed FTS5 search ranking for long queries")
 
 Rules:
-- Start each bullet with a past-tense verb (Built, Fixed, Added, Decided, Explored, Debugged, etc.)
+- Start each bullet with a past-tense verb: Built, Fixed, Added, Decided, Explored, Debugged, Refactored
+- Max 12 words per bullet. Be terse. Cut filler words.
 - Use file names, feature names, and specific concepts
-- No sub-bullets, no multi-sentence bullets
-- Do not start with "The user" or "In this session"
+- No sub-bullets, no multi-sentence bullets, no colons, no explanations
+- No preamble like "Summary:" or "Here are the bullets:"
+- If the session has no meaningful coding work, output a single bullet: "No substantive work"
 
 Conversation:
 ${truncated}`,
@@ -386,7 +387,7 @@ app.get("/api/search", (req, res) => {
   // Group matches by session
   const matchesBySession = new Map<
     string,
-    { matches: Array<{ role: string; snippet: string; timestamp: string; sequence: number }>; match_count: number }
+    { matches: Array<{ role: string; message_type: string; snippet: string; timestamp: string; sequence: number }>; match_count: number }
   >();
 
   let totalMatches = 0;
@@ -394,6 +395,7 @@ app.get("/api/search", (req, res) => {
   for (const row of results as Array<{
     session_id: string;
     role: string;
+    message_type: string;
     snippet: string;
     timestamp: string;
     sequence: number;
@@ -407,6 +409,7 @@ app.get("/api/search", (req, res) => {
     if (entry.matches.length < maxMatchesPerSession) {
       entry.matches.push({
         role: row.role,
+        message_type: row.message_type,
         snippet: row.snippet,
         timestamp: row.timestamp,
         sequence: row.sequence,
@@ -424,8 +427,36 @@ app.get("/api/search", (req, res) => {
       files_changed: changedFilesForSession.all(sessionId),
       matches,
       match_count,
+      match_source: 'content' as const,
     };
-  }).filter(Boolean) as Array<Record<string, unknown> & { match_count: number; started_at?: string }>;
+  }).filter(Boolean) as Array<Record<string, unknown> & { match_count: number; match_source: string; started_at?: string }>;
+
+  // Cross-search: find sessions by file path/name match
+  const fileSearchPattern = `%${query.trim()}%`;
+  const fileHits = db.prepare(`
+    SELECT DISTINCT sf.session_id
+    FROM session_files sf
+    WHERE (sf.file_name LIKE ? OR sf.file_path LIKE ?)
+    AND sf.file_path NOT LIKE '%.png'
+    AND sf.file_path NOT LIKE '%.jpg'
+    LIMIT 100
+  `).all(fileSearchPattern, fileSearchPattern) as Array<{ session_id: string }>;
+
+  for (const { session_id } of fileHits) {
+    if (matchesBySession.has(session_id)) continue; // already in FTS results
+    const session = getSession.get(session_id) as Record<string, unknown> | undefined;
+    if (!session) continue;
+    // Apply workspace filter if specified
+    if (workspaceId && (session as any).workspace_id !== workspaceId) continue;
+    enriched.push({
+      ...session,
+      tags: getTagsForSession.all(session_id),
+      files_changed: changedFilesForSession.all(session_id),
+      matches: [],
+      match_count: 0,
+      match_source: 'files' as const,
+    });
+  }
 
   // Sort based on query parameter
   if (sort === "date") {
@@ -439,7 +470,7 @@ app.get("/api/search", (req, res) => {
 
   res.json({
     results: enriched,
-    total_sessions: matchesBySession.size,
+    total_sessions: enriched.length,
     total_matches: totalMatches,
   });
 });
@@ -953,6 +984,24 @@ app.post("/api/ingest", async (req, res) => {
 
 app.get("/api/ingest/status", (_req, res) => {
   res.json(ingestProgress || { running: false });
+});
+
+// ── Open file in default app ──────────────────────────────────────
+import { exec } from "node:child_process";
+
+app.post("/api/open-file", (req, res) => {
+  const { path: filePath } = req.body as { path?: string };
+  if (!filePath || typeof filePath !== "string") {
+    res.status(400).json({ error: "path is required" });
+    return;
+  }
+  exec(`open ${JSON.stringify(filePath)}`, (err) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.json({ ok: true });
+    }
+  });
 });
 
 // SPA fallback — serve index.html for non-API routes

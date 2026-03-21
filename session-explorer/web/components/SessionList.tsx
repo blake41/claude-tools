@@ -1,6 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { Workspace, SessionSummary } from "../types";
 import SessionCard from "./SessionCard";
+import { categorizeFiles } from "../fileCategories";
+
+type FileFilter = "code" | "docs" | "viz";
 
 function formatDate(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString("en-US", {
@@ -189,7 +192,30 @@ export default function SessionList({ workspace }: SessionListProps) {
     ));
   };
 
-  const grouped = groupByDate(sessions);
+  const [activeFilters, setActiveFilters] = useState<Set<FileFilter>>(new Set());
+
+  const toggleFilter = (f: FileFilter) => {
+    setActiveFilters(prev => {
+      const next = new Set(prev);
+      if (next.has(f)) next.delete(f); else next.add(f);
+      return next;
+    });
+  };
+
+  const filteredSessions = useMemo(() => {
+    if (activeFilters.size === 0) return sessions;
+    return sessions.filter(s => {
+      const files = s.files_changed || [];
+      if (files.length === 0) return false;
+      const cats = categorizeFiles(files);
+      for (const f of activeFilters) {
+        if (cats[f].length > 0) return true;
+      }
+      return false;
+    });
+  }, [sessions, activeFilters]);
+
+  const grouped = groupByDate(filteredSessions);
 
   return (
     <div ref={containerRef} className="px-10 py-8 max-w-[1200px]">
@@ -222,6 +248,28 @@ export default function SessionList({ workspace }: SessionListProps) {
           {summarizeDone && (
             <span className="text-[13px] text-accent-green">
               Done! {summarizeDone.completed} summarized{summarizeDone.failed > 0 ? `, ${summarizeDone.failed} failed` : ""}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {(["code", "docs", "viz"] as const).map(f => (
+            <button
+              key={f}
+              onClick={() => toggleFilter(f)}
+              className={`text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border transition-all ${
+                activeFilters.has(f)
+                  ? f === "code" ? "border-[#3fb950]/40 text-[#3fb950] bg-[#3fb950]/12"
+                  : f === "docs" ? "border-[#56d4dd]/40 text-[#56d4dd] bg-[#56d4dd]/12"
+                  : "border-[#d29922]/40 text-[#d29922] bg-[#d29922]/12"
+                  : "bg-bg-card border-border text-text-dim hover:text-text-secondary"
+              }`}
+            >
+              {f}
+            </button>
+          ))}
+          {activeFilters.size > 0 && (
+            <span className="text-[11px] text-text-dim ml-1">
+              {filteredSessions.length} of {sessions.length}
             </span>
           )}
         </div>

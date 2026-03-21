@@ -246,14 +246,27 @@ function FileCategoryPills({ files }: { files: ChangedFile[] }) {
             </div>
             <div className="flex flex-col gap-px">
               {visible.map((f) => (
-                <div key={f.file_path} className="flex items-center gap-1.5 py-px group/file">
+                <a
+                  key={f.file_path}
+                  className="flex items-center gap-1.5 py-px group/file cursor-pointer no-underline"
+                  href={cls === "viz" ? undefined : `vscode://file${f.file_path}`}
+                  onClick={cls === "viz" ? (e) => {
+                    e.stopPropagation();
+                    fetch("/api/open-file", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ path: f.file_path }),
+                    });
+                  } : (e) => e.stopPropagation()}
+                  title={`Open ${f.file_path}`}
+                >
                   <span className={`text-[11px] font-mono font-bold leading-none w-3 text-center shrink-0 ${f.operation === "write" ? "text-accent-green" : "text-accent-blue"}`}>
                     {f.operation === "write" ? "+" : "~"}
                   </span>
                   <span className="font-mono text-[11px] leading-tight text-text-secondary truncate group-hover/file:text-text transition-colors">
                     {basename(f.file_path)}
                   </span>
-                </div>
+                </a>
               ))}
               {overflow > 0 && (
                 <div className="flex items-center gap-1.5 py-px">
@@ -311,7 +324,7 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
 
         {/* Summary as bullet list, or message count fallback */}
         {session.summary ? (
-          <ul className="mt-2 text-[12px] leading-[1.6] text-text-secondary pl-4 list-disc space-y-0.5">
+          <ul className="mt-2 text-[12px] leading-[1.6] text-text-primary pl-4 list-disc space-y-0.5">
             {parseSummaryBullets(session.summary).map((line, i) => (
               <li key={i}>{line}</li>
             ))}

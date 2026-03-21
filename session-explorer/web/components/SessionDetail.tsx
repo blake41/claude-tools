@@ -31,6 +31,18 @@ function duration(start: string, end: string | null): string {
   return rem > 0 ? `${hrs}h ${rem}m` : `${hrs} hours`;
 }
 
+/** Parse summary into clean bullet points, stripping markdown noise */
+function parseSummaryBullets(raw: string): string[] {
+  return raw
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.match(/^#{1,4}\s/) && !l.match(/^\|?[-:|\s]+\|?$/) && !l.match(/^\*\*.*\*\*:?\s*$/))
+    .map(l => l.startsWith('|') ? l.replace(/^\||\|$/g, '').split('|').map(c => c.trim()).filter(Boolean).join(' — ') : l)
+    .map(l => l.replace(/^[-•*]\s*/, '').replace(/\*\*/g, ''))
+    .filter(l => l.length > 0)
+    .slice(0, 4);
+}
+
 function renderMarkdown(text: string): string {
   let html = escapeHtml(text);
 
@@ -479,6 +491,13 @@ export default function SessionDetail() {
             </svg>
           </button>
           <TagSection sessionId={session.id} initialTags={session.tags || []} />
+          {session.summary && (
+            <ul className="mt-3 text-[13px] leading-[1.6] text-text-primary pl-4 list-disc space-y-0.5">
+              {parseSummaryBullets(session.summary).map((line, i) => (
+                <li key={i}>{line}</li>
+              ))}
+            </ul>
+          )}
         </div>
       </div>
 
