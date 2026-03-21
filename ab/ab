@@ -27,7 +27,11 @@
 # Session management:
 #   Uses --session-name for cookie/localStorage persistence per session.
 #   NOTE: --session launches separate Chrome instances (crashes in sandbox).
-#   Tab-level isolation for parallel agents is handled via AB_CONTEXT naming.
+#
+# Parallel subagent isolation (AB_CONTEXT):
+#   When AB_CONTEXT is set, `ab open` creates a dedicated tab and saves its
+#   index. All subsequent commands switch to that tab first. This lets N
+#   subagents browse simultaneously without stomping on each other's pages.
 
 set -euo pipefail
 
@@ -83,6 +87,42 @@ _ab_browsing_session() {
     echo "${base}-${AB_CONTEXT}"
   else
     echo "${base}"
+  fi
+}
+
+# --- Tab isolation for parallel subagents ---
+# When AB_CONTEXT is set, each subagent gets its own tab.
+# _claim_tab: opens a new tab, saves its index to /tmp/ab-tab-<AB_CONTEXT>
+# _switch_to_tab: switches to the saved tab before running a command
+_tab_file() {
+  echo "/tmp/ab-tab-${AB_CONTEXT:-default}"
+}
+
+_claim_tab() {
+  local url="${1:-about:blank}"
+  if [[ -z "${AB_CONTEXT:-}" ]]; then
+    return 0  # No isolation needed
+  fi
+  # Open a new tab with the URL
+  agent-browser tab new "$url" >/dev/null 2>&1
+  # Capture the active tab index (the one we just created)
+  local idx
+  idx=$(agent-browser tab list --json 2>/dev/null | python3 -c "import json,sys; tabs=json.load(sys.stdin)['data']['tabs']; print(next(t['index'] for t in tabs if t['active']))" 2>/dev/null)
+  if [[ -n "$idx" ]]; then
+    echo "$idx" > "$(_tab_file)"
+  fi
+}
+
+_switch_to_tab() {
+  if [[ -z "${AB_CONTEXT:-}" ]]; then
+    return 0  # No isolation needed
+  fi
+  local tf
+  tf="$(_tab_file)"
+  if [[ -f "$tf" ]]; then
+    local idx
+    idx="$(cat "$tf")"
+    agent-browser tab "$idx" >/dev/null 2>&1
   fi
 }
 
@@ -257,11 +297,16 @@ case "$CMD" in
     do_status
     ;;
   open)
-    # Ensure daemon is ready, then navigate in an isolated context
+    # Ensure daemon is ready, then navigate
     ensure_browser
     SESSION="$(_ab_browsing_session "$BASE_SESSION")"
     if [[ -n "${2:-}" ]]; then
-      agent-browser --session-name "$SESSION" open "$2"
+      if [[ -n "${AB_CONTEXT:-}" ]]; then
+        # Parallel mode: open in a dedicated tab
+        _claim_tab "$2"
+      else
+        agent-browser --session-name "$SESSION" open "$2"
+      fi
     fi
     ;;
   "")
@@ -278,7 +323,8 @@ case "$CMD" in
     exit 1
     ;;
   *)
-    # All other commands: pass through in an isolated context
+    # All other commands: switch to our tab first, then pass through
+    _switch_to_tab
     SESSION="$(_ab_browsing_session "$BASE_SESSION")"
     agent-browser --session-name "$SESSION" "$@"
     ;;
