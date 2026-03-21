@@ -1,16 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
-
-function formatDate(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  });
-}
+import { renderMarkdown } from "../sessionFormat";
+import SessionHeader from "./SessionHeader";
 
 function formatTime(dateStr: string | null): string {
   if (!dateStr) return "";
@@ -21,266 +14,104 @@ function formatTime(dateStr: string | null): string {
   });
 }
 
-function duration(start: string, end: string | null): string {
-  if (!end) return "Ongoing";
-  const ms = new Date(end).getTime() - new Date(start).getTime();
-  const mins = Math.round(ms / 60000);
-  if (mins < 60) return `${mins} minutes`;
-  const hrs = Math.floor(mins / 60);
-  const rem = mins % 60;
-  return rem > 0 ? `${hrs}h ${rem}m` : `${hrs} hours`;
+const TOOL_ICON = (
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+    <path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/>
+  </svg>
+);
+
+/** Pretty-print JSON in content. Handles single objects, arrays, and concatenated JSON objects. */
+function tryPrettyPrint(content: string): string {
+  const trimmed = content.trim();
+  // Single JSON value
+  if ((trimmed.startsWith("{") || trimmed.startsWith("[")) ) {
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2);
+    } catch { /* try splitting */ }
+    // Concatenated JSON objects: {...} {...} or {...}\n{...}
+    const objects: string[] = [];
+    let depth = 0, start = -1;
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (ch === "{" || ch === "[") { if (depth === 0) start = i; depth++; }
+      else if (ch === "}" || ch === "]") {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          try {
+            const chunk = trimmed.slice(start, i + 1);
+            objects.push(JSON.stringify(JSON.parse(chunk), null, 2));
+          } catch { objects.push(trimmed.slice(start, i + 1)); }
+          start = -1;
+        }
+      }
+    }
+    if (objects.length > 0) return objects.join("\n\n");
+  }
+  return content;
 }
 
-import { parseSummaryBullets } from "../summaryUtils";
-
-function renderMarkdown(text: string): string {
-  let html = escapeHtml(text);
-
-  // Code blocks (``` ... ```)
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_match, lang, code) => {
-    const langLabel = lang ? `<span class="code-lang">${lang}</span>` : "";
-    return `<div class="code-block">${langLabel}<pre><code>${code.trimEnd()}</code></pre></div>`;
-  });
-
-  // Inline code
-  html = html.replace(/`([^`\n]+)`/g, "<code class=\"inline-code\">$1</code>");
-
-  // Headers
-  html = html.replace(/^#### (.+)$/gm, "<h4>$1</h4>");
-  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
-  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
-
-  // Bold and italic
-  html = html.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-
-  // Unordered lists
-  html = html.replace(/^(\s*)[-*] (.+)$/gm, "$1<li>$2</li>");
-  // Wrap consecutive <li> in <ul>
-  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
-
-  // Ordered lists
-  html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
-
-  // Horizontal rules
-  html = html.replace(/^---+$/gm, "<hr />");
-
-  // Links
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
-  // Paragraphs - convert double newlines
-  html = html.replace(/\n\n/g, "</p><p>");
-  // Single newlines within paragraphs
-  html = html.replace(/\n/g, "<br />");
-
-  return html;
+/** Parse "ToolName: content" from tool_use messages */
+function parseToolUse(content: string): { name: string; input: string } | null {
+  const match = content.match(/^(\w+):\s*([\s\S]*)$/);
+  if (!match) return null;
+  return { name: match[1], input: match[2] };
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function MessageBubble({ message, highlight }: { message: Message; highlight?: boolean }) {
-  const isUser = message.role === "user";
-
+function ToolBlock({ label, content, timestamp, highlight, sequence }: {
+  label: string; content: string; timestamp?: string | null; highlight?: boolean; sequence: number;
+}) {
   return (
     <div
-      id={`msg-${message.sequence}`}
-      className={`relative ${highlight ? "message-highlight" : ""}`}
+      id={`msg-${sequence}`}
+      className={`result-snippet type-tool ${highlight ? "message-highlight" : ""}`}
     >
-      <div className={`${isUser ? "pr-12" : "pl-10"}`}>
-        <div className="flex items-center gap-2.5 mb-1">
-          {isUser ? (
-            <span className="text-[13px] font-bold uppercase tracking-[0.12em] text-accent-blue">You</span>
-          ) : (
-            <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-text-dim">Claude</span>
-          )}
-          {message.timestamp && (
-            <span className="font-mono text-[10px] text-text-dim/60">{formatTime(message.timestamp)}</span>
-          )}
-        </div>
-        <div
-          className={`message-content text-[13.5px] leading-[1.75] break-words ${isUser ? "text-text" : "text-claude-text"}`}
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
-        />
+      <div className="snippet-tool-label">
+        {TOOL_ICON}
+        {label}
+        {timestamp && (
+          <span className="font-mono text-[10px] text-text-dim/60 font-normal ml-1">{formatTime(timestamp)}</span>
+        )}
+      </div>
+      <div className="snippet-tool-output" style={{ WebkitLineClamp: "unset" }}>
+        {tryPrettyPrint(content)}
       </div>
     </div>
   );
 }
 
-const PRESET_COLORS = [
-  "#58a6ff", "#3fb950", "#bc8cff", "#d29922",
-  "#f85149", "#79c0ff", "#d2a8ff", "#56d364",
-];
+function MessageBubble({ message, highlight }: { message: Message; highlight?: boolean }) {
+  const isToolResult = message.role === "user" && message.message_type === "tool_result";
+  const isToolUse = message.message_type === "tool_use";
+  const isUser = message.role === "user" && !isToolResult;
 
-function TagSection({ sessionId, initialTags }: { sessionId: string; initialTags: Tag[] }) {
-  const [tags, setTags] = useState<Tag[]>(initialTags);
-  const [allTags, setAllTags] = useState<Tag[]>([]);
-  const [showDropdown, setShowDropdown] = useState(false);
-  const [filter, setFilter] = useState("");
-  const [newTagName, setNewTagName] = useState("");
-  const [newTagColor, setNewTagColor] = useState(PRESET_COLORS[0]);
-  const [showCreate, setShowCreate] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (showDropdown) {
-      fetch("/api/tags").then((r) => r.json()).then(setAllTags).catch(() => {});
-    }
-  }, [showDropdown]);
-
-  useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setShowDropdown(false);
-        setShowCreate(false);
-        setFilter("");
-      }
-    }
-    if (showDropdown) {
-      document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
-    }
-  }, [showDropdown]);
-
-  function addTag(tagId: number) {
-    fetch(`/api/sessions/${sessionId}/tags`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tag_id: tagId }),
-    })
-      .then((r) => r.json())
-      .then((tag) => {
-        setTags((prev) => prev.some((t) => t.id === tag.id) ? prev : [...prev, tag]);
-        setShowDropdown(false);
-        setFilter("");
-      })
-      .catch(() => {});
+  // Tool result (output from a tool)
+  if (isToolResult) {
+    return <ToolBlock label="Tool output" content={message.content} timestamp={message.timestamp} highlight={highlight} sequence={message.sequence} />;
   }
 
-  function removeTag(tagId: number) {
-    fetch(`/api/sessions/${sessionId}/tags/${tagId}`, { method: "DELETE" })
-      .then(() => setTags((prev) => prev.filter((t) => t.id !== tagId)))
-      .catch(() => {});
+  // Tool use (Claude invoking a tool)
+  if (isToolUse) {
+    const parsed = parseToolUse(message.content);
+    const label = parsed ? parsed.name : "Tool";
+    const content = parsed ? parsed.input : message.content;
+    return <ToolBlock label={label} content={content} timestamp={message.timestamp} highlight={highlight} sequence={message.sequence} />;
   }
-
-  function createAndAdd(e: React.FormEvent) {
-    e.preventDefault();
-    if (!newTagName.trim()) return;
-    fetch(`/api/sessions/${sessionId}/tags`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: newTagName.trim(), color: newTagColor }),
-    })
-      .then((r) => r.json())
-      .then((tag) => {
-        setTags((prev) => prev.some((t) => t.id === tag.id) ? prev : [...prev, tag]);
-        setNewTagName("");
-        setNewTagColor(PRESET_COLORS[0]);
-        setShowCreate(false);
-        setShowDropdown(false);
-      })
-      .catch(() => {});
-  }
-
-  const existingIds = new Set(tags.map((t) => t.id));
-  const available = allTags
-    .filter((t) => !existingIds.has(t.id))
-    .filter((t) => !filter || t.name.toLowerCase().includes(filter.toLowerCase()));
 
   return (
-    <div className="flex items-center flex-wrap gap-1.5 mt-2.5">
-      {tags.map((tag) => (
-        <span
-          key={tag.id}
-          className="inline-flex items-center gap-1 px-2 py-px rounded-full text-[11px] font-medium whitespace-nowrap"
-          style={{ background: `${tag.color}26`, color: tag.color }}
-        >
-          {tag.name}
-          <button
-            className="text-[13px] leading-none opacity-60 pl-0.5 text-inherit hover:opacity-100"
-            onClick={() => removeTag(tag.id)}
-            title="Remove tag"
-          >
-            {"\u00d7"}
-          </button>
-        </span>
-      ))}
-      <div className="relative" ref={dropdownRef}>
-        <button
-          className="w-[22px] h-[22px] flex items-center justify-center rounded-full text-sm text-text-dim border border-dashed border-border transition-all hover:text-text hover:border-text-secondary"
-          onClick={() => setShowDropdown(!showDropdown)}
-          title="Add tag"
-        >
-          +
-        </button>
-        {showDropdown && (
-          <div className="absolute top-full left-0 mt-1.5 w-[220px] bg-bg-card border border-border rounded-lg shadow-[0_8px_24px_rgba(0,0,0,0.4)] z-50 overflow-hidden">
-            <input
-              className="w-full px-2.5 py-2 bg-transparent border-none border-b border-border outline-none text-xs text-text font-[var(--font-ui)]"
-              style={{ borderBottom: '1px solid var(--color-border)' }}
-              type="text"
-              placeholder="Search tags..."
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              autoFocus
-            />
-            <div className="max-h-[160px] overflow-y-auto p-1">
-              {available.map((tag) => (
-                <button
-                  key={tag.id}
-                  className="flex items-center gap-2 w-full px-2 py-1.5 rounded text-xs text-text text-left transition-[background] duration-100 hover:bg-white/6"
-                  onClick={() => addTag(tag.id)}
-                >
-                  <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: tag.color }} />
-                  {tag.name}
-                </button>
-              ))}
-              {available.length === 0 && !showCreate && (
-                <div className="p-2 text-[11px] text-text-dim text-center">
-                  {filter ? "No matching tags" : "No more tags available"}
-                </div>
-              )}
-            </div>
-            {!showCreate ? (
-              <button
-                className="block w-full px-2.5 py-2 text-xs text-accent-blue text-left border-t border-border transition-[background] duration-100 hover:bg-accent-blue/8"
-                onClick={() => { setShowCreate(true); setNewTagName(filter); }}
-              >
-                + Create new tag{filter ? `: "${filter}"` : ""}
-              </button>
-            ) : (
-              <form className="p-2 border-t border-border flex flex-col gap-1.5" onSubmit={createAndAdd}>
-                <input
-                  type="text"
-                  className="w-full px-2 py-1.5 bg-white/6 border border-border rounded outline-none text-xs text-text font-[var(--font-ui)] focus:border-accent-blue"
-                  placeholder="Tag name..."
-                  value={newTagName}
-                  onChange={(e) => setNewTagName(e.target.value)}
-                  autoFocus
-                />
-                <div className="flex gap-1 flex-wrap">
-                  {PRESET_COLORS.map((c) => (
-                    <button
-                      key={c}
-                      type="button"
-                      className={`w-[18px] h-[18px] rounded-full border-2 transition-[border-color] duration-100 hover:border-text-secondary ${c === newTagColor ? "border-text" : "border-transparent"}`}
-                      style={{ background: c }}
-                      onClick={() => setNewTagColor(c)}
-                    />
-                  ))}
-                </div>
-                <button type="submit" className="px-2.5 py-1 bg-accent-blue text-white rounded text-[11px] font-medium transition-opacity hover:opacity-85 self-start">Create & Add</button>
-              </form>
-            )}
-          </div>
+    <div
+      id={`msg-${message.sequence}`}
+      className={`result-snippet ${isUser ? "type-user" : "type-claude"} ${highlight ? "message-highlight" : ""}`}
+    >
+      <div className="bubble-role">
+        {isUser ? "YOU" : "CLAUDE"}
+        {message.timestamp && (
+          <span className="font-mono text-[10px] opacity-50 font-normal ml-1.5">{formatTime(message.timestamp)}</span>
         )}
       </div>
+      <div
+        className="message-content"
+        dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+      />
     </div>
   );
 }
@@ -420,6 +251,11 @@ export default function SessionDetail() {
     }
   }, [loading, session, highlightMsg]);
 
+  function handleTagsChange(newTags: Tag[]) {
+    if (!session) return;
+    setSession({ ...session, tags: newTags });
+  }
+
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 p-15 text-text-secondary">
@@ -450,18 +286,11 @@ export default function SessionDetail() {
       </div>
       <div className="border-b border-border pb-5 mb-6">
         <div className="mt-1">
-          <h1 className="text-xl font-semibold tracking-tight">{session.title || "Untitled Session"}</h1>
-          <div className="flex items-center flex-wrap gap-3 mt-2 text-[13px] text-text-secondary">
-            <span>{formatDate(session.started_at)}</span>
-            <span>
-              {formatTime(session.started_at)}
-              {session.ended_at && ` - ${formatTime(session.ended_at)}`}
-            </span>
-            <span>{duration(session.started_at, session.ended_at)}</span>
-            {session.git_branch && (
-              <span className="inline-block px-2 py-px rounded-full font-mono text-[11px] bg-accent-purple/12 text-accent-purple whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px]">{session.git_branch}</span>
-            )}
-          </div>
+          <SessionHeader
+            session={session}
+            onTagsChange={handleTagsChange}
+            showTitle
+          />
           <div className="flex items-center gap-2 mt-1 text-xs text-text-dim">
             <span>{session.message_count} messages</span>
             <span className="text-border">/</span>
@@ -469,49 +298,27 @@ export default function SessionDetail() {
             <span className="text-border">/</span>
             <span>{session.workspace.display_name}</span>
           </div>
-          <button
-            className="group/sid flex items-center gap-1 mt-1 font-mono text-[11px] text-text-dim transition-colors hover:text-text-secondary"
-            onClick={() => navigator.clipboard.writeText(session.id)}
-            title="Copy session ID"
-          >
-            <span>{session.id}</span>
-            <svg className="opacity-0 group-hover/sid:opacity-100 transition-opacity" width="12" height="12" viewBox="0 0 16 16" fill="none">
-              <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
-              <path d="M3 11V3.5A1.5 1.5 0 014.5 2H10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-            </svg>
-          </button>
-          <TagSection sessionId={session.id} initialTags={session.tags || []} />
-          {session.summary && (
-            <ul className="mt-3 text-[13px] leading-[1.6] text-text-primary pl-4 list-disc space-y-0.5">
-              {parseSummaryBullets(session.summary).map((line, i) => (
-                <li key={i}>{line}</li>
-              ))}
-            </ul>
-          )}
         </div>
       </div>
 
       <FilesPanel sessionId={session.id} />
 
-      <div className="flex flex-col">
+      <div className="snippet-bubbles" style={{ gap: 10 }}>
         {session.messages.map((msg, i) => {
           const prev = i > 0 ? session.messages[i - 1] : null;
-          const isNewTurn = prev && prev.role !== msg.role;
-          const isNewUserTurn = msg.role === "user" && prev;
+          const isNewUserTurn = msg.role === "user" && msg.message_type !== "tool_result" && prev;
           return (
-            <div key={msg.id}>
+            <React.Fragment key={msg.id}>
               {isNewUserTurn && (
-                <div className="my-7 flex items-center gap-4">
+                <div className="w-full my-4 flex items-center">
                   <div className="flex-1 h-px bg-border/40" />
                 </div>
               )}
-              {isNewTurn && !isNewUserTurn && <div className="mt-5" />}
-              {!isNewTurn && i > 0 && <div className="mt-3" />}
               <MessageBubble
                 message={msg}
                 highlight={highlightMsg === String(msg.sequence)}
               />
-            </div>
+            </React.Fragment>
           );
         })}
       </div>

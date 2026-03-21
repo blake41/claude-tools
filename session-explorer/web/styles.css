@@ -299,65 +299,325 @@ button {
   }
 }
 
-/* ---- Search results grid (mirrors session-row layout) ---- */
+/* ---- Search results ---- */
 .search-results {
-  position: relative;
-}
-
-.search-results::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  right: 220px;
-  width: 1px;
-  background: rgba(48, 54, 61, 0.6);
-  pointer-events: none;
-}
-
-.search-result-row {
-  display: grid;
-  grid-template-columns: 1fr 220px;
-  gap: 0;
-  align-items: stretch;
-  border-top: 1px solid var(--color-border);
-}
-
-.search-result-row:first-child {
-  border-top: none;
-}
-
-.search-result-card {
-  min-width: 0;
-}
-
-.search-result-files {
-  min-width: 0;
-  padding: 12px 0 12px 16px;
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
+  gap: 6px;
 }
 
-.search-result-files--empty {
-  padding: 0;
+/* ---- Line clamp utilities ---- */
+.line-clamp-1 {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
-@media (max-width: 900px) {
-  .search-results::after {
-    display: none;
-  }
-  .search-result-row {
-    grid-template-columns: 1fr;
-  }
-  .search-result-files {
-    padding: 4px 0;
-  }
-}
-
-/* ---- Line clamp utility ---- */
 .line-clamp-2 {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.line-clamp-3 {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Option 10: Search Results Redesign */
+.result-card {
+  background: rgba(30, 37, 46, 0.7);
+  border: 1px solid rgba(48, 54, 61, 0.8);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.result-card:hover {
+  border-color: var(--accent-blue);
+  background: rgba(30, 37, 46, 0.95);
+}
+.result-date {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+.result-branch {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 1px 7px;
+  border-radius: 99px;
+  background: rgba(188, 140, 255, 0.12);
+  color: var(--accent-purple);
+}
+.result-match-count {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+.result-summary {
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 6px;
+  line-height: 1.55;
+  opacity: 0.85;
+}
+.result-stats {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+  display: flex;
+  gap: 12px;
+}
+/* ── Chat Bubble Snippets (Option 6: iMessage-style) ── */
+.snippet-bubbles {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* User bubble: right-aligned, blue */
+.result-snippet.type-user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: rgba(88, 166, 255, 0.15);
+  border-radius: 14px 14px 4px 14px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text);
+}
+.result-snippet.type-user:hover {
+  background: rgba(88, 166, 255, 0.2);
+}
+.result-snippet.type-user .bubble-role {
+  font-size: 10px;
+  font-weight: 600;
+  color: #58a6ff;
+  margin-bottom: 4px;
+}
+
+/* Claude bubble: left-aligned, warm */
+.result-snippet.type-claude {
+  align-self: flex-start;
+  max-width: 85%;
+  background: rgba(196, 181, 160, 0.1);
+  border-radius: 14px 14px 14px 4px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text);
+}
+.result-snippet.type-claude:hover {
+  background: rgba(196, 181, 160, 0.15);
+}
+.result-snippet.type-claude .bubble-role {
+  font-size: 10px;
+  font-weight: 600;
+  color: #c4b5a0;
+  margin-bottom: 4px;
+}
+
+/* Tool block: full width, centered, terminal-style */
+.result-snippet.type-tool {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(63, 185, 80, 0.15);
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text);
+}
+.result-snippet.type-tool:hover {
+  border-color: rgba(63, 185, 80, 0.3);
+}
+.result-snippet .snippet-tool-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #3fb950;
+  margin-bottom: 6px;
+}
+.result-snippet .snippet-tool-output {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--color-text);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+/* Snippet highlight text (FTS matches) */
+.result-snippet .snippet-highlight {
+  font-size: 13px;
+  color: var(--color-text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.view-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.view-toggle button {
+  font-size: 11px;
+  padding: 4px 10px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  transition: all 0.15s;
+}
+.view-toggle button:not(:last-child) {
+  border-right: 1px solid var(--border);
+}
+.view-toggle button.active {
+  background: rgba(88, 166, 255, 0.1);
+  color: var(--accent-blue);
+}
+.view-toggle button:hover:not(.active) {
+  color: var(--text-secondary);
+}
+.sort-btn {
+  font-size: 11px;
+  font-family: var(--font-ui);
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sort-btn:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+.sort-dropdown-menu {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 180px;
+  z-index: 50;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.sort-dropdown-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: background 0.1s;
+}
+.sort-dropdown-item:hover {
+  background: rgba(88, 166, 255, 0.08);
+  color: var(--text-primary);
+}
+.sort-dropdown-item.active {
+  color: var(--accent-blue);
+}
+.filter-chip {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  transition: all 0.15s;
+}
+.filter-chip:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-secondary);
+}
+.filter-chip.active {
+  background: rgba(88, 166, 255, 0.1);
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+}
+
+/* ── Session text formatting (sf-*) ─────────────────────────── */
+/* Used by sessionFormat.tsx across the app for consistent       */
+/* rendering of Claude session content (gist-style)              */
+
+.session-fmt {
+  word-break: break-word;
+}
+.session-fmt strong {
+  font-weight: 600;
+  color: var(--text);
+}
+.session-fmt em {
+  font-style: italic;
+}
+.session-fmt .sf-code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent-orange);
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.session-fmt .sf-path {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  color: var(--accent-blue);
+  opacity: 0.85;
+}
+.session-fmt .sf-pipe {
+  color: var(--text-dim);
+  opacity: 0.5;
+}
+.session-fmt mark.sf-match,
+.session-fmt .sf-match {
+  background: rgba(250, 225, 50, 0.35);
+  color: #fae132;
+  padding: 1px 3px;
+  border-radius: 3px;
+  font-weight: 600;
 }

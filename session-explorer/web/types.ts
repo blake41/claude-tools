@@ -41,6 +41,7 @@ export interface Message {
   content: string;
   timestamp: string | null;
   sequence: number;
+  message_type?: string;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -54,11 +55,18 @@ export interface SearchMatch {
   snippet: string;
   timestamp: string;
   sequence: number;
+  message_type?: string;
+  context?: string | null;
+  context_role?: "user" | "assistant" | null;
+  preview?: string | null;
+  tool_content?: string | null;
 }
 
 export interface SearchResult extends SessionSummary {
   match_count: number;
   matches: SearchMatch[];
+  match_source?: 'content' | 'files';
+  matched_files?: string[];
   workspace_name?: string;
   workspace_path?: string;
 }

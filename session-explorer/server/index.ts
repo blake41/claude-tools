@@ -118,10 +118,29 @@ const getSession = db.prepare(`
 `);
 
 const getMessages = db.prepare(`
-  SELECT role, content, timestamp, sequence
+  SELECT role, content, timestamp, sequence, message_type
   FROM messages
   WHERE session_id = ?
   ORDER BY sequence ASC
+`);
+
+// Fetch the matched message's content for a readable preview
+const getMessageContent = db.prepare(`
+  SELECT content FROM messages
+  WHERE session_id = ? AND sequence = ?
+`);
+
+// Fetch the adjacent message from the opposite role for context around a match
+const getAdjacentContext = db.prepare(`
+  SELECT role, content, sequence FROM messages
+  WHERE session_id = ? AND sequence < ? AND role != ?
+  ORDER BY sequence DESC LIMIT 1
+`);
+
+const getFollowingContext = db.prepare(`
+  SELECT role, content, sequence FROM messages
+  WHERE session_id = ? AND sequence > ? AND role != ?
+  ORDER BY sequence ASC LIMIT 1
 `);
 
 const searchMessagesFts = db.prepare(`
@@ -384,12 +403,8 @@ app.get("/api/search", (req, res) => {
     return;
   }
 
-  // Group matches by session
-  const matchesBySession = new Map<
-    string,
-    { matches: Array<{ role: string; message_type: string; snippet: string; timestamp: string; sequence: number }>; match_count: number }
-  >();
-
+  // Group raw match rows by session, keeping all of them for prioritization
+  const rawMatchesBySession = new Map<string, Array<{ session_id: string; role: string; message_type: string; snippet: string; timestamp: string; sequence: number }>>();
   let totalMatches = 0;
 
   for (const row of results as Array<{
@@ -400,21 +415,133 @@ app.get("/api/search", (req, res) => {
     timestamp: string;
     sequence: number;
   }>) {
-    if (!matchesBySession.has(row.session_id)) {
-      matchesBySession.set(row.session_id, { matches: [], match_count: 0 });
+    if (!rawMatchesBySession.has(row.session_id)) {
+      rawMatchesBySession.set(row.session_id, []);
     }
-    const entry = matchesBySession.get(row.session_id)!;
-    entry.match_count++;
+    rawMatchesBySession.get(row.session_id)!.push(row);
     totalMatches++;
-    if (entry.matches.length < maxMatchesPerSession) {
-      entry.matches.push({
+  }
+
+  // Helper: clean a message into a readable context string
+  function cleanForContext(content: string, maxLen = 120): string {
+    const clean = content
+      .replace(/\x1b\[[\d;]*m/g, '')     // strip ANSI escape codes
+      .replace(/\[[\d;]*m/g, '')          // strip partial ANSI codes
+      .replace(/```[\s\S]*?```/g, '[code]')
+      .replace(/`[^`]+`/g, (m) => m.length > 40 ? '[code]' : m)
+      .replace(/\n+/g, ' ')
+      .trim();
+    return clean.length > maxLen ? clean.slice(0, maxLen) + '…' : clean;
+  }
+
+  // Helper: check if a message is "real conversation" vs tool noise
+  function isConversational(messageType: string): boolean {
+    return messageType === 'text';
+  }
+
+  // Helper: extract a readable preview from message content
+  function extractPreview(content: string): string | null {
+    const lines = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    for (const line of lines.slice(0, 8)) {
+      const cleaned = line
+        .replace(/^#+\s*/, '')
+        .replace(/```\w*/, '')
+        .replace(/^[-*]\s*/, '')
+        .replace(/\x1b\[[\d;]*m/g, '')
+        .replace(/\[[\d;]*m/g, '')
+        .replace(/^\[?\u2713\]?\s*/, '');
+      const pathCount = (cleaned.match(/[\w.-]+\.\w{1,5}/g) || []).length;
+      const isNoise = pathCount > 3 || /^[{[\/"<(]/.test(cleaned) || cleaned.length < 8;
+      if (!isNoise) {
+        return cleaned.length > 150 ? cleaned.slice(0, 150) + '…' : cleaned;
+      }
+    }
+    return null;
+  }
+
+  // For context: find nearest conversational message from the other role
+  const getNearbyConversation = db.prepare(`
+    SELECT role, content, sequence FROM messages
+    WHERE session_id = ? AND sequence < ? AND role != ? AND message_type = 'text'
+    ORDER BY sequence DESC LIMIT 1
+  `);
+  const getFollowingConversation = db.prepare(`
+    SELECT role, content, sequence FROM messages
+    WHERE session_id = ? AND sequence > ? AND role != ? AND message_type = 'text'
+    ORDER BY sequence ASC LIMIT 1
+  `);
+
+  // Pick best matches per session: prefer text messages over tool messages
+  type EnrichedMatch = { role: string; message_type: string; snippet: string; timestamp: string; sequence: number; context: string | null; context_role: string | null; preview: string | null; tool_content: string | null };
+  const matchesBySession = new Map<string, { matches: EnrichedMatch[]; match_count: number }>();
+
+  for (const [sessionId, rows] of rawMatchesBySession) {
+    // Sort: text messages first, then by original FTS rank order
+    const sorted = [...rows].sort((a, b) => {
+      const aConv = isConversational(a.message_type) ? 0 : 1;
+      const bConv = isConversational(b.message_type) ? 0 : 1;
+      return aConv - bConv;
+    });
+
+    const picked: EnrichedMatch[] = [];
+    for (const row of sorted) {
+      if (picked.length >= maxMatchesPerSession) break;
+
+      // Find conversational context (skip tool messages when looking for context)
+      let context: string | null = null;
+      let contextRole: string | null = null;
+      const before = getNearbyConversation.get(sessionId, row.sequence, row.role) as { role: string; content: string } | undefined;
+      const after = getFollowingConversation.get(sessionId, row.sequence, row.role) as { role: string; content: string } | undefined;
+      const adjacent = before || after;
+      if (adjacent) {
+        context = cleanForContext(adjacent.content);
+        contextRole = adjacent.role;
+      }
+
+      // Extract readable preview from matched message
+      let preview: string | null = null;
+      const msg = getMessageContent.get(sessionId, row.sequence) as { content: string } | undefined;
+      if (msg) {
+        preview = extractPreview(msg.content);
+      }
+
+      // For tool output matches, extract content with line breaks preserved
+      let toolContent: string | null = null;
+      if (!isConversational(row.message_type) && msg) {
+        // Clean ANSI codes
+        let cleaned = msg.content
+          .replace(/\x1b\[[\d;]*m/g, '')
+          .replace(/\[[\d;]*m/g, '');
+
+        // JSON pretty-printing is handled client-side (handles truncated JSON)
+        // Truncate by lines, preserving structure
+        const lines = cleaned.split('\n').filter(l => l.trim().length > 0);
+        let result = '';
+        const maxLen = 500; // more room for formatted JSON
+        for (const line of lines) {
+          if (result.length + line.length > maxLen) {
+            result += (result ? '\n' : '') + line.slice(0, Math.max(0, maxLen - result.length)) + '…';
+            break;
+          }
+          result += (result ? '\n' : '') + line;
+        }
+        toolContent = result || null;
+      }
+
+      picked.push({
         role: row.role,
         message_type: row.message_type,
         snippet: row.snippet,
         timestamp: row.timestamp,
         sequence: row.sequence,
+        context,
+        context_role: contextRole,
+        preview,
+        tool_content: toolContent,
       });
     }
+
+    matchesBySession.set(sessionId, { matches: picked, match_count: rows.length });
   }
 
   // Enrich with full session data (summary, tags, files)
@@ -434,19 +561,26 @@ app.get("/api/search", (req, res) => {
   // Cross-search: find sessions by file path/name match
   const fileSearchPattern = `%${query.trim()}%`;
   const fileHits = db.prepare(`
-    SELECT DISTINCT sf.session_id
+    SELECT sf.session_id, sf.file_name, sf.file_path
     FROM session_files sf
     WHERE (sf.file_name LIKE ? OR sf.file_path LIKE ?)
     AND sf.file_path NOT LIKE '%.png'
     AND sf.file_path NOT LIKE '%.jpg'
-    LIMIT 100
-  `).all(fileSearchPattern, fileSearchPattern) as Array<{ session_id: string }>;
+    LIMIT 200
+  `).all(fileSearchPattern, fileSearchPattern) as Array<{ session_id: string; file_name: string; file_path: string }>;
 
-  for (const { session_id } of fileHits) {
-    if (matchesBySession.has(session_id)) continue; // already in FTS results
+  // Group matched files by session
+  const matchedFilesBySession = new Map<string, string[]>();
+  for (const hit of fileHits) {
+    if (matchesBySession.has(hit.session_id)) continue;
+    if (!matchedFilesBySession.has(hit.session_id)) matchedFilesBySession.set(hit.session_id, []);
+    const files = matchedFilesBySession.get(hit.session_id)!;
+    if (!files.includes(hit.file_name)) files.push(hit.file_name);
+  }
+
+  for (const [session_id, matched_files] of matchedFilesBySession) {
     const session = getSession.get(session_id) as Record<string, unknown> | undefined;
     if (!session) continue;
-    // Apply workspace filter if specified
     if (workspaceId && (session as any).workspace_id !== workspaceId) continue;
     enriched.push({
       ...session,
@@ -455,6 +589,7 @@ app.get("/api/search", (req, res) => {
       matches: [],
       match_count: 0,
       match_source: 'files' as const,
+      matched_files,
     });
   }
 
