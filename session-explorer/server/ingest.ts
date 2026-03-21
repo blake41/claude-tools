@@ -106,8 +106,8 @@ const updateWorkspaceStats = db.prepare(`
 const sessionExists = db.prepare(`SELECT 1 FROM sessions WHERE id = ?`);
 
 const insertSession = db.prepare(`
-  INSERT INTO sessions (id, workspace_id, source_path, started_at, ended_at, git_branch, title, message_count, user_message_count, ingested_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO sessions (id, workspace_id, source_path, started_at, ended_at, git_branch, title, message_count, user_message_count, file_size, ingested_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const insertMessage = db.prepare(`
@@ -196,6 +196,14 @@ function ingestSession(
   const startedAt = messages[0]?.timestamp || null;
   const endedAt = messages[messages.length - 1]?.timestamp || null;
 
+  // Get file size for change detection
+  let fileSize: number | null = null;
+  try {
+    fileSize = statSync(jsonlPath).size;
+  } catch {
+    // file may have been removed between strip and stat
+  }
+
   const ingestTx = db.transaction(() => {
     insertSession.run(
       sessionId,
@@ -207,6 +215,7 @@ function ingestSession(
       title,
       messages.length,
       userMessages.length,
+      fileSize,
       new Date().toISOString()
     );
 
@@ -307,6 +316,47 @@ function ingestSession(
   }
 
   return true;
+}
+
+// ── Stale Session Detection ──────────────────────────────────────
+
+const getAllSessionsWithSize = db.prepare(
+  `SELECT id, source_path, workspace_id, file_size FROM sessions WHERE source_path IS NOT NULL AND file_size IS NOT NULL`
+);
+
+export function getStaleSessionsNeedingReingest(
+  idleHoursThreshold: number
+): Array<{ sessionId: string; sourcePath: string; workspaceId: number }> {
+  const rows = getAllSessionsWithSize.all() as Array<{
+    id: string;
+    source_path: string;
+    workspace_id: number;
+    file_size: number;
+  }>;
+
+  const cutoff = Date.now() - idleHoursThreshold * 60 * 60 * 1000;
+  const stale: Array<{ sessionId: string; sourcePath: string; workspaceId: number }> = [];
+
+  for (const row of rows) {
+    try {
+      const stat = statSync(row.source_path);
+      if (stat.mtimeMs < cutoff && stat.size !== row.file_size) {
+        stale.push({
+          sessionId: row.id,
+          sourcePath: row.source_path,
+          workspaceId: row.workspace_id,
+        });
+      }
+    } catch {
+      // File no longer exists — skip
+    }
+  }
+
+  return stale;
+}
+
+export function reingestSession(sourcePath: string, workspaceId: number): boolean {
+  return ingestSession(sourcePath, workspaceId, true);
 }
 
 export async function runIngestion(

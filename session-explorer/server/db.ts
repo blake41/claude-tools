@@ -35,6 +35,7 @@ db.exec(`
     message_count INTEGER DEFAULT 0,
     user_message_count INTEGER DEFAULT 0,
     summary TEXT,
+    file_size INTEGER,
     ingested_at TEXT NOT NULL
   );
 
@@ -124,6 +125,13 @@ db.exec(`
     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
   END;
 `);
+
+// Migration: add file_size column if it doesn't exist (for existing DBs)
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN file_size INTEGER`);
+} catch {
+  // Column already exists
+}
 
 // Rebuild FTS index to cover any data ingested before FTS5 was added
 db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`);

@@ -366,6 +366,7 @@ app.get("/api/search", (req, res) => {
   }
 
   const ftsQuery = toFtsQuery(query);
+  const sort = (req.query.sort as string) || "date";
   const workspaceId = req.query.workspace
     ? Number(req.query.workspace)
     : null;
@@ -424,7 +425,17 @@ app.get("/api/search", (req, res) => {
       matches,
       match_count,
     };
-  }).filter(Boolean);
+  }).filter(Boolean) as Array<Record<string, unknown> & { match_count: number; started_at?: string }>;
+
+  // Sort based on query parameter
+  if (sort === "date") {
+    enriched.sort((a, b) => new Date(b.started_at as string).getTime() - new Date(a.started_at as string).getTime());
+  } else if (sort === "date_asc") {
+    enriched.sort((a, b) => new Date(a.started_at as string).getTime() - new Date(b.started_at as string).getTime());
+  } else if (sort === "matches") {
+    enriched.sort((a, b) => b.match_count - a.match_count);
+  }
+  // sort === "relevance" keeps the FTS5 rank order (default from query)
 
   res.json({
     results: enriched,
@@ -920,7 +931,7 @@ app.delete("/api/workspaces/:id/summarize", (_req, res) => {
 
 // ── Re-ingest Endpoint ────────────────────────────────────────────────
 
-import { runIngestion } from "./ingest.js";
+import { runIngestion, getStaleSessionsNeedingReingest, reingestSession } from "./ingest.js";
 import type { IngestProgress } from "./ingest.js";
 
 let ingestProgress: IngestProgress | null = null;
@@ -954,25 +965,31 @@ app.listen(PORT, () => {
 
   // ── Auto-ingest + auto-summarize polling ─────────────────────────
   setInterval(async () => {
-    // Skip if ingestion or summarization is already running (manual or auto)
     if (ingestProgress?.running || activeJob?.running) return;
 
     try {
-      // Run incremental ingestion
+      // Phase 1: Ingest brand new sessions (not in DB yet)
       ingestProgress = { total: 0, ingested: 0, skipped: 0, running: true };
       const final = await runIngestion({ all: false }, (p) => { ingestProgress = p; });
       ingestProgress = { ...final, running: false };
 
-      // After ingestion, auto-summarize any unsummarized sessions
-      if (activeJob?.running) return;
+      // Phase 2: Re-ingest stale sessions that have new data
+      const stale = getStaleSessionsNeedingReingest(4); // 4 hours idle
+      if (stale.length > 0) {
+        console.log(`[auto-ingest] Re-ingesting ${stale.length} idle session(s) with new data`);
+        for (const s of stale) {
+          reingestSession(s.sourcePath, s.workspaceId);
+        }
+      }
 
+      // Phase 3: Auto-summarize
+      if (activeJob?.running) return;
       const unsummarized = getAllUnsummarizedSessions.all() as Array<{ id: string; title: string }>;
       if (unsummarized.length === 0) return;
 
       console.log(`[auto-ingest] Found ${unsummarized.length} unsummarized session(s), starting summarization`);
-
       activeJob = {
-        workspaceId: 0, // all workspaces
+        workspaceId: 0,
         total: unsummarized.length,
         completed: 0,
         failed: 0,
@@ -980,12 +997,10 @@ app.listen(PORT, () => {
         cancelled: false,
         errors: [],
       };
-
       await runSummarization(unsummarized);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[auto-ingest] Error:", msg);
-      // Reset state so next tick can run
       if (ingestProgress?.running) ingestProgress = { ...ingestProgress, running: false };
     }
   }, config.autoIngestIntervalMs);
