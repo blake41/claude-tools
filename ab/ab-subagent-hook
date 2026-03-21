@@ -1,0 +1,19 @@
+#!/bin/bash
+# SubagentStart hook: inject unique AB_CONTEXT per subagent
+# Reads agent_id from stdin JSON, generates a short unique context ID,
+# returns it as additionalContext so the subagent knows to export it.
+
+input="$(cat)"
+agent_id="$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('agent_id',''))" 2>/dev/null)"
+
+if [[ -z "$agent_id" ]]; then
+  echo '{"decision":"approve"}'
+  exit 0
+fi
+
+# Use last 6 chars of agent_id as the context (already unique per subagent)
+ctx="${agent_id: -6}"
+
+cat <<EOF
+{"decision":"approve","additionalContext":"[BROWSER ISOLATION] This subagent's browser context ID is: ${ctx}\nBefore running any ab or agent-browser command, you MUST first run: export AB_CONTEXT=${ctx}"}
+EOF
