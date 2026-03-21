@@ -35,6 +35,17 @@ set -euo pipefail
 HEALTH_TIMEOUT=5
 OPEN_TIMEOUT=15
 
+# --- macOS-compatible timeout ---
+# macOS doesn't have GNU timeout; use perl one-liner as fallback
+_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  fi
+}
+
 # --- Auto-detect session name ---
 # Priority: AB_SESSION env > auto-detect from context
 #
@@ -103,8 +114,10 @@ if [[ "${1:-}" == "close" ]]; then
 fi
 
 # --- Health check (with timeout) ---
+# Check if the daemon is alive — use default session, not BASE_SESSION,
+# because the specific session may not have a page open yet.
 is_healthy() {
-  timeout "$HEALTH_TIMEOUT" agent-browser --session "$BASE_SESSION" get url >/dev/null 2>&1
+  _timeout "$HEALTH_TIMEOUT" agent-browser get url >/dev/null 2>&1
 }
 
 # --- Detect if running inside cco sandbox ---
@@ -136,7 +149,7 @@ ensure_browser() {
   echo "▶ No healthy session — attempting auto-connect to running Chrome..." >&2
 
   # 2. Try auto-connect (attaches to already-running Chrome)
-  if timeout "$OPEN_TIMEOUT" agent-browser --session "$BASE_SESSION" --auto-connect open "about:blank" >/dev/null 2>&1; then
+  if _timeout "$OPEN_TIMEOUT" agent-browser --auto-connect open "about:blank" >/dev/null 2>&1; then
     if is_healthy; then
       echo "✓ Connected to running Chrome" >&2
       return 0
@@ -146,7 +159,7 @@ ensure_browser() {
   echo "▶ Auto-connect failed — launching headed Chrome..." >&2
 
   # 3. Fall back to headed launch (works when Chrome isn't running)
-  if timeout "$OPEN_TIMEOUT" agent-browser --session "$BASE_SESSION" --headed open "about:blank" >/dev/null 2>&1; then
+  if _timeout "$OPEN_TIMEOUT" agent-browser --headed open "about:blank" >/dev/null 2>&1; then
     if is_healthy; then
       echo "✓ Launched headed Chrome" >&2
       return 0
@@ -214,7 +227,7 @@ do_status() {
   # Health
   if is_healthy; then
     local url
-    url=$(timeout "$HEALTH_TIMEOUT" agent-browser --session "$BASE_SESSION" get url 2>/dev/null || echo "unknown")
+    url=$(_timeout "$HEALTH_TIMEOUT" agent-browser get url 2>/dev/null || echo "unknown")
     echo "Health: ✓ connected"
     echo "URL: $url"
   else
