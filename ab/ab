@@ -24,10 +24,10 @@
 # All commands use --session terra by default.
 # Override with AB_SESSION=<name> or --session-name <name>.
 #
-# Session isolation:
-#   --session-name = cookie/localStorage persistence only (shared tabs)
-#   --session      = isolated browser context (separate tabs per session)
-#   We use --session so parallel agents each get their own pages.
+# Session management:
+#   Uses --session-name for cookie/localStorage persistence per session.
+#   NOTE: --session launches separate Chrome instances (crashes in sandbox).
+#   Tab-level isolation for parallel agents is handled via AB_CONTEXT naming.
 
 set -euo pipefail
 
@@ -261,7 +261,7 @@ case "$CMD" in
     ensure_browser
     SESSION="$(_ab_browsing_session "$BASE_SESSION")"
     if [[ -n "${2:-}" ]]; then
-      agent-browser --session "$SESSION" open "$2"
+      agent-browser --session-name "$SESSION" open "$2"
     fi
     ;;
   "")
@@ -280,6 +280,6 @@ case "$CMD" in
   *)
     # All other commands: pass through in an isolated context
     SESSION="$(_ab_browsing_session "$BASE_SESSION")"
-    agent-browser --session "$SESSION" "$@"
+    agent-browser --session-name "$SESSION" "$@"
     ;;
 esac
