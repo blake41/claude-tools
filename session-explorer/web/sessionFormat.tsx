@@ -39,12 +39,9 @@ export function renderMarkdown(text: string): string {
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
 
-  // Unordered lists
-  html = html.replace(/^(\s*)[-*] (.+)$/gm, "$1<li>$2</li>");
-  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
-
-  // Ordered lists
-  html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
+  // Lists — both ordered (1. ) and unordered (- *) rendered as <ul> to match terminal
+  html = html.replace(/^\s*(?:[-*]|\d+\.)\s+(.+)$/gm, "<li>$1</li>");
+  html = html.replace(/((?:\s*<li>.*<\/li>\s*)+)/g, "<ul>$1</ul>");
 
   // Horizontal rules
   html = html.replace(/^---+$/gm, "<hr />");

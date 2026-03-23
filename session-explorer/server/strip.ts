@@ -15,6 +15,7 @@ export interface StrippedMessage {
   content: string;
   timestamp: string | null;
   sequence: number;
+  messageType: "text" | "tool_use" | "tool_result" | "system";
 }
 
 export interface FileReference {
@@ -268,19 +269,51 @@ export function stripSession(jsonlPath: string): {
     if (content === undefined || content === null) continue;
 
     if (mtype === "user") {
-      if (hasOnlyToolResults(content)) continue;
+      // Extract tool_result blocks from user messages (array content)
+      if (Array.isArray(content)) {
+        for (const block of content as ContentBlock[]) {
+          if (block.type === "tool_result" && (block as any).content) {
+            let resultText = "";
+            const blockContent = (block as any).content;
+            if (typeof blockContent === "string") {
+              resultText = blockContent;
+            } else if (Array.isArray(blockContent)) {
+              resultText = blockContent
+                .filter((b: any) => b.type === "text" && b.text)
+                .map((b: any) => b.text)
+                .join("\n");
+            }
+            // Strip line-number prefixes and excessive whitespace, truncate
+            resultText = resultText.replace(/^\s*\d+[→│|]\s*/gm, "").replace(/\s+/g, " ").trim().slice(0, 500);
+            if (resultText) {
+              messages.push({
+                role: "user",
+                content: resultText,
+                timestamp: m.timestamp || null,
+                sequence: sequence++,
+                messageType: "tool_result",
+              });
+            }
+          }
+        }
+        // If this message ONLY has tool_results, skip text extraction
+        if (hasOnlyToolResults(content)) continue;
+      }
 
       const texts = extractTextBlocks(content);
       for (const text of texts) {
         let processed: string;
 
+        let msgType: StrippedMessage["messageType"] = "text";
         const compacted = compactCommand(text);
         if (compacted) {
           processed = compacted;
         } else if (isSkillInjection(text)) {
           processed = truncateSkill(text);
+          msgType = "system";
         } else if (isSystemContext(text)) {
           processed = truncateSystemContext(text);
+          msgType = "system";
         } else {
           processed = text.trim();
         }
@@ -292,6 +325,7 @@ export function stripSession(jsonlPath: string): {
             content: processed,
             timestamp: m.timestamp || null,
             sequence: sequence++,
+            messageType: msgType,
           });
         }
       }
@@ -305,7 +339,24 @@ export function stripSession(jsonlPath: string): {
             content: trimmed,
             timestamp: m.timestamp || null,
             sequence: sequence++,
+            messageType: "text",
           });
+        }
+      }
+
+      // Emit tool_use messages for this assistant turn
+      if (Array.isArray(content)) {
+        for (const block of content as ContentBlock[]) {
+          if (block.type === "tool_use" && block.name) {
+            const input = (block.input || {}) as Record<string, unknown>;
+            messages.push({
+              role: "assistant",
+              content: `${block.name}: ${summarizeToolInput(block.name, input)}`,
+              timestamp: m.timestamp || null,
+              sequence: sequence++,
+              messageType: "tool_use",
+            });
+          }
         }
       }
     }

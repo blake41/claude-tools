@@ -157,10 +157,12 @@ button {
 .message-content ul {
   padding-left: 20px;
   margin: 8px 0;
+  list-style-type: disc;
 }
 
 .message-content li {
   margin-bottom: 4px;
+  display: list-item;
 }
 
 .message-content hr {
@@ -180,9 +182,10 @@ button {
 
 .message-content .inline-code {
   font-family: var(--font-mono);
-  font-size: 13px;
-  background: rgba(255, 255, 255, 0.08);
-  padding: 2px 6px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 1px 6px;
   border-radius: 4px;
   color: var(--color-accent-orange);
 }
@@ -578,6 +581,33 @@ button {
   background: rgba(88, 166, 255, 0.1);
   border-color: var(--accent-blue);
   color: var(--accent-blue);
+}
+
+/* ── System messages (skill loaded, system context) ── */
+.system-msg {
+  background: rgba(188, 140, 255, 0.05);
+  border: 1px solid rgba(188, 140, 255, 0.12);
+  border-radius: 6px;
+  font-size: 11px;
+}
+.system-msg summary {
+  padding: 6px 10px;
+  cursor: pointer;
+  color: var(--accent-purple);
+  font-weight: 500;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.system-msg summary::-webkit-details-marker { display: none; }
+.system-msg[open] summary { border-bottom: 1px solid rgba(188, 140, 255, 0.1); }
+.system-msg > div {
+  padding: 8px 10px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
 }
 
 /* ── Session text formatting (sf-*) ─────────────────────────── */

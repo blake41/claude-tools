@@ -82,7 +82,23 @@ function ToolBlock({ label, content, timestamp, highlight, sequence }: {
 function MessageBubble({ message, highlight }: { message: Message; highlight?: boolean }) {
   const isToolResult = message.role === "user" && message.message_type === "tool_result";
   const isToolUse = message.message_type === "tool_use";
-  const isUser = message.role === "user" && !isToolResult;
+  const isSystem = message.message_type === "system";
+  const isUser = message.role === "user" && !isToolResult && !isSystem;
+
+  // System message (skill loaded, system context)
+  if (isSystem) {
+    return (
+      <details
+        id={`msg-${message.sequence}`}
+        className={`system-msg ${highlight ? "message-highlight" : ""}`}
+      >
+        <summary>
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="#bc8cff"><path d="M8.5 1.5a1 1 0 00-1 0L2.1 4.75a1 1 0 000 1.73l5.4 3.25a1 1 0 001 0l5.4-3.25a1 1 0 000-1.73zM2.1 9.52l5.4 3.25a1 1 0 001 0l5.4-3.25" stroke="#bc8cff" strokeWidth="1" fill="none"/></svg>
+          {message.content.replace(/^\[|\]$/g, '')}
+        </summary>
+      </details>
+    );
+  }
 
   // Tool result (output from a tool)
   if (isToolResult) {
