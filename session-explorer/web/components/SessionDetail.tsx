@@ -292,12 +292,25 @@ export default function SessionDetail() {
 
   return (
     <div className="max-w-[860px] px-10 pt-0 pb-20">
-      <div className="sticky top-0 z-10 bg-bg pt-6 pb-3">
+      <div className="sticky top-0 z-10 bg-bg pt-6 pb-3 flex items-center justify-between">
         <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate({ to: "/workspace/$id", params: { id: String(session.workspace_id) } })}>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           Back to sessions
+        </button>
+        <button
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
+          onClick={() => {
+            const main = document.querySelector("main");
+            if (main) main.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+          title="Scroll to top"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M8 12V4M4 8L8 4L12 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          Top
         </button>
       </div>
       <div className="border-b border-border pb-5 mb-6">
