@@ -66,7 +66,7 @@ export default function SessionList({ workspace }: SessionListProps) {
   const [progress, setProgress] = useState<{ total: number; completed: number; failed: number } | null>(null);
   const [summarizeDone, setSummarizeDone] = useState<{ completed: number; failed: number } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const limit = 50;
+  const limit = 200;
 
   // Cache sessions state on change
   useEffect(() => {
@@ -291,7 +291,9 @@ export default function SessionList({ workspace }: SessionListProps) {
                   ? f === "code" ? "border-[#3fb950]/40 text-[#3fb950] bg-[#3fb950]/12"
                   : f === "docs" ? "border-[#56d4dd]/40 text-[#56d4dd] bg-[#56d4dd]/12"
                   : "border-[#d29922]/40 text-[#d29922] bg-[#d29922]/12"
-                  : "bg-bg-card border-border text-text-dim hover:text-text-secondary"
+                  : f === "code" ? "border-[#3fb950]/15 text-[#3fb950]/50 bg-[#3fb950]/5 hover:text-[#3fb950]/80 hover:bg-[#3fb950]/10"
+                  : f === "docs" ? "border-[#56d4dd]/15 text-[#56d4dd]/50 bg-[#56d4dd]/5 hover:text-[#56d4dd]/80 hover:bg-[#56d4dd]/10"
+                  : "border-[#d29922]/15 text-[#d29922]/50 bg-[#d29922]/5 hover:text-[#d29922]/80 hover:bg-[#d29922]/10"
               }`}
             >
               {f}

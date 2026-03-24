@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useQueryState, parseAsString, parseAsStringLiteral } from "nuqs";
 import type { SearchResult, SearchMatch, FileSearchResult, ChangedFile } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
 import { SessionText, SnippetText, formatToolContent } from "../sessionFormat";
@@ -409,8 +410,8 @@ function SearchResultCard({
 }
 
 export default function Search({ onClose, onNavigate }: SearchProps) {
-  const [query, setQuery] = useState("");
-  const [tab, setTab] = useState<SearchTab>("messages");
+  const [query, setQuery] = useQueryState("q", parseAsString.withDefault(""));
+  const [tab, setTab] = useQueryState("tab", parseAsStringLiteral(["messages", "files"] as const).withDefault("messages"));
   const [sort, setSort] = useState<SortMode>("date");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [fileResults, setFileResults] = useState<FileSearchResult[]>([]);
@@ -470,7 +471,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     };
   }, [query, tab, sort]);
 
-  const handleTabChange = (newTab: SearchTab) => {
+  const handleTabChange = (newTab: "messages" | "files") => {
     setTab(newTab);
     setResults([]);
     setFileResults([]);

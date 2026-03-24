@@ -1,4 +1,4 @@
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "@tanstack/react-router";
 import type { SessionSummary, Tag, ChangedFile } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
 import SessionHeader from "./SessionHeader";
@@ -82,7 +82,7 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
     <div className="session-row">
       <button
         className="session-row-card block w-full text-left bg-bg-card border border-border rounded-lg px-4 py-3.5 transition-all hover:border-accent-blue hover:bg-[rgba(22,27,34,0.8)]"
-        onClick={() => navigate(`/session/${session.id}`)}
+        onClick={() => navigate({ to: "/session/$id", params: { id: session.id } })}
       >
         <SessionHeader
           session={session}

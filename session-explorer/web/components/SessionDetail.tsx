@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from "react";
-import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { useParams, useNavigate, useSearch } from "@tanstack/react-router";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
 import { renderMarkdown } from "../sessionFormat";
 import SessionHeader from "./SessionHeader";
+import { sessionRoute } from "../router";
 
 function formatTime(dateStr: string | null): string {
   if (!dateStr) return "";
@@ -225,10 +226,9 @@ function FilesPanel({ sessionId }: { sessionId: string }) {
 }
 
 export default function SessionDetail() {
-  const { id } = useParams<{ id: string }>();
+  const { id } = useParams({ from: sessionRoute.id });
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const highlightMsg = searchParams.get("msg");
+  const { msg: highlightMsg } = useSearch({ from: sessionRoute.id });
   const [session, setSession] = useState<SessionDetailType | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -285,7 +285,7 @@ export default function SessionDetail() {
     return (
       <div className="flex flex-col items-center justify-center gap-3 p-15 text-text-secondary">
         <p>{error || "Session not found"}</p>
-        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate(-1)}>Go back</button>
+        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => window.history.back()}>Go back</button>
       </div>
     );
   }
@@ -293,7 +293,7 @@ export default function SessionDetail() {
   return (
     <div className="max-w-[860px] px-10 pt-0 pb-20">
       <div className="sticky top-0 z-10 bg-bg pt-6 pb-3">
-        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate(`/workspace/${session.workspace_id}`)}>
+        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate({ to: "/workspace/$id", params: { id: String(session.workspace_id) } })}>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>

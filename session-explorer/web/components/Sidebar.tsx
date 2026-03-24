@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { NavLink, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import type { Workspace, Tag, SavedSearch } from "../types";
 
 interface SidebarProps {
@@ -85,11 +85,11 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   return (
     <aside className="w-[260px] min-w-[260px] bg-bg-sidebar border-r border-border flex flex-col overflow-hidden">
       <div className="flex items-center justify-between px-4 pt-5 pb-2">
-        <NavLink to="/" className="no-underline text-inherit hover:no-underline">
+        <Link to="/" className="no-underline text-inherit hover:no-underline">
           <h2 className="text-[15px] font-semibold tracking-tight text-text">Session Explorer</h2>
-        </NavLink>
+        </Link>
         <div className="flex items-center gap-1">
-          <button className="p-1.5 rounded-md text-text-secondary transition-all hover:bg-white/8 hover:text-text" onClick={() => navigate("/ask")} title="Ask AI">
+          <button className="p-1.5 rounded-md text-text-secondary transition-all hover:bg-white/8 hover:text-text" onClick={() => navigate({ to: "/ask" })} title="Ask AI">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M2 3.5C2 2.67 2.67 2 3.5 2h9c.83 0 1.5.67 1.5 1.5v7c0 .83-.67 1.5-1.5 1.5H6L3 14.5V12H3.5C2.67 12 2 11.33 2 10.5v-7Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
               <circle cx="5.5" cy="7" r="0.75" fill="currentColor" />
@@ -112,18 +112,17 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
         {workspaces.map((w, i) => (
           <div key={w.id}>
             {i > 0 && <div className="mx-3 border-t border-border/50" />}
-            <NavLink
-              to={`/workspace/${w.id}`}
-              className={({ isActive }) =>
-                `block px-3 py-2.5 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline ${isActive ? "bg-accent-blue/12 [&_.workspace-name]:text-accent-blue" : ""}`
-              }
+            <Link
+              to="/workspace/$id"
+              params={{ id: String(w.id) }}
+              className="block px-3 py-2.5 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline [&[data-status=active]]:bg-accent-blue/12 [&[data-status=active]_.workspace-name]:text-accent-blue"
             >
               <div className="workspace-name text-[13px] font-medium whitespace-nowrap overflow-hidden text-ellipsis">{w.display_name}</div>
               <div className="flex justify-between mt-0.5 text-[11px] text-text-dim">
                 <span>{w.session_count} sessions</span>
                 <span>{formatDate(w.last_activity)}</span>
               </div>
-            </NavLink>
+            </Link>
           </div>
         ))}
         {workspaces.length === 0 && (
@@ -172,12 +171,11 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           {tags.map((tag) => {
             const ss = savedSearchByTagId.get(tag.id);
             return (
-              <NavLink
+              <Link
                 key={tag.id}
-                to={`/tag/${encodeURIComponent(tag.name)}`}
-                className={({ isActive }) =>
-                  `flex items-center gap-2 px-2 py-1.5 rounded-md no-underline text-text text-xs transition-[background] duration-150 hover:bg-white/5 hover:no-underline group ${isActive ? "bg-accent-blue/12" : ""}`
-                }
+                to="/tag/$name"
+                params={{ name: tag.name }}
+                className="flex items-center gap-2 px-2 py-1.5 rounded-md no-underline text-text text-xs transition-[background] duration-150 hover:bg-white/5 hover:no-underline group [&[data-status=active]]:bg-accent-blue/12"
               >
                 <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${ss ? "ring-1 ring-offset-1 ring-accent-blue/40 ring-offset-bg-sidebar" : ""}`} style={{ background: tag.color }} />
                 <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{tag.name}</span>
@@ -194,7 +192,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
                   </button>
                 )}
                 <span className="text-[10px] text-text-dim">{tag.session_count ?? 0}</span>
-              </NavLink>
+              </Link>
             );
           })}
           {tags.length === 0 && !showCreateTag && (

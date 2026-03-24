@@ -303,7 +303,7 @@ app.get("/api/sessions", (req, res) => {
     ? Number(req.query.workspace)
     : null;
   const page = Math.max(1, Number(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
   const offset = (page - 1) * limit;
 
   let sessions;
@@ -929,7 +929,7 @@ const searchFiles = db.prepare(`
   AND sf.file_path NOT LIKE '%.jpg'
   GROUP BY sf.file_path, sf.operation
   ORDER BY last_seen DESC
-  LIMIT 50
+  LIMIT 200
 `);
 
 const searchFilesInWorkspace = db.prepare(`
@@ -944,7 +944,7 @@ const searchFilesInWorkspace = db.prepare(`
   AND sf.file_path NOT LIKE '%.jpg'
   GROUP BY sf.file_path, sf.operation
   ORDER BY last_seen DESC
-  LIMIT 50
+  LIMIT 200
 `);
 
 const filesByPath = db.prepare(`

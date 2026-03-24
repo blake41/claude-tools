@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "@tanstack/react-router";
 import SessionCard from "./SessionCard";
 import type { ChatMessage, ChatResult, SessionSummary, Tag } from "../types";
 
@@ -360,9 +360,9 @@ export default function AskView() {
         );
 
         if (tag) {
-          navigate(`/tag/${encodeURIComponent(tag.name)}`);
+          navigate({ to: "/tag/$name", params: { name: tag.name } });
         } else {
-          navigate("/");
+          navigate({ to: "/" });
         }
       } else if (action.type === "remove_tag") {
         for (const sessionId of currentResult.session_ids) {
@@ -372,7 +372,7 @@ export default function AskView() {
             });
           }
         }
-        navigate("/");
+        navigate({ to: "/" });
       }
     } catch (err) {
       console.error("Apply failed:", err);
@@ -414,7 +414,7 @@ export default function AskView() {
       await fetch(`/api/saved-searches/${savedSearch.id}/run`, { method: "POST" });
 
       // Navigate to the tag
-      navigate(`/tag/${encodeURIComponent(saveTagName.trim())}`);
+      navigate({ to: "/tag/$name", params: { name: saveTagName.trim() } });
     } catch (err) {
       console.error("Save search failed:", err);
     } finally {

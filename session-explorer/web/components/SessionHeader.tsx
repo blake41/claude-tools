@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "@tanstack/react-router";
 import type { SessionSummary, Tag } from "../types";
 import { parseSummaryBullets } from "../summaryUtils";
 
@@ -121,7 +121,8 @@ export function InlineTagAdder({ sessionId, tags, onTagsChange }: {
           style={{ background: `${tag.color}26`, color: tag.color }}
         >
           <Link
-            to={`/tag/${encodeURIComponent(tag.name)}`}
+            to="/tag/$name"
+            params={{ name: tag.name }}
             className="no-underline hover:underline"
             style={{ color: "inherit" }}
             onClick={e => e.stopPropagation()}
@@ -269,7 +270,8 @@ export default function SessionHeader({ session, onTagsChange, showTitle }: Sess
               style={{ background: `${t.color}26`, color: t.color }}
             >
               <Link
-                to={`/tag/${encodeURIComponent(t.name)}`}
+                to="/tag/$name"
+                params={{ name: t.name }}
                 className="no-underline hover:underline"
                 style={{ color: "inherit" }}
                 onClick={e => e.stopPropagation()}

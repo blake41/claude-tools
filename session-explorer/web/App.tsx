@@ -1,14 +1,36 @@
-import { useState, useEffect, useRef } from "react";
-import { Routes, Route, useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { useState, useEffect, useRef, createContext, useContext } from "react";
+import { Outlet, useNavigate, useLocation, useParams, useSearch } from "@tanstack/react-router";
 import Sidebar from "./components/Sidebar";
 import SessionList from "./components/SessionList";
 import SessionDetail from "./components/SessionDetail";
 import Search from "./components/Search";
 import SessionCard from "./components/SessionCard";
 import AskView from "./components/AskView";
+import {
+  rootRoute,
+  indexRoute,
+  workspaceRoute,
+  sessionRoute,
+  tagRoute,
+  fileRoute,
+  askRoute,
+  searchRoute,
+  router,
+} from "./router";
 import type { Workspace, Tag, SessionSummary } from "./types";
 
-function Dashboard({ workspaces }: { workspaces: Workspace[] }) {
+// ── Shared workspace context ──────────────────────────────────────────
+
+const WorkspacesContext = createContext<Workspace[]>([]);
+
+function useWorkspaces() {
+  return useContext(WorkspacesContext);
+}
+
+// ── Page components ───────────────────────────────────────────────────
+
+function Dashboard() {
+  const workspaces = useWorkspaces();
   const totalSessions = workspaces.reduce((s, w) => s + w.session_count, 0);
   const mostRecent = workspaces.length > 0 ? workspaces[0] : null;
 
@@ -37,8 +59,9 @@ function Dashboard({ workspaces }: { workspaces: Workspace[] }) {
   );
 }
 
-function WorkspaceView({ workspaces }: { workspaces: Workspace[] }) {
-  const { id } = useParams<{ id: string }>();
+function WorkspaceView() {
+  const workspaces = useWorkspaces();
+  const { id } = useParams({ from: workspaceRoute.id });
   const workspace = workspaces.find((w) => w.id === Number(id));
 
   if (!workspace) {
@@ -66,7 +89,7 @@ const PRESET_COLORS = [
 ];
 
 function TagView() {
-  const { name } = useParams<{ name: string }>();
+  const { name } = useParams({ from: tagRoute.id });
   const navigate = useNavigate();
   const [tag, setTag] = useState<Tag | null>(null);
   const [sessions, setSessions] = useState<(SessionSummary & { workspace_name?: string })[]>([]);
@@ -102,7 +125,7 @@ function TagView() {
 
   useEffect(() => {
     setLoading(true);
-    fetch(`/api/tags/by-name/${encodeURIComponent(name!)}/sessions`)
+    fetch(`/api/tags/by-name/${encodeURIComponent(name)}/sessions`)
       .then((r) => r.json())
       .then((data: { tag: Tag; sessions: (SessionSummary & { workspace_name?: string })[] }) => {
         setTag(data.tag);
@@ -135,7 +158,7 @@ function TagView() {
 
   return (
     <div className="px-10 py-8 max-w-[1200px]">
-      <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6 mb-4" onClick={() => navigate(-1)}>
+      <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6 mb-4" onClick={() => window.history.back()}>
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
           <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
@@ -190,9 +213,8 @@ function TagView() {
 }
 
 function FileView() {
-  const [searchParams] = useSearchParams();
+  const { path: filePath } = useSearch({ from: fileRoute.id });
   const navigate = useNavigate();
-  const filePath = searchParams.get("path") || "";
   const fileName = filePath.split("/").pop() || filePath;
   const [sessions, setSessions] = useState<Array<{
     id: string;
@@ -233,7 +255,7 @@ function FileView() {
   return (
     <div className="px-10 py-8 max-w-[900px]">
       <div>
-        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate(-1)}>
+        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => window.history.back()}>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
@@ -264,7 +286,7 @@ function FileView() {
         <button
           key={`${session.id}-${session.operation}`}
           className="block w-full text-left bg-bg-card border border-border rounded-lg px-4 py-3.5 mb-1.5 transition-all hover:border-accent-blue hover:bg-[rgba(22,27,34,0.8)]"
-          onClick={() => navigate(`/session/${session.id}`)}
+          onClick={() => navigate({ to: "/session/$id", params: { id: session.id } })}
         >
           <div className="flex items-center gap-2.5 text-xs">
             <span className="font-mono text-xs text-text-secondary">
@@ -294,11 +316,22 @@ function FileView() {
 }
 
 
-export default function App() {
+function SearchOverlay() {
+  return (
+    <Search
+      onClose={() => window.history.back()}
+      onNavigate={(path) => router.history.push(path)}
+    />
+  );
+}
+
+// ── Root layout ───────────────────────────────────────────────────────
+
+function RootLayout() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
-  const [searchOpen, setSearchOpen] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
 
   useEffect(() => {
     fetch("/api/workspaces")
@@ -315,19 +348,25 @@ export default function App() {
       .finally(() => setLoading(false));
   }, []);
 
+  const isSearchOpen = location.pathname === "/search";
+
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
-        setSearchOpen((v) => !v);
+        if (isSearchOpen) {
+          window.history.back();
+        } else {
+          navigate({ to: "/search" });
+        }
       }
-      if (e.key === "Escape") {
-        setSearchOpen(false);
+      if (e.key === "Escape" && isSearchOpen) {
+        window.history.back();
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [isSearchOpen, navigate]);
 
   if (loading) {
     return (
@@ -339,21 +378,25 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full">
-      <Sidebar workspaces={workspaces} onSearchClick={() => setSearchOpen(true)} />
-      <main className="flex-1 overflow-y-auto relative">
-        {searchOpen && (
-          <Search onClose={() => setSearchOpen(false)} onNavigate={(path) => { setSearchOpen(false); navigate(path); }} />
-        )}
-        <Routes>
-          <Route path="/" element={<Dashboard workspaces={workspaces} />} />
-          <Route path="/workspace/:id" element={<WorkspaceView workspaces={workspaces} />} />
-          <Route path="/session/:id" element={<SessionView />} />
-          <Route path="/tag/:name" element={<TagView />} />
-          <Route path="/file" element={<FileView />} />
-          <Route path="/ask" element={<AskView />} />
-        </Routes>
-      </main>
-    </div>
+    <WorkspacesContext.Provider value={workspaces}>
+      <div className="flex h-full">
+        <Sidebar workspaces={workspaces} onSearchClick={() => navigate({ to: "/search" })} />
+        <main className="flex-1 overflow-y-auto relative">
+          {isSearchOpen && <SearchOverlay />}
+          <Outlet />
+        </main>
+      </div>
+    </WorkspacesContext.Provider>
   );
 }
+
+// ── Attach components to routes ───────────────────────────────────────
+
+rootRoute.update({ component: RootLayout });
+indexRoute.update({ component: Dashboard });
+workspaceRoute.update({ component: WorkspaceView });
+sessionRoute.update({ component: SessionView });
+tagRoute.update({ component: TagView });
+fileRoute.update({ component: FileView });
+askRoute.update({ component: AskView });
+searchRoute.update({ component: () => null });
