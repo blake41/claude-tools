@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Watch for a Render deploy to finish and send a macOS notification.
+# Usage: watch-deploy.sh <environment> <commit-sha> <commit-message>
+#
+# Polls render-services deploys until a new deploy reaches a terminal state,
+# then fires an osascript notification.
+
+set -euo pipefail
+
+ENV="${1:-staging}"
+COMMIT_SHA="${2:-}"
+COMMIT_MSG="${3:-}"
+
+# Map environment to Render service ID
+case "$ENV" in
+  staging)    SERVICE_ID="srv-d2f17tjipnbc73ailtb0" ;;
+  production) SERVICE_ID="srv-d1686m6mcj7s73bdqod0" ;;
+  *)          echo "Unknown environment: $ENV" >&2; exit 1 ;;
+esac
+
+SHORT_SHA="${COMMIT_SHA:0:7}"
+POLL_INTERVAL=15
+MAX_WAIT=600  # 10 minutes
+WAITED=0
+
+# Capture the current latest deploy ID so we can detect a new one
+INITIAL_DEPLOY_ID=$(render-services deploys "$SERVICE_ID" 2>/dev/null \
+  | jq -r '.result[0].id // empty')
+
+ICON="$HOME/Documents/Development/tools/clay-logo.png"
+RENDER_URL="https://dashboard.render.com/web/${SERVICE_ID}/deploys"
+
+notify() {
+  local title="$1" body="$2" sound="${3:-default}"
+  terminal-notifier -title "$title" -subtitle "$ENV" -message "$body" -sound "$sound" -open "$RENDER_URL" 2>/dev/null || true
+}
+
+# Wait for a new deploy to appear (the one triggered by our push)
+while true; do
+  DEPLOY_JSON=$(render-services deploys "$SERVICE_ID" 2>/dev/null || echo '{}')
+  LATEST_ID=$(echo "$DEPLOY_JSON" | jq -r '.result[0].id // empty')
+
+  if [[ -n "$LATEST_ID" && "$LATEST_ID" != "$INITIAL_DEPLOY_ID" ]]; then
+    break
+  fi
+
+  WAITED=$((WAITED + POLL_INTERVAL))
+  if (( WAITED >= MAX_WAIT )); then
+    notify "Deploy Timeout" "No new deploy detected after ${MAX_WAIT}s" "Basso"
+    exit 1
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
+
+# Now poll until the new deploy reaches a terminal state
+while true; do
+  DEPLOY_JSON=$(render-services deploys "$SERVICE_ID" 2>/dev/null || echo '{}')
+  STATUS=$(echo "$DEPLOY_JSON" | jq -r '.result[0].status // "unknown"')
+
+  case "$STATUS" in
+    live)
+      notify "Deploy Succeeded" "${SHORT_SHA} ${COMMIT_MSG}" "Glass"
+      exit 0
+      ;;
+    build_failed|update_failed|canceled)
+      notify "Deploy Failed" "$STATUS — ${SHORT_SHA} ${COMMIT_MSG}" "Basso"
+      exit 1
+      ;;
+    deactivated)
+      # Another deploy superseded this one
+      notify "Deploy Superseded" "Replaced — ${SHORT_SHA}" "Purr"
+      exit 0
+      ;;
+  esac
+
+  WAITED=$((WAITED + POLL_INTERVAL))
+  if (( WAITED >= MAX_WAIT )); then
+    notify "Deploy Timeout" "Still $STATUS after ${MAX_WAIT}s — ${SHORT_SHA}" "Basso"
+    exit 1
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
