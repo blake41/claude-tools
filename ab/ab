@@ -2,31 +2,26 @@
 #
 # ab — safe wrapper around agent-browser
 #
-# Encodes everything we've learned about agent-browser failure modes:
+# Strategy: connect to Chrome via CDP on port 9222. If Chrome isn't running
+# with the debug port, launch it ourselves. This is the only reliable approach —
+# agent-browser's --headed and --auto-connect are broken/flaky in 0.21.x.
 #
-# 1. NEVER run `agent-browser close` — corrupts profile, breaks daemon
-# 2. NEVER run `pkill chrome` — kills user's personal Chrome
-# 3. --auto-connect is the preferred mode — attaches to running Chrome
-# 4. --headed only as fallback when no Chrome is running
-# 5. Health checks need timeouts — `get url` can hang indefinitely
-# 6. Multiple daemons can pile up — heal must kill ALL of them
-# 7. Daemon must start OUTSIDE cco sandbox
+# Failure modes this handles:
+#   1. No Chrome running → launch Chrome with --remote-debugging-port=9222
+#   2. Chrome running without debug port → warn, can't auto-fix (user's Chrome)
+#   3. Stale daemon → kill it, reconnect via CDP
+#   4. Inside cco sandbox → can't launch Chrome, fail fast with instructions
+#   5. NEVER run `pkill chrome` — kills user's personal Chrome
+#   6. NEVER run `agent-browser close` — corrupts profile
 #
 # Usage:
-#   ab open <url>              # Open URL (auto-connect or launch)
+#   ab open <url>              # Open URL (ensures Chrome + CDP connection)
 #   ab screenshot <path>       # Take screenshot
 #   ab eval "js code"          # Run JavaScript
 #   ab <any agent-browser cmd> # Pass through to agent-browser
 #   ab ensure                  # Just ensure browser is ready, don't navigate
-#   ab heal                    # Force heal (kill daemons, reset profile, restart)
+#   ab heal                    # Force heal (kill daemons, relaunch Chrome, reconnect)
 #   ab status                  # Show daemon/session health
-#
-# All commands use --session terra by default.
-# Override with AB_SESSION=<name> or --session-name <name>.
-#
-# Session management:
-#   Uses --session-name for cookie/localStorage persistence per session.
-#   NOTE: --session launches separate Chrome instances (crashes in sandbox).
 #
 # Parallel subagent isolation (AB_CONTEXT):
 #   When AB_CONTEXT is set, `ab open` creates a dedicated tab and saves its
@@ -37,10 +32,12 @@ set -euo pipefail
 
 # --- Config ---
 HEALTH_TIMEOUT=5
-OPEN_TIMEOUT=15
+CDP_PORT=9222
+CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_PROFILE="$HOME/.agent-browser/profile"
+CHROME_PIDFILE="/tmp/ab-chrome-${CDP_PORT}.pid"
 
 # --- macOS-compatible timeout ---
-# macOS doesn't have GNU timeout; use perl one-liner as fallback
 _timeout() {
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
@@ -51,37 +48,22 @@ _timeout() {
 }
 
 # --- Auto-detect session name ---
-# Priority: AB_SESSION env > auto-detect from context
-#
-# Two session names:
-#   BASE_SESSION = shared per Claude Code instance (for ensure/heal/status)
-#   SESSION      = unique per ab invocation (for browsing commands)
-#
-# This lets parallel subagents each get their own browser context while
-# sharing a single daemon. ensure/heal operate on the base session;
-# open/screenshot/eval/passthrough get a unique suffix.
 _ab_detect_base_session() {
   if [[ -n "${CCO_SESSION_ID:-}" ]]; then
     echo "terra-${CCO_SESSION_ID:0:8}"
     return
   fi
-
   local cwd="${PWD:-$(pwd)}"
-
   if [[ "$cwd" == */.claude/worktrees/* ]]; then
     local worktree_name="${cwd##*/.claude/worktrees/}"
     worktree_name="${worktree_name%%/*}"
     echo "terra-${worktree_name}"
     return
   fi
-
   echo "terra"
 }
 
 _ab_browsing_session() {
-  # AB_CONTEXT isolates parallel browser subagents. Each subagent must set a
-  # unique value before calling ab (e.g., export AB_CONTEXT=qa1).
-  # Without it, callers share the base session — fine for single-agent use.
   local base="$1"
   if [[ -n "${AB_CONTEXT:-}" ]]; then
     echo "${base}-${AB_CONTEXT}"
@@ -91,9 +73,6 @@ _ab_browsing_session() {
 }
 
 # --- Tab isolation for parallel subagents ---
-# When AB_CONTEXT is set, each subagent gets its own tab.
-# _claim_tab: opens a new tab, saves its index to /tmp/ab-tab-<AB_CONTEXT>
-# _switch_to_tab: switches to the saved tab before running a command
 _tab_file() {
   echo "/tmp/ab-tab-${AB_CONTEXT:-default}"
 }
@@ -101,11 +80,9 @@ _tab_file() {
 _claim_tab() {
   local url="${1:-about:blank}"
   if [[ -z "${AB_CONTEXT:-}" ]]; then
-    return 0  # No isolation needed
+    return 0
   fi
-  # Open a new tab with the URL
   agent-browser tab new "$url" >/dev/null 2>&1
-  # Capture the active tab index (the one we just created)
   local idx
   idx=$(agent-browser tab list --json 2>/dev/null | python3 -c "import json,sys; tabs=json.load(sys.stdin)['data']['tabs']; print(next(t['index'] for t in tabs if t['active']))" 2>/dev/null)
   if [[ -n "$idx" ]]; then
@@ -115,7 +92,7 @@ _claim_tab() {
 
 _switch_to_tab() {
   if [[ -z "${AB_CONTEXT:-}" ]]; then
-    return 0  # No isolation needed
+    return 0
   fi
   local tf
   tf="$(_tab_file)"
@@ -128,7 +105,7 @@ _switch_to_tab() {
 
 # --- Parse session name from args or env ---
 BASE_SESSION="${AB_SESSION:-$(_ab_detect_base_session)}"
-SESSION=""  # Set after arg parsing; browsing commands get a unique suffix
+SESSION=""
 PASSTHROUGH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -153,92 +130,143 @@ if [[ "${1:-}" == "close" ]]; then
   exit 1
 fi
 
-# --- Health check (with timeout) ---
-# Check if the daemon is alive — use default session, not BASE_SESSION,
-# because the specific session may not have a page open yet.
-is_healthy() {
+# --- Check if CDP port is listening ---
+_cdp_is_up() {
+  curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1
+}
+
+# --- Health check: daemon connected and responsive ---
+_daemon_is_healthy() {
   _timeout "$HEALTH_TIMEOUT" agent-browser get url >/dev/null 2>&1
 }
 
-# --- Detect if running inside cco sandbox ---
-_in_sandbox() {
-  # cco sets APP_SANDBOX_CONTAINER_ID or we can check for sandbox profile
-  [[ -n "${APP_SANDBOX_CONTAINER_ID:-}" ]] || [[ -n "${SANDBOX_ENABLED:-}" ]] || sandbox-exec -p '(version 1)(allow default)' true 2>/dev/null
-  # Simpler check: if we can't write to /tmp/ab-sandbox-test, we're sandboxed
-  # Actually, just check if cco is our parent process
-  [[ "${CCO_SESSION_ID:-}" != "" ]]
-}
-
-# --- Ensure browser is connected and ready ---
-ensure_browser() {
-  # 1. Try existing session
-  if is_healthy; then
-    return 0
-  fi
-
-  # If inside sandbox (CCO_SESSION_ID is set), DON'T try to launch or heal.
-  # The daemon should have been started by cco-permissions before entering sandbox.
-  # Launching Chrome or healing from inside sandbox is destructive and unreliable.
-  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
-    echo "✗ Browser not responding (session: $BASE_SESSION)." >&2
-    echo "  The daemon should have been started before entering the sandbox." >&2
-    echo "  Run 'ab heal' from a terminal outside this session, then retry." >&2
-    return 1
-  fi
-
-  echo "▶ No healthy session — attempting auto-connect to running Chrome..." >&2
-
-  # 2. Try auto-connect (attaches to already-running Chrome)
-  if _timeout "$OPEN_TIMEOUT" agent-browser --auto-connect open "about:blank" >/dev/null 2>&1; then
-    if is_healthy; then
-      echo "✓ Connected to running Chrome" >&2
-      return 0
-    fi
-  fi
-
-  echo "▶ Auto-connect failed — launching headed Chrome..." >&2
-
-  # 3. Fall back to headed launch (works when Chrome isn't running)
-  if _timeout "$OPEN_TIMEOUT" agent-browser --headed open "about:blank" >/dev/null 2>&1; then
-    if is_healthy; then
-      echo "✓ Launched headed Chrome" >&2
-      return 0
-    fi
-  fi
-
-  # 4. All failed — try heal (only outside sandbox)
-  echo "▶ Browser unresponsive — running heal..." >&2
-  do_heal || true
-  sleep 3  # Give daemon time to stabilize after heal
-
-  # Trust that heal worked — it already tested with open+get url.
-  if pgrep -q "agent-browser-d" 2>/dev/null; then
-    echo "✓ Healed and reconnected" >&2
-    return 0
-  fi
-
-  echo "✗ Could not establish browser session." >&2
-  echo "  Try: close Chrome, then run 'ab heal' and retry." >&2
-  return 1
-}
-
-# --- Heal: kill daemons, reset profile, restart ---
-do_heal() {
-  # Kill ALL daemon processes (not just one)
+# --- Kill stale agent-browser daemons ---
+_kill_daemons() {
   if pgrep -q "agent-browser-d" 2>/dev/null; then
     pgrep "agent-browser-d" | while read -r pid; do
       kill "$pid" 2>/dev/null && echo "  Killed daemon (PID $pid)" >&2 || true
     done
     sleep 1
   fi
-
-  # Clean daemon state
   rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
+}
 
-  # Try agent-browser-heal if available (handles profile backup/restore)
-  if command -v agent-browser-heal >/dev/null 2>&1; then
-    agent-browser-heal --force >&2 || true
+# --- Launch Chrome with CDP debug port ---
+_launch_chrome() {
+  if _cdp_is_up; then
+    echo "✓ Chrome already listening on CDP port $CDP_PORT" >&2
+    return 0
   fi
+
+  echo "▶ Launching Chrome with --remote-debugging-port=$CDP_PORT..." >&2
+
+  # Launch Chrome in background with debug port
+  "$CHROME_BIN" \
+    --remote-debugging-port="$CDP_PORT" \
+    --user-data-dir="$CHROME_PROFILE" \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-background-networking \
+    --disable-backgrounding-occluded-windows \
+    --disable-component-update \
+    --disable-domain-reliability \
+    --disable-sync \
+    --metrics-recording-only \
+    --disable-machine-learning-model-loader \
+    --disable-client-side-phishing-detection \
+    --safebrowsing-disable-auto-update \
+    "about:blank" >/dev/null 2>&1 &
+
+  local chrome_pid=$!
+  echo "$chrome_pid" > "$CHROME_PIDFILE"
+
+  # Wait for CDP to come up
+  local tries=0
+  while ! _cdp_is_up && [[ $tries -lt 15 ]]; do
+    sleep 1
+    tries=$((tries + 1))
+  done
+
+  if _cdp_is_up; then
+    echo "✓ Chrome launched (PID $chrome_pid, CDP port $CDP_PORT)" >&2
+    return 0
+  else
+    echo "✗ Chrome launched but CDP port not responding after ${tries}s" >&2
+    return 1
+  fi
+}
+
+# --- Connect agent-browser daemon to Chrome via CDP ---
+_connect_cdp() {
+  # Kill any stale daemon first — it might be connected to nothing
+  _kill_daemons
+
+  echo "▶ Connecting agent-browser to CDP port $CDP_PORT..." >&2
+
+  # Use AGENT_BROWSER_AUTO_CONNECT= to prevent conflict with --cdp
+  if AGENT_BROWSER_AUTO_CONNECT= _timeout "$HEALTH_TIMEOUT" agent-browser --cdp "$CDP_PORT" get url >/dev/null 2>&1; then
+    echo "✓ Connected to Chrome via CDP" >&2
+    return 0
+  fi
+
+  echo "✗ Failed to connect agent-browser to CDP port $CDP_PORT" >&2
+  return 1
+}
+
+# --- Ensure browser is connected and ready ---
+ensure_browser() {
+  # 1. Already healthy? Done.
+  if _daemon_is_healthy; then
+    return 0
+  fi
+
+  # 2. Inside sandbox — can't launch Chrome, fail fast
+  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
+    # Try connecting to existing CDP port first (Chrome may be running)
+    if _cdp_is_up; then
+      _connect_cdp && return 0
+    fi
+    echo "✗ Browser not responding (session: $BASE_SESSION)." >&2
+    echo "  The daemon should have been started before entering the sandbox." >&2
+    echo "  Run 'ab heal' from a terminal outside this session, then retry." >&2
+    return 1
+  fi
+
+  # 3. Outside sandbox — ensure Chrome is running with CDP, then connect
+  _launch_chrome || return 1
+  _connect_cdp || return 1
+}
+
+# --- Heal: kill everything, relaunch, reconnect ---
+do_heal() {
+  echo "▶ Healing browser setup..." >&2
+
+  # Kill daemons
+  _kill_daemons
+  echo "✓ Cleaned daemon state" >&2
+
+  # Kill our managed Chrome (NOT user's personal Chrome)
+  if [[ -f "$CHROME_PIDFILE" ]]; then
+    local chrome_pid
+    chrome_pid="$(cat "$CHROME_PIDFILE")"
+    if kill -0 "$chrome_pid" 2>/dev/null; then
+      kill "$chrome_pid" 2>/dev/null
+      echo "  Killed managed Chrome (PID $chrome_pid)" >&2
+      sleep 1
+    fi
+    rm -f "$CHROME_PIDFILE"
+  fi
+
+  # If inside sandbox, stop here
+  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
+    echo "✗ Inside sandbox — run 'ab heal' from an external terminal." >&2
+    return 1
+  fi
+
+  # Launch fresh Chrome and connect
+  _launch_chrome || return 1
+  _connect_cdp || return 1
+  echo "✓ Healed and reconnected" >&2
 }
 
 # --- Status ---
@@ -250,36 +278,34 @@ do_status() {
   daemon_count=$(pgrep -c "agent-browser-d" 2>/dev/null || echo 0)
   echo "Daemons: $daemon_count running"
 
-  # PID file
-  if [[ -f ~/.agent-browser/default.pid ]]; then
-    echo "PID file: $(cat ~/.agent-browser/default.pid)"
+  # CDP port
+  if _cdp_is_up; then
+    echo "CDP port $CDP_PORT: ✓ listening"
   else
-    echo "PID file: none"
+    echo "CDP port $CDP_PORT: ✗ not listening"
   fi
 
-  # Socket
-  if [[ -S ~/.agent-browser/default.sock ]]; then
-    echo "Socket: exists"
+  # Managed Chrome PID
+  if [[ -f "$CHROME_PIDFILE" ]]; then
+    local chrome_pid
+    chrome_pid="$(cat "$CHROME_PIDFILE")"
+    if kill -0 "$chrome_pid" 2>/dev/null; then
+      echo "Managed Chrome: PID $chrome_pid (alive)"
+    else
+      echo "Managed Chrome: PID $chrome_pid (dead)"
+    fi
   else
-    echo "Socket: missing"
+    echo "Managed Chrome: none tracked"
   fi
 
   # Health
-  if is_healthy; then
+  if _daemon_is_healthy; then
     local url
     url=$(_timeout "$HEALTH_TIMEOUT" agent-browser get url 2>/dev/null || echo "unknown")
     echo "Health: ✓ connected"
     echo "URL: $url"
   else
     echo "Health: ✗ not responding"
-  fi
-
-  # Session file
-  local session_file=~/.agent-browser/sessions/${BASE_SESSION}-default.json
-  if [[ -f "$session_file" ]]; then
-    echo "Session file: $session_file ($(wc -c < "$session_file" | tr -d ' ') bytes)"
-  else
-    echo "Session file: none"
   fi
 }
 
@@ -297,15 +323,13 @@ case "$CMD" in
     do_status
     ;;
   open)
-    # Ensure daemon is ready, then navigate
     ensure_browser
     SESSION="$(_ab_browsing_session "$BASE_SESSION")"
     if [[ -n "${2:-}" ]]; then
       if [[ -n "${AB_CONTEXT:-}" ]]; then
-        # Parallel mode: open in a dedicated tab
         _claim_tab "$2"
       else
-        agent-browser --session-name "$SESSION" open "$2"
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" --session-name "$SESSION" open "$2"
       fi
     fi
     ;;
@@ -313,19 +337,18 @@ case "$CMD" in
     echo "Usage: ab <command> [args...]" >&2
     echo "" >&2
     echo "Commands:" >&2
-    echo "  open <url>       Open URL (ensures browser is ready first)" >&2
+    echo "  open <url>       Open URL (ensures Chrome + CDP connection)" >&2
     echo "  screenshot <p>   Take screenshot" >&2
     echo "  eval \"js\"        Run JavaScript in page" >&2
     echo "  ensure           Ensure browser is connected (no navigation)" >&2
-    echo "  heal             Kill daemons, reset profile, restart" >&2
-    echo "  status           Show daemon/session health" >&2
+    echo "  heal             Kill daemons, relaunch Chrome, reconnect" >&2
+    echo "  status           Show daemon/session/CDP health" >&2
     echo "  <any cmd>        Pass through to agent-browser" >&2
     exit 1
     ;;
   *)
-    # All other commands: switch to our tab first, then pass through
     _switch_to_tab
     SESSION="$(_ab_browsing_session "$BASE_SESSION")"
-    agent-browser --session-name "$SESSION" "$@"
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" --session-name "$SESSION" "$@"
     ;;
 esac
