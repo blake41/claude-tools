@@ -103,7 +103,7 @@ while true; do
       notify "Deploy Succeeded" "${SHORT_SHA} ${COMMIT_MSG}" "Glass"
       exit 0
       ;;
-    build_failed|update_failed|canceled)
+    build_failed|update_failed|canceled|pre_deploy_failed)
       log "FAILED status=$STATUS deploy=$LATEST_ID after ${WAITED}s"
       notify "Deploy Failed" "$STATUS — ${SHORT_SHA} ${COMMIT_MSG}" "Basso"
       exit 1
