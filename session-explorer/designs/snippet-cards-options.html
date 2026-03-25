@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snippet Card Design Options — Session Explorer</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-card: #161b22;
+    --bg-elevated: #1e252e;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-dim: #6e7681;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --purple: #bc8cff;
+    --orange: #d29922;
+    --red: #f85149;
+    --claude: #c4b5a0;
+    --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font-ui); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+
+  .page-header { position: sticky; top: 0; z-index: 100; background: rgba(13, 17, 23, 0.9); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); padding: 20px 32px; }
+  .page-header h1 { font-size: 20px; font-weight: 600; }
+  .page-header p { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+
+  .grid { display: grid; grid-template-columns: 1fr; gap: 24px; padding: 24px 32px 64px; max-width: 1400px; margin: 0 auto; }
+  @media (min-width: 1100px) { .grid { grid-template-columns: 1fr 1fr; } }
+
+  .option-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .option-header { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .option-header h2 { font-size: 14px; font-weight: 600; }
+  .option-header p { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  .option-demo { padding: 20px; min-height: 480px; background: var(--bg); }
+
+  /* Shared demo elements */
+  .demo-card { background: rgba(30, 37, 46, 0.7); border: 1px solid rgba(48, 54, 61, 0.8); border-radius: 10px; padding: 16px 18px; margin-bottom: 12px; }
+  .demo-summary { font-size: 13px; color: var(--text); opacity: 0.85; margin-bottom: 8px; line-height: 1.5; }
+  .demo-meta { font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); margin-bottom: 4px; }
+  .demo-stats { font-size: 11px; color: var(--text-secondary); margin-bottom: 10px; }
+  .demo-match-pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 99px; background: rgba(88, 166, 255, 0.15); color: var(--blue); font-weight: 600; margin-left: 8px; }
+
+  mark { background: rgba(210, 153, 34, 0.35); color: var(--orange); padding: 1px 3px; border-radius: 3px; font-weight: 500; }
+  code { font-family: var(--font-mono); font-size: 0.9em; background: rgba(255,255,255,0.08); color: var(--orange); padding: 1px 5px; border-radius: 4px; }
+
+  .context-text { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .preview-text { font-size: 13px; color: var(--text); margin: 4px 0; }
+  .highlight-text { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool-block { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text-secondary); background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
+  .tool-label { display: flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--green); margin-bottom: 6px; }
+  .tool-icon { opacity: 0.8; }
+
+  .snippet:hover { cursor: pointer; }
+</style>
+</head>
+<body>
+
+<div class="page-header">
+  <h1>Snippet Card Design Options</h1>
+  <p>10 approaches for visually distinguishing User, Claude, and Tool Output snippets. Each demo shows one of each type. Click any to see hover states.</p>
+</div>
+
+<div class="grid">
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 1: Top Accent Bar -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 1: Top Accent Bar — GitHub-style</h2>
+    <p>2px colored bar across the top. Role communicated by bar color + badge. Clean, minimal.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Fixed AccountTabBar styling (missing bg-white, border-bottom)</div>
+      <div class="demo-meta">Mar 20, 2026 · 12:43 PM – 8:42 PM · 7h 59m <span class="demo-match-pill">9 matches</span></div>
+      <div class="demo-stats">1752 messages · 801 from you</div>
+
+      <div class="snippet" style="border-top: 2px solid var(--blue); background: rgba(13,17,23,0.5); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px;" onmouseover="this.style.background='rgba(88,166,255,0.06)'" onmouseout="this.style.background='rgba(13,17,23,0.5)'">
+        <div class="context-text" style="margin-bottom: 8px; padding-bottom: 7px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+          <span style="color: var(--claude); font-size: 10px; font-weight: 700; text-transform: uppercase; margin-right: 6px;">Claude</span>
+          I'll check the current styling of the AccountTabBar component...
+        </div>
+        <div style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 3px 10px; border-radius: 4px; color: var(--blue); background: rgba(88,166,255,0.15); margin-bottom: 6px;">You</div>
+        <div class="highlight-text">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+      </div>
+
+      <div class="snippet" style="border-top: 2px solid var(--claude); background: rgba(13,17,23,0.5); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px;" onmouseover="this.style.background='rgba(196,181,160,0.05)'" onmouseout="this.style.background='rgba(13,17,23,0.5)'">
+        <div class="context-text" style="margin-bottom: 8px; padding-bottom: 7px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+          <span style="color: var(--blue); font-size: 10px; font-weight: 700; text-transform: uppercase; margin-right: 6px;">You</span>
+          can you check when it deploys and if everything is good
+        </div>
+        <div style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 3px 10px; border-radius: 4px; color: var(--claude); background: rgba(196,181,160,0.15); margin-bottom: 6px;">Claude</div>
+        <div class="preview-text">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></div>
+      </div>
+
+      <div class="snippet" style="border-top: 2px solid var(--green); background: rgba(13,17,23,0.5); border-radius: 8px; padding: 12px 14px;" onmouseover="this.style.background='rgba(63,185,80,0.05)'" onmouseout="this.style.background='rgba(13,17,23,0.5)'">
+        <div class="context-text" style="margin-bottom: 8px; padding-bottom: 7px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+          <span style="color: var(--claude); font-size: 10px; font-weight: 700; text-transform: uppercase; margin-right: 6px;">Claude</span>
+          Let me check the migration status...
+        </div>
+        <div class="tool-label"><svg class="tool-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/></svg> Tool output</div>
+        <div class="tool-block">{
+  "ok": true,
+  "command": "db-safe",
+  "result": [{
+    "<mark>migration</mark>_name": "20260311_campaign_launcher",
+    "logs": "A <mark>migration</mark> failed to apply..."
+  }]
+}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 2: Icon + Badge Header (Slack-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 2: Icon + Badge Header — Slack-style</h2>
+    <p>Colored icon + role name as the header row. No borders at all. Type communicated entirely by header.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Debugged requiresResolution auto-read logic on staging</div>
+      <div class="demo-meta">Mar 21, 2026 · 10:52 AM – 11:26 AM · 34m <span class="demo-match-pill">5 matches</span></div>
+      <div class="demo-stats">494 messages · 213 from you</div>
+
+      <div class="snippet" style="background: rgba(13,17,23,0.4); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.borderColor='rgba(255,255,255,0.1)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.04)'">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="var(--blue)"><path d="M8 0a8 8 0 110 16A8 8 0 018 0zm0 2a1.5 1.5 0 100 3 1.5 1.5 0 000-3zM5.5 7a.5.5 0 00-.5.5v.5c0 .28.22.5.5.5H6v3.5a.5.5 0 00.5.5h3a.5.5 0 00.5-.5V8.5h.5a.5.5 0 00.5-.5v-.5a.5.5 0 00-.5-.5z"/></svg>
+          <span style="font-size: 12px; font-weight: 600; color: var(--blue);">You</span>
+          <span style="font-size: 11px; color: var(--text-dim); font-family: var(--font-mono);">2:14 PM</span>
+        </div>
+        <div class="preview-text">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+      </div>
+
+      <div class="snippet" style="background: rgba(13,17,23,0.4); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.borderColor='rgba(255,255,255,0.1)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.04)'">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="var(--claude)"><path d="M8 1l2.2 4.4L15 6.1l-3.5 3.4.8 4.9L8 12.2 3.7 14.4l.8-4.9L1 6.1l4.8-.7z"/></svg>
+          <span style="font-size: 12px; font-weight: 600; color: var(--claude);">Claude</span>
+          <span style="font-size: 11px; color: var(--text-dim); font-family: var(--font-mono);">2:15 PM</span>
+        </div>
+        <div class="preview-text">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark>, so it's refusing to run new <mark>migration</mark>s</div>
+      </div>
+
+      <div class="snippet" style="background: rgba(13,17,23,0.4); border-radius: 8px; padding: 12px 14px; border: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.borderColor='rgba(255,255,255,0.1)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.04)'">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="var(--green)"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/></svg>
+          <span style="font-size: 12px; font-weight: 600; color: var(--green);">Tool output</span>
+          <span style="font-size: 11px; color: var(--text-dim); font-family: var(--font-mono);">db-safe sql</span>
+        </div>
+        <div class="tool-block">{
+  "ok": true,
+  "<mark>migration</mark>_name": "20260311_state",
+  "status": "failed"
+}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 3: Warp Blocks (horizontal dividers) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 3: Warp Blocks — Terminal-style</h2>
+    <p>Inspired by Warp terminal. Horizontal dividers between blocks. All content in mono. Prompt vs output differentiation.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Explored staging QA plan with endpoint verification</div>
+      <div class="demo-meta">Mar 21, 2026 · 11:04 AM – 11:16 AM · 13m <span class="demo-match-pill">3 matches</span></div>
+      <div class="demo-stats">685 messages · 295 from you</div>
+
+      <div style="background: rgba(0,0,0,0.25); border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.06);">
+        <!-- User block -->
+        <div class="snippet" style="padding: 10px 14px; border-bottom: 1px solid rgba(88,166,255,0.15);" onmouseover="this.style.background='rgba(88,166,255,0.04)'" onmouseout="this.style.background='transparent'">
+          <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+            <span style="color: var(--blue); font-size: 13px; font-family: var(--font-mono);">❯</span>
+            <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--blue); letter-spacing: 0.05em;">You</span>
+          </div>
+          <div style="font-size: 13px; padding-left: 22px;">the <mark>migration</mark> is failing on staging</div>
+        </div>
+
+        <!-- Claude block -->
+        <div class="snippet" style="padding: 10px 14px; border-bottom: 1px solid rgba(196,181,160,0.15);" onmouseover="this.style.background='rgba(196,181,160,0.03)'" onmouseout="this.style.background='transparent'">
+          <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+            <span style="color: var(--claude); font-size: 13px; font-family: var(--font-mono);">✦</span>
+            <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--claude); letter-spacing: 0.05em;">Claude</span>
+          </div>
+          <div style="font-size: 13px; padding-left: 22px;">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></div>
+        </div>
+
+        <!-- Tool block -->
+        <div class="snippet" style="padding: 10px 14px;" onmouseover="this.style.background='rgba(63,185,80,0.03)'" onmouseout="this.style.background='transparent'">
+          <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 6px;">
+            <span style="color: var(--green); font-size: 13px; font-family: var(--font-mono);">$</span>
+            <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--green); letter-spacing: 0.05em;">Tool output</span>
+            <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">db-safe sql staging</span>
+          </div>
+          <div style="font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text-secondary); padding-left: 22px; white-space: pre-wrap;">{
+  "ok": true,
+  "<mark>migration</mark>_name": "20260311_state",
+  "status": "failed"
+}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 4: Floating Tag Pill (Linear-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 4: Floating Tag Pill — Linear-style</h2>
+    <p>Small colored pill floats at top-right of each snippet. No border changes. Clean container with role pill as only signal.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Added <code>--border-color-*</code> variables to @theme for Tailwind v4</div>
+      <div class="demo-meta">Mar 20, 2026 · 4:32 PM – 4:46 PM · 14m <span class="demo-match-pill">1 match</span></div>
+      <div class="demo-stats">116 messages · 57 from you</div>
+
+      <div class="snippet" style="position: relative; background: rgba(13,17,23,0.4); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px;" onmouseover="this.style.borderColor='rgba(255,255,255,0.12)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.05)'">
+        <span style="position: absolute; top: 8px; right: 10px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 8px; border-radius: 99px; color: var(--blue); background: rgba(88,166,255,0.12);">You</span>
+        <div class="context-text" style="margin-bottom: 6px; padding-right: 50px;">
+          <span style="color: var(--claude); font-size: 10px; font-weight: 600; margin-right: 4px;">Claude:</span>
+          I'll check the current styling of the AccountTabBar...
+        </div>
+        <div class="preview-text">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+      </div>
+
+      <div class="snippet" style="position: relative; background: rgba(13,17,23,0.4); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px;" onmouseover="this.style.borderColor='rgba(255,255,255,0.12)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.05)'">
+        <span style="position: absolute; top: 8px; right: 10px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 8px; border-radius: 99px; color: var(--claude); background: rgba(196,181,160,0.12);">Claude</span>
+        <div class="context-text" style="margin-bottom: 6px; padding-right: 60px;">
+          <span style="color: var(--blue); font-size: 10px; font-weight: 600; margin-right: 4px;">You:</span>
+          can you check when it deploys
+        </div>
+        <div class="preview-text">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></div>
+      </div>
+
+      <div class="snippet" style="position: relative; background: rgba(13,17,23,0.4); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 12px 14px;" onmouseover="this.style.borderColor='rgba(255,255,255,0.12)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.05)'">
+        <span style="position: absolute; top: 8px; right: 10px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 8px; border-radius: 99px; color: var(--green); background: rgba(63,185,80,0.12);">Tool</span>
+        <div class="tool-label" style="margin-top: 0;"><svg class="tool-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/></svg> db-safe sql staging</div>
+        <div class="tool-block">{
+  "ok": true,
+  "<mark>migration</mark>_name": "20260311_state"
+}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 5: Full-Width Header Bar (VS Code-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 5: Full-Width Header Bar — VS Code-style</h2>
+    <p>Each snippet has a colored header bar spanning full width. Body is neutral. Strong visual grouping.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Removed pipeline-stage-cache.ts, replaced with direct DB queries</div>
+      <div class="demo-meta">Mar 19, 2026 · 9:59 PM – 10:49 PM · 50m <span class="demo-match-pill">1 match</span></div>
+      <div class="demo-stats">289 messages · 139 from you</div>
+
+      <div class="snippet" style="border-radius: 8px; overflow: hidden; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.borderColor='rgba(255,255,255,0.1)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.04)'">
+        <div style="background: rgba(88,166,255,0.12); padding: 6px 12px; display: flex; align-items: center; gap: 6px;">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="var(--blue)"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
+          <span style="font-size: 11px; font-weight: 600; color: var(--blue);">You</span>
+        </div>
+        <div style="padding: 10px 12px; background: rgba(13,17,23,0.4);">
+          <div class="preview-text">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+        </div>
+      </div>
+
+      <div class="snippet" style="border-radius: 8px; overflow: hidden; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.borderColor='rgba(255,255,255,0.1)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.04)'">
+        <div style="background: rgba(196,181,160,0.1); padding: 6px 12px; display: flex; align-items: center; gap: 6px;">
+          <span style="font-size: 13px;">✦</span>
+          <span style="font-size: 11px; font-weight: 600; color: var(--claude);">Claude</span>
+        </div>
+        <div style="padding: 10px 12px; background: rgba(13,17,23,0.4);">
+          <div class="preview-text">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></div>
+        </div>
+      </div>
+
+      <div class="snippet" style="border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.borderColor='rgba(255,255,255,0.1)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.04)'">
+        <div style="background: rgba(63,185,80,0.1); padding: 6px 12px; display: flex; align-items: center; gap: 6px;">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="var(--green)"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/></svg>
+          <span style="font-size: 11px; font-weight: 600; color: var(--green);">Tool output</span>
+          <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono); margin-left: auto;">db-safe sql</span>
+        </div>
+        <div style="padding: 10px 12px; background: rgba(0,0,0,0.3);">
+          <div style="font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text-secondary); white-space: pre-wrap;">{ "ok": true, "<mark>migration</mark>_name": "20260311" }</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 6: Chat Bubbles (iMessage-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 6: Chat Bubbles — iMessage-style</h2>
+    <p>User messages right-aligned with blue bubble, Claude left-aligned with warm bubble. Tool is neutral centered block.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Pushed to staging; Docker build succeeded</div>
+      <div class="demo-meta">Mar 19, 2026 · 9:59 PM – 10:49 PM · 50m <span class="demo-match-pill">3 matches</span></div>
+      <div class="demo-stats">289 messages · 139 from you</div>
+
+      <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+        <!-- User bubble -->
+        <div class="snippet" style="align-self: flex-end; max-width: 85%; background: rgba(88,166,255,0.15); border-radius: 14px 14px 4px 14px; padding: 10px 14px;" onmouseover="this.style.background='rgba(88,166,255,0.2)'" onmouseout="this.style.background='rgba(88,166,255,0.15)'">
+          <div style="font-size: 10px; font-weight: 600; color: var(--blue); margin-bottom: 4px;">YOU</div>
+          <div style="font-size: 13px;">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+        </div>
+
+        <!-- Claude bubble -->
+        <div class="snippet" style="align-self: flex-start; max-width: 85%; background: rgba(196,181,160,0.1); border-radius: 14px 14px 14px 4px; padding: 10px 14px;" onmouseover="this.style.background='rgba(196,181,160,0.15)'" onmouseout="this.style.background='rgba(196,181,160,0.1)'">
+          <div style="font-size: 10px; font-weight: 600; color: var(--claude); margin-bottom: 4px;">CLAUDE</div>
+          <div style="font-size: 13px;">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark>, so it's refusing to run new migrations</div>
+        </div>
+
+        <!-- Tool block (centered, full width) -->
+        <div class="snippet" style="background: rgba(0,0,0,0.25); border: 1px solid rgba(63,185,80,0.15); border-radius: 8px; padding: 10px 14px;" onmouseover="this.style.borderColor='rgba(63,185,80,0.3)'" onmouseout="this.style.borderColor='rgba(63,185,80,0.15)'">
+          <div class="tool-label"><svg class="tool-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/></svg> Tool output</div>
+          <div class="tool-block">{
+  "<mark>migration</mark>_name": "20260311_state",
+  "status": "failed"
+}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 7: Gutter Icon (Figma-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 7: Gutter Icon — Figma-style</h2>
+    <p>Colored circle/icon in left gutter. Content area is neutral. The gutter icon is the sole differentiator.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Fixed shift swap blueprint webhook URL to enable testing</div>
+      <div class="demo-meta">Mar 21, 2026 · 10:52 AM – 11:26 AM · 34m <span class="demo-match-pill">3 matches</span></div>
+      <div class="demo-stats">494 messages · 213 from you</div>
+
+      <div class="snippet" style="display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.04); margin-bottom: 0;" onmouseover="this.style.background='rgba(255,255,255,0.02)'" onmouseout="this.style.background='transparent'">
+        <div style="display: flex; flex-direction: column; align-items: center; padding-top: 2px;">
+          <div style="width: 28px; height: 28px; border-radius: 50%; background: rgba(88,166,255,0.15); display: flex; align-items: center; justify-content: center;">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="var(--blue)"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
+          </div>
+        </div>
+        <div style="flex: 1; min-width: 0;">
+          <div style="font-size: 11px; font-weight: 600; color: var(--blue); margin-bottom: 2px;">You</div>
+          <div class="preview-text" style="margin: 0;">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+        </div>
+      </div>
+
+      <div class="snippet" style="display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.background='rgba(255,255,255,0.02)'" onmouseout="this.style.background='transparent'">
+        <div style="display: flex; flex-direction: column; align-items: center; padding-top: 2px;">
+          <div style="width: 28px; height: 28px; border-radius: 50%; background: rgba(196,181,160,0.15); display: flex; align-items: center; justify-content: center;">
+            <span style="font-size: 14px; color: var(--claude);">✦</span>
+          </div>
+        </div>
+        <div style="flex: 1; min-width: 0;">
+          <div style="font-size: 11px; font-weight: 600; color: var(--claude); margin-bottom: 2px;">Claude</div>
+          <div class="preview-text" style="margin: 0;">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></div>
+        </div>
+      </div>
+
+      <div class="snippet" style="display: flex; gap: 12px; padding: 10px 0;" onmouseover="this.style.background='rgba(255,255,255,0.02)'" onmouseout="this.style.background='transparent'">
+        <div style="display: flex; flex-direction: column; align-items: center; padding-top: 2px;">
+          <div style="width: 28px; height: 28px; border-radius: 50%; background: rgba(63,185,80,0.15); display: flex; align-items: center; justify-content: center;">
+            <span style="font-size: 12px; color: var(--green); font-family: var(--font-mono); font-weight: 700;">$</span>
+          </div>
+        </div>
+        <div style="flex: 1; min-width: 0;">
+          <div style="font-size: 11px; font-weight: 600; color: var(--green); margin-bottom: 4px;">Tool output</div>
+          <div class="tool-block" style="margin: 0;">{
+  "ok": true,
+  "<mark>migration</mark>_name": "20260311"
+}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 8: Conversation Thread (Discord-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 8: Conversation Thread — Discord-style</h2>
+    <p>Connected thread with vertical connector line. Each message has avatar + name + content. Compact and scannable.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Created GTM-3884 through GTM-3895 as Done sub-issues</div>
+      <div class="demo-meta">Mar 20, 2026 · 4:32 PM – 4:46 PM · 14m <span class="demo-match-pill">1 match</span></div>
+      <div class="demo-stats">116 messages · 57 from you</div>
+
+      <div style="position: relative; padding-left: 20px; margin-top: 8px;">
+        <!-- Vertical line -->
+        <div style="position: absolute; left: 9px; top: 14px; bottom: 14px; width: 2px; background: linear-gradient(to bottom, var(--blue), var(--claude), var(--green)); border-radius: 1px; opacity: 0.3;"></div>
+
+        <div class="snippet" style="display: flex; gap: 10px; padding: 8px 0; position: relative;" onmouseover="this.querySelector('.msg-body').style.background='rgba(255,255,255,0.03)'" onmouseout="this.querySelector('.msg-body').style.background='transparent'">
+          <div style="width: 8px; height: 8px; border-radius: 50%; background: var(--blue); margin-top: 6px; flex-shrink: 0; position: relative; z-index: 1;"></div>
+          <div class="msg-body" style="flex: 1; min-width: 0; padding: 6px 10px; border-radius: 6px; transition: background 0.15s;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--blue); margin-right: 8px;">You</span>
+            <span style="font-size: 13px;">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</span>
+          </div>
+        </div>
+
+        <div class="snippet" style="display: flex; gap: 10px; padding: 8px 0; position: relative;" onmouseover="this.querySelector('.msg-body').style.background='rgba(255,255,255,0.03)'" onmouseout="this.querySelector('.msg-body').style.background='transparent'">
+          <div style="width: 8px; height: 8px; border-radius: 50%; background: var(--claude); margin-top: 6px; flex-shrink: 0; position: relative; z-index: 1;"></div>
+          <div class="msg-body" style="flex: 1; min-width: 0; padding: 6px 10px; border-radius: 6px; transition: background 0.15s;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--claude); margin-right: 8px;">Claude</span>
+            <span style="font-size: 13px;">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></span>
+          </div>
+        </div>
+
+        <div class="snippet" style="display: flex; gap: 10px; padding: 8px 0; position: relative;" onmouseover="this.querySelector('.msg-body').style.background='rgba(255,255,255,0.03)'" onmouseout="this.querySelector('.msg-body').style.background='transparent'">
+          <div style="width: 8px; height: 8px; border-radius: 50%; background: var(--green); margin-top: 6px; flex-shrink: 0; position: relative; z-index: 1;"></div>
+          <div class="msg-body" style="flex: 1; min-width: 0; padding: 6px 10px; border-radius: 6px; transition: background 0.15s;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--green); margin-right: 8px;">Tool</span>
+            <div class="tool-block" style="margin-top: 4px;">{
+  "<mark>migration</mark>_name": "20260311",
+  "status": "failed"
+}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 9: Bottom Border Accent (Vercel-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 9: Bottom Border + Glow — Vercel-style</h2>
+    <p>Ultra-minimal. Thin colored line at bottom of each snippet with subtle glow effect. Premium feel.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Analyzed 215 commits from master over last month</div>
+      <div class="demo-meta">Mar 20, 2026 · 4:32 PM – 4:46 PM · 14m <span class="demo-match-pill">1 match</span></div>
+      <div class="demo-stats">116 messages · 57 from you</div>
+
+      <div class="snippet" style="position: relative; background: rgba(13,17,23,0.5); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; overflow: hidden;" onmouseover="this.style.background='rgba(13,17,23,0.7)'" onmouseout="this.style.background='rgba(13,17,23,0.5)'">
+        <div style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 3px 10px; border-radius: 4px; color: var(--blue); background: rgba(88,166,255,0.12); margin-bottom: 8px;">You</div>
+        <div class="preview-text">the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?</div>
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--blue);"></div>
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 20px; background: linear-gradient(to top, rgba(88,166,255,0.06), transparent); pointer-events: none;"></div>
+      </div>
+
+      <div class="snippet" style="position: relative; background: rgba(13,17,23,0.5); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; overflow: hidden;" onmouseover="this.style.background='rgba(13,17,23,0.7)'" onmouseout="this.style.background='rgba(13,17,23,0.5)'">
+        <div style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 3px 10px; border-radius: 4px; color: var(--claude); background: rgba(196,181,160,0.12); margin-bottom: 8px;">Claude</div>
+        <div class="preview-text">P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark></div>
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--claude);"></div>
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 20px; background: linear-gradient(to top, rgba(196,181,160,0.05), transparent); pointer-events: none;"></div>
+      </div>
+
+      <div class="snippet" style="position: relative; background: rgba(13,17,23,0.5); border-radius: 8px; padding: 12px 14px; overflow: hidden;" onmouseover="this.style.background='rgba(13,17,23,0.7)'" onmouseout="this.style.background='rgba(13,17,23,0.5)'">
+        <div class="tool-label"><svg class="tool-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25zM7.25 8a.749.749 0 01-.22.53l-2.25 2.25a.749.749 0 11-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 111.06-1.06l2.25 2.25c.141.14.22.331.22.53zm1.5 1.5h3a.75.75 0 010 1.5h-3a.75.75 0 010-1.5z"/></svg> Tool output</div>
+        <div class="tool-block">{
+  "<mark>migration</mark>_name": "20260311",
+  "status": "failed"
+}</div>
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--green);"></div>
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 20px; background: linear-gradient(to top, rgba(63,185,80,0.06), transparent); pointer-events: none;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- OPTION 10: Uniform Terminal (Ghostty-style) -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="option-card">
+  <div class="option-header">
+    <h2>Option 10: Uniform Terminal — Ghostty-style</h2>
+    <p>Everything looks like a terminal. Monospace throughout. Colored prompt characters differentiate roles: ❯ You, ✦ Claude, $ Tool. Minimal, dense, fast to scan.</p>
+  </div>
+  <div class="option-demo">
+    <div class="demo-card">
+      <div class="demo-summary">· Explored staging QA plan with endpoint verification</div>
+      <div class="demo-meta">Mar 21, 2026 · 11:04 AM – 11:16 AM · 13m <span class="demo-match-pill">3 matches</span></div>
+      <div class="demo-stats">685 messages · 295 from you</div>
+
+      <div style="background: rgba(0,0,0,0.3); border-radius: 8px; font-family: var(--font-mono); font-size: 12px; line-height: 1.7; padding: 14px 16px; border: 1px solid rgba(255,255,255,0.06);">
+        <div class="snippet" style="padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04);" onmouseover="this.style.background='rgba(88,166,255,0.04)';this.style.marginLeft='-8px';this.style.paddingLeft='8px';this.style.marginRight='-8px';this.style.paddingRight='8px'" onmouseout="this.style.background='transparent';this.style.marginLeft='0';this.style.paddingLeft='0';this.style.marginRight='0';this.style.paddingRight='0'">
+          <span style="color: var(--blue); font-weight: 600;">❯</span> <span style="color: var(--blue); font-size: 10px; font-weight: 700;">YOU</span>  the <mark>migration</mark> is failing on staging, can you check the <mark>database</mark> logs?
+        </div>
+        <div class="snippet" style="padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); color: var(--text-secondary);" onmouseover="this.style.background='rgba(196,181,160,0.04)';this.style.marginLeft='-8px';this.style.paddingLeft='8px';this.style.marginRight='-8px';this.style.paddingRight='8px'" onmouseout="this.style.background='transparent';this.style.marginLeft='0';this.style.paddingLeft='0';this.style.marginRight='0';this.style.paddingRight='0'">
+          <span style="color: var(--claude); font-weight: 600;">✦</span> <span style="color: var(--claude); font-size: 10px; font-weight: 700;">CLAUDE</span>  P3009 — Prisma found a previously failed <mark>migration</mark> in the staging <mark>database</mark>, so it's refusing to run new <mark>migration</mark>s
+        </div>
+        <div class="snippet" style="padding: 4px 0; color: var(--text-dim);" onmouseover="this.style.background='rgba(63,185,80,0.04)';this.style.marginLeft='-8px';this.style.paddingLeft='8px';this.style.marginRight='-8px';this.style.paddingRight='8px'" onmouseout="this.style.background='transparent';this.style.marginLeft='0';this.style.paddingLeft='0';this.style.marginRight='0';this.style.paddingRight='0'">
+          <span style="color: var(--green); font-weight: 600;">$</span> <span style="color: var(--green); font-size: 10px; font-weight: 700;">TOOL</span>  { "ok": true, "<mark>migration</mark>_name": "20260311", "status": "failed" }
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /grid -->
+
+</body>
+</html>

@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import { mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -12,7 +12,7 @@ mkdirSync(DB_DIR, { recursive: true });
 const db = new Database(DB_PATH);
 
 // Enable WAL mode for better concurrent read performance
-db.pragma("journal_mode = WAL");
+db.exec("PRAGMA journal_mode = WAL");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS workspaces (
@@ -81,18 +81,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_files_session ON session_files(session_id);
   CREATE INDEX IF NOT EXISTS idx_files_name ON session_files(file_name);
 
-  CREATE TABLE IF NOT EXISTS tool_calls (
-    id INTEGER PRIMARY KEY,
-    session_id TEXT REFERENCES sessions(id),
-    tool_name TEXT NOT NULL,
-    input_summary TEXT,
-    timestamp TEXT,
-    sequence INTEGER
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
-  CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(tool_name);
-
   CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY,
     action TEXT NOT NULL,
@@ -126,15 +114,20 @@ db.exec(`
   END;
 `);
 
-// Migration: add file_size column if it doesn't exist (for existing DBs)
+// Migration: add message_type column to messages
 try {
-  db.exec(`ALTER TABLE sessions ADD COLUMN file_size INTEGER`);
+  db.exec(`ALTER TABLE messages ADD COLUMN message_type TEXT DEFAULT 'text'`);
 } catch {
   // Column already exists
 }
 
+// Migration: drop legacy tool_calls table
+db.exec(`DROP TABLE IF EXISTS tool_calls`);
+db.exec(`DROP INDEX IF EXISTS idx_tool_calls_session`);
+db.exec(`DROP INDEX IF EXISTS idx_tool_calls_name`);
+
 // Rebuild FTS index to cover any data ingested before FTS5 was added
-db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`);
+db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
 
 export default db;
 export { DB_PATH };

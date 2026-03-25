@@ -1,5 +1,5 @@
 import { Router } from "express";
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import Anthropic from "@anthropic-ai/sdk";
 import { DB_PATH } from "./db.js";
 import { config } from "./config.js";
@@ -16,11 +16,10 @@ const SYSTEM_PROMPT = `You are an assistant for Session Explorer, a tool for bro
 
 workspaces: id INTEGER PRIMARY KEY, path TEXT, dir_name TEXT, display_name TEXT, session_count INTEGER, last_activity TEXT
 sessions: id TEXT PRIMARY KEY, workspace_id INTEGER REFERENCES workspaces(id), source_path TEXT, started_at TEXT, ended_at TEXT, git_branch TEXT, title TEXT, message_count INTEGER, user_message_count INTEGER, summary TEXT, ingested_at TEXT
-messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role TEXT (user|assistant), content TEXT, timestamp TEXT, sequence INTEGER
+messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role TEXT (user|assistant), content TEXT, timestamp TEXT, sequence INTEGER, message_type TEXT (text|tool_use|tool_result) — text is conversation, tool_use is "ToolName: summary", tool_result is truncated output
 tags: id INTEGER PRIMARY KEY, name TEXT UNIQUE, color TEXT, description TEXT, created_at TEXT
 session_tags: session_id TEXT REFERENCES sessions(id), tag_id INTEGER REFERENCES tags(id), added_at TEXT (PK: both)
 session_files: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), file_path TEXT, file_name TEXT, operation TEXT (write|edit|read), timestamp TEXT, sequence INTEGER
-tool_calls: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), tool_name TEXT, input_summary TEXT, timestamp TEXT, sequence INTEGER
 audit_log: id INTEGER PRIMARY KEY, action TEXT, entity_type TEXT, entity_id TEXT, details TEXT (JSON), created_at TEXT
 
 ## Guidelines
@@ -34,8 +33,8 @@ audit_log: id INTEGER PRIMARY KEY, action TEXT, entity_type TEXT, entity_id TEXT
 - When counting or summarizing, query for the data first, then describe what you found.
 - For full-text search on message content, use the FTS5 table: SELECT m.* FROM messages m JOIN messages_fts fts ON m.id = fts.rowid WHERE messages_fts MATCH 'search terms'. This is much faster than LIKE.
 - FTS5 supports phrase queries ("exact phrase"), AND/OR operators, and prefix queries (term*).
-- tool_calls.tool_name values include: Bash, Read, Edit, Write, Grep, Glob, Agent, ToolSearch, and others.
-- tool_calls.input_summary contains: the command for Bash, file_path for Read/Edit/Write, pattern for Grep/Glob, description for Agent.
+- For tool usage, query: SELECT * FROM messages WHERE message_type = 'tool_use' — content format is "ToolName: summary".
+- For tool results/output, query: SELECT * FROM messages WHERE message_type = 'tool_result' — content is truncated first 500 chars of output.
 
 ## Response format
 

@@ -10,7 +10,8 @@
     "build": "vite build",
     "ingest": "bun run server/ingest.ts",
     "ingest:all": "bun run server/ingest.ts --all",
-    "ingest:force": "bun run server/ingest.ts --force"
+    "ingest:force": "bun run server/ingest.ts --force",
+    "start": "bun server/index.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

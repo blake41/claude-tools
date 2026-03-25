@@ -111,18 +111,13 @@ const insertSession = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (session_id, role, content, timestamp, sequence)
-  VALUES (?, ?, ?, ?, ?)
+  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type)
+  VALUES (?, ?, ?, ?, ?, ?)
 `);
 
 const insertFile = db.prepare(`
   INSERT INTO session_files (session_id, file_path, file_name, operation, timestamp, sequence)
   VALUES (?, ?, ?, ?, ?, ?)
-`);
-
-const insertToolCall = db.prepare(`
-  INSERT INTO tool_calls (session_id, tool_name, input_summary, timestamp, sequence)
-  VALUES (?, ?, ?, ?, ?)
 `);
 
 const updateSessionCounts = db.prepare(`
@@ -133,7 +128,6 @@ const updateSessionCounts = db.prepare(`
 `);
 
 const deleteSessionFiles = db.prepare(`DELETE FROM session_files WHERE session_id = ?`);
-const deleteSessionToolCalls = db.prepare(`DELETE FROM tool_calls WHERE session_id = ?`);
 const deleteSessionMessages = db.prepare(`DELETE FROM messages WHERE session_id = ?`);
 const deleteSessionTags = db.prepare(`DELETE FROM session_tags WHERE session_id = ?`);
 const deleteSession = db.prepare(`DELETE FROM sessions WHERE id = ?`);
@@ -169,7 +163,6 @@ function ingestSession(
   // In force mode, delete existing data first
   if (alreadyExists && forceReingest) {
     const deleteTx = db.transaction(() => {
-      deleteSessionToolCalls.run(sessionId);
       deleteSessionFiles.run(sessionId);
       deleteSessionMessages.run(sessionId);
       // Preserve session_tags — tags are user data, not derived from JSONL
@@ -225,7 +218,8 @@ function ingestSession(
         msg.role,
         msg.content,
         msg.timestamp,
-        msg.sequence
+        msg.sequence,
+        msg.messageType || 'text'
       );
     }
 
@@ -238,16 +232,6 @@ function ingestSession(
         file.operation,
         file.timestamp,
         file.sequence
-      );
-    }
-
-    for (const tc of toolCalls) {
-      insertToolCall.run(
-        sessionId,
-        tc.toolName,
-        tc.inputSummary,
-        tc.timestamp,
-        tc.sequence
       );
     }
 
@@ -276,7 +260,8 @@ function ingestSession(
               msg.role,
               msg.content,
               msg.timestamp,
-              seqOffset + msg.sequence
+              seqOffset + msg.sequence,
+              msg.messageType || 'text'
             );
           }
           for (const file of subResult.files) {
@@ -288,15 +273,6 @@ function ingestSession(
               file.operation,
               file.timestamp,
               seqOffset + file.sequence
-            );
-          }
-          for (const tc of subResult.toolCalls) {
-            insertToolCall.run(
-              sessionId,
-              tc.toolName,
-              tc.inputSummary,
-              tc.timestamp,
-              seqOffset + tc.sequence
             );
           }
           seqOffset += subResult.messages.length + subResult.files.length + subResult.toolCalls.length;
