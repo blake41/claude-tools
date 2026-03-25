@@ -118,6 +118,7 @@ while true; do
       ;;
     *)
       log "UNKNOWN_STATUS status=$STATUS deploy=$LATEST_ID after ${WAITED}s"
+      notify "Unknown Deploy Status" "$STATUS — ${SHORT_SHA}" "Purr"
       ;;
   esac
 
