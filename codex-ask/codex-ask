@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# codex-ask — lightweight Codex API call (no agent loop)
+# Usage: codex-ask "prompt"
+#        echo "prompt" | codex-ask
+#        codex-ask --reasoning medium "prompt"
+#
+# Calls the OpenAI Responses API directly, skipping the full
+# codex exec agent machinery. ~10-30s instead of minutes.
+
+set -euo pipefail
+
+REASONING="xhigh"
+MODEL="gpt-5.3-codex"
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --reasoning) REASONING="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: codex-ask [--reasoning xhigh|high|medium|low] [--model MODEL] \"prompt\""
+      echo "       echo \"prompt\" | codex-ask"
+      exit 0
+      ;;
+    *) break ;;
+  esac
+done
+
+# Get prompt from args or stdin
+if [[ $# -gt 0 ]]; then
+  PROMPT="$*"
+elif [[ ! -t 0 ]]; then
+  PROMPT="$(cat)"
+else
+  echo "Error: no prompt provided" >&2
+  exit 1
+fi
+
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo "Error: OPENAI_API_KEY not set" >&2
+  exit 1
+fi
+
+# Build the JSON payload
+PAYLOAD=$(jq -n \
+  --arg model "$MODEL" \
+  --arg prompt "$PROMPT" \
+  --arg effort "$REASONING" \
+  '{
+    model: $model,
+    input: $prompt,
+    reasoning: { effort: $effort }
+  }')
+
+# Call the API
+RESPONSE=$(curl -s -w "\n%{http_code}" \
+  "https://api.openai.com/v1/responses" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD")
+
+# Split response body and HTTP status
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+if [[ "$HTTP_CODE" != "200" ]]; then
+  echo "Error: API returned HTTP $HTTP_CODE" >&2
+  echo "$BODY" | jq -r '.error.message // .' >&2
+  exit 1
+fi
+
+# Extract the text output and usage
+TEXT=$(echo "$BODY" | jq -r '.output[] | select(.type == "message") | .content[] | select(.type == "output_text") | .text' 2>/dev/null)
+INPUT_TOKENS=$(echo "$BODY" | jq -r '.usage.input_tokens // "?"' 2>/dev/null)
+OUTPUT_TOKENS=$(echo "$BODY" | jq -r '.usage.output_tokens // "?"' 2>/dev/null)
+
+if [[ -z "$TEXT" ]]; then
+  echo "Error: could not extract response text" >&2
+  echo "$BODY" | jq '.' >&2
+  exit 1
+fi
+
+echo "$TEXT"
+echo ""
+echo "---"
+echo "Model: $MODEL | Reasoning: $REASONING | Tokens: $INPUT_TOKENS in / $OUTPUT_TOKENS out"
