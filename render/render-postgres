@@ -53,6 +53,8 @@ cmd_get() {
     local na
     na=$(next_actions \
         "$(next_action "render-postgres conn $db_id" "Get connection strings")" \
+        "$(next_action "render-postgres backups $db_id" "List backup exports")" \
+        "$(next_action "render-postgres recovery-status $db_id" "Check PITR recovery window")" \
         "$(next_action "render-postgres suspend $db_id" "Suspend database")" \
         "$(next_action "render-postgres resume $db_id" "Resume database")")
 
@@ -75,6 +77,74 @@ cmd_conn() {
         "$(next_action "render-postgres get $db_id" "View database details")")
 
     json_ok "$TOOL_NAME conn" "$result" "$na"
+}
+
+cmd_backups() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME backups" "Database ID required" "MISSING_ARG" "Usage: render-postgres backups <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME backups" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local raw
+    raw=$(render_api "/postgres/$db_id/export")
+
+    local exports
+    exports=$(echo "$raw" | jq '[.[] | {
+        id: .id,
+        status: .status,
+        createdAt: .createdAt,
+        completedAt: (.completedAt // null),
+        downloadUrl: (.url // null),
+        sizeBytes: (.sizeBytes // null)
+    }]' 2>/dev/null || echo "$raw")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres export $db_id" "Create a new backup export")" \
+        "$(next_action "render-postgres recovery-status $db_id" "Check PITR recovery window")" \
+        "$(next_action "render-postgres get $db_id" "View database details")")
+
+    json_ok "$TOOL_NAME backups" "$exports" "$na"
+}
+
+cmd_export() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME export" "Database ID required" "MISSING_ARG" "Usage: render-postgres export <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME export" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api_post "/postgres/$db_id/export" '{}')
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres backups $db_id" "Check export status and download link")" \
+        "$(next_action "render-postgres get $db_id" "View database details")")
+
+    json_ok "$TOOL_NAME export" "$result" "$na"
+}
+
+cmd_recovery_status() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME recovery-status" "Database ID required" "MISSING_ARG" "Usage: render-postgres recovery-status <database-id>"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME recovery-status" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local result
+    result=$(render_api "/postgres/$db_id/recovery")
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres backups $db_id" "List logical backup exports")" \
+        "$(next_action "render-postgres get $db_id" "View database details")")
+
+    json_ok "$TOOL_NAME recovery-status" "$result" "$na"
 }
 
 cmd_suspend() {
@@ -124,6 +194,15 @@ case "${1:-}" in
     conn)
         cmd_conn "${2:-}"
         ;;
+    backups)
+        cmd_backups "${2:-}"
+        ;;
+    export)
+        cmd_export "${2:-}"
+        ;;
+    recovery-status)
+        cmd_recovery_status "${2:-}"
+        ;;
     suspend)
         cmd_suspend "${2:-}"
         ;;
@@ -135,6 +214,9 @@ case "${1:-}" in
             {name: "list", description: "List all Postgres databases", usage: "render-postgres list"},
             {name: "get", description: "Get database details", usage: "render-postgres get <database-id>"},
             {name: "conn", description: "Get connection strings and credentials", usage: "render-postgres conn <database-id>"},
+            {name: "backups", description: "List backup exports (with download links)", usage: "render-postgres backups <database-id>"},
+            {name: "export", description: "Trigger a new logical backup export", usage: "render-postgres export <database-id>"},
+            {name: "recovery-status", description: "Check PITR recovery window availability", usage: "render-postgres recovery-status <database-id>"},
             {name: "suspend", description: "Suspend a database", usage: "render-postgres suspend <database-id>"},
             {name: "resume", description: "Resume a suspended database", usage: "render-postgres resume <database-id>"}
         ]')"

@@ -124,21 +124,69 @@ cmd_env() {
 }
 
 cmd_deploy() {
-    local service_id="${1:-}"
+    local service_id=""
+    local commit=""
+    local clear_cache="do_not_clear"
+    local wait_for_deploy=false
+
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --commit) commit="$2"; shift 2 ;;
+            --clear-cache) clear_cache="clear"; shift ;;
+            --wait) wait_for_deploy=true; shift ;;
+            -*) json_error "$TOOL_NAME deploy" "Unknown flag: $1" "BAD_ARG" "Usage: render-services deploy <service-id> [--commit <hash>] [--clear-cache] [--wait]" ;;
+            *) service_id="$1"; shift ;;
+        esac
+    done
+
     if [[ -z "$service_id" ]]; then
-        json_error "$TOOL_NAME deploy" "Service ID required" "MISSING_ARG" "Usage: render-services deploy <service-id>"
+        json_error "$TOOL_NAME deploy" "Service ID required" "MISSING_ARG" \
+            "Usage: render-services deploy <service-id> [--commit <hash>] [--clear-cache] [--wait]"
     fi
 
     load_api_key || json_error "$TOOL_NAME deploy" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
 
-    local result
-    result=$(render_api_post "/services/$service_id/deploys" '{}')
+    # Build request body
+    local body
+    body=$(jq -n \
+        --arg cache "$clear_cache" \
+        --arg commit "$commit" \
+        'if $commit != "" then {clearCache: $cache, commitId: $commit} else {clearCache: $cache} end')
 
-    local deploy
-    deploy=$(echo "$result" | jq '{id: .id, status: .status, trigger: .trigger, createdAt: .createdAt}')
+    local result
+    result=$(render_api_post "/services/$service_id/deploys" "$body")
 
     local deploy_id
     deploy_id=$(echo "$result" | jq -r '.id // empty')
+
+    if [[ "$wait_for_deploy" == true && -n "$deploy_id" ]]; then
+        # Poll until deploy reaches a terminal state
+        local status="created"
+        local attempts=0
+        local max_attempts=120  # 10 minutes at 5s intervals
+
+        while [[ "$status" != "live" && "$status" != "deactivated" && "$status" != "build_failed" && "$status" != "update_failed" && "$status" != "canceled" ]]; do
+            if (( attempts >= max_attempts )); then
+                json_error "$TOOL_NAME deploy" "Timed out waiting for deploy $deploy_id (last status: $status)" "TIMEOUT" \
+                    "Check deploy status: render-services deploys $service_id"
+            fi
+            sleep 5
+            result=$(render_api "/services/$service_id/deploys/$deploy_id")
+            status=$(echo "$result" | jq -r '.status // "unknown"')
+            (( attempts++ ))
+        done
+
+        if [[ "$status" == "build_failed" || "$status" == "update_failed" || "$status" == "canceled" ]]; then
+            local deploy_info
+            deploy_info=$(echo "$result" | jq '{id: .id, status: .status, trigger: .trigger, createdAt: .createdAt, finishedAt: .finishedAt}')
+            json_error "$TOOL_NAME deploy" "Deploy $deploy_id finished with status: $status" "DEPLOY_FAILED" \
+                "Check build logs: render-logs $service_id --type build"
+        fi
+    fi
+
+    local deploy
+    deploy=$(echo "$result" | jq '{id: .id, status: .status, trigger: .trigger, createdAt: .createdAt, finishedAt: (.finishedAt // null)}')
 
     local na
     na=$(next_actions \
@@ -522,7 +570,7 @@ case "${1:-}" in
         shift; cmd_deploys "$@"
         ;;
     deploy)
-        cmd_deploy "${2:-}"
+        shift; cmd_deploy "$@"
         ;;
     deploy-cancel)
         shift; cmd_deploy_cancel "$@"
@@ -576,7 +624,7 @@ case "${1:-}" in
         cmd_tree "$TOOL_NAME" "Render.com service management" "$(jq -n '[
             {name: "list", description: "List all services", usage: "render-services list"},
             {name: "get", description: "Get service details", usage: "render-services get <service-id>"},
-            {name: "deploy", description: "Trigger a deploy", usage: "render-services deploy <service-id>"},
+            {name: "deploy", description: "Trigger a deploy", usage: "render-services deploy <service-id> [--commit <hash>] [--clear-cache] [--wait]"},
             {name: "deploy-cancel", description: "Cancel a running deploy", usage: "render-services deploy-cancel <service-id> <deploy-id>"},
             {name: "deploys", description: "List recent deploys", usage: "render-services deploys <service-id> [--limit N]"},
             {name: "restart", description: "Restart a service", usage: "render-services restart <service-id>"},
