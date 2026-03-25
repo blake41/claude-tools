@@ -113,6 +113,12 @@ while true; do
       notify "Deploy Superseded" "Replaced — ${SHORT_SHA}" "Purr"
       exit 0
       ;;
+    created|build_in_progress|update_in_progress|pre_deploy_in_progress)
+      # Known in-progress states — keep polling
+      ;;
+    *)
+      log "UNKNOWN_STATUS status=$STATUS deploy=$LATEST_ID after ${WAITED}s"
+      ;;
   esac
 
   WAITED=$((WAITED + POLL_INTERVAL))
