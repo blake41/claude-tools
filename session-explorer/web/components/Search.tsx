@@ -582,7 +582,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
             ref={inputRef}
             type="text"
             className="flex-1 bg-transparent border-none outline-none text-xl text-text font-[var(--font-ui)] placeholder:text-text-dim"
-            placeholder={tab === "messages" ? "Search sessions..." : "Search files by name or path..."}
+            placeholder={tab === "messages" ? "Search sessions..." : "Search files — use * and ? for globs (e.g. *blake.html)"}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {

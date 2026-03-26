@@ -170,6 +170,18 @@ const searchMessagesFtsInWorkspace = db.prepare(`
 `);
 
 /** Convert user query to FTS5 query — wraps words in double quotes for phrase-like matching */
+/** Convert a glob pattern (*, ?) to a SQL LIKE pattern */
+function globToLike(glob: string): string {
+  let result = '';
+  for (const ch of glob) {
+    if (ch === '*') result += '%';
+    else if (ch === '?') result += '_';
+    else if (ch === '%' || ch === '_') result += '\\' + ch;
+    else result += ch;
+  }
+  return result;
+}
+
 function toFtsQuery(query: string): string {
   // Escape double quotes, wrap each word in quotes for prefix matching
   const words = query.trim().split(/\s+/).filter(Boolean);
@@ -559,7 +571,8 @@ app.get("/api/search", (req, res) => {
   }).filter(Boolean) as Array<Record<string, unknown> & { match_count: number; match_source: string; started_at?: string }>;
 
   // Cross-search: find sessions by file path/name match
-  const fileSearchPattern = `%${query.trim()}%`;
+  const isGlob = /[*?]/.test(query);
+  const fileSearchPattern = isGlob ? globToLike(query.trim()) : `%${query.trim()}%`;
   const fileHits = db.prepare(`
     SELECT sf.session_id, sf.file_name, sf.file_path
     FROM session_files sf
@@ -989,7 +1002,8 @@ app.get("/api/files/search", (req, res) => {
     return;
   }
 
-  const pattern = `%${query}%`;
+  const isGlob = /[*?]/.test(query);
+  const pattern = isGlob ? globToLike(query) : `%${query}%`;
   const workspaceId = req.query.workspace ? Number(req.query.workspace) : null;
 
   const results = workspaceId
