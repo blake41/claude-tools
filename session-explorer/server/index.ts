@@ -183,8 +183,8 @@ function globToLike(glob: string): string {
 }
 
 function toFtsQuery(query: string): string {
-  // Escape double quotes, wrap each word in quotes for prefix matching
-  const words = query.trim().split(/\s+/).filter(Boolean);
+  // Split on whitespace and underscores since FTS5 tokenizes on underscores
+  const words = query.trim().split(/[\s_]+/).filter(Boolean);
   if (words.length === 0) return '""';
   // Use AND between terms for better precision
   return words.map(w => `"${w.replace(/"/g, '""')}"`).join(' AND ');

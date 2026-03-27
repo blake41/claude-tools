@@ -156,25 +156,36 @@ function BranchGroupHeader({ branch, sessionCount, matchCount, latestDate }: {
 function FilterBar({
   sourceFilter, toggleSource,
   minMatches, setMinMatches,
-  hasFiles, setHasFiles,
+  fileTypeFilter, toggleFileType,
   branchFilter, setBranchFilter,
   branches,
+  workspaceFilter, setWorkspaceFilter,
+  workspaces,
 }: {
   sourceFilter: Set<string>;
   toggleSource: (s: string) => void;
   minMatches: number;
   setMinMatches: (v: number) => void;
-  hasFiles: boolean;
-  setHasFiles: (v: boolean) => void;
+  fileTypeFilter: Set<string>;
+  toggleFileType: (s: string) => void;
   branchFilter: string;
   setBranchFilter: (v: string) => void;
   branches: string[];
+  workspaceFilter: string;
+  setWorkspaceFilter: (v: string) => void;
+  workspaces: string[];
 }) {
   const SOURCE_PILLS: Array<{ key: string; label: string }> = [
     { key: "user", label: "Your messages" },
     { key: "assistant", label: "Claude's" },
     { key: "tool", label: "Tool outputs" },
     { key: "files", label: "File matches" },
+  ];
+
+  const FILE_TYPE_PILLS: Array<{ key: string; label: string }> = [
+    { key: "design", label: "Has design" },
+    { key: "docs", label: "Has docs" },
+    { key: "code", label: "Has code" },
   ];
 
   return (
@@ -201,13 +212,35 @@ function FilterBar({
         </button>
       ))}
       <span style={{ width: 1, background: "var(--border)", margin: "0 4px" }} />
-      {/* Has files */}
-      <button
-        className={`filter-chip ${hasFiles ? "active" : ""}`}
-        onClick={() => setHasFiles(!hasFiles)}
-      >
-        Has files
-      </button>
+      {/* File type filter */}
+      {FILE_TYPE_PILLS.map((pill) => (
+        <button
+          key={pill.key}
+          className={`filter-chip ${fileTypeFilter.has(pill.key) ? "active" : ""}`}
+          onClick={() => toggleFileType(pill.key)}
+        >
+          {pill.label}
+        </button>
+      ))}
+      <span style={{ width: 1, background: "var(--border)", margin: "0 4px" }} />
+      {/* Workspace filter */}
+      {workspaces.length > 1 && (
+        <select
+          value={workspaceFilter}
+          onChange={(e) => setWorkspaceFilter(e.target.value)}
+          style={{
+            fontSize: 11, padding: "3px 8px", borderRadius: 6,
+            border: "1px solid var(--border)", background: "transparent",
+            color: workspaceFilter !== "all" ? "var(--accent-blue)" : "var(--text-dim)",
+            fontFamily: "var(--font-ui)", cursor: "pointer",
+          }}
+        >
+          <option value="all">All workspaces</option>
+          {workspaces.map((w) => (
+            <option key={w} value={w}>{w}</option>
+          ))}
+        </select>
+      )}
       {/* Branch filter */}
       {branches.length > 1 && (
         <select
@@ -449,8 +482,17 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     });
   };
   const [minMatches, setMinMatches] = useState<number>(0);
-  const [hasFiles, setHasFiles] = useState(false);
+  const [fileTypeFilter, setFileTypeFilter] = useState<Set<string>>(new Set());
+  const toggleFileType = (type: string) => {
+    setFileTypeFilter(prev => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  };
   const [branchFilter, setBranchFilter] = useState<string>("all");
+  const [workspaceFilter, setWorkspaceFilter] = useState<string>("all");
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -506,13 +548,32 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
   };
 
   const branches = [...new Set(results.map((r) => r.git_branch).filter(Boolean) as string[])].sort();
+  const workspaces = [...new Set(results.map((r) => r.workspace_name).filter(Boolean) as string[])].sort();
+
+  const DOC_EXTS = new Set([".md", ".mdx", ".txt", ".rst"]);
+  const VIZ_EXTS = new Set([".html", ".htm", ".svg"]);
+
+  function sessionHasFileType(files: Array<{ file_path: string }> | undefined, type: string): boolean {
+    if (!files || files.length === 0) return false;
+    return files.some(f => {
+      const ext = f.file_path.slice(f.file_path.lastIndexOf(".")).toLowerCase();
+      if (type === "design") return VIZ_EXTS.has(ext);
+      if (type === "docs") return DOC_EXTS.has(ext);
+      return !VIZ_EXTS.has(ext) && !DOC_EXTS.has(ext); // code
+    });
+  }
 
   const renderMessageResults = () => {
     // Apply client-side filters
     let filtered = results.filter((r) => {
       if (minMatches > 0 && r.match_count < minMatches) return false;
-      if (hasFiles && (!r.files_changed || r.files_changed.length === 0)) return false;
+      if (workspaceFilter !== "all" && (r.workspace_name || "") !== workspaceFilter) return false;
       if (branchFilter !== "all" && (r.git_branch || "") !== branchFilter) return false;
+      // File type filter: session must have files of ANY selected type
+      if (fileTypeFilter.size > 0) {
+        const hasMatch = [...fileTypeFilter].some(type => sessionHasFileType(r.files_changed, type));
+        if (!hasMatch) return false;
+      }
       // Source filter: when active, a session must have matches for ANY selected type
       if (sourceFilter.size > 0) {
         let passes = false;
@@ -676,9 +737,11 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
             <FilterBar
               sourceFilter={sourceFilter} toggleSource={toggleSource}
               minMatches={minMatches} setMinMatches={setMinMatches}
-              hasFiles={hasFiles} setHasFiles={setHasFiles}
+              fileTypeFilter={fileTypeFilter} toggleFileType={toggleFileType}
               branchFilter={branchFilter} setBranchFilter={setBranchFilter}
               branches={branches}
+              workspaceFilter={workspaceFilter} setWorkspaceFilter={setWorkspaceFilter}
+              workspaces={workspaces}
             />
           </div>
         )}
