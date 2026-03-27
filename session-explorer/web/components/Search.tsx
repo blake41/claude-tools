@@ -160,8 +160,8 @@ function FilterBar({
   branchFilter, setBranchFilter,
   branches,
 }: {
-  roleFilter: "all" | "user" | "assistant";
-  setRoleFilter: (v: "all" | "user" | "assistant") => void;
+  roleFilter: "all" | "user" | "assistant" | "tool";
+  setRoleFilter: (v: "all" | "user" | "assistant" | "tool") => void;
   minMatches: number;
   setMinMatches: (v: number) => void;
   hasFiles: boolean;
@@ -173,13 +173,13 @@ function FilterBar({
   return (
     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
       {/* Role filter */}
-      {(["all", "user", "assistant"] as const).map((r) => (
+      {(["all", "user", "assistant", "tool"] as const).map((r) => (
         <button
           key={r}
           className={`filter-chip ${roleFilter === r ? "active" : ""}`}
           onClick={() => setRoleFilter(r)}
         >
-          {r === "all" ? "All roles" : r === "user" ? "Your messages" : "Claude's"}
+          {r === "all" ? "All roles" : r === "user" ? "Your messages" : r === "assistant" ? "Claude's" : "Tool outputs"}
         </button>
       ))}
       <span style={{ width: 1, background: "var(--border)", margin: "0 4px" }} />
@@ -282,13 +282,17 @@ function SearchResultCard({
   result: SearchResult;
   onNavigate: (path: string) => void;
   groupMode: GroupMode;
-  roleFilter: "all" | "user" | "assistant";
+  roleFilter: "all" | "user" | "assistant" | "tool";
   query: string;
 }) {
-  // Filter matches by role
+  // Filter matches by role/type
   const filteredMatches = roleFilter === "all"
     ? result.matches
-    : result.matches.filter((m) => m.role === (roleFilter === "user" ? "user" : "assistant"));
+    : result.matches.filter((m) => {
+        if (roleFilter === "tool") return m.message_type !== 'text';
+        if (roleFilter === "user") return m.role === "user" && m.message_type === 'text';
+        return m.role === "assistant" && m.message_type === 'text';
+      });
 
   // Parse summary into bullet points
   const summaryBullets = result.summary
@@ -420,7 +424,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [groupMode, setGroupMode] = useState<GroupMode>("branch");
-  const [roleFilter, setRoleFilter] = useState<"all" | "user" | "assistant">("all");
+  const [roleFilter, setRoleFilter] = useState<"all" | "user" | "assistant" | "tool">("all");
   const [minMatches, setMinMatches] = useState<number>(0);
   const [hasFiles, setHasFiles] = useState(false);
   const [branchFilter, setBranchFilter] = useState<string>("all");
@@ -488,9 +492,11 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
       if (branchFilter !== "all" && (r.git_branch || "") !== branchFilter) return false;
       // Role filter: hide sessions where all matches are filtered out (unless file match)
       if (roleFilter !== "all" && r.match_source !== 'files') {
-        const visibleMatches = r.matches.filter((m) =>
-          m.role === (roleFilter === "user" ? "user" : "assistant")
-        );
+        const visibleMatches = r.matches.filter((m) => {
+          if (roleFilter === "tool") return m.message_type !== 'text';
+          if (roleFilter === "user") return m.role === "user" && m.message_type === 'text';
+          return m.role === "assistant" && m.message_type === 'text';
+        });
         if (visibleMatches.length === 0 && r.matches.length > 0) return false;
       }
       return true;
