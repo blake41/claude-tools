@@ -154,14 +154,14 @@ function BranchGroupHeader({ branch, sessionCount, matchCount, latestDate }: {
 
 /** FilterBar component */
 function FilterBar({
-  roleFilter, setRoleFilter,
+  sourceFilter, toggleSource,
   minMatches, setMinMatches,
   hasFiles, setHasFiles,
   branchFilter, setBranchFilter,
   branches,
 }: {
-  roleFilter: "all" | "user" | "assistant" | "tool";
-  setRoleFilter: (v: "all" | "user" | "assistant" | "tool") => void;
+  sourceFilter: Set<string>;
+  toggleSource: (s: string) => void;
   minMatches: number;
   setMinMatches: (v: number) => void;
   hasFiles: boolean;
@@ -170,16 +170,23 @@ function FilterBar({
   setBranchFilter: (v: string) => void;
   branches: string[];
 }) {
+  const SOURCE_PILLS: Array<{ key: string; label: string }> = [
+    { key: "user", label: "Your messages" },
+    { key: "assistant", label: "Claude's" },
+    { key: "tool", label: "Tool outputs" },
+    { key: "files", label: "File matches" },
+  ];
+
   return (
     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
-      {/* Role filter */}
-      {(["all", "user", "assistant", "tool"] as const).map((r) => (
+      {/* Source filter */}
+      {SOURCE_PILLS.map((pill) => (
         <button
-          key={r}
-          className={`filter-chip ${roleFilter === r ? "active" : ""}`}
-          onClick={() => setRoleFilter(r)}
+          key={pill.key}
+          className={`filter-chip ${sourceFilter.has(pill.key) ? "active" : ""}`}
+          onClick={() => toggleSource(pill.key)}
         >
-          {r === "all" ? "All roles" : r === "user" ? "Your messages" : r === "assistant" ? "Claude's" : "Tool outputs"}
+          {pill.label}
         </button>
       ))}
       <span style={{ width: 1, background: "var(--border)", margin: "0 4px" }} />
@@ -276,22 +283,25 @@ function SearchResultCard({
   result,
   onNavigate,
   groupMode,
-  roleFilter,
+  sourceFilter,
   query,
 }: {
   result: SearchResult;
   onNavigate: (path: string) => void;
   groupMode: GroupMode;
-  roleFilter: "all" | "user" | "assistant" | "tool";
+  sourceFilter: Set<string>;
   query: string;
 }) {
-  // Filter matches by role/type
-  const filteredMatches = roleFilter === "all"
+  // Filter matches by source type
+  const messageSourceTypes = new Set(["user", "assistant", "tool"]);
+  const activeMessageSources = [...sourceFilter].filter(s => messageSourceTypes.has(s));
+  const filteredMatches = sourceFilter.size === 0 || activeMessageSources.length === 0
     ? result.matches
     : result.matches.filter((m) => {
-        if (roleFilter === "tool") return m.message_type !== 'text';
-        if (roleFilter === "user") return m.role === "user" && m.message_type === 'text';
-        return m.role === "assistant" && m.message_type === 'text';
+        if (sourceFilter.has("tool") && m.message_type !== 'text') return true;
+        if (sourceFilter.has("user") && m.role === "user" && m.message_type === 'text') return true;
+        if (sourceFilter.has("assistant") && m.role === "assistant" && m.message_type === 'text') return true;
+        return false;
       });
 
   // Parse summary into bullet points
@@ -336,6 +346,11 @@ function SearchResultCard({
         )}
         {groupMode !== "branch" && result.git_branch && (
           <span className="result-branch">{result.git_branch}</span>
+        )}
+        {(result.workspace_name || result.workspace_path) && (
+          <span className="inline-flex items-center px-1.5 py-px rounded text-[10px] font-medium bg-white/6 text-text-secondary border border-border">
+            {result.workspace_name || (result.workspace_path ? result.workspace_path.split("/").pop() : "")}
+          </span>
         )}
       </div>
 
@@ -424,7 +439,15 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [groupMode, setGroupMode] = useState<GroupMode>("branch");
-  const [roleFilter, setRoleFilter] = useState<"all" | "user" | "assistant" | "tool">("all");
+  const [sourceFilter, setSourceFilter] = useState<Set<string>>(new Set());
+  const toggleSource = (source: string) => {
+    setSourceFilter(prev => {
+      const next = new Set(prev);
+      if (next.has(source)) next.delete(source);
+      else next.add(source);
+      return next;
+    });
+  };
   const [minMatches, setMinMatches] = useState<number>(0);
   const [hasFiles, setHasFiles] = useState(false);
   const [branchFilter, setBranchFilter] = useState<string>("all");
@@ -490,14 +513,26 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
       if (minMatches > 0 && r.match_count < minMatches) return false;
       if (hasFiles && (!r.files_changed || r.files_changed.length === 0)) return false;
       if (branchFilter !== "all" && (r.git_branch || "") !== branchFilter) return false;
-      // Role filter: hide sessions where all matches are filtered out (unless file match)
-      if (roleFilter !== "all" && r.match_source !== 'files') {
-        const visibleMatches = r.matches.filter((m) => {
-          if (roleFilter === "tool") return m.message_type !== 'text';
-          if (roleFilter === "user") return m.role === "user" && m.message_type === 'text';
-          return m.role === "assistant" && m.message_type === 'text';
-        });
-        if (visibleMatches.length === 0 && r.matches.length > 0) return false;
+      // Source filter: when active, a session must have matches for ANY selected type
+      if (sourceFilter.size > 0) {
+        let passes = false;
+        // Check file matches source
+        if (sourceFilter.has("files") && r.match_source === 'files') passes = true;
+        // Check message-based sources
+        if (!passes) {
+          const messageSourceTypes = new Set(["user", "assistant", "tool"]);
+          const activeMessageSources = [...sourceFilter].filter(s => messageSourceTypes.has(s));
+          if (activeMessageSources.length > 0 && r.match_source !== 'files') {
+            const visibleMatches = r.matches.filter((m) => {
+              if (sourceFilter.has("tool") && m.message_type !== 'text') return true;
+              if (sourceFilter.has("user") && m.role === "user" && m.message_type === 'text') return true;
+              if (sourceFilter.has("assistant") && m.role === "assistant" && m.message_type === 'text') return true;
+              return false;
+            });
+            if (visibleMatches.length > 0) passes = true;
+          }
+        }
+        if (!passes) return false;
       }
       return true;
     });
@@ -508,7 +543,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
 
     if (groupMode === "none") {
       return filtered.map((result) => (
-        <SearchResultCard key={result.id} result={result} onNavigate={onNavigate} groupMode={groupMode} roleFilter={roleFilter} query={query} />
+        <SearchResultCard key={result.id} result={result} onNavigate={onNavigate} groupMode={groupMode} sourceFilter={sourceFilter} query={query} />
       ));
     }
 
@@ -548,7 +583,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
         );
         for (const result of sessions) {
           elements.push(
-            <SearchResultCard key={result.id} result={result} onNavigate={onNavigate} groupMode={groupMode} roleFilter={roleFilter} query={query} />
+            <SearchResultCard key={result.id} result={result} onNavigate={onNavigate} groupMode={groupMode} sourceFilter={sourceFilter} query={query} />
           );
         }
       }
@@ -569,7 +604,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
         lastGroup = group;
       }
       elements.push(
-        <SearchResultCard key={result.id} result={result} onNavigate={onNavigate} groupMode={groupMode} roleFilter={roleFilter} query={query} />
+        <SearchResultCard key={result.id} result={result} onNavigate={onNavigate} groupMode={groupMode} sourceFilter={sourceFilter} query={query} />
       );
     }
     return elements;
@@ -595,7 +630,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
               if (e.key === "Escape") onClose();
             }}
           />
-          <kbd className="font-mono text-[10px] px-1.5 py-0.5 bg-white/6 border border-border rounded-sm text-text-dim">Esc</kbd>
+          <button onClick={onClose} className="font-mono text-[10px] px-1.5 py-0.5 bg-white/6 border border-border rounded-sm text-text-dim hover:text-text hover:bg-white/10 transition-colors cursor-pointer">Esc</button>
         </div>
 
         {/* Tabs */}
@@ -639,7 +674,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
               </div>
             </div>
             <FilterBar
-              roleFilter={roleFilter} setRoleFilter={setRoleFilter}
+              sourceFilter={sourceFilter} toggleSource={toggleSource}
               minMatches={minMatches} setMinMatches={setMinMatches}
               hasFiles={hasFiles} setHasFiles={setHasFiles}
               branchFilter={branchFilter} setBranchFilter={setBranchFilter}

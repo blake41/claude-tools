@@ -319,7 +319,7 @@ function FileView() {
 function SearchOverlay() {
   return (
     <Search
-      onClose={() => window.history.back()}
+      onClose={() => router.history.push("/")}
       onNavigate={(path) => router.history.push(path)}
     />
   );
@@ -355,13 +355,13 @@ function RootLayout() {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         if (isSearchOpen) {
-          window.history.back();
+          navigate({ to: "/" });
         } else {
           navigate({ to: "/search" });
         }
       }
       if (e.key === "Escape" && isSearchOpen) {
-        window.history.back();
+        navigate({ to: "/" });
       }
     }
     window.addEventListener("keydown", onKeyDown);
