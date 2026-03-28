@@ -1,36 +1,58 @@
 #!/usr/bin/env bash
 # Watch for a Render deploy to finish and send a macOS notification.
-# Usage: watch-deploy <environment> <commit-sha> <commit-message>
+# Usage: watch-deploy <repo> <environment> <branch> <commit-sha> <commit-message>
 #
 # Polls both GitHub Actions and Render deploys. If CI fails, notifies
 # immediately instead of waiting for a Render deploy that will never come.
 
 set -euo pipefail
 
-ENV="${1:-staging}"
-COMMIT_SHA="${2:-}"
-COMMIT_MSG="${3:-}"
+REPO="${1:-}"
+ENV="${2:-}"
+BRANCH="${3:-}"
+COMMIT_SHA="${4:-}"
+COMMIT_MSG="${5:-}"
 
-# Map environment to Render service ID
-case "$ENV" in
-  staging)    SERVICE_ID="srv-d2f17tjipnbc73ailtb0" ;;
-  production) SERVICE_ID="srv-d1686m6mcj7s73bdqod0" ;;
-  *)          echo "Unknown environment: $ENV" >&2; exit 1 ;;
+if [[ -z "$REPO" || -z "$ENV" ]]; then
+  echo "Usage: watch-deploy <repo> <environment> <branch> <commit-sha> <commit-message>" >&2
+  exit 1
+fi
+
+# Map repo+environment to Render service ID and GH workflow name
+case "$REPO/$ENV" in
+  clay-run/Terra/staging)
+    SERVICE_ID="srv-d2f17tjipnbc73ailtb0"
+    GH_WORKFLOW="Docker Build and Push"
+    ;;
+  clay-run/Terra/production)
+    SERVICE_ID="srv-d1686m6mcj7s73bdqod0"
+    GH_WORKFLOW="Docker Build and Push"
+    ;;
+  clay-run/keystone/staging)
+    SERVICE_ID="srv-d6ir1ahdrdic73eko3v0"
+    GH_WORKFLOW="Build and Push Docker Image"
+    ;;
+  clay-run/keystone/production)
+    SERVICE_ID="srv-d5ij7eadbo4c73el9s80"
+    GH_WORKFLOW="Build and Push Docker Image"
+    ;;
+  *)
+    echo "Unknown repo/env: $REPO/$ENV" >&2; exit 1
+    ;;
 esac
 
+GH_REPO="$REPO"
 SHORT_SHA="${COMMIT_SHA:0:7}"
+PUSH_TIME=$(date "+%s")
 POLL_INTERVAL=15
 MAX_WAIT=600  # 10 minutes
 WAITED=0
-
-GH_REPO="clay-run/Terra"
-GH_WORKFLOW="Docker Build and Push"
 
 # Logging
 LOGFILE="$HOME/Library/Logs/watch-deploy.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOGFILE"; }
 
-log "START env=$ENV sha=$SHORT_SHA msg=\"$COMMIT_MSG\" service=$SERVICE_ID"
+log "START repo=$GH_REPO env=$ENV branch=$BRANCH sha=$SHORT_SHA msg=\"$COMMIT_MSG\" service=$SERVICE_ID"
 
 # Capture the current latest deploy ID so we can detect a new one
 INITIAL_DEPLOY_ID=$(render-services deploys "$SERVICE_ID" 2>/dev/null \
@@ -46,14 +68,34 @@ notify() {
   terminal-notifier -title "$title" -subtitle "$ENV" -message "$body" -sound "$sound" -open "$url" 2>/dev/null || true
 }
 
-# Check if the GH Actions CI run has failed for this commit
+# Check if the GH Actions CI run has failed for this branch
 check_ci() {
-  if [[ -z "$COMMIT_SHA" ]]; then return 1; fi
+  if [[ -z "$BRANCH" ]]; then return 0; fi
   local result
-  result=$(gh run list --repo "$GH_REPO" --commit "$COMMIT_SHA" --workflow "$GH_WORKFLOW" --json conclusion,databaseId --limit 1 2>/dev/null) || return 1
-  local conclusion run_id
+  result=$(gh run list \
+    --repo "$GH_REPO" \
+    --branch "$BRANCH" \
+    --workflow "$GH_WORKFLOW" \
+    --json conclusion,databaseId,createdAt \
+    --limit 1 2>/dev/null) || return 0
+
+  # No run found yet — CI hasn't started
+  if [[ -z "$result" || "$result" == "[]" ]]; then return 0; fi
+
+  local conclusion run_id created_at
   conclusion=$(echo "$result" | jq -r '.[0].conclusion // empty')
   run_id=$(echo "$result" | jq -r '.[0].databaseId // empty')
+  created_at=$(echo "$result" | jq -r '.[0].createdAt // empty')
+
+  # Ignore runs that started before our push (stale results)
+  if [[ -n "$created_at" ]]; then
+    local run_epoch
+    run_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$created_at" "+%s" 2>/dev/null || echo 0)
+    if (( run_epoch < PUSH_TIME - 60 )); then
+      return 0
+    fi
+  fi
+
   case "$conclusion" in
     failure)
       log "CI_FAILED workflow=\"$GH_WORKFLOW\" run=$run_id after ${WAITED}s"
