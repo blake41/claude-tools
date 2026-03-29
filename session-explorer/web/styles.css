@@ -643,6 +643,20 @@ button {
   color: var(--text-dim);
   opacity: 0.5;
 }
+/* ── In-page search highlights ── */
+.page-search-match {
+  background: rgba(234, 179, 8, 0.25);
+  color: inherit;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+.page-search-current {
+  background: rgba(234, 179, 8, 0.6);
+  color: inherit;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+
 .session-fmt mark.sf-match,
 .session-fmt .sf-match {
   background: rgba(250, 225, 50, 0.35);

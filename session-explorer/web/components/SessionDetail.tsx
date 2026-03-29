@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useParams, useNavigate, useSearch } from "@tanstack/react-router";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
@@ -233,6 +233,14 @@ export default function SessionDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // -- In-page search state --
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [matches, setMatches] = useState<Element[]>([]);
+  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => {
     setLoading(true);
     setError(null);
@@ -267,6 +275,224 @@ export default function SessionDetail() {
     }
   }, [loading, session, highlightMsg]);
 
+  // -- Feature 1: Prev/Next user message navigation --
+  const userMessageSequences = useMemo(() => {
+    if (!session) return [];
+    return session.messages
+      .filter((m) => m.role === "user" && m.message_type !== "tool_result")
+      .map((m) => String(m.sequence));
+  }, [session]);
+
+  const currentUserIdx = useMemo(() => {
+    if (!highlightMsg) return -1;
+    return userMessageSequences.indexOf(highlightMsg);
+  }, [highlightMsg, userMessageSequences]);
+
+  const jumpToUserMessage = useCallback(
+    (direction: -1 | 1) => {
+      if (userMessageSequences.length === 0) return;
+      let targetIdx: number;
+      if (currentUserIdx === -1) {
+        // No current position: go to first (next) or last (prev)
+        targetIdx = direction === 1 ? 0 : userMessageSequences.length - 1;
+      } else {
+        targetIdx = currentUserIdx + direction;
+      }
+      if (targetIdx < 0 || targetIdx >= userMessageSequences.length) return;
+      navigate({
+        to: "/session/$id",
+        params: { id },
+        search: { msg: userMessageSequences[targetIdx] },
+        replace: true,
+      });
+    },
+    [userMessageSequences, currentUserIdx, navigate, id],
+  );
+
+  // -- Feature 2: In-page text search helpers --
+  const clearHighlights = useCallback(() => {
+    const container = document.querySelector(".snippet-bubbles");
+    if (!container) return;
+    const marks = container.querySelectorAll("mark.page-search-match, mark.page-search-current");
+    marks.forEach((mark) => {
+      const parent = mark.parentNode;
+      if (parent) {
+        parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
+        parent.normalize();
+      }
+    });
+  }, []);
+
+  const performSearch = useCallback(
+    (query: string) => {
+      clearHighlights();
+      if (!query) {
+        setMatches([]);
+        setCurrentMatchIndex(0);
+        return;
+      }
+
+      const container = document.querySelector(".snippet-bubbles");
+      if (!container) return;
+
+      const lowerQuery = query.toLowerCase();
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+      const newMatches: Element[] = [];
+      let matchCount = 0;
+
+      // Collect text nodes with matches
+      const textNodes: Text[] = [];
+      let node: Node | null;
+      while ((node = walker.nextNode())) {
+        const text = node.textContent || "";
+        if (text.toLowerCase().includes(lowerQuery)) {
+          textNodes.push(node as Text);
+        }
+      }
+
+      // Process each text node (splitting and wrapping matches)
+      for (const textNode of textNodes) {
+        const text = textNode.textContent || "";
+        const parent = textNode.parentNode;
+        if (!parent) continue;
+
+        const fragment = document.createDocumentFragment();
+        let lastIdx = 0;
+        const lowerText = text.toLowerCase();
+        let searchIdx = lowerText.indexOf(lowerQuery, 0);
+
+        while (searchIdx !== -1) {
+          // Text before match
+          if (searchIdx > lastIdx) {
+            fragment.appendChild(document.createTextNode(text.slice(lastIdx, searchIdx)));
+          }
+          // Wrap match
+          const mark = document.createElement("mark");
+          mark.className = "page-search-match";
+          mark.dataset.matchIndex = String(matchCount);
+          mark.textContent = text.slice(searchIdx, searchIdx + query.length);
+          fragment.appendChild(mark);
+          newMatches.push(mark);
+          matchCount++;
+          lastIdx = searchIdx + query.length;
+          searchIdx = lowerText.indexOf(lowerQuery, lastIdx);
+        }
+
+        // Remaining text
+        if (lastIdx < text.length) {
+          fragment.appendChild(document.createTextNode(text.slice(lastIdx)));
+        }
+
+        parent.replaceChild(fragment, textNode);
+      }
+
+      setMatches(newMatches);
+      setCurrentMatchIndex(0);
+
+      // Highlight first match
+      if (newMatches.length > 0) {
+        newMatches[0].className = "page-search-current";
+        newMatches[0].scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    },
+    [clearHighlights],
+  );
+
+  const navigateMatch = useCallback(
+    (direction: 1 | -1) => {
+      if (matches.length === 0) return;
+      // Reset current
+      if (matches[currentMatchIndex]) {
+        matches[currentMatchIndex].className = "page-search-match";
+      }
+      const next = (currentMatchIndex + direction + matches.length) % matches.length;
+      setCurrentMatchIndex(next);
+      if (matches[next]) {
+        matches[next].className = "page-search-current";
+        matches[next].scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    },
+    [matches, currentMatchIndex],
+  );
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    clearHighlights();
+    setMatches([]);
+    setCurrentMatchIndex(0);
+  }, [clearHighlights]);
+
+  // Debounced search effect
+  useEffect(() => {
+    if (!searchOpen) return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      performSearch(searchQuery);
+    }, 150);
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [searchQuery, searchOpen, performSearch]);
+
+  // Focus input when search opens
+  useEffect(() => {
+    if (searchOpen) {
+      setTimeout(() => searchInputRef.current?.focus(), 50);
+    }
+  }, [searchOpen]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement;
+      const isInput = target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+
+      // Cmd+F to open search
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        if (!searchOpen) {
+          setSearchOpen(true);
+        } else {
+          searchInputRef.current?.select();
+        }
+        return;
+      }
+
+      // Escape to close search
+      if (e.key === "Escape" && searchOpen) {
+        closeSearch();
+        return;
+      }
+
+      // Enter / Shift+Enter in search input to navigate matches
+      if (searchOpen && isInput && target === searchInputRef.current) {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          navigateMatch(e.shiftKey ? -1 : 1);
+          return;
+        }
+      }
+
+      // [ and ] for prev/next user message (only when not in an input)
+      if (!isInput && !searchOpen) {
+        if (e.key === "[") {
+          e.preventDefault();
+          jumpToUserMessage(-1);
+          return;
+        }
+        if (e.key === "]") {
+          e.preventDefault();
+          jumpToUserMessage(1);
+          return;
+        }
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [searchOpen, closeSearch, navigateMatch, jumpToUserMessage]);
+
   function handleTagsChange(newTags: Tag[]) {
     if (!session) return;
     setSession({ ...session, tags: newTags });
@@ -290,28 +516,129 @@ export default function SessionDetail() {
     );
   }
 
+  const canGoPrev = userMessageSequences.length > 0 && (currentUserIdx === -1 || currentUserIdx > 0);
+  const canGoNext = userMessageSequences.length > 0 && (currentUserIdx === -1 || currentUserIdx < userMessageSequences.length - 1);
+
   return (
     <div className="max-w-[860px] px-10 pt-0 pb-20">
-      <div className="sticky top-0 z-10 bg-bg pt-6 pb-3 flex items-center justify-between">
-        <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate({ to: "/workspace/$id", params: { id: String(session.workspace_id) } })}>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          Back to sessions
-        </button>
-        <button
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
-          onClick={() => {
-            const main = document.querySelector("main");
-            if (main) main.scrollTo({ top: 0, behavior: "smooth" });
-          }}
-          title="Scroll to top"
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <path d="M8 12V4M4 8L8 4L12 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          Top
-        </button>
+      <div className="sticky top-0 z-10 bg-bg pt-6 pb-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1">
+            <button className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6" onClick={() => navigate({ to: "/workspace/$id", params: { id: String(session.workspace_id) } })}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Back to sessions
+            </button>
+
+            {/* Prev/Next user message buttons */}
+            <div className="flex items-center gap-0.5 ml-2">
+              <button
+                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-text-dim rounded transition-all hover:text-text hover:bg-white/6 disabled:opacity-30 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-text-dim"
+                onClick={() => jumpToUserMessage(-1)}
+                disabled={!canGoPrev}
+                title="Previous user message  ["
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                  <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                Prev
+              </button>
+              <button
+                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-text-dim rounded transition-all hover:text-text hover:bg-white/6 disabled:opacity-30 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-text-dim"
+                onClick={() => jumpToUserMessage(1)}
+                disabled={!canGoNext}
+                title="Next user message  ]"
+              >
+                Next
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                  <path d="M6 4L10 8L6 12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1">
+            {/* Search toggle button */}
+            <button
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[13px] rounded-md transition-all hover:text-text hover:bg-white/6 ${searchOpen ? "text-accent-blue" : "text-text-secondary"}`}
+              onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}
+              title="Search in page  Cmd+F"
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+                <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </button>
+            <button
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
+              onClick={() => {
+                const main = document.querySelector("main");
+                if (main) main.scrollTo({ top: 0, behavior: "smooth" });
+              }}
+              title="Scroll to top"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 12V4M4 8L8 4L12 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Top
+            </button>
+          </div>
+        </div>
+
+        {/* Search bar (second row) */}
+        {searchOpen && (
+          <div className="flex items-center gap-2 mt-2 px-1">
+            <div className="flex items-center flex-1 gap-2 bg-white/6 border border-border rounded-lg px-3 py-1.5">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="shrink-0 text-text-dim">
+                <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+              <input
+                ref={searchInputRef}
+                type="text"
+                className="flex-1 bg-transparent text-[13px] text-text outline-none placeholder:text-text-dim"
+                placeholder="Search in conversation..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              {searchQuery && (
+                <span className="text-[11px] text-text-dim font-mono whitespace-nowrap">
+                  {matches.length > 0 ? `${currentMatchIndex + 1} of ${matches.length}` : "0 of 0"}
+                </span>
+              )}
+            </div>
+            <button
+              className="p-1.5 text-text-dim rounded transition-all hover:text-text hover:bg-white/6 disabled:opacity-30"
+              onClick={() => navigateMatch(-1)}
+              disabled={matches.length === 0}
+              title="Previous match  Shift+Enter"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M12 10L8 6L4 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <button
+              className="p-1.5 text-text-dim rounded transition-all hover:text-text hover:bg-white/6 disabled:opacity-30"
+              onClick={() => navigateMatch(1)}
+              disabled={matches.length === 0}
+              title="Next match  Enter"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M4 6L8 10L12 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <button
+              className="p-1.5 text-text-dim rounded transition-all hover:text-text hover:bg-white/6"
+              onClick={closeSearch}
+              title="Close search  Esc"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M4 4L12 12M12 4L4 12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+        )}
       </div>
       <div className="border-b border-border pb-5 mb-6">
         <div className="mt-1">
