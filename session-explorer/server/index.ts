@@ -8,7 +8,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import PQueue from "p-queue";
 import db from "./db.js";
 import { config } from "./config.js";
-import chatRouter, { SYSTEM_PROMPT, tools, executeSql, parseResult } from "./chat.js";
+import chatRouter, { buildSystemPrompt, tools, executeSql, parseResult } from "./chat.js";
 
 function cleanXmlNoise(text: string): string {
   return text
@@ -916,7 +916,7 @@ app.post("/api/saved-searches/:id/run", async (req, res) => {
       const response = await anthropic.messages.create({
         model: config.chatModel,
         max_tokens: config.chatMaxTokens,
-        system: SYSTEM_PROMPT,
+        system: buildSystemPrompt(),
         tools,
         messages: anthropicMessages,
       });

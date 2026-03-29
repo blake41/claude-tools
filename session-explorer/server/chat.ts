@@ -15,75 +15,120 @@ const insertChatHistory = db.prepare(
   `INSERT INTO chat_history (query_text, answer_text, session_ids, session_count, queries, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))`
 );
 
-const SYSTEM_PROMPT = `You are an assistant for Session Explorer, a tool for browsing Claude Code session history. You have direct SQL access to the SQLite database.
+function buildSystemPrompt(): string {
+  // Dynamic data profile from the database
+  let sessionCount = 0, workspaceCount = 0, messageCount = 0, dateRange = "";
+  try {
+    const stats = readDb.prepare(`
+      SELECT
+        (SELECT count(*) FROM sessions) as sessions,
+        (SELECT count(*) FROM workspaces) as workspaces,
+        (SELECT count(*) FROM messages) as messages,
+        (SELECT min(started_at) FROM sessions) as earliest,
+        (SELECT max(started_at) FROM sessions) as latest
+    `).get() as Record<string, unknown>;
+    sessionCount = stats.sessions as number;
+    workspaceCount = stats.workspaces as number;
+    messageCount = stats.messages as number;
+    dateRange = `${(stats.earliest as string || "").slice(0, 10)} to ${(stats.latest as string || "").slice(0, 10)}`;
+  } catch {}
+
+  return `You are a search assistant for Session Explorer, a tool for browsing Claude Code session history. You answer questions by querying a SQLite database.
 
 ## Schema
 
 workspaces: id INTEGER PRIMARY KEY, path TEXT, dir_name TEXT, display_name TEXT, session_count INTEGER, last_activity TEXT
 sessions: id TEXT PRIMARY KEY, workspace_id INTEGER REFERENCES workspaces(id), source_path TEXT, started_at TEXT, ended_at TEXT, git_branch TEXT, title TEXT, message_count INTEGER, user_message_count INTEGER, summary TEXT, ingested_at TEXT
-messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role TEXT (user|assistant), content TEXT, timestamp TEXT, sequence INTEGER, message_type TEXT (text|tool_use|tool_result) — text is conversation, tool_use is "ToolName: summary", tool_result is truncated output
+messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role TEXT (user|assistant), content TEXT, timestamp TEXT, sequence INTEGER, message_type TEXT (text|tool_use|tool_result)
 tags: id INTEGER PRIMARY KEY, name TEXT UNIQUE, color TEXT, description TEXT, created_at TEXT
-session_tags: session_id TEXT REFERENCES sessions(id), tag_id INTEGER REFERENCES tags(id), added_at TEXT (PK: both)
-session_files: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), file_path TEXT, file_name TEXT, operation TEXT (write|edit|read), timestamp TEXT, sequence INTEGER
-audit_log: id INTEGER PRIMARY KEY, action TEXT, entity_type TEXT, entity_id TEXT, details TEXT (JSON), created_at TEXT
+session_tags: session_id TEXT, tag_id INTEGER, added_at TEXT
+session_files: id INTEGER PRIMARY KEY, session_id TEXT, file_path TEXT, file_name TEXT, operation TEXT (write|edit|read), timestamp TEXT, sequence INTEGER
+messages_fts: FTS5 virtual table on messages.content — JOIN via messages_fts.rowid = messages.id
 
-## Guidelines
+## Data Profile
 
-- Use run_sql to query the database. SELECT only.
+- ${sessionCount} sessions across ${workspaceCount} workspaces, ${messageCount} messages
+- Date range: ${dateRange}
 - Dates are ISO 8601 strings. Use datetime() for comparisons.
-- file_path contains full absolute paths. Use LIKE '%pattern%' for matching.
-- Filter out image files (png/jpg/gif/webp/svg) from file queries unless specifically asked about them.
-- Return concise result counts, not raw data dumps.
-- LIMIT large result sets to avoid token bloat. Use LIMIT 200 for session ID queries.
-- When counting or summarizing, query for the data first, then describe what you found.
-- For full-text search on message content, use the FTS5 table: SELECT m.* FROM messages m JOIN messages_fts fts ON m.id = fts.rowid WHERE messages_fts MATCH 'search terms'. This is much faster than LIKE.
-- FTS5 supports phrase queries ("exact phrase"), AND/OR operators, and prefix queries (term*).
-- For tool usage, query: SELECT * FROM messages WHERE message_type = 'tool_use' — content format is "ToolName: summary".
-- For tool results/output, query: SELECT * FROM messages WHERE message_type = 'tool_result' — content is truncated first 500 chars of output.
+- file_path contains absolute paths. Use LIKE '%pattern%' for matching.
+- message_type values: 'text' (conversation), 'tool_use' (format: "ToolName: summary"), 'tool_result' (truncated first 500 chars)
+- session_files.operation values: 'write' | 'edit' | 'read'
+- Filter out image files (png/jpg/gif/webp/svg) from file queries unless asked.
 
-## Response format
+## Query Recipes (use these patterns directly)
 
-Your response has TWO parts: an explanation for the human, then a machine-readable result block.
+Topic search (always use FTS5, not LIKE):
+  SELECT DISTINCT s.id, s.title, s.started_at, s.summary, w.display_name
+  FROM messages_fts fts
+  JOIN messages m ON m.id = fts.rowid
+  JOIN sessions s ON s.id = m.session_id
+  JOIN workspaces w ON w.id = s.workspace_id
+  WHERE messages_fts MATCH '"exact phrase" OR term1 AND term2'
+  ORDER BY s.started_at DESC LIMIT 50
 
-### Explanation (required)
+File search:
+  SELECT DISTINCT s.id, sf.file_path, sf.operation
+  FROM session_files sf JOIN sessions s ON s.id = sf.session_id
+  WHERE sf.file_path LIKE '%pattern%' AND sf.operation IN ('write','edit')
 
-Write a clear, concise explanation of what you found and WHY. Structure it like this:
+Workspace sessions:
+  SELECT s.id, s.title, s.started_at, s.message_count FROM sessions s
+  JOIN workspaces w ON w.id = s.workspace_id
+  WHERE w.display_name LIKE '%name%' ORDER BY s.started_at DESC
 
-1. **Search strategy** — One sentence: what you searched for and how (e.g. "Searched for sessions with file edits matching \`plans/v4\`")
-2. **What matched** — Summarize the results in 1-3 sentences. Mention key patterns: how many sessions, which workspaces, what date range, what branches.
-3. **Notable sessions** — If helpful, call out 2-3 interesting sessions by title/date with a brief note on why they stand out.
+Time-bounded:
+  SELECT s.id, s.title, s.started_at FROM sessions s
+  WHERE s.started_at >= datetime('now', '-7 days') ORDER BY s.started_at DESC
 
-RULES for the explanation:
-- NEVER dump raw query results, tables, or long lists. The UI already shows each session as a card.
-- Use markdown: **bold** for emphasis, \`code\` for file paths/SQL, bullet lists for patterns.
-- Keep it under 150 words. Be a thoughtful analyst, not a data printer.
+Tool usage:
+  SELECT * FROM messages WHERE message_type = 'tool_use' AND content LIKE 'ToolName:%'
 
-### Result block
+## Query Strategy
 
-When you have identified target sessions and/or an action, include a result block:
+1. PLAN: From the user's question, determine which 1-2 queries will get the answer.
+2. EXECUTE: Run them. Prefer a single well-crafted query over multiple exploratory ones.
+3. ANSWER: Write your response immediately.
 
-<result>
-{"session_ids": ["id1", "id2", ...], "action": {"type": "add_tag", "tag_name": "my-tag"}}
-</result>
+- Most questions need exactly 1 query. Complex questions need 2. Maximum 3.
+- NEVER run exploratory queries to understand the data — the schema, data profile, and recipes above are complete.
+- If a query returns 0 rows, try ONE broader alternative, then answer with what you have.
+- A partial answer is ALWAYS better than more searching. Present what you found and note any caveats.
+- LIMIT results: 50 for browsing, 200 for collecting session IDs.
 
-Available actions: add_tag, remove_tag
+## Response Rules
 
-If the tag doesn't exist yet, include tag_name and optionally tag_color. If the tag exists, include tag_id.
-The frontend will create the tag on apply if needed.
+- Do NOT narrate your search process. The user sees your SQL queries in a separate UI element.
+- NEVER write "Let me search...", "I found X results...", "Let me look at...", "Let me verify...", or "To be thorough..."
+- Run your queries, then write a clean final answer. No preamble.
 
-For query-only requests (no action needed), you can still return session IDs so the user can browse them:
+## Response Format
+
+Write a concise answer (under 150 words):
+1. **What matched** — count, workspaces, date range, key patterns.
+2. **Notable sessions** — call out 2-3 interesting ones if helpful.
+
+Then include a machine-readable result block when you have session IDs:
 
 <result>
 {"session_ids": ["id1", "id2", ...]}
 </result>
 
-Only include the result block when you have concrete session IDs to show. For general questions or counts, just answer in text.`;
+To suggest an action (tag sessions), add an action field:
+<result>
+{"session_ids": ["id1", "id2", ...], "action": {"type": "add_tag", "tag_name": "my-tag"}}
+</result>
+
+Available actions: add_tag, remove_tag. Omit action if not requested.
+Only include <result> when you have concrete session IDs.`;
+}
 
 const tools: Anthropic.Messages.Tool[] = [
   {
     name: "run_sql",
     description:
-      "Execute a read-only SQL query against the session database. Returns rows as a JSON array. Use SELECT only -- writes are blocked.",
+      "Execute a read-only SQL query against the session database. Returns rows as a JSON array. " +
+      "Use this to answer the user's question directly — not to explore or understand the data. " +
+      "The schema and query recipes in your instructions have everything you need.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -159,6 +204,7 @@ router.post("/api/chat", async (req, res) => {
       })
     );
 
+    const systemPrompt = buildSystemPrompt();
     const queries: string[] = [];
     const maxIterations = config.chatMaxToolIterations;
     let fullText = "";
@@ -168,7 +214,7 @@ router.post("/api/chat", async (req, res) => {
       const stream = anthropic.messages.stream({
         model: config.chatModel,
         max_tokens: config.chatMaxTokens,
-        system: SYSTEM_PROMPT,
+        system: systemPrompt,
         tools,
         messages: anthropicMessages,
       });
@@ -224,10 +270,21 @@ router.post("/api/chat", async (req, res) => {
         });
       }
 
-      anthropicMessages.push({
-        role: "user" as const,
-        content: toolResults,
-      });
+      // Soft nudge after 3+ rounds of tool calls: ask the model to wrap up
+      if (i >= 2) {
+        anthropicMessages.push({
+          role: "user" as const,
+          content: [
+            ...toolResults,
+            { type: "text" as const, text: "You've run several queries. Please summarize your findings and provide your final answer now." },
+          ],
+        });
+      } else {
+        anthropicMessages.push({
+          role: "user" as const,
+          content: toolResults,
+        });
+      }
 
       // If last iteration, whatever text we got is all we'll get
       if (i === maxIterations - 1 && !roundText) {
@@ -274,5 +331,5 @@ router.post("/api/chat", async (req, res) => {
   }
 });
 
-export { SYSTEM_PROMPT, tools, executeSql, parseResult };
+export { buildSystemPrompt, tools, executeSql, parseResult };
 export default router;

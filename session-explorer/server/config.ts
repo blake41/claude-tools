@@ -10,7 +10,7 @@ export const config = {
 
   // Chat
   chatMaxTokens: 4096,
-  chatMaxToolIterations: 10,
+  chatMaxToolIterations: 5,
 
   // Summarization
   summaryConcurrency: 5,
