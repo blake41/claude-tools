@@ -11,7 +11,8 @@
     "ingest": "bun run server/ingest.ts",
     "ingest:all": "bun run server/ingest.ts --all",
     "ingest:force": "bun run server/ingest.ts --force",
-    "start": "bun server/index.ts"
+    "start": "bun server/index.ts",
+    "restart": "launchctl kickstart -k gui/$(id -u)/com.blake.session-explorer"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

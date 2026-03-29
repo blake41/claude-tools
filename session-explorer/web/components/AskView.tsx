@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import SessionCard from "./SessionCard";
-import type { ChatMessage, ChatResult, SessionSummary, Tag } from "../types";
+import type { ChatMessage, ChatHistoryEntry, ChatResult, SessionSummary, Tag } from "../types";
 
 // ── Markdown helpers ──────────────────────────────────────────────────
 
@@ -59,6 +59,18 @@ type SortKey = "date" | "duration" | "messages";
 function getDurationMs(s: SessionSummary): number {
   if (!s.ended_at) return 0;
   return new Date(s.ended_at).getTime() - new Date(s.started_at).getTime();
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso + "Z").getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return `${Math.floor(days / 7)}w ago`;
 }
 
 function formatDurationShort(ms: number): string {
@@ -162,6 +174,50 @@ export default function AskView() {
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [applying, setApplying] = useState(false);
 
+  // Chat history
+  const [history, setHistory] = useState<ChatHistoryEntry[]>([]);
+
+  const fetchHistory = useCallback(() => {
+    fetch("/api/chat-history")
+      .then((r) => r.json())
+      .then((data) => setHistory(data))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
+  function restoreHistoryEntry(entry: ChatHistoryEntry) {
+    const sessionIds: string[] = entry.session_ids ? JSON.parse(entry.session_ids) : [];
+    const queries: string[] = entry.queries ? JSON.parse(entry.queries) : [];
+
+    const userMsg: ChatMessage = { role: "user", content: entry.query_text };
+    const result: ChatResult | undefined =
+      sessionIds.length > 0
+        ? {
+            session_ids: sessionIds,
+            explanation: entry.answer_text || undefined,
+            queries: queries.length > 0 ? queries : undefined,
+          }
+        : undefined;
+    const assistantMsg: ChatMessage = {
+      role: "assistant",
+      content: entry.answer_text || "",
+      result,
+      queries: queries.length > 0 ? queries : undefined,
+    };
+
+    setMessages([userMsg, assistantMsg]);
+    if (result) setCurrentResult(result);
+  }
+
+  function deleteHistoryEntry(id: number) {
+    fetch(`/api/chat-history/${id}`, { method: "DELETE" }).then(() => {
+      setHistory((prev) => prev.filter((h) => h.id !== id));
+    });
+  }
+
   // Save as smart tag
   const [showSaveSearch, setShowSaveSearch] = useState(false);
   const [saveTagName, setSaveTagName] = useState("");
@@ -246,17 +302,9 @@ export default function AskView() {
       let accQueries: string[] = [];
       let finalResult: ChatResult | undefined;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
+      function processLines(rawLines: string[]) {
         let eventType = "";
-        for (const line of lines) {
+        for (const line of rawLines) {
           if (line.startsWith("event: ")) {
             eventType = line.slice(7);
           } else if (line.startsWith("data: ")) {
@@ -285,6 +333,22 @@ export default function AskView() {
         }
       }
 
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        processLines(lines);
+      }
+
+      // Flush remaining bytes from TextDecoder and process any buffered SSE events
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        processLines(buffer.split("\n"));
+      }
+
       // Strip <result> block from display text
       const displayContent = accText
         .replace(/<result>\s*[\s\S]*?\s*<\/result>/g, "")
@@ -307,6 +371,9 @@ export default function AskView() {
       if (finalResult) {
         setCurrentResult(finalResult);
       }
+
+      // Refresh history so new entry appears
+      fetchHistory();
     } catch (err: unknown) {
       if (abort.signal.aborted) return;
       const msg = err instanceof Error ? err.message : String(err);
@@ -469,38 +536,109 @@ export default function AskView() {
             <p className="text-text-secondary text-[14px] mt-1">Search with natural language, find patterns, tag in bulk</p>
           </div>
         )}
-        <div className="relative">
-          <textarea
-            ref={inputRef}
-            className={`w-full bg-bg-card border border-border rounded-xl outline-none text-[15px] text-text resize-none font-[var(--font-ui)] transition-all placeholder:text-text-dim focus:border-accent-blue/60 focus:shadow-[0_0_0_3px_rgba(88,166,255,0.08)] ${
-              isIdle ? "px-5 py-4 min-h-[56px]" : "px-4 py-3 min-h-[44px]"
-            }`}
-            rows={isIdle ? 2 : 1}
-            placeholder={isIdle
-              ? 'e.g. "sessions that modified auth files last week" or "tag all React refactors"'
-              : "Ask a follow-up..."
-            }
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            disabled={loading}
-          />
-          <button
-            className="absolute right-3 bottom-3 p-1.5 bg-accent-blue text-white rounded-lg transition-opacity hover:opacity-85 disabled:opacity-30"
-            onClick={sendMessage}
-            disabled={loading || !input.trim()}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path
-                d="M14 2L7 9M14 2L9.5 14L7 9M14 2L2 6.5L7 9"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </button>
+        <div className="relative flex gap-2 items-start">
+          {!isIdle && (
+            <button
+              className="shrink-0 mt-1.5 p-2 rounded-lg text-text-dim hover:text-text-secondary hover:bg-white/8 transition-all"
+              onClick={() => {
+                setMessages([]);
+                setCurrentResult(null);
+                setSessions([]);
+                setInput("");
+                fetchHistory();
+              }}
+              title="New search"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 4v4l3 1.5M14 8A6 6 0 112 8a6 6 0 0112 0z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          )}
+          <div className="relative flex-1">
+            <textarea
+              ref={inputRef}
+              className={`w-full bg-bg-card border border-border rounded-xl outline-none text-[15px] text-text resize-none font-[var(--font-ui)] transition-all placeholder:text-text-dim focus:border-accent-blue/60 focus:shadow-[0_0_0_3px_rgba(88,166,255,0.08)] ${
+                isIdle ? "px-5 py-4 min-h-[56px]" : "px-4 py-3 min-h-[44px]"
+              }`}
+              rows={isIdle ? 2 : 1}
+              placeholder={isIdle
+                ? 'e.g. "sessions that modified auth files last week" or "tag all React refactors"'
+                : "Ask a follow-up..."
+              }
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              disabled={loading}
+            />
+            <button
+              className="absolute right-3 bottom-3 p-1.5 bg-accent-blue text-white rounded-lg transition-opacity hover:opacity-85 disabled:opacity-30"
+              onClick={sendMessage}
+              disabled={loading || !input.trim()}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path
+                  d="M14 2L7 9M14 2L9.5 14L7 9M14 2L2 6.5L7 9"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          </div>
         </div>
+
+        {/* History list when idle */}
+        {isIdle && history.length > 0 && (
+          <div className="mt-4 rounded-xl border border-border bg-bg-card overflow-hidden">
+            <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-text-dim">Recent queries</span>
+              <button
+                className="text-[11px] text-text-dim hover:text-text-secondary transition-colors"
+                onClick={() => {
+                  fetch("/api/chat-history", { method: "DELETE" }).then(() => setHistory([]));
+                }}
+              >
+                Clear all
+              </button>
+            </div>
+            <div className="divide-y divide-border">
+              {history.slice(0, 10).map((entry) => (
+                <div
+                  key={entry.id}
+                  className="flex items-center gap-3 px-4 py-2.5 hover:bg-white/4 cursor-pointer transition-colors group"
+                  onClick={() => restoreHistoryEntry(entry)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="shrink-0 text-text-dim">
+                    <path d="M8 4v4l3 1.5M14 8A6 6 0 112 8a6 6 0 0112 0z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span className="flex-1 text-[13px] text-text-secondary truncate">
+                    {entry.query_text}
+                  </span>
+                  {entry.session_count > 0 && (
+                    <span className="shrink-0 text-[11px] text-text-dim bg-white/6 rounded-full px-2 py-0.5">
+                      {entry.session_count}
+                    </span>
+                  )}
+                  <span className="shrink-0 text-[11px] text-text-dim">
+                    {relativeTime(entry.created_at)}
+                  </span>
+                  <button
+                    className="shrink-0 p-0.5 rounded text-text-dim opacity-0 group-hover:opacity-100 hover:text-text-secondary hover:bg-white/8 transition-all"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteHistoryEntry(entry.id);
+                    }}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Previous conversation turns (compact) */}

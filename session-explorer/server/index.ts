@@ -169,6 +169,31 @@ const searchMessagesFtsInWorkspace = db.prepare(`
   LIMIT 200
 `);
 
+/** LIKE-based fallback for underscore terms that FTS5 can't match as phrases */
+const searchMessagesLike = db.prepare(`
+  SELECT m.session_id, m.role, m.message_type, m.timestamp, m.sequence,
+         substr(m.content, max(1, instr(lower(m.content), lower(?1)) - 80), 200) as snippet,
+         s.title, s.started_at, s.git_branch,
+         0 as rank
+  FROM messages m
+  JOIN sessions s ON m.session_id = s.id
+  WHERE m.content LIKE ?2
+  ORDER BY m.timestamp DESC
+  LIMIT 200
+`);
+
+const searchMessagesLikeInWorkspace = db.prepare(`
+  SELECT m.session_id, m.role, m.message_type, m.timestamp, m.sequence,
+         substr(m.content, max(1, instr(lower(m.content), lower(?1)) - 80), 200) as snippet,
+         s.title, s.started_at, s.git_branch,
+         0 as rank
+  FROM messages m
+  JOIN sessions s ON m.session_id = s.id
+  WHERE s.workspace_id = ?3 AND m.content LIKE ?2
+  ORDER BY m.timestamp DESC
+  LIMIT 200
+`);
+
 /** Convert user query to FTS5 query — wraps words in double quotes for phrase-like matching */
 /** Convert a glob pattern (*, ?) to a SQL LIKE pattern */
 function globToLike(glob: string): string {
@@ -183,11 +208,25 @@ function globToLike(glob: string): string {
 }
 
 function toFtsQuery(query: string): string {
-  // Split on whitespace and underscores since FTS5 tokenizes on underscores
-  const words = query.trim().split(/[\s_]+/).filter(Boolean);
+  const trimmed = query.trim();
+
+  // Exact phrase match: user wrapped query in quotes e.g. "artifacts = the data layer"
+  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length > 2) {
+    const phrase = trimmed.slice(1, -1).replace(/[^a-zA-Z0-9_.\-\s]/g, '').trim();
+    return phrase ? `"${phrase}"` : '""';
+  }
+
+  // Default: AND between individual terms
+  const words = trimmed.split(/\s+/).filter(Boolean)
+    .map(w => w.replace(/[^a-zA-Z0-9_.\-]/g, ''))
+    .filter(w => w.length > 0);
   if (words.length === 0) return '""';
-  // Use AND between terms for better precision
   return words.map(w => `"${w.replace(/"/g, '""')}"`).join(' AND ');
+}
+
+/** Check if query contains underscore-joined terms that FTS5 can't match as phrases */
+function hasUnderscoreTerms(query: string): boolean {
+  return query.trim().split(/\s+/).some(w => w.includes('_'));
 }
 
 // ── Summarization Prepared Statements ─────────────────────────────
@@ -397,7 +436,8 @@ app.get("/api/search", (req, res) => {
     return;
   }
 
-  const ftsQuery = toFtsQuery(query);
+  const isExact = req.query.exact === "1";
+  const ftsQuery = isExact ? toFtsQuery(`"${query}"`) : toFtsQuery(query);
   const sort = (req.query.sort as string) || "date";
   const workspaceId = req.query.workspace
     ? Number(req.query.workspace)
@@ -413,6 +453,18 @@ app.get("/api/search", (req, res) => {
     // FTS query syntax error — fall back to empty
     res.json({ results: [], total_sessions: 0, total_matches: 0 });
     return;
+  }
+
+  // LIKE fallback for underscore-joined terms (FTS5 tokenizes on underscores)
+  if (results.length === 0 && hasUnderscoreTerms(query)) {
+    const likePattern = `%${query.trim()}%`;
+    try {
+      results = workspaceId
+        ? searchMessagesLikeInWorkspace.all(query.trim(), likePattern, workspaceId)
+        : searchMessagesLike.all(query.trim(), likePattern);
+    } catch {
+      // ignore LIKE errors
+    }
   }
 
   // Group raw match rows by session, keeping all of them for prioritization
@@ -1159,6 +1211,26 @@ app.post("/api/open-file", (req, res) => {
   });
 });
 
+// ── Chat History Routes ────────────────────────────────────────────
+
+const listChatHistory = db.prepare(`SELECT * FROM chat_history ORDER BY created_at DESC LIMIT 50`);
+const deleteChatHistoryEntry = db.prepare(`DELETE FROM chat_history WHERE id = ?`);
+const clearChatHistory = db.prepare(`DELETE FROM chat_history`);
+
+app.get("/api/chat-history", (_req, res) => {
+  res.json(listChatHistory.all());
+});
+
+app.delete("/api/chat-history/:id", (req, res) => {
+  deleteChatHistoryEntry.run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.delete("/api/chat-history", (_req, res) => {
+  clearChatHistory.run();
+  res.json({ ok: true });
+});
+
 // SPA fallback — serve index.html for non-API routes
 app.get("*", (_req, res) => {
   res.sendFile(join(__dirname, "..", "dist", "web", "index.html"));
@@ -1172,21 +1244,12 @@ app.listen(PORT, () => {
     if (ingestProgress?.running || activeJob?.running) return;
 
     try {
-      // Phase 1: Ingest brand new sessions (not in DB yet)
+      // Phase 1: Ingest new sessions + reingest changed ones (file size check)
       ingestProgress = { total: 0, ingested: 0, skipped: 0, running: true };
       const final = await runIngestion({ all: false }, (p) => { ingestProgress = p; });
       ingestProgress = { ...final, running: false };
 
-      // Phase 2: Re-ingest stale sessions that have new data
-      const stale = getStaleSessionsNeedingReingest(4); // 4 hours idle
-      if (stale.length > 0) {
-        console.log(`[auto-ingest] Re-ingesting ${stale.length} idle session(s) with new data`);
-        for (const s of stale) {
-          reingestSession(s.sourcePath, s.workspaceId);
-        }
-      }
-
-      // Phase 3: Auto-summarize
+      // Phase 2: Auto-summarize
       if (activeJob?.running) return;
       const unsummarized = getAllUnsummarizedSessions.all() as Array<{ id: string; title: string }>;
       if (unsummarized.length === 0) return;

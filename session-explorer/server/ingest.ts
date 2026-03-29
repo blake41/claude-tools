@@ -104,6 +104,9 @@ const updateWorkspaceStats = db.prepare(`
 `);
 
 const sessionExists = db.prepare(`SELECT 1 FROM sessions WHERE id = ?`);
+const sessionFileSize = db.prepare(`SELECT file_size FROM sessions WHERE id = ?`);
+const sessionSummary = db.prepare(`SELECT summary FROM sessions WHERE id = ?`);
+const restoreSessionSummary = db.prepare(`UPDATE sessions SET summary = ? WHERE id = ?`);
 
 const insertSession = db.prepare(`
   INSERT INTO sessions (id, workspace_id, source_path, started_at, ended_at, git_branch, title, message_count, user_message_count, file_size, ingested_at)
@@ -160,8 +163,25 @@ function ingestSession(
 
   const alreadyExists = !!sessionExists.get(sessionId);
 
-  // In force mode, delete existing data first
-  if (alreadyExists && forceReingest) {
+  // Auto-reingest if file size has changed (session grew since last ingest)
+  let needsReingest = forceReingest;
+  if (alreadyExists && !forceReingest) {
+    try {
+      const stored = sessionFileSize.get(sessionId) as { file_size: number } | undefined;
+      const currentSize = statSync(jsonlPath).size;
+      if (stored && stored.file_size !== currentSize) {
+        needsReingest = true;
+      }
+    } catch {
+      // stat failed, skip size check
+    }
+  }
+
+  // Preserve summary across reingest so we don't trigger unnecessary resummarization
+  let existingSummary: string | null = null;
+  if (alreadyExists && needsReingest) {
+    const row = sessionSummary.get(sessionId) as { summary: string | null } | undefined;
+    existingSummary = row?.summary ?? null;
     const deleteTx = db.transaction(() => {
       deleteSessionFiles.run(sessionId);
       deleteSessionMessages.run(sessionId);
@@ -284,6 +304,11 @@ function ingestSession(
   });
 
   ingestTx();
+
+  // Restore existing summary so reingest doesn't trigger resummarization
+  if (existingSummary) {
+    restoreSessionSummary.run(existingSummary, sessionId);
+  }
 
   // Update counts to include subagent messages
   const subagentDir = join(jsonlPath.replace(/\.jsonl$/, ""), "subagents");

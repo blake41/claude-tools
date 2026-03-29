@@ -3,13 +3,14 @@ import { useQueryState, parseAsString, parseAsStringLiteral } from "nuqs";
 import type { SearchResult, SearchMatch, FileSearchResult, ChangedFile } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
 import { SessionText, SnippetText, formatToolContent } from "../sessionFormat";
+import AskView from "./AskView";
 
 interface SearchProps {
   onClose: () => void;
   onNavigate: (path: string) => void;
 }
 
-type SearchTab = "messages" | "files";
+type SearchTab = "messages" | "files" | "ask";
 
 type SortMode = "date" | "date_asc" | "relevance" | "matches";
 
@@ -463,7 +464,8 @@ function SearchResultCard({
 
 export default function Search({ onClose, onNavigate }: SearchProps) {
   const [query, setQuery] = useQueryState("q", parseAsString.withDefault(""));
-  const [tab, setTab] = useQueryState("tab", parseAsStringLiteral(["messages", "files"] as const).withDefault("messages"));
+  const [tab, setTab] = useQueryState("tab", parseAsStringLiteral(["messages", "files", "ask"] as const).withDefault("messages"));
+  const [exact, setExact] = useState(false);
   const [sort, setSort] = useState<SortMode>("date");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [fileResults, setFileResults] = useState<FileSearchResult[]>([]);
@@ -517,7 +519,9 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
       setSearched(true);
 
       if (tab === "messages") {
-        fetch(`/api/search?q=${encodeURIComponent(query.trim())}&sort=${sort}`)
+        const params = new URLSearchParams({ q: query.trim(), sort });
+        if (exact) params.set("exact", "1");
+        fetch(`/api/search?${params}`)
           .then((r) => r.json())
           .then((data) => {
             setResults(data.results || []);
@@ -538,9 +542,9 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, tab, sort]);
+  }, [query, tab, sort, exact]);
 
-  const handleTabChange = (newTab: "messages" | "files") => {
+  const handleTabChange = (newTab: "messages" | "files" | "ask") => {
     setTab(newTab);
     setResults([]);
     setFileResults([]);
@@ -674,25 +678,37 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
   return (
     <div className="fixed inset-0 bg-bg z-[100] flex flex-col" onClick={onClose}>
       <div className="w-full h-full bg-bg flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
-        {/* Search input */}
-        <div className="flex items-center gap-3.5 px-8 py-5 border-b border-border bg-bg-card">
-          <svg className="text-text-secondary shrink-0" width="18" height="18" viewBox="0 0 16 16" fill="none">
-            <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
-            <line x1="11" y1="11" x2="14.5" y2="14.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-          </svg>
-          <input
-            ref={inputRef}
-            type="text"
-            className="flex-1 bg-transparent border-none outline-none text-xl text-text font-[var(--font-ui)] placeholder:text-text-dim"
-            placeholder={tab === "messages" ? "Search sessions..." : "Search files — use * and ? for globs (e.g. *blake.html)"}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") onClose();
-            }}
-          />
-          <button onClick={onClose} className="font-mono text-[10px] px-1.5 py-0.5 bg-white/6 border border-border rounded-sm text-text-dim hover:text-text hover:bg-white/10 transition-colors cursor-pointer">Esc</button>
-        </div>
+        {/* Search input (hidden on Ask AI tab) */}
+        {tab !== "ask" && (
+          <div className="flex items-center gap-3.5 px-8 py-5 border-b border-border bg-bg-card">
+            <svg className="text-text-secondary shrink-0" width="18" height="18" viewBox="0 0 16 16" fill="none">
+              <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
+              <line x1="11" y1="11" x2="14.5" y2="14.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            <input
+              ref={inputRef}
+              type="text"
+              className="flex-1 bg-transparent border-none outline-none text-xl text-text font-[var(--font-ui)] placeholder:text-text-dim"
+              placeholder={tab === "messages" ? "Search sessions..." : "Search files — use * and ? for globs (e.g. *blake.html)"}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") onClose();
+              }}
+            />
+            {tab === "messages" && (
+              <button
+                className={`shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md border transition-all flex items-center gap-1.5 ${exact ? "bg-accent-blue text-white border-accent-blue" : "bg-white/4 text-text-dim border-border hover:text-text-secondary hover:bg-white/8"}`}
+                onClick={() => setExact(!exact)}
+                title="Exact phrase match"
+              >
+                <span className={`inline-block w-2 h-2 rounded-full border ${exact ? "bg-white border-white" : "border-text-dim"}`} />
+                Exact
+              </button>
+            )}
+            <button onClick={onClose} className="font-mono text-[10px] px-1.5 py-0.5 bg-white/6 border border-border rounded-sm text-text-dim hover:text-text hover:bg-white/10 transition-colors cursor-pointer">Esc</button>
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="flex items-center justify-between px-8 border-b border-border bg-bg-card">
@@ -709,12 +725,21 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
             >
               Files
             </button>
+            <button
+              className={`px-5 py-2.5 text-[13px] font-medium border-b-2 transition-all hover:text-text ${tab === "ask" ? "text-accent-blue border-b-accent-blue" : "text-text-secondary border-b-transparent"}`}
+              onClick={() => handleTabChange("ask")}
+            >
+              Ask AI
+            </button>
           </div>
           <div className="flex items-center gap-3">
             {!loading && searched && tab === "files" && fileResults.length > 0 && (
               <span className="text-[11px] text-text-dim">
                 {fileResults.length} file{fileResults.length !== 1 ? "s" : ""}
               </span>
+            )}
+            {tab === "ask" && (
+              <button onClick={onClose} className="font-mono text-[10px] px-1.5 py-0.5 bg-white/6 border border-border rounded-sm text-text-dim hover:text-text hover:bg-white/10 transition-colors cursor-pointer">Esc</button>
             )}
           </div>
         </div>
@@ -746,8 +771,15 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
           </div>
         )}
 
+        {/* Ask AI tab */}
+        {tab === "ask" && (
+          <div className="flex-1 overflow-y-auto">
+            <AskView />
+          </div>
+        )}
+
         {/* Results */}
-        <div className="flex-1 overflow-y-auto px-8 py-4">
+        {tab !== "ask" && <div className="flex-1 overflow-y-auto px-8 py-4">
           {loading && (
             <div className="flex items-center justify-center gap-2 p-6 text-[13px] text-text-secondary">
               <div className="spinner small" />
@@ -811,7 +843,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
               </div>
             ));
           })()}
-        </div>
+        </div>}
       </div>
     </div>
   );

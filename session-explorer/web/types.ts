@@ -98,6 +98,16 @@ export interface SavedSearch {
   tag_color?: string;
 }
 
+export interface ChatHistoryEntry {
+  id: number;
+  query_text: string;
+  answer_text: string | null;
+  session_ids: string | null;
+  session_count: number;
+  queries: string | null;
+  created_at: string;
+}
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;

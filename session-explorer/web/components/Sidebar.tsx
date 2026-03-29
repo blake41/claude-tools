@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import type { Workspace, Tag, SavedSearch } from "../types";
 
 interface SidebarProps {
@@ -26,8 +26,18 @@ function formatDate(dateStr: string | null): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function loadStarredIds(): Set<number> {
+  try {
+    const raw = localStorage.getItem("starred-workspaces");
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch { return new Set(); }
+}
+
+function saveStarredIds(ids: Set<number>) {
+  localStorage.setItem("starred-workspaces", JSON.stringify([...ids]));
+}
+
 export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
-  const navigate = useNavigate();
   const [tags, setTags] = useState<Tag[]>([]);
   const [showCreateTag, setShowCreateTag] = useState(false);
   const [newTagName, setNewTagName] = useState("");
@@ -35,6 +45,19 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   const [ingesting, setIngesting] = useState(false);
   const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([]);
   const [refreshingTag, setRefreshingTag] = useState<number | null>(null);
+  const [starredIds, setStarredIds] = useState<Set<number>>(loadStarredIds);
+  const [showMore, setShowMore] = useState(false);
+
+  function toggleStar(id: number, e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setStarredIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      saveStarredIds(next);
+      return next;
+    });
+  }
 
   useEffect(() => {
     fetch("/api/tags")
@@ -89,14 +112,6 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           <h2 className="text-[15px] font-semibold tracking-tight text-text">Session Explorer</h2>
         </Link>
         <div className="flex items-center gap-1">
-          <button className="p-1.5 rounded-md text-text-secondary transition-all hover:bg-white/8 hover:text-text" onClick={() => navigate({ to: "/ask" })} title="Ask AI">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path d="M2 3.5C2 2.67 2.67 2 3.5 2h9c.83 0 1.5.67 1.5 1.5v7c0 .83-.67 1.5-1.5 1.5H6L3 14.5V12H3.5C2.67 12 2 11.33 2 10.5v-7Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-              <circle cx="5.5" cy="7" r="0.75" fill="currentColor" />
-              <circle cx="8" cy="7" r="0.75" fill="currentColor" />
-              <circle cx="10.5" cy="7" r="0.75" fill="currentColor" />
-            </svg>
-          </button>
           <button className="p-1.5 rounded-md text-text-secondary transition-all hover:bg-white/8 hover:text-text" onClick={onSearchClick} title="Search (Cmd+K)">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
@@ -109,25 +124,64 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
         <kbd className="inline-block px-1.5 py-px font-mono text-[10px] bg-white/6 border border-border rounded-sm">Cmd</kbd> + <kbd className="inline-block px-1.5 py-px font-mono text-[10px] bg-white/6 border border-border rounded-sm">K</kbd> to search
       </div>
       <nav className="flex-1 overflow-y-auto px-2 pb-4">
-        {workspaces.map((w, i) => (
-          <div key={w.id}>
-            {i > 0 && <div className="mx-3 border-t border-border/50" />}
-            <Link
-              to="/workspace/$id"
-              params={{ id: String(w.id) }}
-              className="block px-3 py-2.5 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline [&[data-status=active]]:bg-accent-blue/12 [&[data-status=active]_.workspace-name]:text-accent-blue"
-            >
-              <div className="workspace-name text-[13px] font-medium whitespace-nowrap overflow-hidden text-ellipsis">{w.display_name}</div>
-              <div className="flex justify-between mt-0.5 text-[11px] text-text-dim">
-                <span>{w.session_count} sessions</span>
-                <span>{formatDate(w.last_activity)}</span>
+        {(() => {
+          const starred = workspaces.filter(w => starredIds.has(w.id));
+          const rest = workspaces.filter(w => !starredIds.has(w.id));
+          const hasStars = starred.length > 0;
+
+          function renderWorkspace(w: Workspace, showDivider: boolean) {
+            return (
+              <div key={w.id}>
+                {showDivider && <div className="mx-3 border-t border-border/50" />}
+                <Link
+                  to="/workspace/$id"
+                  params={{ id: String(w.id) }}
+                  className="group/ws block px-3 py-2.5 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline [&[data-status=active]]:bg-accent-blue/12 [&[data-status=active]_.workspace-name]:text-accent-blue"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <div className="workspace-name flex-1 text-[13px] font-medium whitespace-nowrap overflow-hidden text-ellipsis">{w.display_name}</div>
+                    <button
+                      className={`shrink-0 p-0.5 rounded transition-all ${starredIds.has(w.id) ? "text-accent-yellow" : "text-text-dim opacity-0 group-hover/ws:opacity-100 hover:text-accent-yellow"}`}
+                      onClick={(e) => toggleStar(w.id, e)}
+                      title={starredIds.has(w.id) ? "Unstar" : "Star"}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill={starredIds.has(w.id) ? "currentColor" : "none"}>
+                        <path d="M8 1.5l2 4.5 5 .5-3.75 3.25L12.5 15 8 12.25 3.5 15l1.25-5.25L1 6.5l5-.5L8 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                  </div>
+                  <div className="flex justify-between mt-0.5 text-[11px] text-text-dim">
+                    <span>{w.session_count} sessions</span>
+                    <span>{formatDate(w.last_activity)}</span>
+                  </div>
+                </Link>
               </div>
-            </Link>
-          </div>
-        ))}
-        {workspaces.length === 0 && (
-          <div className="p-4 text-xs text-text-secondary text-center">No workspaces found. Run the ingestion script first.</div>
-        )}
+            );
+          }
+
+          return (
+            <>
+              {starred.map((w, i) => renderWorkspace(w, i > 0))}
+              {hasStars && rest.length > 0 && (
+                <div className="mx-3 mt-1 mb-1">
+                  <button
+                    className="flex items-center gap-1.5 text-[11px] text-text-dim hover:text-text-secondary transition-colors py-1"
+                    onClick={() => setShowMore(!showMore)}
+                  >
+                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" className={`transition-transform ${showMore ? "rotate-90" : ""}`}>
+                      <path d="M2 1l4 3-4 3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    {rest.length} more workspace{rest.length !== 1 ? "s" : ""}
+                  </button>
+                </div>
+              )}
+              {(!hasStars || showMore) && rest.map((w, i) => renderWorkspace(w, hasStars ? true : i > 0))}
+              {workspaces.length === 0 && (
+                <div className="p-4 text-xs text-text-secondary text-center">No workspaces found. Run the ingestion script first.</div>
+              )}
+            </>
+          );
+        })()}
       </nav>
 
       <div className="border-t border-border px-2 pt-3 pb-4 shrink-0">

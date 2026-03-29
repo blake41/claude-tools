@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { Database } from "bun:sqlite";
 import Anthropic from "@anthropic-ai/sdk";
-import { DB_PATH } from "./db.js";
+import db, { DB_PATH } from "./db.js";
 import { config } from "./config.js";
 
 const router = Router();
@@ -9,6 +9,11 @@ const anthropic = new Anthropic();
 
 // Read-only database connection for safety
 const readDb = new Database(DB_PATH, { readonly: true });
+
+// Prepared statement for saving chat history
+const insertChatHistory = db.prepare(
+  `INSERT INTO chat_history (query_text, answer_text, session_ids, session_count, queries, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))`
+);
 
 const SYSTEM_PROMPT = `You are an assistant for Session Explorer, a tool for browsing Claude Code session history. You have direct SQL access to the SQLite database.
 
@@ -232,6 +237,22 @@ router.post("/api/chat", async (req, res) => {
 
     // Parse result block from accumulated text
     const result = parseResult(fullText);
+
+    // Save to chat history
+    try {
+      const userQuery = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+      const displayText = fullText.replace(/<result>\s*[\s\S]*?\s*<\/result>/g, "").trim();
+      const sessionIds = result?.session_ids || [];
+      insertChatHistory.run(
+        userQuery,
+        displayText || null,
+        sessionIds.length > 0 ? JSON.stringify(sessionIds) : null,
+        sessionIds.length,
+        queries.length > 0 ? JSON.stringify(queries) : null,
+      );
+    } catch (historyErr) {
+      console.error("Failed to save chat history:", historyErr);
+    }
 
     // Send final event with result and queries
     sendEvent(res, "done", {
