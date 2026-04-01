@@ -1,5 +1,5 @@
 #!/bin/bash
-# SubagentStart hook: inject unique AB_CONTEXT per subagent
+# SubagentStart hook: inject unique AB_SUBAGENT_SESSION_ID per subagent
 # Reads agent_id from stdin JSON, generates a short unique context ID,
 # returns it as additionalContext so the subagent knows to export it.
 
@@ -15,5 +15,5 @@ fi
 ctx="${agent_id: -6}"
 
 cat <<EOF
-{"decision":"approve","additionalContext":"[BROWSER ISOLATION] This subagent's browser context ID is: ${ctx}\nBefore running any ab or agent-browser command, you MUST first run: export AB_CONTEXT=${ctx}"}
+{"decision":"approve","additionalContext":"[BROWSER ISOLATION] This subagent's browser context ID is: ${ctx}\nBefore running any ab or agent-browser command, you MUST first run: export AB_SUBAGENT_SESSION_ID=${ctx}"}
 EOF

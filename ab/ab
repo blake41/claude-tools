@@ -2,131 +2,37 @@
 #
 # ab — safe wrapper around agent-browser
 #
-# Strategy: connect to Chrome via CDP on port 9222. If Chrome isn't running
-# with the debug port, launch it ourselves. This is the only reliable approach —
-# agent-browser's --headed and --auto-connect are broken/flaky in 0.21.x.
+# Minimal wrapper that:
+#   1. Ensures Chrome is running with CDP on port 9222
+#   2. Passes every command through with --cdp 9222
+#   3. Blocks `close` (corrupts profile)
 #
-# Failure modes this handles:
-#   1. No Chrome running → launch Chrome with --remote-debugging-port=9222
-#   2. Chrome running without debug port → warn, can't auto-fix (user's Chrome)
-#   3. Stale daemon → kill it, reconnect via CDP
-#   4. Inside cco sandbox → can't launch Chrome, fail fast with instructions
-#   5. NEVER run `pkill chrome` — kills user's personal Chrome
-#   6. NEVER run `agent-browser close` — corrupts profile
+# Let agent-browser handle daemon lifecycle. Don't kill daemons manually —
+# they maintain tab state (active_page_index, CDP session IDs).
 #
-# Usage:
-#   ab open <url>              # Open URL (ensures Chrome + CDP connection)
-#   ab screenshot <path>       # Take screenshot
-#   ab eval "js code"          # Run JavaScript
-#   ab <any agent-browser cmd> # Pass through to agent-browser
-#   ab ensure                  # Just ensure browser is ready, don't navigate
-#   ab heal                    # Force heal (kill daemons, relaunch Chrome, reconnect)
-#   ab status                  # Show daemon/session health
-#
-# Parallel subagent isolation (AB_CONTEXT):
-#   When AB_CONTEXT is set, `ab open` creates a dedicated tab and saves its
-#   index. All subsequent commands switch to that tab first. This lets N
-#   subagents browse simultaneously without stomping on each other's pages.
+# Tab isolation via AB_SUBAGENT_SESSION_ID:
+#   First `ab open` with a new AB_SUBAGENT_SESSION_ID creates a new tab.
+#   Subsequent commands switch to that tab automatically.
+#   Tab index stored in /tmp/ab-tab-<session>-<context>.
 
 set -euo pipefail
 
-# --- Config ---
-HEALTH_TIMEOUT=5
 CDP_PORT=9222
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE="$HOME/.agent-browser/profile"
 CHROME_PIDFILE="/tmp/ab-chrome-${CDP_PORT}.pid"
+AUTH_STATE="$HOME/.agent-browser/terra-auth.json"
+SEED_ORIGINS=("http://localhost:5173" "https://slack-feedback-staging.onrender.com" "https://terra.clay.com")
+DASHBOARD_PORT=4848
+DASHBOARD_PIDFILE="$HOME/.agent-browser/dashboard.pid"
 
-# --- macOS-compatible timeout ---
-_timeout() {
-  local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
-  else
-    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
-  fi
-}
-
-# --- Auto-detect session name ---
-_ab_detect_base_session() {
-  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
-    echo "terra-${CCO_SESSION_ID:0:8}"
-    return
-  fi
-  local cwd="${PWD:-$(pwd)}"
-  if [[ "$cwd" == */.claude/worktrees/* ]]; then
-    local worktree_name="${cwd##*/.claude/worktrees/}"
-    worktree_name="${worktree_name%%/*}"
-    echo "terra-${worktree_name}"
-    return
-  fi
-  echo "terra"
-}
-
-_ab_browsing_session() {
-  local base="$1"
-  if [[ -n "${AB_CONTEXT:-}" ]]; then
-    echo "${base}-${AB_CONTEXT}"
-  else
-    echo "${base}"
-  fi
-}
-
-# --- Tab isolation for parallel subagents ---
-_tab_file() {
-  echo "/tmp/ab-tab-${AB_CONTEXT:-default}"
-}
-
-_claim_tab() {
-  local url="${1:-about:blank}"
-  if [[ -z "${AB_CONTEXT:-}" ]]; then
-    return 0
-  fi
-  agent-browser tab new "$url" >/dev/null 2>&1
-  local idx
-  idx=$(agent-browser tab list --json 2>/dev/null | python3 -c "import json,sys; tabs=json.load(sys.stdin)['data']['tabs']; print(next(t['index'] for t in tabs if t['active']))" 2>/dev/null)
-  if [[ -n "$idx" ]]; then
-    echo "$idx" > "$(_tab_file)"
-  fi
-}
-
-_switch_to_tab() {
-  if [[ -z "${AB_CONTEXT:-}" ]]; then
-    return 0
-  fi
-  local tf
-  tf="$(_tab_file)"
-  if [[ -f "$tf" ]]; then
-    local idx
-    idx="$(cat "$tf")"
-    agent-browser tab "$idx" >/dev/null 2>&1
-  fi
-}
-
-# --- Parse session name from args or env ---
-BASE_SESSION="${AB_SESSION:-$(_ab_detect_base_session)}"
-SESSION=""
-PASSTHROUGH_ARGS=()
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --session-name|--session)
-      BASE_SESSION="$2"
-      shift 2
-      ;;
-    *)
-      PASSTHROUGH_ARGS+=("$1")
-      shift
-      ;;
-  esac
-done
-
-set -- "${PASSTHROUGH_ARGS[@]}"
+# Headless by default. Set AB_HEADED=1 or pass --headed to show the window.
+HEADED=0
+if [[ "${AB_HEADED:-}" == "1" ]]; then HEADED=1; fi
 
 # --- Blocked commands ---
 if [[ "${1:-}" == "close" ]]; then
-  echo "✗ BLOCKED: 'close' corrupts the browser profile and breaks daemon state." >&2
-  echo "  To reset: ab heal" >&2
+  echo "✗ BLOCKED: 'close' corrupts the browser profile. Use 'ab heal'." >&2
   exit 1
 fi
 
@@ -135,13 +41,326 @@ _cdp_is_up() {
   curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1
 }
 
-# --- Health check: daemon connected and responsive ---
-_daemon_is_healthy() {
-  _timeout "$HEALTH_TIMEOUT" agent-browser get url >/dev/null 2>&1
+# --- Ensure Chrome is running with CDP ---
+_ensure_chrome() {
+  _cdp_is_up && return 0
+
+  # Inside sandbox — can't launch Chrome
+  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
+    echo "✗ Chrome not running. Run 'ab heal' from a terminal outside this session." >&2
+    return 1
+  fi
+
+  local headless_flag=""
+  if [[ "$HEADED" == "0" ]]; then
+    headless_flag="--headless=new"
+    echo "▶ Launching Chrome headless on CDP port $CDP_PORT..." >&2
+  else
+    echo "▶ Launching Chrome headed on CDP port $CDP_PORT..." >&2
+  fi
+  "$CHROME_BIN" \
+    --remote-debugging-port="$CDP_PORT" \
+    --user-data-dir="$CHROME_PROFILE" \
+    $headless_flag \
+    --no-first-run --no-default-browser-check \
+    --disable-background-networking --disable-backgrounding-occluded-windows \
+    --disable-component-update --disable-domain-reliability --disable-sync \
+    --metrics-recording-only --disable-machine-learning-model-loader \
+    --disable-client-side-phishing-detection --safebrowsing-disable-auto-update \
+    "about:blank" >/dev/null 2>&1 &
+  echo "$!" > "$CHROME_PIDFILE"
+
+  local tries=0
+  while ! _cdp_is_up && [[ $tries -lt 15 ]]; do sleep 1; tries=$((tries+1)); done
+  if _cdp_is_up; then
+    echo "✓ Chrome ready (CDP port $CDP_PORT)" >&2
+    # Ensure dashboard is running alongside Chrome
+    _dashboard_is_up || _dashboard_start 2>/dev/null
+  else
+    echo "✗ Chrome not responding" >&2
+    return 1
+  fi
 }
 
-# --- Kill stale agent-browser daemons ---
-_kill_daemons() {
+# --- Tab file for AB_SUBAGENT_SESSION_ID ---
+_tab_file() {
+  local prefix="${CCO_SESSION_ID:+${CCO_SESSION_ID:0:8}-}"
+  echo "/tmp/ab-tab-${prefix}${AB_SUBAGENT_SESSION_ID:-default}"
+}
+
+_create_new_tab() {
+  local url="$1" tf="$2"
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab new >/dev/null 2>&1
+  local idx
+  idx=$(AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab list --json 2>/dev/null \
+    | python3 -c "import json,sys; tabs=json.load(sys.stdin)['data']['tabs']; print(next(t['index'] for t in tabs if t['active']))" 2>/dev/null)
+  [[ -n "$idx" ]] && echo "$idx" > "$tf"
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
+}
+
+# --- Open URL with tab isolation ---
+_open_with_context() {
+  local url="$1"
+  if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
+    # No context — just open in default tab
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
+    return
+  fi
+
+  local tf
+  tf="$(_tab_file)"
+  if [[ -f "$tf" ]]; then
+    # Existing tab — try to switch to it
+    if AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab "$(cat "$tf")" >/dev/null 2>&1; then
+      AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
+    else
+      # Tab was closed or index shifted — recreate
+      echo "  Tab gone, recreating..." >&2
+      rm -f "$tf"
+      _create_new_tab "$url" "$tf"
+    fi
+  else
+    _create_new_tab "$url" "$tf"
+  fi
+}
+
+# --- Switch to context tab before any command ---
+_switch_to_context_tab() {
+  [[ -z "${AB_SUBAGENT_SESSION_ID:-}" ]] && return 0
+  local tf
+  tf="$(_tab_file)"
+  if [[ -f "$tf" ]]; then
+    if ! AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab "$(cat "$tf")" >/dev/null 2>&1; then
+      # Tab gone — remove stale file so next open recreates
+      rm -f "$tf"
+    fi
+  fi
+}
+
+# --- Dashboard: manage the agent-browser dashboard ---
+_dashboard_is_up() {
+  curl -s --max-time 2 "http://127.0.0.1:${DASHBOARD_PORT}/" >/dev/null 2>&1
+}
+
+_dashboard_start() {
+  if _dashboard_is_up; then
+    echo "✓ Dashboard already running on port $DASHBOARD_PORT" >&2
+    return 0
+  fi
+
+  echo "▶ Starting dashboard on port $DASHBOARD_PORT..." >&2
+  agent-browser dashboard start --port "$DASHBOARD_PORT" >/dev/null 2>&1
+  sleep 1
+
+  if _dashboard_is_up; then
+    echo "✓ Dashboard running at http://127.0.0.1:${DASHBOARD_PORT}" >&2
+  else
+    echo "✗ Dashboard failed to start" >&2
+    return 1
+  fi
+}
+
+_dashboard_stop() {
+  if [[ -f "$DASHBOARD_PIDFILE" ]]; then
+    local p; p="$(cat "$DASHBOARD_PIDFILE")"
+    if kill -0 "$p" 2>/dev/null; then
+      kill "$p" 2>/dev/null
+      echo "✓ Dashboard stopped (PID $p)" >&2
+    fi
+    rm -f "$DASHBOARD_PIDFILE"
+  else
+    # Try to find and kill by port
+    local pid
+    pid=$(lsof -ti :"$DASHBOARD_PORT" 2>/dev/null | head -1)
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null
+      echo "✓ Dashboard stopped (PID $pid)" >&2
+    else
+      echo "  Dashboard not running" >&2
+    fi
+  fi
+}
+
+_dashboard() {
+  case "${1:-}" in
+    start)   _dashboard_start ;;
+    stop)    _dashboard_stop ;;
+    restart) _dashboard_stop; sleep 1; _dashboard_start ;;
+    status)
+      if _dashboard_is_up; then
+        echo "Dashboard: ✓ http://127.0.0.1:${DASHBOARD_PORT}" >&2
+      else
+        echo "Dashboard: ✗ not running" >&2
+      fi
+      ;;
+    *)
+      echo "Usage: ab dashboard <start|stop|restart|status>" >&2
+      return 1
+      ;;
+  esac
+}
+
+# --- Seed: set app-level localStorage defaults ---
+_seed() {
+  _ensure_chrome || return 1
+  echo "▶ Seeding localStorage defaults..." >&2
+
+  # Set renderer=v4 on each origin
+  for origin in "${SEED_ORIGINS[@]}"; do
+    echo "  Setting terra:renderer=v4 on $origin" >&2
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$origin" 2>/dev/null
+    # Wait for page to be interactive enough for localStorage access
+    sleep 2
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" eval 'localStorage.setItem("terra:renderer", "v4"); "ok"' 2>/dev/null \
+      && echo "    ✓ Set" >&2 || echo "    ✗ Failed (page may need auth first)" >&2
+  done
+
+  # Return to blank page
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "about:blank" 2>/dev/null
+  echo "✓ Seeded" >&2
+}
+
+# --- Reauth: grab cookies from user's personal Chrome ---
+_reauth() {
+  _ensure_chrome || return 1
+  echo "▶ Grabbing auth from your personal Chrome..." >&2
+
+  local tmp_state="/tmp/ab-reauth-$$.json"
+
+  # Connect to user's personal Chrome and export state
+  # Use a separate session to avoid contaminating the default daemon
+  if ! agent-browser --auto-connect --session reauth-tmp state save "$tmp_state" 2>/dev/null; then
+    echo "✗ Could not connect to your personal Chrome." >&2
+    echo "  Make sure Chrome is running with at least one tab open." >&2
+    return 1
+  fi
+  # Kill the temporary daemon immediately so it doesn't intercept future --cdp commands
+  pgrep -f "agent-browser-d.*reauth-tmp" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
+  rm -f ~/.agent-browser/reauth-tmp.sock 2>/dev/null
+
+  local cookie_count
+  cookie_count=$(python3 -c "import json; d=json.load(open('$tmp_state')); print(len(d.get('cookies',[])))" 2>/dev/null || echo 0)
+  if [[ "$cookie_count" -eq 0 ]]; then
+    echo "✗ No cookies found in personal Chrome." >&2
+    rm -f "$tmp_state"
+    return 1
+  fi
+
+  # Load into managed Chrome
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" state load "$tmp_state" 2>/dev/null \
+    && echo "  ✓ Loaded $cookie_count cookies into managed Chrome" >&2 \
+    || { echo "  ✗ Failed to load cookies" >&2; rm -f "$tmp_state"; return 1; }
+
+  # Update the backup file too
+  cp "$tmp_state" "$AUTH_STATE" 2>/dev/null
+  rm -f "$tmp_state"
+
+  # Re-seed localStorage defaults
+  _seed
+
+  echo "✓ Reauth complete — grabbed cookies from personal Chrome" >&2
+}
+
+# --- Restore: load auth state backup into managed Chrome ---
+_restore_auth() {
+  if [[ ! -f "$AUTH_STATE" ]]; then
+    echo "  No auth backup at $AUTH_STATE — skipping restore" >&2
+    return 0
+  fi
+
+  # Check if the backup has actual content (not empty cookies)
+  local cookie_count
+  cookie_count=$(python3 -c "import json; d=json.load(open('$AUTH_STATE')); print(len(d.get('cookies',[])))" 2>/dev/null || echo 0)
+  if [[ "$cookie_count" -eq 0 ]]; then
+    echo "  Auth backup is empty — skipping restore" >&2
+    return 0
+  fi
+
+  echo "  Restoring auth from backup ($cookie_count cookies)..." >&2
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" state load "$AUTH_STATE" 2>/dev/null \
+    && echo "  ✓ Auth restored" >&2 || echo "  ✗ Auth restore failed" >&2
+}
+
+# --- Import: headed login + export auth backup ---
+_import() {
+  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
+    echo "✗ Cannot import inside sandbox — run 'ab import' from a terminal." >&2
+    return 1
+  fi
+
+  echo "▶ Import: starting headed Chrome for manual login..." >&2
+  echo "" >&2
+  echo "  A Chrome window will open. Log into Google/Clerk on:" >&2
+  echo "    1. http://localhost:5173 (local dev)" >&2
+  echo "    2. https://slack-feedback-staging.onrender.com (staging)" >&2
+  echo "    3. https://terra.clay.com (production)" >&2
+  echo "" >&2
+  echo "  Press Enter here when done logging in." >&2
+  echo "" >&2
+
+  # If Chrome is running headless, kill and restart headed
+  local was_running=0
+  if _cdp_is_up; then
+    was_running=1
+    echo "  Stopping headless Chrome first..." >&2
+    if [[ -f "$CHROME_PIDFILE" ]]; then
+      local p; p="$(cat "$CHROME_PIDFILE")"
+      kill "$p" 2>/dev/null; sleep 1
+      rm -f "$CHROME_PIDFILE"
+    fi
+    # Kill daemons too
+    pgrep "agent-browser-d" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
+    rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
+    sleep 1
+  fi
+
+  # Launch headed Chrome with same profile
+  "$CHROME_BIN" \
+    --remote-debugging-port="$CDP_PORT" \
+    --user-data-dir="$CHROME_PROFILE" \
+    --no-first-run --no-default-browser-check \
+    "http://localhost:5173/?renderer=v4" >/dev/null 2>&1 &
+  echo "$!" > "$CHROME_PIDFILE"
+
+  local tries=0
+  while ! _cdp_is_up && [[ $tries -lt 15 ]]; do sleep 1; tries=$((tries+1)); done
+  if ! _cdp_is_up; then
+    echo "✗ Chrome failed to start" >&2
+    return 1
+  fi
+
+  echo "  Chrome is open. Log in now, then press Enter..." >&2
+  read -r
+
+  # Export state as backup
+  echo "  Exporting auth state..." >&2
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" state save "$AUTH_STATE" 2>/dev/null \
+    && echo "  ✓ Auth backed up to $AUTH_STATE" >&2 || echo "  ✗ Auth backup failed" >&2
+
+  # Run seed to ensure localStorage defaults
+  _seed
+
+  # Restart headless
+  echo "  Restarting Chrome headless..." >&2
+  local p; p="$(cat "$CHROME_PIDFILE")"
+  kill "$p" 2>/dev/null; sleep 1
+  pgrep "agent-browser-d" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
+  rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock "$CHROME_PIDFILE"
+  sleep 1
+
+  HEADED=0
+  _ensure_chrome
+
+  echo "" >&2
+  echo "✓ Import complete. Auth persisted in profile + backed up to terra-auth.json" >&2
+  echo "  Managed Chrome is headless again and ready for automation." >&2
+}
+
+# --- Heal: kill managed Chrome + daemons, start fresh ---
+_heal() {
+  echo "▶ Healing..." >&2
+
+  # Kill daemons
   if pgrep -q "agent-browser-d" 2>/dev/null; then
     pgrep "agent-browser-d" | while read -r pid; do
       kill "$pid" 2>/dev/null && echo "  Killed daemon (PID $pid)" >&2 || true
@@ -149,206 +368,166 @@ _kill_daemons() {
     sleep 1
   fi
   rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
-}
 
-# --- Launch Chrome with CDP debug port ---
-_launch_chrome() {
-  if _cdp_is_up; then
-    echo "✓ Chrome already listening on CDP port $CDP_PORT" >&2
-    return 0
-  fi
+  # Clean tab files
+  rm -f /tmp/ab-tab-* 2>/dev/null || true
 
-  echo "▶ Launching Chrome with --remote-debugging-port=$CDP_PORT..." >&2
-
-  # Launch Chrome in background with debug port
-  "$CHROME_BIN" \
-    --remote-debugging-port="$CDP_PORT" \
-    --user-data-dir="$CHROME_PROFILE" \
-    --no-first-run \
-    --no-default-browser-check \
-    --disable-background-networking \
-    --disable-backgrounding-occluded-windows \
-    --disable-component-update \
-    --disable-domain-reliability \
-    --disable-sync \
-    --metrics-recording-only \
-    --disable-machine-learning-model-loader \
-    --disable-client-side-phishing-detection \
-    --safebrowsing-disable-auto-update \
-    "about:blank" >/dev/null 2>&1 &
-
-  local chrome_pid=$!
-  echo "$chrome_pid" > "$CHROME_PIDFILE"
-
-  # Wait for CDP to come up
-  local tries=0
-  while ! _cdp_is_up && [[ $tries -lt 15 ]]; do
-    sleep 1
-    tries=$((tries + 1))
-  done
-
-  if _cdp_is_up; then
-    echo "✓ Chrome launched (PID $chrome_pid, CDP port $CDP_PORT)" >&2
-    return 0
-  else
-    echo "✗ Chrome launched but CDP port not responding after ${tries}s" >&2
-    return 1
-  fi
-}
-
-# --- Connect agent-browser daemon to Chrome via CDP ---
-_connect_cdp() {
-  # Kill any stale daemon first — it might be connected to nothing
-  _kill_daemons
-
-  echo "▶ Connecting agent-browser to CDP port $CDP_PORT..." >&2
-
-  # Use AGENT_BROWSER_AUTO_CONNECT= to prevent conflict with --cdp
-  if AGENT_BROWSER_AUTO_CONNECT= _timeout "$HEALTH_TIMEOUT" agent-browser --cdp "$CDP_PORT" get url >/dev/null 2>&1; then
-    echo "✓ Connected to Chrome via CDP" >&2
-    return 0
-  fi
-
-  echo "✗ Failed to connect agent-browser to CDP port $CDP_PORT" >&2
-  return 1
-}
-
-# --- Ensure browser is connected and ready ---
-ensure_browser() {
-  # 1. Already healthy? Done.
-  if _daemon_is_healthy; then
-    return 0
-  fi
-
-  # 2. Inside sandbox — can't launch Chrome, fail fast
-  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
-    # Try connecting to existing CDP port first (Chrome may be running)
-    if _cdp_is_up; then
-      _connect_cdp && return 0
-    fi
-    echo "✗ Browser not responding (session: $BASE_SESSION)." >&2
-    echo "  The daemon should have been started before entering the sandbox." >&2
-    echo "  Run 'ab heal' from a terminal outside this session, then retry." >&2
-    return 1
-  fi
-
-  # 3. Outside sandbox — ensure Chrome is running with CDP, then connect
-  _launch_chrome || return 1
-  _connect_cdp || return 1
-}
-
-# --- Heal: kill everything, relaunch, reconnect ---
-do_heal() {
-  echo "▶ Healing browser setup..." >&2
-
-  # Kill daemons
-  _kill_daemons
-  echo "✓ Cleaned daemon state" >&2
-
-  # Kill our managed Chrome (NOT user's personal Chrome)
+  # Kill managed Chrome
   if [[ -f "$CHROME_PIDFILE" ]]; then
-    local chrome_pid
-    chrome_pid="$(cat "$CHROME_PIDFILE")"
-    if kill -0 "$chrome_pid" 2>/dev/null; then
-      kill "$chrome_pid" 2>/dev/null
-      echo "  Killed managed Chrome (PID $chrome_pid)" >&2
-      sleep 1
-    fi
+    local p; p="$(cat "$CHROME_PIDFILE")"
+    kill -0 "$p" 2>/dev/null && { kill "$p" 2>/dev/null; echo "  Killed Chrome (PID $p)" >&2; sleep 1; }
     rm -f "$CHROME_PIDFILE"
   fi
 
-  # If inside sandbox, stop here
-  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
-    echo "✗ Inside sandbox — run 'ab heal' from an external terminal." >&2
-    return 1
+  [[ -n "${CCO_SESSION_ID:-}" ]] && { echo "✗ Inside sandbox — run 'ab heal' from a terminal." >&2; return 1; }
+
+  local reset_profile=0
+  if [[ "${1:-}" == "--reset-profile" ]]; then
+    reset_profile=1
+    echo "  Resetting profile..." >&2
+    if [[ -d "$CHROME_PROFILE" ]]; then
+      mv "$CHROME_PROFILE" "${CHROME_PROFILE}-backup-$(date +%s)" 2>/dev/null || true
+    fi
   fi
 
-  # Launch fresh Chrome and connect
-  _launch_chrome || return 1
-  _connect_cdp || return 1
-  echo "✓ Healed and reconnected" >&2
+  _ensure_chrome
+
+  # After heal, restore auth backup if profile was reset
+  if [[ "$reset_profile" -eq 1 ]]; then
+    _restore_auth
+    _seed
+  fi
+
+  echo "✓ Healed" >&2
 }
 
 # --- Status ---
-do_status() {
-  echo "Session: $BASE_SESSION"
-
-  # Daemon processes
-  local daemon_count
-  daemon_count=$(pgrep -c "agent-browser-d" 2>/dev/null || echo 0)
-  echo "Daemons: $daemon_count running"
-
-  # CDP port
-  if _cdp_is_up; then
-    echo "CDP port $CDP_PORT: ✓ listening"
-  else
-    echo "CDP port $CDP_PORT: ✗ not listening"
-  fi
-
-  # Managed Chrome PID
+_status() {
+  _cdp_is_up && echo "CDP: ✓ port $CDP_PORT" || echo "CDP: ✗ port $CDP_PORT"
+  [[ "$HEADED" == "1" ]] && echo "Mode: headed" || echo "Mode: headless"
+  [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]] && echo "Context: $AB_SUBAGENT_SESSION_ID → $(_tab_file)" || echo "Context: (none)"
+  local dc; dc=$(pgrep -c "agent-browser-d" 2>/dev/null || echo 0); echo "Daemons: $dc"
   if [[ -f "$CHROME_PIDFILE" ]]; then
-    local chrome_pid
-    chrome_pid="$(cat "$CHROME_PIDFILE")"
-    if kill -0 "$chrome_pid" 2>/dev/null; then
-      echo "Managed Chrome: PID $chrome_pid (alive)"
-    else
-      echo "Managed Chrome: PID $chrome_pid (dead)"
-    fi
-  else
-    echo "Managed Chrome: none tracked"
+    local p; p="$(cat "$CHROME_PIDFILE")"
+    kill -0 "$p" 2>/dev/null && echo "Chrome: PID $p" || echo "Chrome: PID $p (dead)"
   fi
-
-  # Health
-  if _daemon_is_healthy; then
-    local url
-    url=$(_timeout "$HEALTH_TIMEOUT" agent-browser get url 2>/dev/null || echo "unknown")
-    echo "Health: ✓ connected"
-    echo "URL: $url"
-  else
-    echo "Health: ✗ not responding"
-  fi
+  _dashboard_is_up && echo "Dashboard: ✓ http://127.0.0.1:${DASHBOARD_PORT}" || echo "Dashboard: ✗ not running"
+  echo "Sessions:"
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" session list 2>/dev/null || echo "  (cannot list)"
 }
 
-# --- Main dispatch ---
-CMD="${1:-}"
+# --- Strip --session-name and parse --headed from args ---
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --session-name|--session) shift 2 ;;
+    --headed) HEADED=1; shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${ARGS[@]}"
 
-case "$CMD" in
-  ensure)
-    ensure_browser
+# --- Warn if no AB_SUBAGENT_SESSION_ID (fragile without tab isolation) ---
+if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" && "${1:-}" != "heal" && "${1:-}" != "status" && "${1:-}" != "ensure" && "${1:-}" != "" ]]; then
+  echo "⚠ No AB_SUBAGENT_SESSION_ID set — tab isolation disabled. Set AB_SUBAGENT_SESSION_ID for parallel safety." >&2
+fi
+
+# --- Main dispatch ---
+case "${1:-}" in
+  # --- Lifecycle ---
+  heal)      _heal "${2:-}" ;;
+  status)    _status ;;
+  ensure)    _ensure_chrome ;;
+  import)    _import ;;
+  reauth)    _reauth ;;
+  seed)      _seed ;;
+  dashboard) _dashboard "${2:-}" ;;
+
+  # --- Navigation (navigate/goto aliased to open) ---
+  open|navigate|goto)
+    _ensure_chrome
+    _open_with_context "${2:-about:blank}"
     ;;
-  heal)
-    do_heal
+
+  # --- Recording (auth-safe start→restart workaround) ---
+  record)
+    _ensure_chrome
+    _switch_to_context_tab
+    case "${2:-}" in
+      start)
+        [[ -z "${3:-}" ]] && { echo "Usage: ab record start <output.webm>" >&2; exit 1; }
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" record start /dev/null 2>/dev/null
+        sleep 0.5
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" record restart "$3"
+        ;;
+      stop)
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" record stop
+        ;;
+      *)
+        echo "Usage: ab record <start|stop> [output.webm]" >&2
+        exit 1
+        ;;
+    esac
     ;;
-  status)
-    do_status
+
+  # --- Allowed agent-browser passthroughs (all switch to context tab first) ---
+  snapshot|screenshot|click|fill|type|select|check|press|scroll|\
+  find|get|wait|eval|highlight|pdf|diff|set|keyboard|frame)
+    _ensure_chrome
+    _switch_to_context_tab
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "$@"
+    rc=$?
+    [[ $rc -ne 0 ]] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL($rc) $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
+    exit $rc
     ;;
-  open)
-    ensure_browser
-    SESSION="$(_ab_browsing_session "$BASE_SESSION")"
-    if [[ -n "${2:-}" ]]; then
-      if [[ -n "${AB_CONTEXT:-}" ]]; then
-        _claim_tab "$2"
-      else
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" --session-name "$SESSION" open "$2"
-      fi
-    fi
-    ;;
+
+  # --- Usage / unknown ---
   "")
     echo "Usage: ab <command> [args...]" >&2
     echo "" >&2
-    echo "Commands:" >&2
-    echo "  open <url>       Open URL (ensures Chrome + CDP connection)" >&2
-    echo "  screenshot <p>   Take screenshot" >&2
-    echo "  eval \"js\"        Run JavaScript in page" >&2
-    echo "  ensure           Ensure browser is connected (no navigation)" >&2
-    echo "  heal             Kill daemons, relaunch Chrome, reconnect" >&2
-    echo "  status           Show daemon/session/CDP health" >&2
-    echo "  <any cmd>        Pass through to agent-browser" >&2
+    echo "Navigation:" >&2
+    echo "  open <url>          Navigate (creates tab for AB_SUBAGENT_SESSION_ID)" >&2
+    echo "" >&2
+    echo "Interaction:" >&2
+    echo "  snapshot -i         Discover interactive elements (get @refs)" >&2
+    echo "  click @ref          Click element" >&2
+    echo "  fill @ref \"text\"    Clear and type text" >&2
+    echo "  type @ref \"text\"    Type without clearing" >&2
+    echo "  select @ref \"opt\"   Select dropdown option" >&2
+    echo "  check @ref          Check checkbox" >&2
+    echo "  press Enter         Press key" >&2
+    echo "  scroll down 500     Scroll page" >&2
+    echo "  find text \"X\" click Semantic click by text" >&2
+    echo "  keyboard type \"X\"   Type at current focus" >&2
+    echo "" >&2
+    echo "Inspection:" >&2
+    echo "  screenshot          Screenshot to /tmp/agent-browser/" >&2
+    echo "  get text @ref       Get element text" >&2
+    echo "  get url             Get current URL" >&2
+    echo "  eval 'js'           Run JavaScript (localStorage, computed values only)" >&2
+    echo "  wait --load networkidle  Wait for page load" >&2
+    echo "  diff snapshot       Compare current vs last snapshot" >&2
+    echo "  highlight @ref      Highlight element visually" >&2
+    echo "" >&2
+    echo "Recording:" >&2
+    echo "  record start <file> Record video of active tab (auth-safe)" >&2
+    echo "  record stop         Stop recording" >&2
+    echo "" >&2
+    echo "Auth & Lifecycle:" >&2
+    echo "  reauth              Grab cookies from personal Chrome" >&2
+    echo "  import              Headed login (manual Google/Clerk auth)" >&2
+    echo "  heal                Kill everything, restart fresh" >&2
+    echo "  status              Show health" >&2
+    echo "  dashboard <cmd>     Dashboard management" >&2
+    echo "" >&2
+    echo "Env: AB_SUBAGENT_SESSION_ID=name (tab isolation), AB_HEADED=1 (headed mode)" >&2
     exit 1
     ;;
   *)
-    _switch_to_tab
-    SESSION="$(_ab_browsing_session "$BASE_SESSION")"
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" --session-name "$SESSION" "$@"
+    echo "✗ Unknown command: $1" >&2
+    echo "  Run 'ab' with no arguments to see available commands." >&2
+    # Log for alias evolution — review with: sort ~/.agent-browser/unknown-commands.log | uniq -c | sort -rn
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$HOME/.agent-browser/unknown-commands.log" 2>/dev/null
+    exit 1
     ;;
 esac
