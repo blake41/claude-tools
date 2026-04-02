@@ -98,9 +98,19 @@ cmd_deploys() {
 }
 
 cmd_env() {
-    local service_id="${1:-}"
+    local service_id=""
+    local reveal=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --reveal) reveal=true; shift ;;
+            -*) json_error "$TOOL_NAME env" "Unknown flag: $1" "BAD_ARG" "Usage: render-services env <service-id> [--reveal]" ;;
+            *) service_id="$1"; shift ;;
+        esac
+    done
+
     if [[ -z "$service_id" ]]; then
-        json_error "$TOOL_NAME env" "Service ID required" "MISSING_ARG" "Usage: render-services env <service-id>"
+        json_error "$TOOL_NAME env" "Service ID required" "MISSING_ARG" "Usage: render-services env <service-id> [--reveal]"
     fi
 
     load_api_key || json_error "$TOOL_NAME env" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
@@ -108,11 +118,17 @@ cmd_env() {
     local raw
     raw=$(render_api "/services/$service_id/env-vars")
 
-    # Mask secret values (show first 4 chars + ...)
     local env_vars
-    env_vars=$(echo "$raw" | jq '[.[] | .envVar | {
-        key, value: (if .value then (.value[:4] + "...") else "(secret)" end)
-    }]')
+    if [[ "$reveal" == true ]]; then
+        env_vars=$(echo "$raw" | jq '[.[] | .envVar | {
+            key, value: (.value // "(secret)")
+        }]')
+    else
+        # Mask secret values (show first 4 chars + ...)
+        env_vars=$(echo "$raw" | jq '[.[] | .envVar | {
+            key, value: (if .value then (.value[:4] + "...") else "(secret)" end)
+        }]')
+    fi
 
     local na
     na=$(next_actions \
@@ -484,10 +500,21 @@ cmd_env_group_delete() {
 }
 
 cmd_env_group_env() {
-    local group_id="${1:-}"
+    local group_id=""
+    local reveal=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --reveal) reveal=true; shift ;;
+            -*) json_error "$TOOL_NAME env-group-env" "Unknown flag: $1" "BAD_ARG" \
+                "Usage: render-services env-group-env <env-group-id> [--reveal]" ;;
+            *) group_id="$1"; shift ;;
+        esac
+    done
+
     if [[ -z "$group_id" ]]; then
         json_error "$TOOL_NAME env-group-env" "Env group ID required" "MISSING_ARG" \
-            "Usage: render-services env-group-env <env-group-id>"
+            "Usage: render-services env-group-env <env-group-id> [--reveal]"
     fi
 
     load_api_key || json_error "$TOOL_NAME env-group-env" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
@@ -496,7 +523,11 @@ cmd_env_group_env() {
     raw=$(render_api "/env-groups/$group_id")
 
     local env_vars
-    env_vars=$(echo "$raw" | jq '[.envVars[] | {key, value: (if .value then (.value[:4] + "...") else "(secret)" end)}]')
+    if [[ "$reveal" == true ]]; then
+        env_vars=$(echo "$raw" | jq '[.envVars[] | {key, value: (.value // "(secret)")}]')
+    else
+        env_vars=$(echo "$raw" | jq '[.envVars[] | {key, value: (if .value then (.value[:4] + "...") else "(secret)" end)}]')
+    fi
 
     local na
     na=$(next_actions \
@@ -600,7 +631,7 @@ case "${1:-}" in
         cmd_custom_domains "${2:-}"
         ;;
     env)
-        cmd_env "${2:-}"
+        shift; cmd_env "$@"
         ;;
     env-set)
         shift; cmd_env_set "$@"
@@ -612,7 +643,7 @@ case "${1:-}" in
         cmd_env_group_delete "${2:-}"
         ;;
     env-group-env)
-        cmd_env_group_env "${2:-}"
+        shift; cmd_env_group_env "$@"
         ;;
     env-group-set)
         shift; cmd_env_group_set "$@"
@@ -635,7 +666,7 @@ case "${1:-}" in
             {name: "instances", description: "List running instances", usage: "render-services instances <service-id>"},
             {name: "rollback", description: "Rollback to a previous deploy", usage: "render-services rollback <service-id> <deploy-id>"},
             {name: "custom-domains", description: "List custom domains", usage: "render-services custom-domains <service-id>"},
-            {name: "env", description: "List environment variables (masked)", usage: "render-services env <service-id>"},
+            {name: "env", description: "List environment variables (masked, use --reveal for full values)", usage: "render-services env <service-id> [--reveal]"},
             {name: "env-set", description: "Set an environment variable", usage: "render-services env-set <service-id> <KEY> <VALUE>"},
             {name: "env-group-create", description: "Create an env group", usage: "render-services env-group-create <name>"},
             {name: "env-group-delete", description: "Delete an env group", usage: "render-services env-group-delete <env-group-id>"},
