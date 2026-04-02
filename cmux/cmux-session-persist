@@ -1,0 +1,59 @@
+#!/bin/bash
+# Persist Claude session → cmux workspace/surface mapping on SessionStart
+# Uses CMUX_SESSION_KEY_HASH (set by cco-permissions from the pre-Claude surface name)
+# Falls back to computing the key from cmux identify (works for non-cco sessions)
+
+MAPPING_DIR="$HOME/.cmux/claude-sessions"
+LOG="$HOME/.cmux/session-persist.log"
+mkdir -p "$MAPPING_DIR" 2>/dev/null
+
+log() { echo "$(date '+%H:%M:%S') $1" >> "$LOG" 2>/dev/null; }
+
+log "INVOKED pid=$$ ppid=$PPID"
+
+# Must be inside cmux
+if [ -z "$CMUX_SURFACE_ID" ]; then log "SKIP: no CMUX_SURFACE_ID"; exit 0; fi
+
+# Read session_id from stdin JSON (Claude Code sends this on SessionStart)
+SESSION_ID=""
+if read -t 2 INPUT 2>/dev/null && [ -n "$INPUT" ]; then
+  SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
+  log "stdin: session_id=$SESSION_ID"
+else
+  log "stdin: empty or timed out"
+fi
+
+# Fallback for session ID: read from session file by PPID
+if [ -z "$SESSION_ID" ]; then
+  SESSION_FILE="$HOME/.claude/sessions/$PPID.json"
+  if [ -f "$SESSION_FILE" ]; then
+    SESSION_ID=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['sessionId'])" 2>/dev/null)
+    log "fallback PPID=$PPID -> session_id=$SESSION_ID"
+  fi
+fi
+
+[ -z "$SESSION_ID" ] && { log "FAIL: no session_id found"; exit 0; }
+
+# Use pre-computed hash from cco-permissions (preferred — uses pre-Claude surface name)
+KEY_HASH="${CMUX_SESSION_KEY_HASH:-}"
+
+# Fallback: compute from cmux identify (for non-cco sessions like bare `claude`)
+if [ -z "$KEY_HASH" ] && command -v cmux >/dev/null 2>&1; then
+  IDENTIFY=$(cmux identify 2>/dev/null) || true
+  if [ -n "$IDENTIFY" ]; then
+    WORKSPACE_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
+    SURFACE_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
+    WORKSPACE_NAME=$(cmux list-workspaces 2>/dev/null | grep "$WORKSPACE_REF " | sed "s/^[* ]*$WORKSPACE_REF  //" | sed 's/  \[selected\]//')
+    SURFACE_NAME=$(cmux list-pane-surfaces 2>/dev/null | grep "$SURFACE_REF " | sed "s/^[* ]*$SURFACE_REF  //" | sed 's/  \[selected\]//')
+    if [ -n "$WORKSPACE_NAME" ] && [ -n "$SURFACE_NAME" ]; then
+      KEY="${WORKSPACE_NAME}/${SURFACE_NAME}"
+      KEY_HASH=$(echo -n "$KEY" | shasum -a 256 | cut -c1-16)
+      log "computed key: $KEY (hash=$KEY_HASH)"
+    fi
+  fi
+fi
+
+[ -z "$KEY_HASH" ] && { log "FAIL: no key hash"; exit 0; }
+
+echo "$SESSION_ID" > "$MAPPING_DIR/$KEY_HASH"
+log "OK: hash=$KEY_HASH -> $SESSION_ID"
