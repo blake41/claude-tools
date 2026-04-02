@@ -45,11 +45,8 @@ _cdp_is_up() {
 _ensure_chrome() {
   _cdp_is_up && return 0
 
-  # Inside sandbox — can't launch Chrome
-  if [[ -n "${CCO_SESSION_ID:-}" ]]; then
-    echo "✗ Chrome not running. Run 'ab heal' from a terminal outside this session." >&2
-    return 1
-  fi
+  # Note: Chrome launches fine inside Seatbelt sandbox as long as
+  # ~/.agent-browser, ~/Library/Caches, ~/Library/Application Support, and /tmp are writable
 
   local headless_flag=""
   if [[ "$HEADED" == "0" ]]; then
@@ -95,6 +92,8 @@ _create_new_tab() {
   idx=$(AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab list --json 2>/dev/null \
     | python3 -c "import json,sys; tabs=json.load(sys.stdin)['data']['tabs']; print(next(t['index'] for t in tabs if t['active']))" 2>/dev/null)
   [[ -n "$idx" ]] && echo "$idx" > "$tf"
+  # Set viewport to match a typical laptop display (retina)
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" set viewport 1440 900 2 >/dev/null 2>&1
   AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
 }
 
@@ -379,7 +378,7 @@ _heal() {
     rm -f "$CHROME_PIDFILE"
   fi
 
-  [[ -n "${CCO_SESSION_ID:-}" ]] && { echo "✗ Inside sandbox — run 'ab heal' from a terminal." >&2; return 1; }
+  # Note: heal works inside Seatbelt sandbox — Chrome can relaunch with allowlisted write paths
 
   local reset_profile=0
   if [[ "${1:-}" == "--reset-profile" ]]; then
@@ -441,6 +440,17 @@ case "${1:-}" in
   import)    _import ;;
   reauth)    _reauth ;;
   seed)      _seed ;;
+  seed-url)
+    [[ -z "${2:-}" ]] && { echo "Usage: ab seed-url <url>" >&2; exit 1; }
+    _ensure_chrome || exit 1
+    echo "▶ Seeding localStorage on $2..." >&2
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$2" 2>/dev/null
+    sleep 2
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" eval 'localStorage.setItem("terra:renderer", "v4"); "ok"' 2>/dev/null \
+      && echo "  ✓ Set terra:renderer=v4" >&2 || echo "  ✗ Failed (page may need auth first)" >&2
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "about:blank" 2>/dev/null
+    echo "✓ Seeded $2" >&2
+    ;;
   dashboard) _dashboard "${2:-}" ;;
 
   # --- Navigation (navigate/goto aliased to open) ---
@@ -449,19 +459,20 @@ case "${1:-}" in
     _open_with_context "${2:-about:blank}"
     ;;
 
-  # --- Recording (auth-safe start→restart workaround) ---
+  # --- Recording (auth-safe: records the active tab directly) ---
+  # Uses agent-browser's "video" command which records the existing authenticated
+  # tab via Page.captureScreenshot at 10fps. Unlike "record", it does NOT create
+  # a fresh browser context, so localStorage/sessionStorage auth is preserved.
   record)
     _ensure_chrome
     _switch_to_context_tab
     case "${2:-}" in
       start)
         [[ -z "${3:-}" ]] && { echo "Usage: ab record start <output.webm>" >&2; exit 1; }
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" record start /dev/null 2>/dev/null
-        sleep 0.5
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" record restart "$3"
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" video start "$3"
         ;;
       stop)
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" record stop
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" video stop
         ;;
       *)
         echo "Usage: ab record <start|stop> [output.webm]" >&2
@@ -516,6 +527,7 @@ case "${1:-}" in
     echo "Auth & Lifecycle:" >&2
     echo "  reauth              Grab cookies from personal Chrome" >&2
     echo "  import              Headed login (manual Google/Clerk auth)" >&2
+    echo "  seed-url <url>      Seed localStorage on a single origin" >&2
     echo "  heal                Kill everything, restart fresh" >&2
     echo "  status              Show health" >&2
     echo "  dashboard <cmd>     Dashboard management" >&2

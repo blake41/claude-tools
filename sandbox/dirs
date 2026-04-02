@@ -1,0 +1,38 @@
+# Claude Code sandbox allowlist
+# Paths Claude can write to. Everything else is read-only at the kernel level.
+# Suffix :ro for read-only access (can read but not modify)
+# WARNING: Do not add ~ or ~/* — that defeats the entire sandbox.
+# NOTE: This file lives in tools/sandbox/ which is :ro — Claude can't edit it
+
+# === Project code ===
+~/Documents/Development/
+
+# === Runtime / temp ===
+/tmp
+/tmp/bun-db-safe
+
+# === Package managers & caches ===
+~/.bun
+~/.bun/install/cache/
+~/.cache/prisma
+
+# === Dev tool state (needs read-write) ===
+~/.pm2
+~/.cmux
+~/.portless
+~/.agent-browser
+~/.chrome-dev-profiles
+~/.oracle
+~/.codex
+~/.local/state/interview/
+~/.config/interview/
+
+# === Cloud / API credentials (needs read-write for token refresh) ===
+~/.sf
+~/.sfdx
+~/.infisical
+~/infisical-keyring/
+
+# === Read-only (Claude can see but not modify) ===
+~/Library/Preferences:ro
+~/Documents/Development/tools/sandbox:ro

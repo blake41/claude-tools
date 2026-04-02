@@ -8,6 +8,7 @@ Central location for reusable CLI tools and documentation.
 tools/
 ├── cli-over-mcp.md       # Pattern: replacing MCP with CLI scripts
 ├── render-config.md      # Render CLI setup docs
+├── sandbox/              # Seatbelt/bwrap sandbox for Claude Code
 ├── browser/              # Browser debugging via Chrome DevTools Protocol
 ├── render/               # Render CLI scripts (reference copy)
 ├── cloudflare/           # Cloudflare CLI scripts (reference copy)
@@ -23,6 +24,8 @@ tools/
 
 | Component | Location |
 |-----------|----------|
+| Sandbox | `~/.local/bin/claude-sandbox` |
+| Sandbox config | `tools/sandbox/dirs` (write allowlist, self-protected via `:ro`) |
 | Browser scripts | `~/.local/bin/browser-*` |
 | Browser config | No config needed (uses Chrome profile) |
 | Render scripts | `~/.local/bin/render-*` |

@@ -1,0 +1,34 @@
+#!/bin/bash
+# sandbox-request: Request sandbox expansion from inside a sandboxed Claude session
+# Writes a request to /tmp that the cco-permissions wrapper reads on exit.
+# Usage: sandbox-request <path> [--ro]
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: sandbox-request <path> [--ro]" >&2
+    echo "Request write (or read-only) access to a path outside the sandbox." >&2
+    echo "After running this, type /exit in Claude. The session will restart with the new path." >&2
+    exit 1
+fi
+
+PATH_REQUEST="$1"
+MODE="${2:---rw}"
+
+# Expand ~ to $HOME
+PATH_REQUEST="${PATH_REQUEST/#\~/$HOME}"
+
+# Resolve to absolute path
+if [[ -d "$PATH_REQUEST" ]]; then
+    PATH_REQUEST="$(cd "$PATH_REQUEST" && pwd -P)"
+elif [[ -d "$(dirname "$PATH_REQUEST")" ]]; then
+    PATH_REQUEST="$(cd "$(dirname "$PATH_REQUEST")" && pwd -P)/$(basename "$PATH_REQUEST")"
+fi
+
+REQUEST_FILE="/tmp/sandbox-expand-request-${CCO_SESSION_ID:-unknown}"
+
+# Append (multiple requests can queue up before /exit)
+echo "${MODE} ${PATH_REQUEST}" >> "$REQUEST_FILE"
+
+echo "Queued sandbox expansion: ${PATH_REQUEST} (${MODE})"
+echo "Type /exit to restart the session with the new path."
