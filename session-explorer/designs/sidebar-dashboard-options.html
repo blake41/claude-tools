@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sidebar + Dashboard — Design Options</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          bg: '#0d1117',
+          'bg-card': '#161b22',
+          'bg-sidebar': '#1a1a2e',
+          border: '#30363d',
+          text: '#e6edf3',
+          'text-secondary': '#8b949e',
+          'text-dim': '#6e7681',
+          'accent-blue': '#58a6ff',
+          'accent-green': '#3fb950',
+          'accent-purple': '#bc8cff',
+          'accent-orange': '#d29922',
+          'accent-red': '#f85149',
+          'accent-yellow': '#d29922',
+        }
+      }
+    }
+  }
+  </script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background: #0a0a0a; margin: 0; font-family: system-ui, -apple-system, sans-serif; }
+    .options-grid { display: grid; grid-template-columns: 1fr; gap: 32px; max-width: 1200px; margin: 0 auto; padding: 40px 24px; }
+    @media (min-width: 900px) { .options-grid { grid-template-columns: 1fr 1fr; } }
+    .option-card { background: #111; border: 1px solid #222; border-radius: 12px; overflow: hidden; }
+    .option-header { padding: 16px 20px; border-bottom: 1px solid #222; }
+    .option-header h3 { color: #e6edf3; font-size: 15px; font-weight: 600; margin: 0 0 4px; }
+    .option-header p { color: #8b949e; font-size: 12px; margin: 0; line-height: 1.5; }
+    .option-demo { height: 520px; overflow: hidden; }
+    .page-title { color: #e6edf3; font-size: 28px; font-weight: 700; text-align: center; padding: 40px 0 0; }
+    .page-sub { color: #8b949e; font-size: 14px; text-align: center; padding: 8px 0 16px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    /* ── Shared mock data ─────────────────────────────────── */
+    const starred = [
+      { name: "clay/terra", sessions: 289, date: "Today" },
+      { name: "clay/keystone", sessions: 3, date: "4d ago" },
+    ];
+    const more = [
+      { name: "tools/session-explorer", sessions: 42, date: "2d ago" },
+      { name: "tools/db-safe", sessions: 18, date: "1w ago" },
+      { name: "personal/blog", sessions: 7, date: "2w ago" },
+    ];
+    const tags = [
+      { name: "auth-rewrite", color: "#58a6ff", count: 12 },
+      { name: "performance", color: "#3fb950", count: 8 },
+      { name: "bug-fixes", color: "#f85149", count: 23 },
+    ];
+    const recentSessions = [
+      { title: "Fix email classification logic", workspace: "clay/terra", time: "2h ago", msgs: 34 },
+      { title: "Add webhook retry backoff", workspace: "clay/terra", time: "5h ago", msgs: 18 },
+      { title: "Refactor ingest pipeline", workspace: "tools/session-explorer", time: "Yesterday", msgs: 52 },
+      { title: "Debug Keystone proxy timeout", workspace: "clay/keystone", time: "2d ago", msgs: 27 },
+      { title: "Update Tailwind to v4", workspace: "clay/terra", time: "3d ago", msgs: 15 },
+      { title: "Session search FTS fixes", workspace: "tools/session-explorer", time: "4d ago", msgs: 41 },
+    ];
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 1 — Linear: Quiet sidebar + recent activity feed
+       ═══════════════════════════════════════════════════════ */
+    function Option1_Linear() {
+      const [expanded, setExpanded] = useState(false);
+      return (
+        <div className="flex h-full">
+          <aside className="w-[220px] min-w-[220px] bg-bg-sidebar border-r border-border flex flex-col">
+            <div className="px-3 pt-4 pb-1">
+              <div className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                <div className="w-5 h-5 rounded bg-accent-blue/20 flex items-center justify-center text-accent-blue text-[10px] font-bold">S</div>
+                <span className="text-[13px] font-medium text-text flex-1">Sessions</span>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="text-text-dim"><circle cx="6" cy="6" r="5" stroke="currentColor" strokeWidth="1.2"/><line x1="4" y1="6" x2="8" y2="6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/><line x1="6" y1="4" x2="6" y2="8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+              </div>
+            </div>
+            <div className="px-3 pb-2">
+              <div className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-white/5 text-text-secondary text-[12px] cursor-pointer">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                <span className="flex-1">Search...</span>
+                <span className="text-[10px] text-text-dim font-mono">⌘K</span>
+              </div>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-3">
+              <div className="px-2 pt-1 pb-1 text-[10px] font-semibold uppercase tracking-widest text-text-dim">Starred</div>
+              {starred.map((w, i) => (
+                <div key={i} className="group flex items-center px-2 py-1.5 rounded-md hover:bg-white/6 cursor-pointer transition-colors">
+                  <span className="text-[13px] text-text flex-1 truncate">{w.name}</span>
+                  <span className="text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity">{w.sessions}</span>
+                </div>
+              ))}
+              <div className="mt-2">
+                <button onClick={() => setExpanded(!expanded)} className="flex items-center gap-1 px-2 py-1 text-[11px] text-text-dim hover:text-text-secondary transition-colors">
+                  <svg width="8" height="8" viewBox="0 0 8 8" fill="none" className={`transition-transform ${expanded ? "rotate-90" : ""}`}><path d="M2 1l4 3-4 3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+                  131 more
+                </button>
+                {expanded && more.map((w, i) => (
+                  <div key={i} className="group flex items-center px-2 py-1.5 rounded-md hover:bg-white/6 cursor-pointer transition-colors">
+                    <span className="text-[13px] text-text-secondary flex-1 truncate">{w.name}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 px-2 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-widest text-text-dim">Tags</div>
+              {tags.map((t, i) => (
+                <div key={i} className="flex items-center gap-2 px-2 py-1 rounded-md hover:bg-white/6 cursor-pointer transition-colors">
+                  <span className="w-1.5 h-1.5 rounded-full" style={{background: t.color}}/>
+                  <span className="text-[12px] text-text-secondary flex-1 truncate">{t.name}</span>
+                </div>
+              ))}
+            </nav>
+          </aside>
+          <main className="flex-1 bg-bg p-8 overflow-y-auto">
+            <div className="max-w-[640px]">
+              <div className="text-[11px] text-text-dim mb-1">133 workspaces &middot; 1,468 sessions</div>
+              <h1 className="text-[22px] font-semibold text-text tracking-tight">Good evening</h1>
+              <p className="text-[13px] text-text-secondary mt-1">Pick up where you left off</p>
+              <div className="mt-6 space-y-1">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-white/4 cursor-pointer transition-colors group">
+                    <div className="w-1 h-1 rounded-full bg-accent-blue/60 shrink-0"/>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] text-text truncate">{s.title}</div>
+                      <div className="text-[11px] text-text-dim">{s.workspace}</div>
+                    </div>
+                    <div className="text-[11px] text-text-dim shrink-0">{s.time}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 2 — Vercel: Minimal sidebar + stat sparklines
+       ═══════════════════════════════════════════════════════ */
+    function Option2_Vercel() {
+      return (
+        <div className="flex h-full">
+          <aside className="w-[200px] min-w-[200px] bg-[#0d0d0d] border-r border-[#1a1a1a] flex flex-col">
+            <div className="px-3 pt-4 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-6 h-6 rounded-full bg-gradient-to-br from-accent-blue to-accent-purple"/>
+                <span className="text-[13px] font-semibold text-text">Sessions</span>
+              </div>
+            </div>
+            <nav className="flex-1 px-2 overflow-y-auto">
+              {starred.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <div className="w-1.5 h-1.5 rounded-full bg-accent-green"/>
+                  <span className="text-[12px] text-text flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+              <div className="h-px bg-white/5 my-2 mx-2"/>
+              {more.slice(0,2).map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <span className="text-[12px] text-text-secondary flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+              <div className="px-2.5 py-1.5 text-[11px] text-text-dim hover:text-text-secondary cursor-pointer">View all...</div>
+            </nav>
+            <div className="px-3 py-3 border-t border-[#1a1a1a]">
+              {tags.slice(0,2).map((t, i) => (
+                <div key={i} className="flex items-center gap-2 px-1 py-1 text-[11px] text-text-dim">
+                  <span className="w-2 h-2 rounded-full" style={{background: t.color}}/>
+                  <span className="truncate">{t.name}</span>
+                </div>
+              ))}
+            </div>
+          </aside>
+          <main className="flex-1 bg-bg p-10 overflow-y-auto">
+            <div className="max-w-[700px]">
+              <h1 className="text-[20px] font-semibold text-text">Overview</h1>
+              <div className="grid grid-cols-3 gap-3 mt-6">
+                <div className="bg-bg-card rounded-lg p-4">
+                  <div className="text-[11px] text-text-dim uppercase tracking-wide">Sessions</div>
+                  <div className="text-[28px] font-bold text-text mt-1">1,468</div>
+                  <svg className="mt-2" width="100%" height="24" viewBox="0 0 120 24"><path d="M0 20 L10 18 L20 16 L30 19 L40 14 L50 12 L60 15 L70 10 L80 8 L90 11 L100 6 L110 4 L120 2" fill="none" stroke="#58a6ff" strokeWidth="1.5"/></svg>
+                </div>
+                <div className="bg-bg-card rounded-lg p-4">
+                  <div className="text-[11px] text-text-dim uppercase tracking-wide">Workspaces</div>
+                  <div className="text-[28px] font-bold text-text mt-1">133</div>
+                  <svg className="mt-2" width="100%" height="24" viewBox="0 0 120 24"><path d="M0 18 L20 16 L40 17 L60 14 L80 12 L100 10 L120 8" fill="none" stroke="#3fb950" strokeWidth="1.5"/></svg>
+                </div>
+                <div className="bg-bg-card rounded-lg p-4">
+                  <div className="text-[11px] text-text-dim uppercase tracking-wide">Today</div>
+                  <div className="text-[28px] font-bold text-text mt-1">12</div>
+                  <div className="text-[11px] text-accent-green mt-2">+3 from yesterday</div>
+                </div>
+              </div>
+              <h2 className="text-[14px] font-medium text-text mt-8 mb-3">Recent</h2>
+              <div className="space-y-px">
+                {recentSessions.slice(0,4).map((s, i) => (
+                  <div key={i} className="flex items-center gap-3 px-4 py-3 bg-bg-card first:rounded-t-lg last:rounded-b-lg hover:bg-white/4 cursor-pointer transition-colors border-b border-border/30 last:border-0">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] text-text">{s.title}</div>
+                      <div className="text-[11px] text-text-dim mt-0.5">{s.workspace} &middot; {s.msgs} messages</div>
+                    </div>
+                    <span className="text-[11px] text-text-dim">{s.time}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 3 — Raycast: Ultra-compact sidebar + command bar focus
+       ═══════════════════════════════════════════════════════ */
+    function Option3_Raycast() {
+      return (
+        <div className="flex h-full">
+          <aside className="w-[52px] min-w-[52px] bg-[#0f0f14] border-r border-[#1e1e28] flex flex-col items-center py-3 gap-1">
+            <div className="w-8 h-8 rounded-lg bg-accent-blue/15 flex items-center justify-center text-accent-blue text-[11px] font-bold mb-2 cursor-pointer hover:bg-accent-blue/25 transition-colors" title="Search">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.4"/><line x1="10.5" y1="10.5" x2="14" y2="14" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+            </div>
+            <div className="w-8 h-8 rounded-lg bg-accent-blue/10 flex items-center justify-center text-accent-blue text-[10px] font-bold cursor-pointer" title="clay/terra">T</div>
+            <div className="w-8 h-8 rounded-lg hover:bg-white/6 flex items-center justify-center text-text-dim text-[10px] font-bold cursor-pointer transition-colors" title="clay/keystone">K</div>
+            <div className="h-px w-5 bg-white/8 my-1"/>
+            <div className="w-8 h-8 rounded-lg hover:bg-white/6 flex items-center justify-center text-text-dim text-[10px] font-bold cursor-pointer transition-colors" title="tools/session-explorer">S</div>
+            <div className="w-8 h-8 rounded-lg hover:bg-white/6 flex items-center justify-center text-text-dim text-[10px] font-bold cursor-pointer transition-colors" title="tools/db-safe">D</div>
+            <div className="flex-1"/>
+            <div className="w-2 h-2 rounded-full bg-accent-green/60 mb-1" title="3 tags"/>
+          </aside>
+          <main className="flex-1 bg-bg p-8 overflow-y-auto">
+            <div className="max-w-[660px] mx-auto">
+              <div className="rounded-xl bg-bg-card border border-border p-1 mb-8">
+                <div className="flex items-center gap-3 px-4 py-3 text-text-secondary text-[13px]">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                  Search sessions, files, messages...
+                  <span className="ml-auto text-[10px] font-mono text-text-dim bg-white/6 px-1.5 py-0.5 rounded">⌘K</span>
+                </div>
+              </div>
+              <div className="flex items-baseline gap-3 mb-6">
+                <h1 className="text-[20px] font-semibold text-text">clay/terra</h1>
+                <span className="text-[12px] text-text-dim">289 sessions</span>
+              </div>
+              <div className="space-y-1">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-bg-card cursor-pointer transition-colors group">
+                    <div className="w-7 h-7 rounded-md bg-white/5 flex items-center justify-center text-text-dim text-[10px] group-hover:bg-accent-blue/10 group-hover:text-accent-blue transition-colors">
+                      {s.msgs}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] text-text truncate">{s.title}</div>
+                    </div>
+                    <span className="text-[11px] text-text-dim">{s.time}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 4 — Obsidian: Graph-inspired with activity heatmap
+       ═══════════════════════════════════════════════════════ */
+    function Option4_Obsidian() {
+      const days = Array.from({length: 28}, (_, i) => Math.random() > 0.3 ? Math.floor(Math.random() * 4) + 1 : 0);
+      return (
+        <div className="flex h-full">
+          <aside className="w-[230px] min-w-[230px] bg-[#101018] border-r border-border/50 flex flex-col">
+            <div className="px-4 pt-4 pb-2 flex items-center gap-2">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1L14 5V11L8 15L2 11V5L8 1Z" stroke="#bc8cff" strokeWidth="1.3"/></svg>
+              <span className="text-[14px] font-semibold text-text">Explorer</span>
+            </div>
+            <div className="px-3 pb-3">
+              <input className="w-full px-2.5 py-1.5 bg-white/4 border border-white/8 rounded-md text-[12px] text-text placeholder:text-text-dim outline-none focus:border-accent-purple/50 transition-colors" placeholder="Filter workspaces..." />
+            </div>
+            <nav className="flex-1 overflow-y-auto px-2">
+              {starred.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <svg width="10" height="10" viewBox="0 0 16 16" fill="#d29922"><path d="M8 1.5l2 4.5 5 .5-3.75 3.25L12.5 15 8 12.25 3.5 15l1.25-5.25L1 6.5l5-.5L8 1.5z"/></svg>
+                  <span className="text-[12px] text-text flex-1 truncate">{w.name}</span>
+                  <span className="text-[10px] text-text-dim">{w.date}</span>
+                </div>
+              ))}
+              <div className="h-px bg-white/5 my-2"/>
+              {more.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <span className="text-[12px] text-text-secondary flex-1 truncate">{w.name}</span>
+                  <span className="text-[10px] text-text-dim">{w.date}</span>
+                </div>
+              ))}
+            </nav>
+            <div className="px-3 py-3 border-t border-border/50">
+              <div className="flex flex-wrap gap-1">
+                {tags.map((t, i) => (
+                  <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] bg-white/5 text-text-secondary hover:bg-white/8 cursor-pointer transition-colors">
+                    <span className="w-1.5 h-1.5 rounded-full" style={{background: t.color}}/>{t.name}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </aside>
+          <main className="flex-1 bg-bg p-8 overflow-y-auto">
+            <div className="max-w-[640px]">
+              <h1 className="text-[20px] font-semibold text-text">Session Activity</h1>
+              <p className="text-[13px] text-text-dim mt-1 mb-6">1,468 sessions across 133 workspaces</p>
+              <div className="bg-bg-card rounded-lg p-4 mb-6">
+                <div className="text-[11px] text-text-dim mb-2">Last 4 weeks</div>
+                <div className="flex gap-[3px] flex-wrap" style={{maxWidth: "calc(7 * 14px + 6 * 3px)"}}>
+                  {days.map((v, i) => (
+                    <div key={i} className="w-[12px] h-[12px] rounded-[2px]" style={{background: v === 0 ? 'rgba(255,255,255,0.04)' : `rgba(188,140,255,${0.15 + v * 0.2})`}}/>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-2">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="flex items-start gap-3 px-4 py-3 bg-bg-card rounded-lg hover:bg-white/4 cursor-pointer transition-colors border border-transparent hover:border-accent-purple/20">
+                    <div className="w-8 h-8 rounded-md bg-accent-purple/10 flex items-center justify-center text-accent-purple text-[11px] font-mono mt-0.5">{s.msgs}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] text-text">{s.title}</div>
+                      <div className="text-[11px] text-text-dim mt-0.5">{s.workspace} &middot; {s.time}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 5 — Slack: Chunky sidebar with section headers
+       ═══════════════════════════════════════════════════════ */
+    function Option5_Slack() {
+      const [tagsOpen, setTagsOpen] = useState(true);
+      return (
+        <div className="flex h-full">
+          <aside className="w-[240px] min-w-[240px] bg-[#12121f] flex flex-col">
+            <div className="px-4 pt-4 pb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-accent-blue/40 to-accent-purple/40 flex items-center justify-center text-[11px] text-white font-bold">SE</div>
+                <div>
+                  <div className="text-[13px] font-semibold text-text leading-none">Session Explorer</div>
+                  <div className="text-[10px] text-text-dim mt-0.5">1,468 sessions</div>
+                </div>
+              </div>
+            </div>
+            <div className="px-3 pb-2">
+              <button className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-white/5 hover:bg-white/8 text-text-secondary text-[12px] transition-colors cursor-pointer">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                Search
+                <span className="ml-auto text-[10px] text-text-dim">⌘K</span>
+              </button>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-2">
+              <div className="px-2 py-1.5 text-[11px] font-semibold text-text-dim uppercase tracking-wider flex items-center gap-1">
+                <svg width="6" height="6" viewBox="0 0 6 6" fill="none"><path d="M1 1l4 2-4 2" fill="currentColor"/></svg>
+                Starred
+              </div>
+              {starred.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <span className="w-2 h-2 rounded-sm bg-accent-green"/>
+                  <span className="text-[13px] text-text-secondary flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+              <div className="px-2 py-1.5 mt-2 text-[11px] font-semibold text-text-dim uppercase tracking-wider flex items-center gap-1">
+                <svg width="6" height="6" viewBox="0 0 6 6" fill="none"><path d="M1 1l4 2-4 2" fill="currentColor"/></svg>
+                Workspaces
+              </div>
+              {more.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <span className="w-2 h-2 rounded-sm bg-text-dim/40"/>
+                  <span className="text-[13px] text-text-secondary flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+              <button onClick={() => setTagsOpen(!tagsOpen)} className="w-full px-2 py-1.5 mt-2 text-[11px] font-semibold text-text-dim uppercase tracking-wider flex items-center gap-1 hover:text-text-secondary transition-colors">
+                <svg width="6" height="6" viewBox="0 0 6 6" fill="none" className={`transition-transform ${tagsOpen ? "rotate-90" : ""}`}><path d="M1 1l4 2-4 2" fill="currentColor"/></svg>
+                Tags
+              </button>
+              {tagsOpen && tags.map((t, i) => (
+                <div key={i} className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <span className="w-2 h-2 rounded-full" style={{background: t.color}}/>
+                  <span className="text-[12px] text-text-secondary flex-1 truncate">{t.name}</span>
+                  <span className="text-[10px] text-text-dim">{t.count}</span>
+                </div>
+              ))}
+            </nav>
+            <div className="px-3 py-2 border-t border-white/5">
+              <button className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-text-dim hover:text-text-secondary transition-colors rounded hover:bg-white/5 w-full">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M13.65 2.35A8 8 0 103.34 13.66M13.65 2.35V6.5M13.65 2.35H9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                Re-ingest
+              </button>
+            </div>
+          </aside>
+          <main className="flex-1 bg-bg p-8 overflow-y-auto">
+            <div className="max-w-[640px]">
+              <h1 className="text-[20px] font-semibold text-text">Recent sessions</h1>
+              <div className="mt-4 space-y-0.5">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="flex items-center gap-3 px-4 py-2.5 rounded-md hover:bg-bg-card cursor-pointer transition-colors">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] text-text">{s.title}</div>
+                      <div className="text-[11px] text-text-dim mt-0.5">{s.workspace}</div>
+                    </div>
+                    <span className="text-[11px] text-text-dim">{s.time}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 6 — GitHub: File-tree sidebar + tabbed dashboard
+       ═══════════════════════════════════════════════════════ */
+    function Option6_GitHub() {
+      const [tab, setTab] = useState("recent");
+      return (
+        <div className="flex h-full">
+          <aside className="w-[240px] min-w-[240px] bg-bg-sidebar border-r border-border flex flex-col">
+            <div className="px-4 pt-4 pb-2 flex items-center gap-2">
+              <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="14" height="14" rx="3" stroke="#58a6ff" strokeWidth="1.2"/><path d="M5 5h6M5 8h4M5 11h5" stroke="#58a6ff" strokeWidth="1" strokeLinecap="round"/></svg>
+              <span className="text-[14px] font-semibold text-text">Session Explorer</span>
+            </div>
+            <div className="px-3 mt-1 mb-2">
+              <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-border bg-bg text-[12px] text-text-secondary cursor-pointer hover:border-text-dim transition-colors">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                Go to workspace...
+              </div>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-2">
+              {starred.map((w, i) => (
+                <div key={i} className="group flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M2 3h12v2L8 9 2 5V3z" fill="#d29922"/><path d="M2 5v8h12V5L8 9 2 5z" stroke="#d29922" strokeWidth="1" fill="none"/></svg>
+                  <span className="text-[12px] text-text flex-1 truncate">{w.name}</span>
+                  <span className="text-[10px] text-text-dim bg-white/6 px-1.5 py-px rounded-full">{w.sessions}</span>
+                </div>
+              ))}
+              <div className="h-px bg-border/50 my-2 mx-2"/>
+              {more.map((w, i) => (
+                <div key={i} className="group flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M2 3h12v2L8 9 2 5V3z" fill="#6e7681"/><path d="M2 5v8h12V5L8 9 2 5z" stroke="#6e7681" strokeWidth="1" fill="none"/></svg>
+                  <span className="text-[12px] text-text-secondary flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+            </nav>
+            <div className="px-3 py-2.5 border-t border-border flex gap-1 flex-wrap">
+              {tags.map((t, i) => (
+                <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] border border-border text-text-secondary hover:bg-white/5 cursor-pointer transition-colors">
+                  <span className="w-2 h-2 rounded-full" style={{background: t.color}}/>{t.name}
+                </span>
+              ))}
+            </div>
+          </aside>
+          <main className="flex-1 bg-bg overflow-y-auto">
+            <div className="border-b border-border px-8 flex gap-0">
+              <button onClick={() => setTab("recent")} className={`px-4 py-3 text-[13px] font-medium border-b-2 transition-colors ${tab === "recent" ? "text-text border-accent-blue" : "text-text-secondary border-transparent hover:text-text"}`}>Recent</button>
+              <button onClick={() => setTab("stats")} className={`px-4 py-3 text-[13px] font-medium border-b-2 transition-colors ${tab === "stats" ? "text-text border-accent-blue" : "text-text-secondary border-transparent hover:text-text"}`}>Stats</button>
+            </div>
+            <div className="p-8 max-w-[700px]">
+              {tab === "recent" ? (
+                <div className="space-y-0">
+                  {recentSessions.map((s, i) => (
+                    <div key={i} className="flex items-center gap-3 px-4 py-3 border-b border-border/40 hover:bg-bg-card cursor-pointer transition-colors">
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[13px] text-accent-blue hover:underline cursor-pointer">{s.title}</div>
+                        <div className="text-[11px] text-text-dim mt-0.5">{s.workspace} &middot; {s.msgs} messages &middot; {s.time}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="bg-bg-card border border-border rounded-lg p-5">
+                    <div className="text-3xl font-bold text-text">133</div>
+                    <div className="text-[12px] text-text-dim mt-1">Workspaces</div>
+                  </div>
+                  <div className="bg-bg-card border border-border rounded-lg p-5">
+                    <div className="text-3xl font-bold text-text">1,468</div>
+                    <div className="text-[12px] text-text-dim mt-1">Total Sessions</div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 7 — Arc: Sidebar-less, everything in main + side pane
+       ═══════════════════════════════════════════════════════ */
+    function Option7_Arc() {
+      const [selected, setSelected] = useState(null);
+      return (
+        <div className="flex h-full bg-bg">
+          <main className="flex-1 p-6 overflow-y-auto">
+            <div className="max-w-[800px] mx-auto">
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h1 className="text-[20px] font-semibold text-text">Sessions</h1>
+                  <p className="text-[12px] text-text-dim mt-0.5">133 workspaces &middot; 1,468 sessions</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-bg-card border border-border text-[12px] text-text-secondary cursor-pointer hover:border-text-dim transition-colors">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                    Search
+                    <kbd className="text-[10px] font-mono text-text-dim">⌘K</kbd>
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-2 mb-5 overflow-x-auto pb-1">
+                {[...starred, ...more.slice(0,1)].map((w, i) => (
+                  <button key={i} onClick={() => setSelected(i)} className={`shrink-0 px-3 py-1.5 rounded-full text-[12px] font-medium transition-colors ${selected === i ? "bg-accent-blue/15 text-accent-blue" : "bg-white/5 text-text-secondary hover:bg-white/8"}`}>
+                    {w.name}
+                  </button>
+                ))}
+                <button className="shrink-0 px-3 py-1.5 rounded-full text-[12px] bg-white/5 text-text-dim hover:bg-white/8 transition-colors">+130 more</button>
+              </div>
+              <div className="flex gap-2 mb-5">
+                {tags.map((t, i) => (
+                  <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] bg-white/4 text-text-dim hover:bg-white/8 cursor-pointer transition-colors">
+                    <span className="w-1.5 h-1.5 rounded-full" style={{background: t.color}}/>{t.name}
+                  </span>
+                ))}
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="bg-bg-card rounded-xl p-4 hover:bg-white/4 cursor-pointer transition-all border border-transparent hover:border-border group">
+                    <div className="text-[13px] text-text font-medium truncate">{s.title}</div>
+                    <div className="text-[11px] text-text-dim mt-1.5">{s.workspace}</div>
+                    <div className="flex items-center gap-3 mt-3 text-[11px] text-text-dim">
+                      <span>{s.msgs} msgs</span>
+                      <span>{s.time}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 8 — Notion: Warm sidebar + page-style dashboard
+       ═══════════════════════════════════════════════════════ */
+    function Option8_Notion() {
+      return (
+        <div className="flex h-full">
+          <aside className="w-[230px] min-w-[230px] bg-[#13131d] flex flex-col">
+            <div className="px-3 pt-4 pb-1">
+              <div className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors">
+                <span className="text-[16px]">📋</span>
+                <span className="text-[13px] font-medium text-text flex-1">Session Explorer</span>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="text-text-dim hover:text-text transition-colors"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+              </div>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-1.5 mt-2">
+              <div className="px-2.5 py-1 text-[11px] text-text-dim font-medium">Favorites</div>
+              {starred.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors mx-0.5">
+                  <span className="text-[13px]">📁</span>
+                  <span className="text-[13px] text-text-secondary flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+              <div className="px-2.5 py-1 mt-3 text-[11px] text-text-dim font-medium">All Workspaces</div>
+              {more.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-white/5 cursor-pointer transition-colors mx-0.5">
+                  <span className="text-[13px]">📁</span>
+                  <span className="text-[13px] text-text-secondary flex-1 truncate">{w.name}</span>
+                </div>
+              ))}
+            </nav>
+            <div className="px-3 py-2.5 border-t border-white/5">
+              <div className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-text-dim hover:text-text-secondary hover:bg-white/5 rounded cursor-pointer transition-colors">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M13.65 2.35A8 8 0 103.34 13.66M13.65 2.35V6.5M13.65 2.35H9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                Sync sessions
+              </div>
+            </div>
+          </aside>
+          <main className="flex-1 bg-bg p-10 overflow-y-auto">
+            <div className="max-w-[640px]">
+              <div className="text-[32px] mb-1">📋</div>
+              <h1 className="text-[28px] font-bold text-text">Session Explorer</h1>
+              <p className="text-[14px] text-text-secondary mt-2 leading-relaxed">Your Claude Code session history. 133 workspaces with 1,468 total sessions.</p>
+              <div className="h-px bg-border/40 my-6"/>
+              <h2 className="text-[14px] font-medium text-text mb-3">Recently visited</h2>
+              <div className="grid grid-cols-3 gap-2">
+                {recentSessions.slice(0,3).map((s, i) => (
+                  <div key={i} className="bg-bg-card rounded-lg p-3 hover:bg-white/5 cursor-pointer transition-colors border border-border/40">
+                    <div className="text-[12px] text-text truncate font-medium">{s.title}</div>
+                    <div className="text-[11px] text-text-dim mt-1">{s.workspace}</div>
+                    <div className="text-[10px] text-text-dim mt-2">{s.time}</div>
+                  </div>
+                ))}
+              </div>
+              <h2 className="text-[14px] font-medium text-text mt-6 mb-3">All recent</h2>
+              {recentSessions.map((s, i) => (
+                <div key={i} className="flex items-center gap-3 py-2 border-b border-border/20 hover:bg-white/3 cursor-pointer transition-colors px-1 rounded">
+                  <span className="text-[13px] text-text flex-1 truncate">{s.title}</span>
+                  <span className="text-[11px] text-text-dim shrink-0">{s.workspace}</span>
+                  <span className="text-[11px] text-text-dim shrink-0">{s.time}</span>
+                </div>
+              ))}
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 9 — Figma: Floating sidebar + cards grid
+       ═══════════════════════════════════════════════════════ */
+    function Option9_Figma() {
+      return (
+        <div className="flex h-full bg-[#0e0e12]">
+          <aside className="w-[220px] min-w-[220px] bg-[#18181f] m-2 rounded-xl flex flex-col overflow-hidden">
+            <div className="px-3 pt-3 pb-2 flex items-center justify-between">
+              <span className="text-[13px] font-semibold text-text">Workspaces</span>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="text-text-dim hover:text-text cursor-pointer transition-colors"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-1.5">
+              {starred.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-2 rounded-lg hover:bg-white/6 cursor-pointer transition-colors mx-0.5">
+                  <div className="w-6 h-6 rounded bg-accent-blue/15 flex items-center justify-center text-accent-blue text-[10px] font-bold">{w.name.split('/')[1]?.[0]?.toUpperCase()}</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12px] text-text truncate">{w.name}</div>
+                    <div className="text-[10px] text-text-dim">{w.sessions} sessions</div>
+                  </div>
+                </div>
+              ))}
+              <div className="h-px bg-white/6 my-1.5 mx-2"/>
+              {more.map((w, i) => (
+                <div key={i} className="flex items-center gap-2 px-2.5 py-2 rounded-lg hover:bg-white/6 cursor-pointer transition-colors mx-0.5">
+                  <div className="w-6 h-6 rounded bg-white/6 flex items-center justify-center text-text-dim text-[10px] font-bold">{w.name.split('/')[1]?.[0]?.toUpperCase()}</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12px] text-text-secondary truncate">{w.name}</div>
+                  </div>
+                </div>
+              ))}
+            </nav>
+            <div className="px-2 py-2 border-t border-white/6">
+              <div className="flex flex-wrap gap-1 px-1">
+                {tags.map((t, i) => (
+                  <span key={i} className="w-3 h-3 rounded-full cursor-pointer hover:ring-2 hover:ring-white/20 transition-shadow" style={{background: t.color}} title={t.name}/>
+                ))}
+              </div>
+            </div>
+          </aside>
+          <main className="flex-1 p-6 overflow-y-auto">
+            <div className="max-w-[700px] mx-auto">
+              <div className="flex items-baseline gap-2 mb-1">
+                <h1 className="text-[18px] font-semibold text-text">Recent</h1>
+                <span className="text-[12px] text-text-dim">1,468 sessions</span>
+              </div>
+              <div className="grid grid-cols-3 gap-3 mt-4">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="bg-[#18181f] rounded-xl overflow-hidden hover:ring-1 hover:ring-accent-blue/30 cursor-pointer transition-all group">
+                    <div className="h-20 bg-gradient-to-br from-accent-blue/8 to-accent-purple/8 flex items-end px-3 pb-2">
+                      <span className="text-[10px] text-text-dim bg-black/30 px-1.5 py-0.5 rounded">{s.msgs} msgs</span>
+                    </div>
+                    <div className="p-3">
+                      <div className="text-[12px] text-text font-medium truncate">{s.title}</div>
+                      <div className="text-[10px] text-text-dim mt-1">{s.workspace} &middot; {s.time}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       OPTION 10 — Stripe: Clean data-dense sidebar + metrics dashboard
+       ═══════════════════════════════════════════════════════ */
+    function Option10_Stripe() {
+      return (
+        <div className="flex h-full">
+          <aside className="w-[220px] min-w-[220px] bg-[#0c0c14] border-r border-white/6 flex flex-col">
+            <div className="px-4 pt-4 pb-3">
+              <div className="text-[14px] font-semibold text-text tracking-tight">Session Explorer</div>
+            </div>
+            <div className="px-3 mb-2">
+              <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-white/8 text-[12px] text-text-dim cursor-pointer hover:border-white/15 transition-colors">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
+                Search...
+              </div>
+            </div>
+            <nav className="flex-1 overflow-y-auto">
+              {starred.map((w, i) => (
+                <div key={i} className="flex items-center gap-3 px-4 py-2 hover:bg-white/4 cursor-pointer transition-colors border-l-2 border-transparent hover:border-accent-blue">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12px] text-text truncate">{w.name}</div>
+                  </div>
+                  <span className="text-[10px] text-text-dim tabular-nums">{w.sessions}</span>
+                </div>
+              ))}
+              <div className="h-px bg-white/5 my-1"/>
+              {more.map((w, i) => (
+                <div key={i} className="flex items-center gap-3 px-4 py-2 hover:bg-white/4 cursor-pointer transition-colors border-l-2 border-transparent hover:border-white/20">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12px] text-text-secondary truncate">{w.name}</div>
+                  </div>
+                  <span className="text-[10px] text-text-dim tabular-nums">{w.sessions}</span>
+                </div>
+              ))}
+            </nav>
+            <div className="px-4 py-3 border-t border-white/5">
+              <div className="flex gap-2">
+                {tags.map((t, i) => (
+                  <div key={i} className="w-2.5 h-2.5 rounded-sm cursor-pointer hover:ring-1 hover:ring-white/30 transition-shadow" style={{background: t.color}} title={`${t.name} (${t.count})`}/>
+                ))}
+              </div>
+            </div>
+          </aside>
+          <main className="flex-1 bg-bg p-8 overflow-y-auto">
+            <div className="max-w-[720px]">
+              <div className="flex items-center gap-6 mb-8">
+                <div>
+                  <div className="text-[11px] text-text-dim uppercase tracking-wider font-medium">Sessions</div>
+                  <div className="text-[32px] font-bold text-text leading-none mt-1 tabular-nums">1,468</div>
+                </div>
+                <div className="h-10 w-px bg-border/40"/>
+                <div>
+                  <div className="text-[11px] text-text-dim uppercase tracking-wider font-medium">Workspaces</div>
+                  <div className="text-[32px] font-bold text-text leading-none mt-1 tabular-nums">133</div>
+                </div>
+                <div className="h-10 w-px bg-border/40"/>
+                <div>
+                  <div className="text-[11px] text-text-dim uppercase tracking-wider font-medium">Today</div>
+                  <div className="text-[32px] font-bold text-accent-green leading-none mt-1 tabular-nums">12</div>
+                </div>
+              </div>
+              <h2 className="text-[13px] font-medium text-text mb-3 uppercase tracking-wider">Recent Sessions</h2>
+              <div className="rounded-lg border border-border overflow-hidden">
+                {recentSessions.map((s, i) => (
+                  <div key={i} className="flex items-center gap-4 px-4 py-3 border-b border-border/40 last:border-0 hover:bg-bg-card cursor-pointer transition-colors">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] text-text">{s.title}</div>
+                    </div>
+                    <span className="text-[11px] text-text-dim shrink-0">{s.workspace}</span>
+                    <span className="text-[11px] text-text-dim tabular-nums shrink-0">{s.msgs}</span>
+                    <span className="text-[11px] text-text-dim shrink-0">{s.time}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    /* ── Showcase wrapper ──────────────────────────────── */
+    function OptionCard({ number, title, description, children }) {
+      return (
+        <div data-option={number} className="option-card">
+          <div className="option-header">
+            <h3>Option {number} — {title}</h3>
+            <p>{description}</p>
+          </div>
+          <div className="option-demo">{children}</div>
+        </div>
+      );
+    }
+
+    function App() {
+      return (
+        <div>
+          <h1 className="page-title">Sidebar + Dashboard — Design Options</h1>
+          <p className="page-sub">10 interactive redesigns. Click, hover, and interact with each option.</p>
+          <div className="options-grid">
+            <OptionCard number={1} title="Linear" description="Quiet sidebar with hover-reveal metadata. Main content is a 'pick up where you left off' activity feed. Minimal visual noise.">
+              <Option1_Linear />
+            </OptionCard>
+            <OptionCard number={2} title="Vercel" description="Ultra-minimal sidebar with green status dots. Dashboard with stat sparklines and stacked recent sessions list.">
+              <Option2_Vercel />
+            </OptionCard>
+            <OptionCard number={3} title="Raycast" description="Icon-only rail sidebar (52px). Prominent command bar in main area. Session list with message count badges.">
+              <Option3_Raycast />
+            </OptionCard>
+            <OptionCard number={4} title="Obsidian" description="Filter input in sidebar. Activity heatmap on dashboard. Purple accent with card-based session list.">
+              <Option4_Obsidian />
+            </OptionCard>
+            <OptionCard number={5} title="Slack" description="Chunky sidebar with collapsible section headers (Starred, Workspaces, Tags). Colored status squares. Re-ingest in footer.">
+              <Option5_Slack />
+            </OptionCard>
+            <OptionCard number={6} title="GitHub" description="File-tree sidebar with badges. Tabbed main area (Recent / Stats). Blue link-style session titles.">
+              <Option6_GitHub />
+            </OptionCard>
+            <OptionCard number={7} title="Arc" description="No sidebar. Workspace chips as horizontal pills. Tag filters inline. Card grid for sessions.">
+              <Option7_Arc />
+            </OptionCard>
+            <OptionCard number={8} title="Notion" description="Warm sidebar with emoji icons and Favorites/All sections. Page-style main with recently visited cards grid + full list.">
+              <Option8_Notion />
+            </OptionCard>
+            <OptionCard number={9} title="Figma" description="Floating rounded sidebar panel. Workspace avatars with initials. Sessions as preview cards with gradient headers.">
+              <Option9_Figma />
+            </OptionCard>
+            <OptionCard number={10} title="Stripe" description="Data-dense sidebar with left-edge hover accent. Inline metrics with dividers. Table-style session list in bordered container.">
+              <Option10_Stripe />
+            </OptionCard>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

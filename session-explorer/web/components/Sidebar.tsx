@@ -13,7 +13,7 @@ const PRESET_COLORS = [
 ];
 
 function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "No activity";
+  if (!dateStr) return "";
   const d = new Date(dateStr);
   const now = new Date();
   const diffMs = now.getTime() - d.getTime();
@@ -47,6 +47,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   const [refreshingTag, setRefreshingTag] = useState<number | null>(null);
   const [starredIds, setStarredIds] = useState<Set<number>>(loadStarredIds);
   const [showMore, setShowMore] = useState(false);
+  const [filter, setFilter] = useState("");
 
   function toggleStar(id: number, e: React.MouseEvent) {
     e.preventDefault();
@@ -105,87 +106,125 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
       .catch(() => {});
   }
 
+  function shortName(name: string): string {
+    return name.replace(/^Development\//, "");
+  }
+
+  // Filter workspaces client-side
+  const filterLower = filter.toLowerCase();
+  const filteredWorkspaces = filter
+    ? workspaces.filter(w => w.display_name.toLowerCase().includes(filterLower))
+    : workspaces;
+
+  const starred = filteredWorkspaces.filter(w => starredIds.has(w.id));
+  const rest = filteredWorkspaces.filter(w => !starredIds.has(w.id));
+  const hasStars = starred.length > 0;
+
   return (
-    <aside className="w-[260px] min-w-[260px] bg-bg-sidebar border-r border-border flex flex-col overflow-hidden">
-      <div className="flex items-center justify-between px-4 pt-5 pb-2">
-        <Link to="/" className="no-underline text-inherit hover:no-underline">
-          <h2 className="text-[15px] font-semibold tracking-tight text-text">Session Explorer</h2>
+    <aside className="w-[230px] min-w-[230px] bg-[#101018] border-r border-border/50 flex flex-col overflow-hidden">
+      {/* Header: Diamond icon + Explorer */}
+      <div className="flex items-center gap-2.5 px-4 pt-5 pb-3">
+        <Link to="/" className="flex items-center gap-2.5 no-underline text-inherit hover:no-underline">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M9 1L16.5 9L9 17L1.5 9L9 1Z" fill="#bc8cff" fillOpacity="0.25" stroke="#bc8cff" strokeWidth="1.5" strokeLinejoin="round" />
+          </svg>
+          <span className="text-[15px] font-semibold tracking-tight text-text">Explorer</span>
         </Link>
-        <div className="flex items-center gap-1">
-          <button className="p-1.5 rounded-md text-text-secondary transition-all hover:bg-white/8 hover:text-text" onClick={onSearchClick} title="Search (Cmd+K)">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
-              <line x1="11" y1="11" x2="14.5" y2="14.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-            </svg>
-          </button>
+      </div>
+
+      {/* Filter input */}
+      <div className="px-3 pb-2">
+        <div className="relative">
+          <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-dim" width="12" height="12" viewBox="0 0 16 16" fill="none">
+            <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
+            <line x1="11" y1="11" x2="14.5" y2="14.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+          <input
+            type="text"
+            className="w-full pl-7 pr-2 py-1.5 bg-white/5 border border-border/50 rounded-md outline-none text-xs text-text placeholder:text-text-dim focus:border-accent-purple/50 transition-colors"
+            placeholder="Filter workspaces..."
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
         </div>
       </div>
-      <div className="px-4 pb-3 text-[11px] text-text-dim">
-        <kbd className="inline-block px-1.5 py-px font-mono text-[10px] bg-white/6 border border-border rounded-sm">Cmd</kbd> + <kbd className="inline-block px-1.5 py-px font-mono text-[10px] bg-white/6 border border-border rounded-sm">K</kbd> to search
-      </div>
-      <nav className="flex-1 overflow-y-auto px-2 pb-4">
-        {(() => {
-          const starred = workspaces.filter(w => starredIds.has(w.id));
-          const rest = workspaces.filter(w => !starredIds.has(w.id));
-          const hasStars = starred.length > 0;
 
-          function renderWorkspace(w: Workspace, showDivider: boolean) {
-            return (
-              <div key={w.id}>
-                {showDivider && <div className="mx-3 border-t border-border/50" />}
-                <Link
-                  to="/workspace/$id"
-                  params={{ id: String(w.id) }}
-                  className="group/ws block px-3 py-2.5 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline [&[data-status=active]]:bg-accent-blue/12 [&[data-status=active]_.workspace-name]:text-accent-blue"
-                >
-                  <div className="flex items-center gap-1.5">
-                    <div className="workspace-name flex-1 text-[13px] font-medium whitespace-nowrap overflow-hidden text-ellipsis">{w.display_name}</div>
-                    <button
-                      className={`shrink-0 p-0.5 rounded transition-all ${starredIds.has(w.id) ? "text-accent-yellow" : "text-text-dim opacity-0 group-hover/ws:opacity-100 hover:text-accent-yellow"}`}
-                      onClick={(e) => toggleStar(w.id, e)}
-                      title={starredIds.has(w.id) ? "Unstar" : "Star"}
-                    >
-                      <svg width="12" height="12" viewBox="0 0 16 16" fill={starredIds.has(w.id) ? "currentColor" : "none"}>
-                        <path d="M8 1.5l2 4.5 5 .5-3.75 3.25L12.5 15 8 12.25 3.5 15l1.25-5.25L1 6.5l5-.5L8 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-                      </svg>
-                    </button>
-                  </div>
-                  <div className="flex justify-between mt-0.5 text-[11px] text-text-dim">
-                    <span>{w.session_count} sessions</span>
-                    <span>{formatDate(w.last_activity)}</span>
-                  </div>
-                </Link>
-              </div>
-            );
-          }
+      {/* Workspace list */}
+      <nav className="flex-1 overflow-y-auto px-2 pb-2">
+        {/* Starred workspaces */}
+        {starred.map((w) => (
+          <Link
+            key={w.id}
+            to="/workspace/$id"
+            params={{ id: String(w.id) }}
+            className="group/ws flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline [&[data-status=active]]:bg-accent-purple/12"
+          >
+            <button
+              className="shrink-0 text-[#d29922] p-0"
+              onClick={(e) => toggleStar(w.id, e)}
+              title="Unstar"
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M8 1.5l2 4.5 5 .5-3.75 3.25L12.5 15 8 12.25 3.5 15l1.25-5.25L1 6.5l5-.5L8 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <span className="flex-1 text-[13px] font-medium whitespace-nowrap overflow-hidden text-ellipsis">{shortName(w.display_name)}</span>
+            <span className="text-[10px] text-text-dim shrink-0">{formatDate(w.last_activity)}</span>
+          </Link>
+        ))}
 
-          return (
-            <>
-              {starred.map((w, i) => renderWorkspace(w, i > 0))}
-              {hasStars && rest.length > 0 && (
-                <div className="mx-3 mt-1 mb-1">
-                  <button
-                    className="flex items-center gap-1.5 text-[11px] text-text-dim hover:text-text-secondary transition-colors py-1"
-                    onClick={() => setShowMore(!showMore)}
-                  >
-                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" className={`transition-transform ${showMore ? "rotate-90" : ""}`}>
-                      <path d="M2 1l4 3-4 3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                    {rest.length} more workspace{rest.length !== 1 ? "s" : ""}
-                  </button>
-                </div>
-              )}
-              {(!hasStars || showMore) && rest.map((w, i) => renderWorkspace(w, hasStars ? true : i > 0))}
-              {workspaces.length === 0 && (
-                <div className="p-4 text-xs text-text-secondary text-center">No workspaces found. Run the ingestion script first.</div>
-              )}
-            </>
-          );
-        })()}
+        {/* Divider between starred and rest */}
+        {hasStars && rest.length > 0 && (
+          <div className="mx-2.5 my-1.5 border-t border-border/40" />
+        )}
+
+        {/* Collapsible "more workspaces" toggle when starred exist */}
+        {hasStars && rest.length > 0 && (
+          <div className="mx-2.5 mb-1">
+            <button
+              className="flex items-center gap-1.5 text-[11px] text-text-dim hover:text-text-secondary transition-colors py-1"
+              onClick={() => setShowMore(!showMore)}
+            >
+              <svg width="8" height="8" viewBox="0 0 8 8" fill="none" className={`transition-transform ${showMore ? "rotate-90" : ""}`}>
+                <path d="M2 1l4 3-4 3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {rest.length} more workspace{rest.length !== 1 ? "s" : ""}
+            </button>
+          </div>
+        )}
+
+        {/* Rest of workspaces */}
+        {(!hasStars || showMore) && rest.map((w) => (
+          <Link
+            key={w.id}
+            to="/workspace/$id"
+            params={{ id: String(w.id) }}
+            className="group/ws flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text transition-[background] duration-150 hover:bg-white/5 hover:no-underline [&[data-status=active]]:bg-accent-purple/12"
+          >
+            <button
+              className="shrink-0 text-text-dim opacity-0 group-hover/ws:opacity-100 hover:text-[#d29922] transition-all p-0"
+              onClick={(e) => toggleStar(w.id, e)}
+              title="Star"
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                <path d="M8 1.5l2 4.5 5 .5-3.75 3.25L12.5 15 8 12.25 3.5 15l1.25-5.25L1 6.5l5-.5L8 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <span className="flex-1 text-[13px] font-medium whitespace-nowrap overflow-hidden text-ellipsis">{shortName(w.display_name)}</span>
+            <span className="text-[10px] text-text-dim shrink-0">{formatDate(w.last_activity)}</span>
+          </Link>
+        ))}
+
+        {filteredWorkspaces.length === 0 && (
+          <div className="p-4 text-xs text-text-secondary text-center">
+            {filter ? "No matching workspaces" : "No workspaces found. Run the ingestion script first."}
+          </div>
+        )}
       </nav>
 
-      <div className="border-t border-border px-2 pt-3 pb-4 shrink-0">
-        <div className="flex items-center justify-between px-2 pb-2">
+      {/* Tags section — compact pills */}
+      <div className="border-t border-border/40 px-3 pt-3 pb-3 shrink-0">
+        <div className="flex items-center justify-between pb-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-text-dim">Tags</span>
           <button
             className="w-5 h-5 flex items-center justify-center rounded text-sm text-text-dim transition-all hover:text-text hover:bg-white/8"
@@ -197,7 +236,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
         </div>
 
         {showCreateTag && (
-          <form className="px-2 pb-2 flex flex-col gap-1.5" onSubmit={handleCreateTag}>
+          <form className="pb-2 flex flex-col gap-1.5" onSubmit={handleCreateTag}>
             <input
               type="text"
               className="w-full px-2 py-1.5 bg-white/6 border border-border rounded outline-none text-xs text-text font-[var(--font-ui)] focus:border-accent-blue"
@@ -221,7 +260,8 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           </form>
         )}
 
-        <div className="max-h-[200px] overflow-y-auto">
+        {/* Tag pills */}
+        <div className="flex flex-wrap gap-1.5 max-h-[140px] overflow-y-auto">
           {tags.map((tag) => {
             const ss = savedSearchByTagId.get(tag.id);
             return (
@@ -229,35 +269,35 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
                 key={tag.id}
                 to="/tag/$name"
                 params={{ name: tag.name }}
-                className="flex items-center gap-2 px-2 py-1.5 rounded-md no-underline text-text text-xs transition-[background] duration-150 hover:bg-white/5 hover:no-underline group [&[data-status=active]]:bg-accent-blue/12"
+                className="group inline-flex items-center gap-1.5 px-2 py-1 rounded-full no-underline text-text-secondary text-[11px] bg-white/5 border border-transparent transition-all hover:bg-white/8 hover:border-border/50 hover:text-text hover:no-underline [&[data-status=active]]:bg-accent-purple/15 [&[data-status=active]]:text-accent-purple [&[data-status=active]]:border-accent-purple/30"
               >
-                <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${ss ? "ring-1 ring-offset-1 ring-accent-blue/40 ring-offset-bg-sidebar" : ""}`} style={{ background: tag.color }} />
-                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{tag.name}</span>
+                <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: tag.color }} />
+                <span className="whitespace-nowrap">{tag.name}</span>
                 {ss && (
                   <button
-                    className={`w-4 h-4 flex items-center justify-center rounded text-text-dim transition-all hover:text-accent-blue hover:bg-white/10 opacity-0 group-hover:opacity-100 ${refreshingTag === tag.id ? "opacity-100 animate-spin" : ""}`}
+                    className={`w-3.5 h-3.5 flex items-center justify-center rounded-full text-text-dim transition-all hover:text-accent-blue opacity-0 group-hover:opacity-100 ${refreshingTag === tag.id ? "opacity-100 animate-spin" : ""}`}
                     onClick={(e) => handleRefreshSearch(e, ss)}
                     title={`Refresh smart tag (last run: ${ss.last_run_at ? new Date(ss.last_run_at).toLocaleDateString() : "never"})`}
                     disabled={refreshingTag === tag.id}
                   >
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
+                    <svg width="8" height="8" viewBox="0 0 16 16" fill="none">
                       <path d="M13.65 2.35A8 8 0 103.34 13.66M13.65 2.35V6.5M13.65 2.35H9.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                     </svg>
                   </button>
                 )}
-                <span className="text-[10px] text-text-dim">{tag.session_count ?? 0}</span>
               </Link>
             );
           })}
           {tags.length === 0 && !showCreateTag && (
-            <div className="px-2 py-1 text-[11px] text-text-dim">No tags yet</div>
+            <span className="text-[11px] text-text-dim">No tags yet</span>
           )}
         </div>
       </div>
 
-      <div className="border-t border-border px-3 py-2.5 shrink-0">
+      {/* Re-ingest button */}
+      <div className="border-t border-border/40 px-3 py-2.5 shrink-0">
         <button
-          className="w-full text-[11px] text-text-dim transition-all hover:text-text-secondary disabled:opacity-40 text-left"
+          className="flex items-center gap-2 w-full text-[11px] text-text-dim transition-all hover:text-text-secondary disabled:opacity-40 text-left"
           onClick={() => {
             setIngesting(true);
             fetch("/api/ingest", { method: "POST" })
@@ -276,6 +316,9 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           }}
           disabled={ingesting}
         >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" className={ingesting ? "animate-spin" : ""}>
+            <path d="M13.65 2.35A8 8 0 103.34 13.66M13.65 2.35V6.5M13.65 2.35H9.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
           {ingesting ? "Ingesting..." : "Re-ingest sessions"}
         </button>
       </div>

@@ -344,6 +344,19 @@ ${truncated}`,
 
 // ── Routes ─────────────────────────────────────────────────────────
 
+const activityHeatmap = db.prepare(`
+  SELECT date(started_at) as date, COUNT(*) as count
+  FROM sessions
+  WHERE started_at >= date('now', '-28 days')
+  GROUP BY date(started_at)
+  ORDER BY date ASC
+`);
+
+app.get("/api/activity-heatmap", (_req, res) => {
+  const rows = activityHeatmap.all();
+  res.json(rows);
+});
+
 app.get("/api/workspaces", (_req, res) => {
   const workspaces = listWorkspaces.all();
   res.json(workspaces);

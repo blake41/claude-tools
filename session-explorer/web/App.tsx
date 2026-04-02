@@ -19,42 +19,184 @@ import {
 } from "./router";
 import type { Workspace, Tag, SessionSummary } from "./types";
 
-// ── Shared workspace context ──────────────────────────────────────────
+// ── Shared contexts ──────────────────────────────────────────────────
 
 const WorkspacesContext = createContext<Workspace[]>([]);
+const SearchClickContext = createContext<(() => void) | null>(null);
 
 function useWorkspaces() {
   return useContext(WorkspacesContext);
 }
 
+function useSearchClick() {
+  return useContext(SearchClickContext);
+}
+
 // ── Page components ───────────────────────────────────────────────────
+
+interface HeatmapDay {
+  date: string;
+  count: number;
+}
+
+interface RecentSession {
+  id: string;
+  title: string | null;
+  started_at: string;
+  message_count: number;
+  workspace_name?: string;
+}
 
 function Dashboard() {
   const workspaces = useWorkspaces();
+  const onSearchClick = useSearchClick();
+  const navigate = useNavigate();
   const totalSessions = workspaces.reduce((s, w) => s + w.session_count, 0);
-  const mostRecent = workspaces.length > 0 ? workspaces[0] : null;
+  const [heatmap, setHeatmap] = useState<HeatmapDay[]>([]);
+  const [recentSessions, setRecentSessions] = useState<RecentSession[]>([]);
+
+  useEffect(() => {
+    fetch("/api/activity-heatmap")
+      .then((r) => r.json())
+      .then((data) => setHeatmap(data))
+      .catch(() => {});
+    fetch("/api/sessions?limit=8")
+      .then((r) => r.json())
+      .then((data) => {
+        // The API returns { sessions, pagination } — enrich with workspace name
+        const sessions = (data.sessions || []).map((s: Record<string, unknown>) => ({
+          id: s.id,
+          title: s.title,
+          started_at: s.started_at,
+          message_count: s.message_count,
+          workspace_name: (s as { workspace_name?: string }).workspace_name,
+          workspace_id: s.workspace_id,
+        }));
+        // Resolve workspace names from context
+        setRecentSessions(sessions.map((s: Record<string, unknown>) => {
+          const ws = workspaces.find(w => w.id === Number(s.workspace_id));
+          return { ...s, workspace_name: ws?.display_name || "Unknown" };
+        }));
+      })
+      .catch(() => {});
+  }, [workspaces]);
+
+  // Build 28-day heatmap grid (4 weeks, Mon-Sun columns)
+  const heatmapByDate = new Map(heatmap.map(h => [h.date, h.count]));
+  const days: { date: string; count: number; label: string }[] = [];
+  const today = new Date();
+  for (let i = 27; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().split("T")[0];
+    const count = heatmapByDate.get(dateStr) || 0;
+    const label = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+    days.push({ date: dateStr, count, label });
+  }
+  const maxCount = Math.max(1, ...days.map(d => d.count));
+
+  function heatColor(count: number): string {
+    if (count === 0) return "rgba(188, 140, 255, 0.06)";
+    const intensity = Math.min(count / maxCount, 1);
+    if (intensity < 0.25) return "rgba(188, 140, 255, 0.18)";
+    if (intensity < 0.5) return "rgba(188, 140, 255, 0.35)";
+    if (intensity < 0.75) return "rgba(188, 140, 255, 0.55)";
+    return "rgba(188, 140, 255, 0.8)";
+  }
+
+  function formatTime(dateStr: string): string {
+    const d = new Date(dateStr);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    if (diffMins < 60) return `${diffMins}m ago`;
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) return `${diffHours}h ago`;
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }
 
   return (
-    <div className="px-12 pt-15 max-w-[800px]">
-      <h1 className="text-[28px] font-semibold tracking-tight">Session Explorer</h1>
-      <p className="text-text-secondary mt-1 text-[15px]">Browse your Claude Code session history</p>
-      <div className="flex gap-4 mt-8">
-        <div className="bg-bg-card border border-border rounded-[10px] px-6 py-5 min-w-[160px]">
-          <div className="text-2xl font-semibold text-text whitespace-nowrap overflow-hidden text-ellipsis">{workspaces.length}</div>
-          <div className="text-xs text-text-secondary mt-1">Workspaces</div>
-        </div>
-        <div className="bg-bg-card border border-border rounded-[10px] px-6 py-5 min-w-[160px]">
-          <div className="text-2xl font-semibold text-text whitespace-nowrap overflow-hidden text-ellipsis">{totalSessions}</div>
-          <div className="text-xs text-text-secondary mt-1">Total Sessions</div>
-        </div>
-        {mostRecent && (
-          <div className="bg-bg-card border border-border rounded-[10px] px-6 py-5 min-w-[160px]">
-            <div className="text-2xl font-semibold text-text whitespace-nowrap overflow-hidden text-ellipsis">{mostRecent.display_name}</div>
-            <div className="text-xs text-text-secondary mt-1">Most Recent Activity</div>
-          </div>
-        )}
+    <div className="px-12 pt-10 pb-12">
+      {/* Prominent search bar (Raycast style) */}
+      <button
+        className="w-full bg-bg-card border border-border rounded-2xl px-6 py-5 flex items-center gap-4 transition-all hover:border-accent-purple/50 hover:bg-bg-card/80 group cursor-pointer text-left"
+        onClick={() => onSearchClick?.()}
+      >
+        <svg className="text-text-dim group-hover:text-accent-purple transition-colors shrink-0" width="22" height="22" viewBox="0 0 16 16" fill="none">
+          <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.5" />
+          <line x1="11" y1="11" x2="14.5" y2="14.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+        <span className="flex-1 text-[15px] text-text-dim group-hover:text-text-secondary transition-colors">Search sessions, files, messages...</span>
+        <kbd className="inline-flex items-center gap-1 px-2 py-1 font-mono text-[11px] text-text-dim bg-white/6 border border-border/60 rounded-md">
+          <span className="text-[13px]">&#8984;</span>K
+        </kbd>
+      </button>
+
+      {/* Session Activity heading */}
+      <div className="mt-5 mb-3">
+        <h2 className="text-[20px] font-semibold tracking-tight text-text">Session Activity</h2>
+        <p className="text-[13px] text-text-dim mt-0.5">{totalSessions} sessions across {workspaces.length} workspaces</p>
       </div>
-      <p className="mt-8 text-text-dim text-[13px]">Select a workspace from the sidebar to browse sessions.</p>
+
+      {/* Activity heatmap — two-row grid */}
+      <div className="bg-bg-card border border-border rounded-xl px-5 py-4 mb-8">
+        <div className="grid gap-[3px]" style={{ gridTemplateColumns: `repeat(14, 1fr)`, gridTemplateRows: "repeat(2, 1fr)" }}>
+          {days.map((day) => (
+            <div
+              key={day.date}
+              className="h-[16px] rounded-[3px] transition-colors"
+              style={{ background: heatColor(day.count) }}
+              title={`${day.label}: ${day.count} session${day.count !== 1 ? "s" : ""}`}
+            />
+          ))}
+        </div>
+        <div className="flex items-center justify-between mt-2">
+          <span className="text-[10px] text-text-dim">4 weeks ago</span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-text-dim mr-1">Less</span>
+            {[0, 0.25, 0.5, 0.75, 1].map((v, i) => (
+              <div key={i} className="w-[10px] h-[10px] rounded-[2px]" style={{ background: heatColor(v === 0 ? 0 : v * maxCount) }} />
+            ))}
+            <span className="text-[10px] text-text-dim ml-1">More</span>
+          </div>
+          <span className="text-[10px] text-text-dim">Today</span>
+        </div>
+      </div>
+
+      {/* Recent sessions */}
+      {recentSessions.length > 0 && (
+        <div>
+          <h3 className="text-[14px] font-semibold text-text mb-3">Recent Sessions</h3>
+          <div className="flex flex-col gap-1.5">
+            {recentSessions.map((session) => (
+              <button
+                key={session.id}
+                className="flex items-center gap-4 bg-bg-card border border-border rounded-lg px-4 py-3.5 transition-all hover:border-accent-purple/40 hover:bg-[rgba(22,27,34,0.8)] text-left w-full group"
+                onClick={() => navigate({ to: "/session/$id", params: { id: session.id } })}
+              >
+                {/* Purple message count badge */}
+                <div className="shrink-0 w-9 h-9 rounded-lg bg-accent-purple/12 flex items-center justify-center">
+                  <span className="text-[13px] font-semibold text-accent-purple">{session.message_count}</span>
+                </div>
+                {/* Session info */}
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] font-medium text-text line-clamp-1 group-hover:text-accent-purple transition-colors">
+                    {session.title || "Untitled session"}
+                  </div>
+                </div>
+                {/* Workspace + time */}
+                <div className="shrink-0 text-right">
+                  <div className="text-[11px] text-text-dim">{session.workspace_name}</div>
+                  <div className="text-[10px] text-text-dim mt-0.5">{formatTime(session.started_at)}</div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -377,15 +519,19 @@ function RootLayout() {
     );
   }
 
+  const handleSearchClick = () => navigate({ to: "/search" });
+
   return (
     <WorkspacesContext.Provider value={workspaces}>
-      <div className="flex h-full">
-        <Sidebar workspaces={workspaces} onSearchClick={() => navigate({ to: "/search" })} />
-        <main className="flex-1 overflow-y-auto relative">
-          {isSearchOpen && <SearchOverlay />}
-          <Outlet />
-        </main>
-      </div>
+      <SearchClickContext.Provider value={handleSearchClick}>
+        <div className="flex h-full">
+          <Sidebar workspaces={workspaces} onSearchClick={handleSearchClick} />
+          <main className="flex-1 overflow-y-auto relative">
+            {isSearchOpen && <SearchOverlay />}
+            <Outlet />
+          </main>
+        </div>
+      </SearchClickContext.Provider>
     </WorkspacesContext.Provider>
   );
 }
