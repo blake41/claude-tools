@@ -24,8 +24,11 @@ tools/
 
 | Component | Location |
 |-----------|----------|
-| Sandbox | `~/.local/bin/claude-sandbox` |
+| Sandbox | `~/.local/bin/claude-sandbox` (symlink) |
+| Sandbox request | `~/.local/bin/sandbox-request` (symlink) |
 | Sandbox config | `tools/sandbox/dirs` (write allowlist, self-protected via `:ro`) |
+| Sandbox fish fn | `tools/sandbox/cco-permissions.fish` (sourced from `config.fish`) |
+| Sandbox statusline | `~/.claude/statusline.sh` (symlink) |
 | Browser scripts | `~/.local/bin/browser-*` |
 | Browser config | No config needed (uses Chrome profile) |
 | Render scripts | `~/.local/bin/render-*` |
@@ -48,6 +51,29 @@ tools/
 | Docs | This folder |
 
 ## Quick Reference
+
+### Sandbox (Seatbelt)
+
+```bash
+# Launch Claude Code in sandbox
+cco-permissions                           # Start new sandboxed session
+cco-permissions --resume <session-id>     # Resume existing session
+
+# Inside the sandbox, if you hit "Operation not permitted":
+sandbox-request ~/.some-path              # Queue expansion request
+sandbox-request ~/.some-path --ro         # Read-only access
+# Then type /exit — the wrapper prompts: y=permanent, s=session, n=deny
+
+# Debug the Seatbelt policy
+CCO_DEBUG=1 cco-permissions               # Keeps policy file for inspection
+```
+
+Setup: `source ~/Documents/Development/tools/sandbox/cco-permissions.fish` in `~/.config/fish/config.fish`
+
+Symlinks needed:
+- `ln -sf ~/Documents/Development/tools/sandbox/claude-sandbox ~/.local/bin/claude-sandbox`
+- `ln -sf ~/Documents/Development/tools/sandbox/sandbox-request ~/.local/bin/sandbox-request`
+- `ln -sf ~/Documents/Development/tools/sandbox/statusline.sh ~/.claude/statusline.sh`
 
 ### Browser Control (Playwright + CDP)
 
