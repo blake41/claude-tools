@@ -19,4 +19,9 @@ sleep 3
 # Start dashboard
 "$AB" dashboard start
 
-echo "ab-startup: Chrome + dashboard ready" >&2
+# Start portless proxy (named .localhost URLs for dev servers)
+if command -v portless &>/dev/null; then
+  portless proxy start 2>/dev/null || true
+fi
+
+echo "ab-startup: Chrome + dashboard + portless ready" >&2
