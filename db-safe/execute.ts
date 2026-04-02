@@ -20,6 +20,8 @@ interface EnvConfig {
   url: string;
   label?: string;
   infisical?: { env: string; secret: string };
+  /** Allow write operations without TTY confirmation (for non-production envs) */
+  allowNonInteractiveWrites?: boolean;
 }
 
 interface Config {
@@ -297,9 +299,16 @@ async function main() {
 
   // Write guard
   if (isWrite) {
-    requireTTY(query, label);
-    const confirmed = await confirmWrite(query, label);
-    if (!confirmed) process.exit(1);
+    if (envConfig.allowNonInteractiveWrites && !process.stdin.isTTY) {
+      // Skip TTY check and confirmation for explicitly opted-in environments
+      console.error(`⚠️  WRITE on [${label}] (auto-confirmed via allowNonInteractiveWrites)`);
+      console.error(`  Operation: ${query}`);
+      console.error("");
+    } else {
+      requireTTY(query, label);
+      const confirmed = await confirmWrite(query, label);
+      if (!confirmed) process.exit(1);
+    }
   }
 
   try {

@@ -222,10 +222,16 @@ Use JSON-compatible format: { "key": "value" }`);
     const url2 = resolveUrl(envConfig);
     const isWrite = mode === "sql-write" || mode === "prisma-write";
     if (isWrite) {
-      requireTTY(query2, label);
-      const confirmed = await confirmWrite(query2, label);
-      if (!confirmed)
-        process.exit(1);
+      if (envConfig.allowNonInteractiveWrites && !process.stdin.isTTY) {
+        console.error(`\u26A0\uFE0F  WRITE on [${label}] (auto-confirmed via allowNonInteractiveWrites)`);
+        console.error(`  Operation: ${query2}`);
+        console.error("");
+      } else {
+        requireTTY(query2, label);
+        const confirmed = await confirmWrite(query2, label);
+        if (!confirmed)
+          process.exit(1);
+      }
     }
     try {
       let result;
