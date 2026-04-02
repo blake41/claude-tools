@@ -5,7 +5,9 @@
 # Polls both GitHub Actions and Render deploys. If CI fails, notifies
 # immediately instead of waiting for a Render deploy that will never come.
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: no `set -e` — this is a background polling script that must survive
+# transient failures (network blips, API timeouts, jq parse errors).
 
 REPO="${1:-}"
 ENV="${2:-}"
@@ -43,7 +45,6 @@ esac
 
 GH_REPO="$REPO"
 SHORT_SHA="${COMMIT_SHA:0:7}"
-PUSH_TIME=$(date "+%s")
 POLL_INTERVAL=15
 MAX_WAIT=600  # 10 minutes
 WAITED=0
@@ -52,11 +53,23 @@ WAITED=0
 LOGFILE="$HOME/Library/Logs/watch-deploy.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOGFILE"; }
 
+# Kill any previous watcher for the same repo+env
+PIDFILE="/tmp/watch-deploy-${REPO//\//-}-${ENV}.pid"
+if [[ -f "$PIDFILE" ]]; then
+  OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
+  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    log "KILLING_STALE pid=$OLD_PID"
+    kill "$OLD_PID" 2>/dev/null || true
+  fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
 log "START repo=$GH_REPO env=$ENV branch=$BRANCH sha=$SHORT_SHA msg=\"$COMMIT_MSG\" service=$SERVICE_ID"
 
 # Capture the current latest deploy ID so we can detect a new one
 INITIAL_DEPLOY_ID=$(render-services deploys "$SERVICE_ID" 2>/dev/null \
-  | jq -r '.result[0].id // empty')
+  | jq -r '.result[0].id // empty' 2>/dev/null) || INITIAL_DEPLOY_ID=""
 
 log "INITIAL_DEPLOY_ID=$INITIAL_DEPLOY_ID"
 
@@ -72,29 +85,27 @@ notify() {
 check_ci() {
   if [[ -z "$BRANCH" ]]; then return 0; fi
   local result
-  result=$(gh run list \
+  if ! result=$(gh run list \
     --repo "$GH_REPO" \
     --branch "$BRANCH" \
     --workflow "$GH_WORKFLOW" \
-    --json conclusion,databaseId,createdAt \
-    --limit 1 2>/dev/null) || return 0
+    --json conclusion,databaseId,headSha \
+    --limit 5 2>&1); then
+    log "GH_API_ERROR: $result"
+    return 0  # API error — keep polling, don't bail
+  fi
 
-  # No run found yet — CI hasn't started
+  # No runs found yet — CI hasn't started
   if [[ -z "$result" || "$result" == "[]" ]]; then return 0; fi
 
-  local conclusion run_id created_at
-  conclusion=$(echo "$result" | jq -r '.[0].conclusion // empty')
-  run_id=$(echo "$result" | jq -r '.[0].databaseId // empty')
-  created_at=$(echo "$result" | jq -r '.[0].createdAt // empty')
+  # Find the run matching our commit SHA — ignore runs for other commits
+  local matched
+  matched=$(echo "$result" | jq -r "[.[] | select(.headSha == \"$COMMIT_SHA\")] | .[0] // empty")
+  if [[ -z "$matched" || "$matched" == "null" ]]; then return 0; fi
 
-  # Ignore runs that started before our push (stale results)
-  if [[ -n "$created_at" ]]; then
-    local run_epoch
-    run_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$created_at" "+%s" 2>/dev/null || echo 0)
-    if (( run_epoch < PUSH_TIME - 60 )); then
-      return 0
-    fi
-  fi
+  local conclusion run_id
+  conclusion=$(echo "$matched" | jq -r '.conclusion // empty')
+  run_id=$(echo "$matched" | jq -r '.databaseId // empty')
 
   case "$conclusion" in
     failure)
@@ -116,9 +127,11 @@ while true; do
   # Check CI status — bail early if build failed
   check_ci
 
-  DEPLOY_JSON=$(render-services deploys "$SERVICE_ID" 2>/dev/null || echo '{}')
-  LATEST_ID=$(echo "$DEPLOY_JSON" | jq -r '.result[0].id // empty')
+  DEPLOY_JSON=$(render-services deploys "$SERVICE_ID" 2>/dev/null) || true
+  LATEST_ID=$(echo "$DEPLOY_JSON" | jq -r '.result[0].id // empty' 2>/dev/null) || true
 
+  # Only break if we got a real deploy ID that differs from the initial one.
+  # Empty LATEST_ID means the API failed — keep polling, don't false-positive.
   if [[ -n "$LATEST_ID" && "$LATEST_ID" != "$INITIAL_DEPLOY_ID" ]]; then
     log "NEW_DEPLOY id=$LATEST_ID after ${WAITED}s"
     break
@@ -136,8 +149,8 @@ done
 
 # Now poll until the new deploy reaches a terminal state
 while true; do
-  DEPLOY_JSON=$(render-services deploys "$SERVICE_ID" 2>/dev/null || echo '{}')
-  STATUS=$(echo "$DEPLOY_JSON" | jq -r '.result[0].status // "unknown"')
+  DEPLOY_JSON=$(render-services deploys "$SERVICE_ID" 2>/dev/null) || true
+  STATUS=$(echo "$DEPLOY_JSON" | jq -r '.result[0].status // "unknown"' 2>/dev/null) || STATUS="unknown"
 
   case "$STATUS" in
     live)
@@ -160,7 +173,6 @@ while true; do
       ;;
     *)
       log "UNKNOWN_STATUS status=$STATUS deploy=$LATEST_ID after ${WAITED}s"
-      notify "Unknown Deploy Status" "$STATUS — ${SHORT_SHA}" "Purr"
       ;;
   esac
 
