@@ -17,7 +17,10 @@
 
 set -euo pipefail
 
-CDP_PORT=9333
+CDP_PORT_USER=9222      # User's personal Chrome (for reauth cookie stealing)
+CDP_PORT_HEADLESS=9333  # Managed headless Chrome (automation target)
+CDP_PORT_HEADED=9444    # Managed headed Chrome (debugging/import)
+CDP_PORT=$CDP_PORT_HEADLESS
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE="$HOME/.agent-browser/profile"
 CHROME_PIDFILE="/tmp/ab-chrome-${CDP_PORT}.pid"
@@ -190,11 +193,10 @@ _reauth() {
 
   local tmp_state="/tmp/ab-reauth-$$.json"
 
-  # Connect to user's personal Chrome and export state
-  # Use a separate session to avoid contaminating the default daemon
-  if ! agent-browser --auto-connect --session reauth-tmp state save "$tmp_state" 2>/dev/null; then
-    echo "✗ Could not connect to your personal Chrome." >&2
-    echo "  Make sure Chrome is running with at least one tab open." >&2
+  # Connect to user's personal Chrome on port 9222 and export state
+  if ! agent-browser --cdp "$CDP_PORT_USER" --session reauth-tmp state save "$tmp_state" 2>/dev/null; then
+    echo "✗ Could not connect to your personal Chrome on port $CDP_PORT_USER." >&2
+    echo "  Make sure Chrome is running with --remote-debugging-port=$CDP_PORT_USER" >&2
     return 1
   fi
   # Kill the temporary daemon immediately so it doesn't intercept future --cdp commands
@@ -251,7 +253,9 @@ _import() {
     return 1
   fi
 
-  echo "▶ Import: starting headed Chrome for manual login..." >&2
+  local headed_pidfile="/tmp/ab-chrome-${CDP_PORT_HEADED}.pid"
+
+  echo "▶ Import: starting headed Chrome on port $CDP_PORT_HEADED for manual login..." >&2
   echo "" >&2
   echo "  A Chrome window will open. Log into Google/Clerk on:" >&2
   echo "    1. http://localhost:5173 (local dev)" >&2
@@ -261,62 +265,43 @@ _import() {
   echo "  Press Enter here when done logging in." >&2
   echo "" >&2
 
-  # If Chrome is running headless, kill and restart headed
-  local was_running=0
-  if _cdp_is_up; then
-    was_running=1
-    echo "  Stopping headless Chrome first..." >&2
-    if [[ -f "$CHROME_PIDFILE" ]]; then
-      local p; p="$(cat "$CHROME_PIDFILE")"
-      kill "$p" 2>/dev/null; sleep 1
-      rm -f "$CHROME_PIDFILE"
-    fi
-    # Kill daemons too
-    pgrep "agent-browser-d" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
-    rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
-    sleep 1
-  fi
-
-  # Launch headed Chrome with same profile
+  # Launch headed Chrome on its own port (headless stays running)
   "$CHROME_BIN" \
-    --remote-debugging-port="$CDP_PORT" \
+    --remote-debugging-port="$CDP_PORT_HEADED" \
     --user-data-dir="$CHROME_PROFILE" \
     --no-first-run --no-default-browser-check \
     "http://localhost:5173/?renderer=v4" >/dev/null 2>&1 &
-  echo "$!" > "$CHROME_PIDFILE"
+  echo "$!" > "$headed_pidfile"
 
   local tries=0
-  while ! _cdp_is_up && [[ $tries -lt 15 ]]; do sleep 1; tries=$((tries+1)); done
-  if ! _cdp_is_up; then
-    echo "✗ Chrome failed to start" >&2
+  while ! curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT_HEADED}/json/version" >/dev/null 2>&1 && [[ $tries -lt 15 ]]; do
+    sleep 1; tries=$((tries+1))
+  done
+  if ! curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT_HEADED}/json/version" >/dev/null 2>&1; then
+    echo "✗ Headed Chrome failed to start on port $CDP_PORT_HEADED" >&2
     return 1
   fi
 
   echo "  Chrome is open. Log in now, then press Enter..." >&2
   read -r
 
-  # Export state as backup
+  # Export state from headed Chrome
   echo "  Exporting auth state..." >&2
-  agent-browser --cdp "$CDP_PORT" state save "$AUTH_STATE" 2>/dev/null \
+  agent-browser --cdp "$CDP_PORT_HEADED" state save "$AUTH_STATE" 2>/dev/null \
     && echo "  ✓ Auth backed up to $AUTH_STATE" >&2 || echo "  ✗ Auth backup failed" >&2
 
-  # Run seed to ensure localStorage defaults
-  _seed
-
-  # Restart headless
-  echo "  Restarting Chrome headless..." >&2
-  local p; p="$(cat "$CHROME_PIDFILE")"
+  # Kill headed Chrome
+  local p; p="$(cat "$headed_pidfile")"
   kill "$p" 2>/dev/null; sleep 1
-  pgrep "agent-browser-d" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
-  rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock "$CHROME_PIDFILE"
-  sleep 1
+  rm -f "$headed_pidfile"
 
-  HEADED=0
+  # Load auth into managed headless Chrome and re-seed
   _ensure_chrome
+  _restore_auth
+  _seed
 
   echo "" >&2
   echo "✓ Import complete. Auth persisted in profile + backed up to terra-auth.json" >&2
-  echo "  Managed Chrome is headless again and ready for automation." >&2
 }
 
 # --- Heal: kill managed Chrome + daemons, start fresh ---
@@ -459,23 +444,31 @@ case "${1:-}" in
     esac
     ;;
 
-  # --- Aliases for Playwright-like commands the model naturally tries ---
-  js|execute)
+  # --- Storage commands (replaces raw eval for localStorage) ---
+  localStorage)
     _ensure_chrome
-    shift  # remove js/execute, replace with eval
-    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval "$@"
-    rc=$?
-    [[ $rc -ne 0 ]] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL($rc) eval $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
-    exit $rc
+    case "${2:-}" in
+      get) agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval "localStorage.getItem('${3:-}')" ;;
+      set) agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval "localStorage.setItem('${3:-}','${4:-}');'ok'" ;;
+      *)   echo "Usage: ab localStorage <get|set> <key> [value]" >&2; exit 1 ;;
+    esac
     ;;
-  console)
-    _ensure_chrome
-    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval 'JSON.stringify(window.__console_logs || "console not captured")' 2>/dev/null
+
+  # --- Blocked: eval/js/execute — use snapshot + refs instead ---
+  eval|js|execute)
+    echo "✗ eval is blocked. Use the proper commands instead:" >&2
+    echo "  ab snapshot -i          # discover elements" >&2
+    echo "  ab click @ref           # click by ref" >&2
+    echo "  ab get text @ref        # read element text" >&2
+    echo "  ab find text \"X\" click  # click by visible text" >&2
+    echo "  ab localStorage get/set # read/write localStorage" >&2
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) BLOCKED eval $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
+    exit 1
     ;;
 
   # --- Allowed agent-browser passthroughs (session-isolated) ---
   snapshot|screenshot|click|fill|type|select|check|press|scroll|\
-  find|get|wait|eval|highlight|hover|pdf|diff|set|keyboard|frame)
+  find|get|wait|highlight|hover|pdf|diff|set|keyboard|frame)
     _ensure_chrome
     agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
     rc=$?
