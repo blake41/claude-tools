@@ -206,44 +206,93 @@ _seed() {
     && echo "✓ Seeded" >&2 || echo "✗ Seed failed (pages may need auth first)" >&2
 }
 
-# --- Reauth: grab cookies from user's personal Chrome ---
-_reauth() {
-  _ensure_chrome || return 1
-  echo "▶ Grabbing auth from your personal Chrome..." >&2
-
-  local tmp_state="/tmp/ab-reauth-$$.json"
-
-  # Connect to user's personal Chrome on port 9222 and export state
-  if ! agent-browser --cdp "$CDP_PORT_USER" --session reauth-tmp state save "$tmp_state" 2>/dev/null; then
-    echo "✗ Could not connect to your personal Chrome on port $CDP_PORT_USER." >&2
-    echo "  Make sure Chrome is running with --remote-debugging-port=$CDP_PORT_USER" >&2
-    return 1
+# --- Discover personal Chrome's CDP port via DevToolsActivePort ---
+_discover_personal_chrome_port() {
+  local dtap="$HOME/Library/Application Support/Google/Chrome/DevToolsActivePort"
+  if [[ -f "$dtap" ]]; then
+    head -1 "$dtap" 2>/dev/null
   fi
-  # Kill the temporary daemon immediately so it doesn't intercept future --cdp commands
+}
+
+# --- Try to grab cookies from a Chrome on a given port ---
+_grab_cookies_from_port() {
+  local port="$1" tmp_state="$2" label="$3"
+  _port_is_up "$port" || return 1
+  echo "  Trying $label (port $port)..." >&2
+  if agent-browser --cdp "$port" --session reauth-tmp state save "$tmp_state" 2>/dev/null; then
+    pgrep -f "agent-browser-d.*reauth-tmp" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
+    rm -f ~/.agent-browser/reauth-tmp.sock 2>/dev/null
+    local count
+    count=$(python3 -c "import json; d=json.load(open('$tmp_state')); print(len(d.get('cookies',[])))" 2>/dev/null || echo 0)
+    if [[ "$count" -gt 0 ]]; then
+      echo "  ✓ Got $count cookies from $label" >&2
+      return 0
+    fi
+  fi
   pgrep -f "agent-browser-d.*reauth-tmp" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
   rm -f ~/.agent-browser/reauth-tmp.sock 2>/dev/null
+  return 1
+}
 
-  local cookie_count
-  cookie_count=$(python3 -c "import json; d=json.load(open('$tmp_state')); print(len(d.get('cookies',[])))" 2>/dev/null || echo 0)
-  if [[ "$cookie_count" -eq 0 ]]; then
-    echo "✗ No cookies found in personal Chrome." >&2
+# --- Reauth: grab cookies with cascade fallback ---
+_reauth() {
+  _ensure_chrome || return 1
+  echo "▶ Grabbing auth cookies..." >&2
+
+  local tmp_state="/tmp/ab-reauth-$$.json"
+  local got_cookies=false
+
+  # 1. Try personal Chrome on known port
+  if _grab_cookies_from_port "$CDP_PORT_USER" "$tmp_state" "personal Chrome"; then
+    got_cookies=true
+  fi
+
+  # 2. Try personal Chrome via DevToolsActivePort discovery
+  if [[ "$got_cookies" == "false" ]]; then
+    local discovered_port
+    discovered_port=$(_discover_personal_chrome_port)
+    if [[ -n "$discovered_port" && "$discovered_port" != "$CDP_PORT_USER" ]]; then
+      if _grab_cookies_from_port "$discovered_port" "$tmp_state" "personal Chrome (discovered port $discovered_port)"; then
+        got_cookies=true
+      fi
+    fi
+  fi
+
+  # 3. Try headed managed Chrome
+  if [[ "$got_cookies" == "false" ]]; then
+    if _grab_cookies_from_port "$CDP_PORT_HEADED" "$tmp_state" "headed Chrome"; then
+      got_cookies=true
+    fi
+  fi
+
+  # 4. Fall back to backup file
+  if [[ "$got_cookies" == "false" && -f "$AUTH_STATE" ]]; then
+    local backup_count
+    backup_count=$(python3 -c "import json; d=json.load(open('$AUTH_STATE')); print(len(d.get('cookies',[])))" 2>/dev/null || echo 0)
+    if [[ "$backup_count" -gt 0 ]]; then
+      echo "  Using auth backup ($backup_count cookies)..." >&2
+      cp "$AUTH_STATE" "$tmp_state"
+      got_cookies=true
+    fi
+  fi
+
+  if [[ "$got_cookies" == "false" ]]; then
+    echo "✗ No auth source available. Run 'ab import' for manual login." >&2
     rm -f "$tmp_state"
     return 1
   fi
 
   # Load into managed Chrome
   agent-browser --cdp "$CDP_PORT" state load "$tmp_state" 2>/dev/null \
-    && echo "  ✓ Loaded $cookie_count cookies into managed Chrome" >&2 \
+    && echo "  ✓ Loaded cookies into managed Chrome" >&2 \
     || { echo "  ✗ Failed to load cookies" >&2; rm -f "$tmp_state"; return 1; }
 
-  # Update the backup file too
+  # Update backup
   cp "$tmp_state" "$AUTH_STATE" 2>/dev/null
   rm -f "$tmp_state"
 
-  # Re-seed localStorage defaults
   _seed
-
-  echo "✓ Reauth complete — grabbed cookies from personal Chrome" >&2
+  echo "✓ Reauth complete" >&2
 }
 
 # --- Restore: load auth state backup into managed Chrome ---
