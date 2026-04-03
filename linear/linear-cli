@@ -76,6 +76,67 @@ cmd_projects() {
   json_ok "$TOOL_NAME projects" "$result" "$na"
 }
 
+# Download Linear upload images from description, resize for AI vision, cache locally.
+# Sets $PROCESSED_DESCRIPTION (URLs replaced with local paths) and $IMAGES_JSON (array).
+process_description_images() {
+  local description="$1"
+  local image_dir="/tmp/linear-images"
+  mkdir -p "$image_dir"
+
+  local api_key
+  api_key=$(get_api_key)
+
+  local images_json="[]"
+  local processed_desc="$description"
+
+  # Extract all markdown image URLs pointing to Linear uploads
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local alt url
+    alt=$(echo "$line" | sed -n 's/.*!\[\([^]]*\)\].*/\1/p')
+    url=$(echo "$line" | sed -n 's/.*!(\([^)]*\)).*/\1/p')
+    [[ -z "$url" ]] && url=$(echo "$line" | sed -n 's/.*(\(https:\/\/uploads\.linear\.app\/[^)]*\)).*/\1/p')
+    [[ -z "$url" ]] && continue
+
+    # Deterministic filename from URL hash
+    local hash
+    hash=$(echo -n "$url" | md5 -q 2>/dev/null || echo -n "$url" | md5sum | cut -d' ' -f1)
+    local cached_path="$image_dir/${hash}.png"
+
+    # Download and resize if not cached
+    if [[ ! -f "$cached_path" ]]; then
+      local tmp_path="$image_dir/${hash}_raw"
+      local http_code
+      http_code=$(curl -s -w '%{http_code}' -H "Authorization: $api_key" -o "$tmp_path" "$url")
+
+      if [[ "$http_code" == "200" && -f "$tmp_path" && -s "$tmp_path" ]]; then
+        # Resize to max 1200px on longest edge (macOS sips)
+        if command -v sips &>/dev/null; then
+          sips -Z 1200 "$tmp_path" --out "$cached_path" &>/dev/null
+        else
+          cp "$tmp_path" "$cached_path"
+        fi
+        rm -f "$tmp_path"
+      else
+        rm -f "$tmp_path"
+        continue
+      fi
+    fi
+
+    # Add to images array
+    images_json=$(echo "$images_json" | jq --arg path "$cached_path" --arg alt "$alt" --arg url "$url" \
+      '. + [{"path": $path, "alt": $alt, "original_url": $url}]')
+
+    # Replace URL in description with local path
+    local escaped_url
+    escaped_url=$(printf '%s\n' "$url" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    processed_desc=$(echo "$processed_desc" | sed "s|$escaped_url|$cached_path|g")
+  done < <(echo "$description" | grep -oE '!\[[^]]*\]\(https://uploads\.linear\.app/[^)]+\)')
+
+  PROCESSED_DESCRIPTION="$processed_desc"
+  IMAGES_JSON="$images_json"
+}
+
 cmd_issue() {
   local issue_id="$1"
   # Parse identifier like "GTM-3424" into team key and number
@@ -87,10 +148,21 @@ cmd_issue() {
   fi
 
   local result
-  result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty')
+  result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } attachments { nodes { id title url metadata sourceType } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty')
 
   if [[ -z "$result" || "$result" == "null" ]]; then
     json_error "$TOOL_NAME issue" "Issue '$issue_id' not found" "NOT_FOUND" "Check the issue identifier"
+  fi
+
+  # Process inline images from description
+  local description
+  description=$(echo "$result" | jq -r '.description // ""')
+
+  if echo "$description" | grep -q 'https://uploads\.linear\.app/'; then
+    process_description_images "$description"
+    # Update result with processed description and images array
+    result=$(echo "$result" | jq --arg desc "$PROCESSED_DESCRIPTION" --argjson imgs "$IMAGES_JSON" \
+      '.description = $desc | .images = $imgs')
   fi
 
   local na
