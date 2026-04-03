@@ -86,22 +86,22 @@ _open_with_context() {
   local url="$1"
   if [[ ${#SESSION_ARGS[@]} -eq 0 ]]; then
     # No session — just open in default daemon's default tab
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
+    agent-browser --cdp "$CDP_PORT" open "$url"
     return
   fi
 
   # Check if this daemon already has a tab (tab list returns data)
   local tab_count
-  tab_count=$(AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" tab list --json 2>/dev/null \
+  tab_count=$(agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" tab list --json 2>/dev/null \
     | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('data',{}).get('tabs',[])))" 2>/dev/null || echo "0")
 
   if [[ "$tab_count" -le 1 ]]; then
     # First open for this session — create a dedicated tab
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" tab new >/dev/null 2>&1
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" set viewport 1440 900 2 >/dev/null 2>&1
+    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" tab new >/dev/null 2>&1
+    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" set viewport 1440 900 2 >/dev/null 2>&1
   fi
 
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" open "$url"
+  agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" open "$url"
 }
 
 # --- Dashboard: manage the agent-browser dashboard ---
@@ -172,19 +172,15 @@ _seed() {
   _ensure_chrome || return 1
   echo "▶ Seeding localStorage defaults..." >&2
 
-  # Set renderer=v4 on each origin
+  # Build batch: for each origin, navigate + wait + set localStorage, then blank
+  local batch='['
   for origin in "${SEED_ORIGINS[@]}"; do
-    echo "  Setting terra:renderer=v4 on $origin" >&2
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$origin" 2>/dev/null
-    # Wait for page to be interactive enough for localStorage access
-    sleep 2
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" eval 'localStorage.setItem("terra:renderer", "v4"); "ok"' 2>/dev/null \
-      && echo "    ✓ Set" >&2 || echo "    ✗ Failed (page may need auth first)" >&2
+    batch+="[\"open\",\"$origin\"],[\"wait\",\"--load\",\"domcontentloaded\"],[\"eval\",\"localStorage.setItem('terra:renderer','v4');'ok'\"],"
   done
+  batch+='["open","about:blank"]]'
 
-  # Return to blank page
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "about:blank" 2>/dev/null
-  echo "✓ Seeded" >&2
+  echo "$batch" | agent-browser --cdp "$CDP_PORT" batch --json 2>/dev/null \
+    && echo "✓ Seeded" >&2 || echo "✗ Seed failed (pages may need auth first)" >&2
 }
 
 # --- Reauth: grab cookies from user's personal Chrome ---
@@ -214,7 +210,7 @@ _reauth() {
   fi
 
   # Load into managed Chrome
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" state load "$tmp_state" 2>/dev/null \
+  agent-browser --cdp "$CDP_PORT" state load "$tmp_state" 2>/dev/null \
     && echo "  ✓ Loaded $cookie_count cookies into managed Chrome" >&2 \
     || { echo "  ✗ Failed to load cookies" >&2; rm -f "$tmp_state"; return 1; }
 
@@ -244,7 +240,7 @@ _restore_auth() {
   fi
 
   echo "  Restoring auth from backup ($cookie_count cookies)..." >&2
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" state load "$AUTH_STATE" 2>/dev/null \
+  agent-browser --cdp "$CDP_PORT" state load "$AUTH_STATE" 2>/dev/null \
     && echo "  ✓ Auth restored" >&2 || echo "  ✗ Auth restore failed" >&2
 }
 
@@ -301,7 +297,7 @@ _import() {
 
   # Export state as backup
   echo "  Exporting auth state..." >&2
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" state save "$AUTH_STATE" 2>/dev/null \
+  agent-browser --cdp "$CDP_PORT" state save "$AUTH_STATE" 2>/dev/null \
     && echo "  ✓ Auth backed up to $AUTH_STATE" >&2 || echo "  ✗ Auth backup failed" >&2
 
   # Run seed to ensure localStorage defaults
@@ -380,7 +376,7 @@ _status() {
   fi
   _dashboard_is_up && echo "Dashboard: ✓ http://127.0.0.1:${DASHBOARD_PORT}" || echo "Dashboard: ✗ not running"
   echo "Sessions:"
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" session list 2>/dev/null || echo "  (cannot list)"
+  agent-browser --cdp "$CDP_PORT" session list 2>/dev/null || echo "  (cannot list)"
 }
 
 # --- Parse flags from args ---
@@ -421,11 +417,11 @@ case "${1:-}" in
     [[ -z "${2:-}" ]] && { echo "Usage: ab seed-url <url>" >&2; exit 1; }
     _ensure_chrome || exit 1
     echo "▶ Seeding localStorage on $2..." >&2
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$2" 2>/dev/null
+    agent-browser --cdp "$CDP_PORT" open "$2" 2>/dev/null
     sleep 2
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" eval 'localStorage.setItem("terra:renderer", "v4"); "ok"' 2>/dev/null \
+    agent-browser --cdp "$CDP_PORT" eval 'localStorage.setItem("terra:renderer", "v4"); "ok"' 2>/dev/null \
       && echo "  ✓ Set terra:renderer=v4" >&2 || echo "  ✗ Failed (page may need auth first)" >&2
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "about:blank" 2>/dev/null
+    agent-browser --cdp "$CDP_PORT" open "about:blank" 2>/dev/null
     echo "✓ Seeded $2" >&2
     ;;
   dashboard) _dashboard "${2:-}" ;;
@@ -451,10 +447,10 @@ case "${1:-}" in
     case "${2:-}" in
       start)
         [[ -z "${3:-}" ]] && { echo "Usage: ab record start <output.webm>" >&2; exit 1; }
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" video start "$3"
+        agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" video start "$3"
         ;;
       stop)
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" video stop
+        agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" video stop
         ;;
       *)
         echo "Usage: ab record <start|stop> [output.webm]" >&2
@@ -463,11 +459,25 @@ case "${1:-}" in
     esac
     ;;
 
+  # --- Aliases for Playwright-like commands the model naturally tries ---
+  js|execute)
+    _ensure_chrome
+    shift  # remove js/execute, replace with eval
+    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval "$@"
+    rc=$?
+    [[ $rc -ne 0 ]] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL($rc) eval $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
+    exit $rc
+    ;;
+  console)
+    _ensure_chrome
+    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval 'JSON.stringify(window.__console_logs || "console not captured")' 2>/dev/null
+    ;;
+
   # --- Allowed agent-browser passthroughs (session-isolated) ---
   snapshot|screenshot|click|fill|type|select|check|press|scroll|\
-  find|get|wait|eval|highlight|pdf|diff|set|keyboard|frame)
+  find|get|wait|eval|highlight|hover|pdf|diff|set|keyboard|frame)
     _ensure_chrome
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
+    agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
     rc=$?
     [[ $rc -ne 0 ]] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL($rc) $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
     exit $rc
