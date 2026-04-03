@@ -583,6 +583,19 @@ export default function SessionDetail() {
               </svg>
               Top
             </button>
+            <button
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
+              onClick={() => {
+                const main = document.querySelector("main");
+                if (main) main.scrollTo({ top: main.scrollHeight, behavior: "smooth" });
+              }}
+              title="Scroll to bottom"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 4V12M4 8L8 12L12 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Bottom
+            </button>
           </div>
         </div>
 

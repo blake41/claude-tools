@@ -122,14 +122,24 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
 
   return (
     <aside className="w-[230px] min-w-[230px] bg-[#101018] border-r border-border/50 flex flex-col overflow-hidden">
-      {/* Header: Diamond icon + Explorer */}
+      {/* Header: Diamond icon + Explorer + Search */}
       <div className="flex items-center gap-2.5 px-4 pt-5 pb-3">
-        <Link to="/" className="flex items-center gap-2.5 no-underline text-inherit hover:no-underline">
+        <Link to="/" className="flex items-center gap-2.5 no-underline text-inherit hover:no-underline flex-1">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
             <path d="M9 1L16.5 9L9 17L1.5 9L9 1Z" fill="#bc8cff" fillOpacity="0.25" stroke="#bc8cff" strokeWidth="1.5" strokeLinejoin="round" />
           </svg>
           <span className="text-[15px] font-semibold tracking-tight text-text">Explorer</span>
         </Link>
+        <button
+          className="shrink-0 p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8"
+          onClick={onSearchClick}
+          title="Search (⌘K)"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+            <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
       </div>
 
       {/* Filter input */}
