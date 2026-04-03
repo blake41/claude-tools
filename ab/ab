@@ -51,7 +51,8 @@ _port_is_up() {
 
 # --- Launch Chrome on a given port ---
 _launch_chrome() {
-  local port="$1" mode="$2" pidfile="/tmp/ab-chrome-${port}.pid"
+  local port="$1" mode="$2"
+  local pidfile="/tmp/ab-chrome-${port}.pid"
 
   _port_is_up "$port" && return 0
 
