@@ -29,7 +29,7 @@ SEED_ORIGINS=("http://localhost:5173" "https://slack-feedback-staging.onrender.c
 DASHBOARD_PORT=4848
 DASHBOARD_PIDFILE="$HOME/.agent-browser/dashboard.pid"
 
-# Headless by default. Set AB_HEADED=1 or pass --headed to show the window.
+# Headless by default. Set AB_HEADED=1 or pass --headed to route to headed Chrome.
 HEADED=0
 if [[ "${AB_HEADED:-}" == "1" ]]; then HEADED=1; fi
 
@@ -39,27 +39,31 @@ if [[ "${1:-}" == "close" ]]; then
   exit 1
 fi
 
-# --- Check if CDP port is listening ---
+# --- Check if the active CDP port is listening ---
 _cdp_is_up() {
   curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1
 }
 
-# --- Ensure Chrome is running with CDP ---
-_ensure_chrome() {
-  _cdp_is_up && return 0
+# --- Check if a specific CDP port is listening ---
+_port_is_up() {
+  curl -s --max-time 2 "http://127.0.0.1:${1}/json/version" >/dev/null 2>&1
+}
 
-  # Note: Chrome launches fine inside Seatbelt sandbox as long as
-  # ~/.agent-browser, ~/Library/Caches, ~/Library/Application Support, and /tmp are writable
+# --- Launch Chrome on a given port ---
+_launch_chrome() {
+  local port="$1" mode="$2" pidfile="/tmp/ab-chrome-${port}.pid"
+
+  _port_is_up "$port" && return 0
 
   local headless_flag=""
-  if [[ "$HEADED" == "0" ]]; then
+  if [[ "$mode" == "headless" ]]; then
     headless_flag="--headless=new"
-    echo "▶ Launching Chrome headless on CDP port $CDP_PORT..." >&2
+    echo "▶ Launching Chrome headless on CDP port $port..." >&2
   else
-    echo "▶ Launching Chrome headed on CDP port $CDP_PORT..." >&2
+    echo "▶ Launching Chrome headed on CDP port $port..." >&2
   fi
   "$CHROME_BIN" \
-    --remote-debugging-port="$CDP_PORT" \
+    --remote-debugging-port="$port" \
     --user-data-dir="$CHROME_PROFILE" \
     $headless_flag \
     --no-first-run --no-default-browser-check \
@@ -68,17 +72,32 @@ _ensure_chrome() {
     --metrics-recording-only --disable-machine-learning-model-loader \
     --disable-client-side-phishing-detection --safebrowsing-disable-auto-update \
     "about:blank" >/dev/null 2>&1 &
-  echo "$!" > "$CHROME_PIDFILE"
+  echo "$!" > "$pidfile"
 
   local tries=0
-  while ! _cdp_is_up && [[ $tries -lt 15 ]]; do sleep 1; tries=$((tries+1)); done
-  if _cdp_is_up; then
-    echo "✓ Chrome ready (CDP port $CDP_PORT)" >&2
-    # Ensure dashboard is running alongside Chrome
-    _dashboard_is_up || _dashboard_start 2>/dev/null
+  while ! _port_is_up "$port" && [[ $tries -lt 15 ]]; do sleep 1; tries=$((tries+1)); done
+  if _port_is_up "$port"; then
+    echo "✓ Chrome ready (CDP port $port)" >&2
   else
-    echo "✗ Chrome not responding" >&2
+    echo "✗ Chrome not responding on port $port" >&2
     return 1
+  fi
+}
+
+# --- Ensure the active Chrome is running ---
+_ensure_chrome() {
+  if [[ "$HEADED" == "1" ]]; then
+    local was_up=0
+    _port_is_up "$CDP_PORT_HEADED" && was_up=1
+    _launch_chrome "$CDP_PORT_HEADED" headed || return 1
+    # First launch: seed auth + localStorage into headed Chrome
+    if [[ "$was_up" == "0" ]]; then
+      _restore_auth
+      _seed
+    fi
+  else
+    _launch_chrome "$CDP_PORT_HEADLESS" headless || return 1
+    _dashboard_is_up || _dashboard_start 2>/dev/null
   fi
 }
 
@@ -369,7 +388,7 @@ ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --session-name|--session) shift 2 ;;  # stripped — we derive from AB_SUBAGENT_SESSION_ID
-    --headed) HEADED=1; shift ;;
+    --headed) HEADED=1; CDP_PORT=$CDP_PORT_HEADED; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
@@ -395,6 +414,13 @@ case "${1:-}" in
   heal)      _heal "${2:-}" ;;
   status)    _status ;;
   ensure)    _ensure_chrome ;;
+  headed)    HEADED=1; CDP_PORT=$CDP_PORT_HEADED; _ensure_chrome ;;
+  setupV4)
+    _ensure_chrome || exit 1
+    _restore_auth
+    _seed
+    echo "✓ Ready — auth loaded + v4 renderer set" >&2
+    ;;
   import)    _import ;;
   reauth)    _reauth ;;
   seed)      _seed ;;
