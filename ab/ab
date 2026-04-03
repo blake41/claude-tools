@@ -3,8 +3,8 @@
 # ab — safe wrapper around agent-browser
 #
 # Minimal wrapper that:
-#   1. Ensures Chrome is running with CDP on port 9222
-#   2. Passes every command through with --cdp 9222
+#   1. Ensures Chrome is running with CDP on port 9333
+#   2. Passes every command through with --cdp 9333
 #   3. Blocks `close` (corrupts profile)
 #
 # Let agent-browser handle daemon lifecycle. Don't kill daemons manually —
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-CDP_PORT=9222
+CDP_PORT=9333
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE="$HOME/.agent-browser/profile"
 CHROME_PIDFILE="/tmp/ab-chrome-${CDP_PORT}.pid"
@@ -404,7 +404,7 @@ if [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
 fi
 
 # --- Warn if no AB_SUBAGENT_SESSION_ID ---
-if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" && "${1:-}" != "heal" && "${1:-}" != "status" && "${1:-}" != "ensure" && "${1:-}" != "" ]]; then
+if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" && "${1:-}" != "heal" && "${1:-}" != "status" && "${1:-}" != "ensure" && "${1:-}" != "new-session" && "${1:-}" != "" ]]; then
   echo "⚠ No AB_SUBAGENT_SESSION_ID set — session isolation disabled. Set AB_SUBAGENT_SESSION_ID for parallel safety." >&2
 fi
 
@@ -429,6 +429,12 @@ case "${1:-}" in
     echo "✓ Seeded $2" >&2
     ;;
   dashboard) _dashboard "${2:-}" ;;
+  new-session)
+    # Generate a unique session ID. First `ab open` with this ID will
+    # lazily create the daemon + tab.
+    # Usage: export AB_SUBAGENT_SESSION_ID=$(ab new-session)
+    head -c 4 /dev/urandom | xxd -p
+    ;;
 
   # --- Navigation (navigate/goto aliased to open) ---
   open|navigate|goto)

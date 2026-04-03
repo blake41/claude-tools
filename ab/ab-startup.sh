@@ -2,7 +2,7 @@
 #
 # ab-startup — launched by launchd on login
 #
-# Starts the managed Chrome (headless, CDP 9222) and the agent-browser dashboard.
+# Starts the managed Chrome (headless, CDP 9333) and the agent-browser dashboard.
 # Uses `ab` for all operations so config stays in one place.
 #
 
