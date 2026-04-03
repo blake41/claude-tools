@@ -513,7 +513,7 @@ case "${1:-}" in
     echo "  status              Show health" >&2
     echo "  dashboard <cmd>     Dashboard management" >&2
     echo "" >&2
-    echo "Env: AB_SUBAGENT_SESSION_ID=name (tab isolation), AB_HEADED=1 (headed mode)" >&2
+    echo "Env: AB_SUBAGENT_SESSION_ID=name (session isolation), AB_HEADED=1 (headed mode)" >&2
     exit 1
     ;;
   *)
