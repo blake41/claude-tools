@@ -399,7 +399,8 @@ set -- "${ARGS[@]}"
 # No tab switching needed — daemons are independent.
 SESSION_ARGS=()
 if [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
-  SESSION_ARGS=(--session "ab-${AB_SUBAGENT_SESSION_ID}")
+  # Include CCO_SESSION_ID prefix to avoid collisions between cco sessions
+  SESSION_ARGS=(--session "ab-${CCO_SESSION_ID:+${CCO_SESSION_ID:0:8}-}${AB_SUBAGENT_SESSION_ID}")
 fi
 
 # --- Warn if no AB_SUBAGENT_SESSION_ID ---
