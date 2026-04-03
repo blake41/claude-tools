@@ -10,10 +10,10 @@
 # Let agent-browser handle daemon lifecycle. Don't kill daemons manually —
 # they maintain tab state (active_page_index, CDP session IDs).
 #
-# Tab isolation via AB_SUBAGENT_SESSION_ID:
-#   First `ab open` with a new AB_SUBAGENT_SESSION_ID creates a new tab.
-#   Subsequent commands switch to that tab automatically.
-#   Tab index stored in /tmp/ab-tab-<session>-<context>.
+# Session isolation via AB_SUBAGENT_SESSION_ID:
+#   Each unique ID gets its own daemon process (--session ab-<id>) and its
+#   own Chrome tab (created via `tab new` on first open). Daemons are
+#   independent — no tab switching, no races between parallel agents.
 
 set -euo pipefail
 
@@ -79,61 +79,29 @@ _ensure_chrome() {
   fi
 }
 
-# --- Tab file for AB_SUBAGENT_SESSION_ID ---
-_tab_file() {
-  local prefix="${CCO_SESSION_ID:+${CCO_SESSION_ID:0:8}-}"
-  echo "/tmp/ab-tab-${prefix}${AB_SUBAGENT_SESSION_ID:-default}"
-}
-
-_create_new_tab() {
-  local url="$1" tf="$2"
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab new >/dev/null 2>&1
-  local idx
-  idx=$(AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab list --json 2>/dev/null \
-    | python3 -c "import json,sys; tabs=json.load(sys.stdin)['data']['tabs']; print(next(t['index'] for t in tabs if t['active']))" 2>/dev/null)
-  [[ -n "$idx" ]] && echo "$idx" > "$tf"
-  # Set viewport to match a typical laptop display (retina)
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" set viewport 1440 900 2 >/dev/null 2>&1
-  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
-}
-
-# --- Open URL with tab isolation ---
+# --- Open URL with session isolation ---
+# Each AB_SUBAGENT_SESSION_ID gets its own daemon (--session) AND its own tab.
+# First open creates a new tab in that daemon; subsequent opens reuse it.
 _open_with_context() {
   local url="$1"
-  if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
-    # No context — just open in default tab
+  if [[ ${#SESSION_ARGS[@]} -eq 0 ]]; then
+    # No session — just open in default daemon's default tab
     AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
     return
   fi
 
-  local tf
-  tf="$(_tab_file)"
-  if [[ -f "$tf" ]]; then
-    # Existing tab — try to switch to it
-    if AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab "$(cat "$tf")" >/dev/null 2>&1; then
-      AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" open "$url"
-    else
-      # Tab was closed or index shifted — recreate
-      echo "  Tab gone, recreating..." >&2
-      rm -f "$tf"
-      _create_new_tab "$url" "$tf"
-    fi
-  else
-    _create_new_tab "$url" "$tf"
-  fi
-}
+  # Check if this daemon already has a tab (tab list returns data)
+  local tab_count
+  tab_count=$(AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" tab list --json 2>/dev/null \
+    | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('data',{}).get('tabs',[])))" 2>/dev/null || echo "0")
 
-# --- Switch to context tab before any command ---
-_switch_to_context_tab() {
-  [[ -z "${AB_SUBAGENT_SESSION_ID:-}" ]] && return 0
-  local tf
-  tf="$(_tab_file)"
-  if [[ -f "$tf" ]]; then
-    if ! AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" tab "$(cat "$tf")" >/dev/null 2>&1; then
-      # Tab gone — remove stale file so next open recreates
-      rm -f "$tf"
-    fi
+  if [[ "$tab_count" -le 1 ]]; then
+    # First open for this session — create a dedicated tab
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" tab new >/dev/null 2>&1
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" set viewport 1440 900 2 >/dev/null 2>&1
   fi
+
+  AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" open "$url"
 }
 
 # --- Dashboard: manage the agent-browser dashboard ---
@@ -368,8 +336,8 @@ _heal() {
   fi
   rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
 
-  # Clean tab files
-  rm -f /tmp/ab-tab-* 2>/dev/null || true
+  # Clean session daemon sockets (except dashboard)
+  find ~/.agent-browser -name "ab-*.sock" -delete 2>/dev/null || true
 
   # Kill managed Chrome
   if [[ -f "$CHROME_PIDFILE" ]]; then
@@ -404,7 +372,7 @@ _heal() {
 _status() {
   _cdp_is_up && echo "CDP: ✓ port $CDP_PORT" || echo "CDP: ✗ port $CDP_PORT"
   [[ "$HEADED" == "1" ]] && echo "Mode: headed" || echo "Mode: headless"
-  [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]] && echo "Context: $AB_SUBAGENT_SESSION_ID → $(_tab_file)" || echo "Context: (none)"
+  [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]] && echo "Session: ab-$AB_SUBAGENT_SESSION_ID" || echo "Session: (default)"
   local dc; dc=$(pgrep -c "agent-browser-d" 2>/dev/null || echo 0); echo "Daemons: $dc"
   if [[ -f "$CHROME_PIDFILE" ]]; then
     local p; p="$(cat "$CHROME_PIDFILE")"
@@ -415,20 +383,28 @@ _status() {
   AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" session list 2>/dev/null || echo "  (cannot list)"
 }
 
-# --- Strip --session-name and parse --headed from args ---
+# --- Parse flags from args ---
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --session-name|--session) shift 2 ;;
+    --session-name|--session) shift 2 ;;  # stripped — we derive from AB_SUBAGENT_SESSION_ID
     --headed) HEADED=1; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]}"
 
-# --- Warn if no AB_SUBAGENT_SESSION_ID (fragile without tab isolation) ---
+# --- Session isolation via AB_SUBAGENT_SESSION_ID ---
+# Each unique ID gets its own agent-browser daemon (separate .sock, separate active_page).
+# No tab switching needed — daemons are independent.
+SESSION_ARGS=()
+if [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
+  SESSION_ARGS=(--session "ab-${AB_SUBAGENT_SESSION_ID}")
+fi
+
+# --- Warn if no AB_SUBAGENT_SESSION_ID ---
 if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" && "${1:-}" != "heal" && "${1:-}" != "status" && "${1:-}" != "ensure" && "${1:-}" != "" ]]; then
-  echo "⚠ No AB_SUBAGENT_SESSION_ID set — tab isolation disabled. Set AB_SUBAGENT_SESSION_ID for parallel safety." >&2
+  echo "⚠ No AB_SUBAGENT_SESSION_ID set — session isolation disabled. Set AB_SUBAGENT_SESSION_ID for parallel safety." >&2
 fi
 
 # --- Main dispatch ---
@@ -465,14 +441,13 @@ case "${1:-}" in
   # a fresh browser context, so localStorage/sessionStorage auth is preserved.
   record)
     _ensure_chrome
-    _switch_to_context_tab
     case "${2:-}" in
       start)
         [[ -z "${3:-}" ]] && { echo "Usage: ab record start <output.webm>" >&2; exit 1; }
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" video start "$3"
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" video start "$3"
         ;;
       stop)
-        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" video stop
+        AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" video stop
         ;;
       *)
         echo "Usage: ab record <start|stop> [output.webm]" >&2
@@ -481,12 +456,11 @@ case "${1:-}" in
     esac
     ;;
 
-  # --- Allowed agent-browser passthroughs (all switch to context tab first) ---
+  # --- Allowed agent-browser passthroughs (session-isolated) ---
   snapshot|screenshot|click|fill|type|select|check|press|scroll|\
   find|get|wait|eval|highlight|pdf|diff|set|keyboard|frame)
     _ensure_chrome
-    _switch_to_context_tab
-    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "$@"
+    AGENT_BROWSER_AUTO_CONNECT= agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
     rc=$?
     [[ $rc -ne 0 ]] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL($rc) $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
     exit $rc
