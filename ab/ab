@@ -87,18 +87,18 @@ _launch_chrome() {
 
 # --- Ensure the active Chrome is running ---
 _ensure_chrome() {
+  local was_up=0
   if [[ "$HEADED" == "1" ]]; then
-    local was_up=0
     _port_is_up "$CDP_PORT_HEADED" && was_up=1
     _launch_chrome "$CDP_PORT_HEADED" headed || return 1
-    # First launch: seed auth + localStorage into headed Chrome
-    if [[ "$was_up" == "0" ]]; then
-      _restore_auth
-      _seed
-    fi
   else
+    _port_is_up "$CDP_PORT_HEADLESS" && was_up=1
     _launch_chrome "$CDP_PORT_HEADLESS" headless || return 1
     _dashboard_is_up || _dashboard_start 2>/dev/null
+  fi
+  # First launch of any Chrome instance: grab fresh auth
+  if [[ "$was_up" == "0" ]]; then
+    _reauth
   fi
 }
 
