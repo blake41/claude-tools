@@ -525,7 +525,7 @@ case "${1:-}" in
 
   # --- Allowed agent-browser passthroughs (session-isolated) ---
   snapshot|screenshot|click|fill|type|select|check|press|scroll|\
-  find|get|wait|highlight|hover|pdf|diff|set|keyboard|frame)
+  find|get|wait|highlight|hover|pdf|diff|set|keyboard|frame|console)
     _ensure_chrome
     agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
     rc=$?
@@ -558,6 +558,7 @@ case "${1:-}" in
     echo "  get url             Get current URL" >&2
     echo "  eval 'js'           Run JavaScript (localStorage, computed values only)" >&2
     echo "  wait --load networkidle  Wait for page load" >&2
+    echo "  console             View browser console logs (--clear to reset)" >&2
     echo "  diff snapshot       Compare current vs last snapshot" >&2
     echo "  highlight @ref      Highlight element visually" >&2
     echo "" >&2
