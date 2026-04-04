@@ -377,6 +377,25 @@ resolve_cycle_id() {
   fi
 }
 
+# Resolve a project name to its UUID
+resolve_project_id() {
+  local project_name="$1"
+
+  local result
+  result=$(graphql "{ projects(first: 50) { nodes { id name } } }")
+
+  local project_id
+  project_id=$(echo "$result" | jq -r --arg name "$project_name" \
+    '.data.projects.nodes[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id' | head -1)
+
+  if [[ -z "$project_id" ]]; then
+    local available
+    available=$(echo "$result" | jq -r '[.data.projects.nodes[].name] | join(", ")')
+    json_error "$TOOL_NAME create" "Project '$project_name' not found" "NOT_FOUND" "Available projects: $available"
+  fi
+  echo "$project_id"
+}
+
 cmd_update() {
   local issue_id="$1"
   shift
@@ -593,13 +612,19 @@ cmd_create() {
   local description=""
   local priority=""
   local parent=""
+  local label=""
+  local assignee=""
+  local project=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --description|-d) description="$2"; shift 2 ;;
       --priority|-p) priority="$2"; shift 2 ;;
       --parent) parent="$2"; shift 2 ;;
-      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123]" ;;
+      --label|-l) label="$2"; shift 2 ;;
+      --assignee|-a) assignee="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]" ;;
     esac
   done
 
@@ -611,12 +636,18 @@ cmd_create() {
   local todo_state_id
   todo_state_id=$(get_todo_state_id "$team_key")
 
+  # Resolve assignee (default: current user)
+  local assignee_id="$my_id"
+  if [[ -n "$assignee" ]]; then
+    try_resolve assignee_id resolve_user_id "$assignee"
+  fi
+
   # Build input as JSON using jq for proper escaping
   local input
   input=$(jq -n \
     --arg teamId "$team_id" \
     --arg title "$title" \
-    --arg assigneeId "$my_id" \
+    --arg assigneeId "$assignee_id" \
     '{teamId: $teamId, title: $title, assigneeId: $assigneeId}')
 
   if [[ -n "$todo_state_id" ]]; then
@@ -635,6 +666,18 @@ cmd_create() {
     local parent_uuid
     parent_uuid=$(resolve_issue_uuid "$parent")
     input=$(echo "$input" | jq --arg pid "$parent_uuid" '. + {parentId: $pid}')
+  fi
+
+  if [[ -n "$label" ]]; then
+    local label_id
+    try_resolve label_id resolve_label_id "$team_key" "$label"
+    input=$(echo "$input" | jq --arg lid "$label_id" '. + {labelIds: [$lid]}')
+  fi
+
+  if [[ -n "$project" ]]; then
+    local project_id
+    try_resolve project_id resolve_project_id "$project"
+    input=$(echo "$input" | jq --arg pid "$project_id" '. + {projectId: $pid}')
   fi
 
   local api_key
@@ -741,7 +784,7 @@ if [[ $# -lt 1 ]]; then
         {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
         {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
         {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]"},
-        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123]"},
+        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]"},
         {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
         {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
         {name: "search",   description: "Search issues by text",                usage: "linear-cli search <query>"},
@@ -787,7 +830,7 @@ case "$CMD" in
   issues) cmd_issues "$@" ;;
   create)
     [[ $# -lt 2 ]] && json_error "$TOOL_NAME create" "Team key and title required" "MISSING_ARG" \
-      "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123]"
+      "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]"
     cmd_create "$@"
     ;;
   cancel)
