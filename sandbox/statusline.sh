@@ -127,8 +127,16 @@ rst() { if [ "$use_color" -eq 1 ]; then printf '\033[0m'; fi; }
 
 # ---- git ----
 git_branch=""
+git_dirty=""
 if git rev-parse --git-dir >/dev/null 2>&1; then
   git_branch=$(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
+  staged=$(git diff --cached --numstat 2>/dev/null | wc -l | tr -d ' ')
+  modified=$(git diff --numstat 2>/dev/null | wc -l | tr -d ' ')
+  untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
+  [ "$staged" -gt 0 ] && git_dirty="\033[38;5;150m+${staged}\033[0m"
+  [ "$modified" -gt 0 ] && git_dirty="${git_dirty}\033[38;5;215m~${modified}\033[0m"
+  [ "$untracked" -gt 0 ] && git_dirty="${git_dirty}\033[38;5;245m?${untracked}\033[0m"
+  [ -n "$git_dirty" ] && git_dirty=" ${git_dirty}"
 fi
 
 # ---- context window calculation (native) ----
@@ -180,6 +188,7 @@ fi
 printf '📁 %s%s%s' "$(dir_color)" "$current_dir" "$(rst)"
 if [ -n "$git_branch" ]; then
   printf '  🌿 %s%s%s' "$(git_color)" "$git_branch" "$(rst)"
+  [ -n "$git_dirty" ] && printf "$git_dirty"
 fi
 if [ -n "$cc_version" ] && [ "$cc_version" != "null" ]; then
   printf '  📟 %sv%s%s' "$(cc_version_color)" "$cc_version" "$(rst)"
