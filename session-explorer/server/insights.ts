@@ -160,12 +160,12 @@ Extract ONLY insights that would be valuable if encountered again in a future se
 
 ## Insight Types
 
-- **correction**: The human corrected the AI's approach, assumption, or output. These are the most valuable — they reveal gaps in the AI's defaults.
-- **decision**: An explicit architectural or design decision was made with reasoning. Not just "we used X" but "we chose X over Y because Z."
-- **gotcha**: A non-obvious pitfall, edge case, or compatibility issue was discovered. Something that would bite you again.
-- **pattern**: A recurring workflow, code pattern, or convention specific to this project or team. Not general best practices.
-- **discovery**: Something genuinely new was learned — an API behavior, a library quirk, a system characteristic.
-- **preference**: A stated user preference for tools, style, approach, or workflow that the AI should remember.
+- **correction**: The human redirected the AI's approach — even subtly. This includes: "no, don't do X", "use Y instead", pushing back on a suggestion, overriding a default, asking to undo/revert, or expressing dissatisfaction with output. Even politely phrased redirections count ("actually, let's...", "I'd prefer...", "that's not what I meant"). These are the most valuable type — they reveal gaps in the AI's defaults. When in doubt between correction and preference, choose correction if the human was responding to something the AI did wrong.
+- **decision**: An explicit architectural or design decision was made with clear reasoning. Not just "we used X" but "we chose X over Y because Z." The reasoning must be present in the conversation.
+- **gotcha**: A non-obvious pitfall, edge case, or compatibility issue that was discovered the hard way. Something that would bite you again if you forgot it. Failed attempts that led to a workaround count.
+- **pattern**: A workflow or convention that the human wants followed in future sessions — something you'd do again. NOT a description of how existing code is structured. "Always run X before Y" is a pattern. "The codebase uses a registry pattern in registry.ts" is NOT a pattern (that's just reading the code).
+- **discovery**: Something genuinely surprising was learned — an undocumented API behavior, a library quirk, a system characteristic that contradicts expectations. NOT obvious architecture descriptions you could derive from reading the code.
+- **preference**: A stated user preference for tools, style, naming, workflow, or approach. "Use bun not npm", "I like terse commit messages", "always use Sonnet for this". Only extract if explicitly stated, not inferred.
 
 ## Rules
 
@@ -176,6 +176,8 @@ Extract ONLY insights that would be valuable if encountered again in a future se
 5. If the session has no extractable insights, return an empty array.
 6. The entities field should list specific technical entities mentioned (library names, API endpoints, config keys, etc.).
 7. The relevant_files field should list file paths that are directly related to the insight.
+8. Prioritize corrections and preferences — these are the highest-signal types. Look for any moment where the human pushed back, redirected, or stated how they want things done.
+9. Do NOT extract architecture descriptions. "The app uses React Router" is not an insight. "React Router's Link component requires data-status not className for active state styling" IS an insight (gotcha).
 
 ## Output Format
 
@@ -207,21 +209,46 @@ async function extractFromSession(sessionId: string): Promise<void> {
   const parentCount = sourceBreakdown.find(s => s.source === 'parent')?.count || 0;
   const sessionSource = subagentCount > parentCount ? 'subagent' : 'parent';
 
-  const transcript = rawMessages
+  // Build transcript with smart truncation for long sessions:
+  // 1. Strip tool_use/tool_result messages (low insight density, high token cost)
+  // 2. For long sessions, sample beginning + middle + end sections
+  const conversational = rawMessages.filter(
+    (m) => m.message_type === "text" || m.message_type === "system"
+  );
+
+  const formatted = conversational
     .map((m) => {
       const cleaned = cleanXmlNoise(m.content);
       if (!cleaned) return null;
       return `[${m.role}]: ${cleaned}`;
     })
-    .filter(Boolean)
-    .join("\n\n");
+    .filter(Boolean) as string[];
 
-  if (!transcript) {
+  if (formatted.length === 0) {
     markSessionExtracted.run(sessionId);
     return;
   }
 
-  const truncated = transcript.slice(0, config.insightTranscriptMaxChars);
+  const fullTranscript = formatted.join("\n\n");
+  let truncated: string;
+
+  if (fullTranscript.length <= config.insightTranscriptMaxChars) {
+    truncated = fullTranscript;
+  } else {
+    // Sample three sections: beginning (40%), middle (30%), end (30%)
+    // This ensures we see the problem setup AND the corrections/decisions later
+    const budget = config.insightTranscriptMaxChars;
+    const beginBudget = Math.floor(budget * 0.4);
+    const midBudget = Math.floor(budget * 0.3);
+    const endBudget = budget - beginBudget - midBudget;
+
+    const begin = fullTranscript.slice(0, beginBudget);
+    const midPoint = Math.floor(fullTranscript.length / 2);
+    const mid = fullTranscript.slice(midPoint - Math.floor(midBudget / 2), midPoint + Math.floor(midBudget / 2));
+    const end = fullTranscript.slice(-endBudget);
+
+    truncated = `${begin}\n\n[... middle of session ...]\n\n${mid}\n\n[... later in session ...]\n\n${end}`;
+  }
 
   const files = (getSessionFiles.all(sessionId) as Array<{ file_path: string }>)
     .map((f) => f.file_path);
