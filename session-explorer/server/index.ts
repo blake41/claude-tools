@@ -1689,10 +1689,11 @@ app.listen(PORT, () => {
       );
 
       // Phase 3: Auto-extract insights if interval has elapsed
+      // Only auto-triggers after the first manual run (last_run must be non-null)
       if (!getExtractionStatus().running) {
         const settings = getExtractionSettings();
-        if (settings.interval_days > 0) {
-          const lastRun = settings.last_run ? new Date(settings.last_run).getTime() : 0;
+        if (settings.interval_days > 0 && settings.last_run) {
+          const lastRun = new Date(settings.last_run).getTime();
           const intervalMs = settings.interval_days * 24 * 60 * 60 * 1000;
           if (Date.now() - lastRun >= intervalMs) {
             console.log(`[auto-ingest] Extraction interval elapsed, starting insight extraction`);

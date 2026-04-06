@@ -29,11 +29,13 @@ const getSessionFiles = db.prepare(`
 const getUnextractedSessions = db.prepare(`
   SELECT s.id, s.title FROM sessions s
   WHERE s.workspace_id = ? AND s.insights_extracted = 0 AND s.message_count > 5
+    AND s.started_at >= datetime('now', '-' || ? || ' days')
 `);
 
 const getAllUnextractedSessions = db.prepare(`
   SELECT s.id, s.title FROM sessions s
   WHERE s.insights_extracted = 0 AND s.message_count > 5
+    AND s.started_at >= datetime('now', '-' || ? || ' days')
 `);
 
 const markSessionExtracted = db.prepare(`
@@ -395,9 +397,10 @@ export function startExtraction(workspaceId: number, force?: boolean): {
     }
   }
 
+  const maxAge = config.insightMaxAgeDays;
   const sessions = workspaceId > 0
-    ? (getUnextractedSessions.all(workspaceId) as Array<{ id: string; title: string }>)
-    : (getAllUnextractedSessions.all() as Array<{ id: string; title: string }>);
+    ? (getUnextractedSessions.all(workspaceId, maxAge) as Array<{ id: string; title: string }>)
+    : (getAllUnextractedSessions.all(maxAge) as Array<{ id: string; title: string }>);
 
   if (sessions.length === 0) {
     return { total: 0, message: "All sessions already have insights extracted" };

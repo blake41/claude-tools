@@ -24,6 +24,7 @@ export const config = {
   insightConcurrency: 3,
   insightMaxTokens: 4096,
   insightTranscriptMaxChars: 30_000,
+  insightMaxAgeDays: 60,
 
   // Pagination
   defaultPageSize: 50,
