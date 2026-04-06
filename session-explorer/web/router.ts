@@ -47,6 +47,11 @@ export const searchRoute = createRoute({
   path: "/search",
 });
 
+export const insightsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/insights",
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   workspaceRoute,
@@ -55,6 +60,7 @@ const routeTree = rootRoute.addChildren([
   fileRoute,
   askRoute,
   searchRoute,
+  insightsRoute,
 ]);
 
 export const router = createRouter({

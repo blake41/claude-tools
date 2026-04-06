@@ -5,8 +5,8 @@ import { fileURLToPath } from "url";
 import { readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import Anthropic from "@anthropic-ai/sdk";
-import PQueue from "p-queue";
 import db from "./db.js";
+import { BackgroundJob } from "./background-job.js";
 import { config } from "./config.js";
 import chatRouter, { buildSystemPrompt, tools, executeSql, parseResult } from "./chat.js";
 
@@ -95,6 +95,15 @@ const listSessions = db.prepare(`
   LIMIT ? OFFSET ?
 `);
 
+const listSessionsByActivity = db.prepare(`
+  SELECT s.id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary,
+    (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY sequence DESC LIMIT 1) as last_user_message
+  FROM sessions s
+  WHERE s.workspace_id = ?
+  ORDER BY COALESCE(s.ended_at, s.started_at) DESC
+  LIMIT ? OFFSET ?
+`);
+
 const countSessions = db.prepare(`
   SELECT COUNT(*) as total FROM sessions WHERE workspace_id = ?
 `);
@@ -103,6 +112,14 @@ const listAllSessions = db.prepare(`
   SELECT id, workspace_id, started_at, ended_at, git_branch, title, message_count, user_message_count, summary
   FROM sessions
   ORDER BY started_at DESC
+  LIMIT ? OFFSET ?
+`);
+
+const listAllSessionsByActivity = db.prepare(`
+  SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary,
+    (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY sequence DESC LIMIT 1) as last_user_message
+  FROM sessions s
+  ORDER BY COALESCE(s.ended_at, s.started_at) DESC
   LIMIT ? OFFSET ?
 `);
 
@@ -243,63 +260,115 @@ const updateSessionSummary = db.prepare(`
   UPDATE sessions SET summary = ? WHERE id = ?
 `);
 
-// ── Summarization Job Tracker ────────────────────────────────────
+// ── Insight Stats Prepared Statements ─────────────────────────────
 
-interface SummarizeJob {
-  workspaceId: number;
-  total: number;
-  completed: number;
-  failed: number;
-  running: boolean;
-  cancelled: boolean;
-  errors: Array<{ sessionId: string; error: string }>;
-}
+const insightTypeDistribution = db.prepare(`
+  SELECT type, COUNT(*) as count FROM insights
+  WHERE deleted_at IS NULL GROUP BY type ORDER BY count DESC
+`);
 
-let activeJob: SummarizeJob | null = null;
+const insightTypeDistributionByWorkspace = db.prepare(`
+  SELECT type, COUNT(*) as count FROM insights
+  WHERE deleted_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE workspace_id = ?)
+  GROUP BY type ORDER BY count DESC
+`);
+
+const insightTotalCount = db.prepare(`
+  SELECT COUNT(*) as total FROM insights WHERE deleted_at IS NULL
+`);
+
+const insightTotalCountByWorkspace = db.prepare(`
+  SELECT COUNT(*) as total FROM insights
+  WHERE deleted_at IS NULL AND session_id IN (SELECT id FROM sessions WHERE workspace_id = ?)
+`);
+
+const insightTopFiles = db.prepare(`
+  SELECT ifp.file_path, COUNT(*) as insight_count
+  FROM insight_files ifp JOIN insights i ON i.id = ifp.insight_id
+  WHERE i.deleted_at IS NULL
+  GROUP BY ifp.file_path ORDER BY insight_count DESC LIMIT 20
+`);
+
+const insightTopFilesByWorkspace = db.prepare(`
+  SELECT ifp.file_path, COUNT(*) as insight_count
+  FROM insight_files ifp JOIN insights i ON i.id = ifp.insight_id
+  WHERE i.deleted_at IS NULL AND i.session_id IN (SELECT id FROM sessions WHERE workspace_id = ?)
+  GROUP BY ifp.file_path ORDER BY insight_count DESC LIMIT 20
+`);
+
+const insightCoverage = db.prepare(`
+  SELECT COUNT(*) as total_sessions,
+    SUM(CASE WHEN insights_extracted = 1 THEN 1 ELSE 0 END) as extracted_sessions
+  FROM sessions WHERE message_count > 0
+`);
+
+const insightCoverageByWorkspace = db.prepare(`
+  SELECT COUNT(*) as total_sessions,
+    SUM(CASE WHEN insights_extracted = 1 THEN 1 ELSE 0 END) as extracted_sessions
+  FROM sessions WHERE workspace_id = ? AND message_count > 0
+`);
+
+const getInsightWithJoins = db.prepare(`
+  SELECT i.*, s.title as session_title, w.display_name as workspace_name
+  FROM insights i
+  JOIN sessions s ON s.id = i.session_id
+  JOIN workspaces w ON w.id = s.workspace_id
+  WHERE i.id = ? AND i.deleted_at IS NULL
+`);
+
+const getInsightFiles = db.prepare(`
+  SELECT file_path FROM insight_files WHERE insight_id = ?
+`);
+
+const getInsightSessions = db.prepare(`
+  SELECT ise.session_id, ise.extracted_at, s.title, s.started_at
+  FROM insight_sessions ise
+  JOIN sessions s ON s.id = ise.session_id
+  WHERE ise.insight_id = ?
+  ORDER BY ise.extracted_at DESC
+`);
+
+const getSessionInsights = db.prepare(`
+  SELECT i.*, s.title as session_title, w.display_name as workspace_name
+  FROM insights i
+  JOIN insight_sessions ise ON ise.insight_id = i.id
+  JOIN sessions s ON s.id = i.session_id
+  JOIN workspaces w ON w.id = s.workspace_id
+  WHERE ise.session_id = ? AND i.deleted_at IS NULL
+  ORDER BY i.score DESC
+`);
+
 const anthropic = new Anthropic();
-let summarizeQueue: PQueue | null = null;
+const summarizeJob = new BackgroundJob(config.summaryConcurrency);
 
-async function runSummarization(
-  sessionIds: Array<{ id: string; title: string }>
-) {
-  const queue = new PQueue({ concurrency: config.summaryConcurrency });
-  summarizeQueue = queue;
+async function summarizeSession(sessionId: string): Promise<void> {
+  const rawMessages = getMessages.all(sessionId) as Array<{
+    role: string;
+    content: string;
+    timestamp: string;
+    sequence: number;
+  }>;
 
-  const tasks = sessionIds.map((s) => {
-    return queue.add(async () => {
-      if (!activeJob || activeJob.cancelled) return;
+  const transcript = rawMessages
+    .map((m) => {
+      const cleaned = cleanXmlNoise(m.content);
+      if (!cleaned) return null;
+      return `[${m.role}]: ${cleaned}`;
+    })
+    .filter(Boolean)
+    .join("\n\n");
 
-      try {
-        const rawMessages = getMessages.all(s.id) as Array<{
-          role: string;
-          content: string;
-          timestamp: string;
-          sequence: number;
-        }>;
+  if (!transcript) return;
 
-        const transcript = rawMessages
-          .map((m) => {
-            const cleaned = cleanXmlNoise(m.content);
-            if (!cleaned) return null;
-            return `[${m.role}]: ${cleaned}`;
-          })
-          .filter(Boolean)
-          .join("\n\n");
+  const truncated = transcript.slice(0, 32000);
 
-        if (!transcript) {
-          activeJob.completed++;
-          return;
-        }
-
-        const truncated = transcript.slice(0, 32000);
-
-        const response = await anthropic.messages.create({
-          model: config.summaryModel,
-          max_tokens: config.summaryMaxTokens,
-          messages: [
-            {
-              role: "user",
-              content: `Summarize this coding session as 2-3 bullet points. MAX 12 words per bullet.
+  const response = await anthropic.messages.create({
+    model: config.summaryModel,
+    max_tokens: config.summaryMaxTokens,
+    messages: [
+      {
+        role: "user",
+        content: `Summarize this coding session as 2-3 bullet points. MAX 12 words per bullet.
 
 Format — output ONLY bullets, nothing else:
 - Verb + what + where (e.g. "Added auto-ingest polling to session-explorer server")
@@ -315,31 +384,16 @@ Rules:
 
 Conversation:
 ${truncated}`,
-            },
-          ],
-        });
-
-        const summary =
-          response.content[0].type === "text" ? response.content[0].text : "";
-
-        if (summary) {
-          updateSessionSummary.run(summary, s.id);
-        }
-        activeJob.completed++;
-      } catch (err: unknown) {
-        activeJob.failed++;
-        const msg = err instanceof Error ? err.message : String(err);
-        activeJob.errors.push({ sessionId: s.id, error: msg });
-      }
-    });
+      },
+    ],
   });
 
-  await Promise.allSettled(tasks);
+  const summary =
+    response.content[0].type === "text" ? response.content[0].text : "";
 
-  if (activeJob) {
-    activeJob.running = false;
+  if (summary) {
+    updateSessionSummary.run(summary, sessionId);
   }
-  summarizeQueue = null;
 }
 
 // ── Routes ─────────────────────────────────────────────────────────
@@ -369,15 +423,20 @@ app.get("/api/sessions", (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
   const offset = (page - 1) * limit;
+  const sortByActivity = req.query.sort === "activity";
 
   let sessions;
   let total: number;
 
   if (workspaceId) {
-    sessions = listSessions.all(workspaceId, limit, offset);
+    sessions = sortByActivity
+      ? listSessionsByActivity.all(workspaceId, limit, offset)
+      : listSessions.all(workspaceId, limit, offset);
     total = (countSessions.get(workspaceId) as { total: number }).total;
   } else {
-    sessions = listAllSessions.all(limit, offset);
+    sessions = sortByActivity
+      ? listAllSessionsByActivity.all(limit, offset)
+      : listAllSessions.all(limit, offset);
     total = (countAllSessions.get() as { total: number }).total;
   }
 
@@ -1124,58 +1183,49 @@ app.get("/api/files/view", (req, res) => {
 // ── Summarization Routes ─────────────────────────────────────────
 
 app.post("/api/workspaces/:id/summarize", (req, res) => {
-  if (activeJob?.running) {
-    res.status(409).json({ error: "A summarization job is already running" });
-    return;
-  }
-
   const workspaceId = Number(req.params.id);
   const unsummarized = getUnsummarizedSessions.all(workspaceId) as Array<{
     id: string;
     title: string;
   }>;
 
-  if (unsummarized.length === 0) {
-    res.status(200).json({ message: "All sessions already summarized" });
+  const result = summarizeJob.start(
+    unsummarized,
+    (s) => s.id,
+    async (s) => summarizeSession(s.id)
+  );
+  if (result.message) {
+    if (result.message.includes("already running")) {
+      res.status(409).json({ error: result.message });
+    } else {
+      res.status(200).json({ message: result.message });
+    }
     return;
   }
-
-  activeJob = {
-    workspaceId,
-    total: unsummarized.length,
-    completed: 0,
-    failed: 0,
-    running: true,
-    cancelled: false,
-    errors: [],
-  };
-
-  // Fire-and-forget
-  runSummarization(unsummarized);
-
-  res.status(202).json({ total: unsummarized.length });
+  res.status(202).json({ total: result.total });
 });
 
 app.get("/api/workspaces/:id/summarize/status", (_req, res) => {
-  if (!activeJob) {
-    res.json({ running: false });
-    return;
-  }
-  res.json(activeJob);
+  res.json(summarizeJob.getStatus());
 });
 
 app.delete("/api/workspaces/:id/summarize", (_req, res) => {
-  if (activeJob) {
-    activeJob.cancelled = true;
-    if (summarizeQueue) {
-      summarizeQueue.clear();
-    }
-  }
+  summarizeJob.cancel();
   res.json({ ok: true });
 });
 
 // ── Re-ingest Endpoint ────────────────────────────────────────────────
 
+import {
+  startExtraction,
+  getExtractionStatus,
+  cancelExtraction,
+  upvoteInsight,
+  downvoteInsight,
+  deleteInsight,
+  getExtractionSettings,
+  setExtractionInterval,
+} from "./insights.js";
 import { runIngestion, getStaleSessionsNeedingReingest, reingestSession } from "./ingest.js";
 import type { IngestProgress } from "./ingest.js";
 
@@ -1244,6 +1294,215 @@ app.delete("/api/chat-history", (_req, res) => {
   res.json({ ok: true });
 });
 
+// ── Insight Extraction Routes (global) ──────────────────────────
+
+app.post("/api/extract-insights", (req, res) => {
+  const force = req.body?.force === true;
+  const result = startExtraction(0, force);
+  if (result.message && result.total === 0) {
+    if (result.message.includes("already running")) {
+      res.status(409).json({ error: result.message });
+    } else {
+      res.status(200).json({ message: result.message });
+    }
+    return;
+  }
+  res.status(202).json({ total: result.total });
+});
+
+app.get("/api/extract-insights/status", (_req, res) => {
+  res.json(getExtractionStatus());
+});
+
+app.delete("/api/extract-insights", (_req, res) => {
+  cancelExtraction();
+  res.json({ ok: true });
+});
+
+// ── Insights CRUD Routes ────────────────────────────────────────
+
+// Stats must be registered before :id to avoid route conflict
+app.get("/api/insights/stats", (req, res) => {
+  const workspaceId = req.query.workspace_id ? Number(req.query.workspace_id) : null;
+
+  const typeDistribution = workspaceId
+    ? insightTypeDistributionByWorkspace.all(workspaceId)
+    : insightTypeDistribution.all();
+
+  const totalCount = workspaceId
+    ? (insightTotalCountByWorkspace.get(workspaceId) as { total: number }).total
+    : (insightTotalCount.get() as { total: number }).total;
+
+  const topFiles = workspaceId
+    ? insightTopFilesByWorkspace.all(workspaceId)
+    : insightTopFiles.all();
+
+  const extractionCoverage = workspaceId
+    ? insightCoverageByWorkspace.get(workspaceId) as { total_sessions: number; extracted_sessions: number }
+    : insightCoverage.get() as { total_sessions: number; extracted_sessions: number };
+
+  res.json({
+    total: totalCount,
+    type_distribution: typeDistribution,
+    top_files: topFiles,
+    extraction_coverage: extractionCoverage,
+  });
+});
+
+app.get("/api/insights", (req, res) => {
+  const type = req.query.type as string | undefined;
+  const filePath = req.query.file_path as string | undefined;
+  const minObservations = req.query.min_observations ? Number(req.query.min_observations) : undefined;
+  const source = req.query.source as string | undefined;
+  const workspaceId = req.query.workspace_id ? Number(req.query.workspace_id) : undefined;
+  const sort = (req.query.sort as string) || "score";
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+
+  const conditions: string[] = ["i.deleted_at IS NULL"];
+  const params: unknown[] = [];
+
+  if (type) {
+    conditions.push("i.type = ?");
+    params.push(type);
+  }
+  if (filePath) {
+    conditions.push("i.id IN (SELECT insight_id FROM insight_files WHERE file_path LIKE ?)");
+    params.push(`%${filePath}%`);
+  }
+  if (minObservations) {
+    conditions.push("i.observation_count >= ?");
+    params.push(minObservations);
+  }
+  if (source) {
+    conditions.push("i.source = ?");
+    params.push(source);
+  }
+  if (workspaceId) {
+    conditions.push("i.session_id IN (SELECT id FROM sessions WHERE workspace_id = ?)");
+    params.push(workspaceId);
+  }
+
+  const where = conditions.join(" AND ");
+
+  const sortMap: Record<string, string> = {
+    score: "i.score DESC",
+    observation_count: "i.observation_count DESC",
+    extracted_at: "i.extracted_at DESC",
+    last_observed_at: "i.last_observed_at DESC",
+  };
+  const orderBy = sortMap[sort] || "i.score DESC";
+
+  const countResult = db.prepare(
+    `SELECT COUNT(*) as total FROM insights i WHERE ${where}`
+  ).get(...params) as { total: number };
+
+  const insights = db.prepare(
+    `SELECT i.*, s.title as session_title, w.display_name as workspace_name
+     FROM insights i
+     JOIN sessions s ON s.id = i.session_id
+     JOIN workspaces w ON w.id = s.workspace_id
+     WHERE ${where}
+     ORDER BY ${orderBy}
+     LIMIT ? OFFSET ?`
+  ).all(...params, limit, offset);
+
+  // Enrich with files
+  const enriched = (insights as Array<Record<string, unknown>>).map((insight) => ({
+    ...insight,
+    entities: insight.entities ? JSON.parse(insight.entities as string) : null,
+    files: (getInsightFiles.all(insight.id as number) as Array<{ file_path: string }>).map((f) => f.file_path),
+  }));
+
+  res.json({
+    insights: enriched,
+    pagination: {
+      total: countResult.total,
+      limit,
+      offset,
+    },
+  });
+});
+
+app.get("/api/insights/:id", (req, res) => {
+  const insightId = Number(req.params.id);
+  const insight = getInsightWithJoins.get(insightId) as Record<string, unknown> | undefined;
+
+  if (!insight) {
+    res.status(404).json({ error: "Insight not found" });
+    return;
+  }
+
+  const files = getInsightFiles.all(insightId) as Array<{ file_path: string }>;
+  const sessions = getInsightSessions.all(insightId) as Array<Record<string, unknown>>;
+
+  res.json({
+    ...insight,
+    entities: insight.entities ? JSON.parse(insight.entities as string) : null,
+    files: files.map((f) => f.file_path),
+    sessions,
+  });
+});
+
+// Get insights for a specific session (via insight_sessions junction table)
+app.get("/api/sessions/:id/insights", (req, res) => {
+  const sessionId = req.params.id;
+  const insights = getSessionInsights.all(sessionId);
+
+  const enriched = (insights as Array<Record<string, unknown>>).map((insight) => ({
+    ...insight,
+    entities: insight.entities ? JSON.parse(insight.entities as string) : null,
+    files: (getInsightFiles.all(insight.id as number) as Array<{ file_path: string }>).map((f) => f.file_path),
+  }));
+
+  res.json({ insights: enriched });
+});
+
+// ── Insight Feedback Routes ─────────────────────────────────────
+
+app.post("/api/insights/:id/upvote", (req, res) => {
+  const result = upvoteInsight(Number(req.params.id));
+  if (!result) {
+    res.status(404).json({ error: "Insight not found" });
+    return;
+  }
+  res.json(result);
+});
+
+app.post("/api/insights/:id/downvote", (req, res) => {
+  const result = downvoteInsight(Number(req.params.id));
+  if (!result) {
+    res.status(404).json({ error: "Insight not found" });
+    return;
+  }
+  res.json(result);
+});
+
+app.delete("/api/insights/:id", (req, res) => {
+  const success = deleteInsight(Number(req.params.id));
+  if (!success) {
+    res.status(404).json({ error: "Insight not found" });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// ── Extraction Settings Routes ──────────────────────────────────
+
+app.get("/api/settings/extraction", (_req, res) => {
+  res.json(getExtractionSettings());
+});
+
+app.put("/api/settings/extraction", (req, res) => {
+  const { interval_days } = req.body;
+  if (typeof interval_days !== "number" || interval_days < 1) {
+    res.status(400).json({ error: "interval_days must be a positive number" });
+    return;
+  }
+  setExtractionInterval(interval_days);
+  res.json(getExtractionSettings());
+});
+
 // SPA fallback — serve index.html for non-API routes
 app.get("*", (_req, res) => {
   res.sendFile(join(__dirname, "..", "dist", "web", "index.html"));
@@ -1254,7 +1513,7 @@ app.listen(PORT, () => {
 
   // ── Auto-ingest + auto-summarize polling ─────────────────────────
   setInterval(async () => {
-    if (ingestProgress?.running || activeJob?.running) return;
+    if (ingestProgress?.running || summarizeJob.isRunning) return;
 
     try {
       // Phase 1: Ingest new sessions + reingest changed ones (file size check)
@@ -1263,21 +1522,29 @@ app.listen(PORT, () => {
       ingestProgress = { ...final, running: false };
 
       // Phase 2: Auto-summarize
-      if (activeJob?.running) return;
+      if (summarizeJob.isRunning) return;
       const unsummarized = getAllUnsummarizedSessions.all() as Array<{ id: string; title: string }>;
       if (unsummarized.length === 0) return;
 
       console.log(`[auto-ingest] Found ${unsummarized.length} unsummarized session(s), starting summarization`);
-      activeJob = {
-        workspaceId: 0,
-        total: unsummarized.length,
-        completed: 0,
-        failed: 0,
-        running: true,
-        cancelled: false,
-        errors: [],
-      };
-      await runSummarization(unsummarized);
+      summarizeJob.start(
+        unsummarized,
+        (s) => s.id,
+        async (s) => summarizeSession(s.id)
+      );
+
+      // Phase 3: Auto-extract insights if interval has elapsed
+      if (!getExtractionStatus().running) {
+        const settings = getExtractionSettings();
+        if (settings.interval_days > 0) {
+          const lastRun = settings.last_run ? new Date(settings.last_run).getTime() : 0;
+          const intervalMs = settings.interval_days * 24 * 60 * 60 * 1000;
+          if (Date.now() - lastRun >= intervalMs) {
+            console.log(`[auto-ingest] Extraction interval elapsed, starting insight extraction`);
+            startExtraction(0);
+          }
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[auto-ingest] Error:", msg);

@@ -114,8 +114,8 @@ const insertSession = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type)
-  VALUES (?, ?, ?, ?, ?, ?)
+  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type, source)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
 
 const insertFile = db.prepare(`
@@ -239,7 +239,8 @@ function ingestSession(
         msg.content,
         msg.timestamp,
         msg.sequence,
-        msg.messageType || 'text'
+        msg.messageType || 'text',
+        'parent'
       );
     }
 
@@ -281,7 +282,8 @@ function ingestSession(
               msg.content,
               msg.timestamp,
               seqOffset + msg.sequence,
-              msg.messageType || 'text'
+              msg.messageType || 'text',
+              'subagent'
             );
           }
           for (const file of subResult.files) {

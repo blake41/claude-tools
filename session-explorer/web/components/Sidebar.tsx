@@ -304,6 +304,20 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
         </div>
       </div>
 
+      {/* Insights link */}
+      <div className="border-t border-border/40 px-3 pt-2 pb-1 shrink-0">
+        <Link
+          to="/insights"
+          className="group flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text-secondary transition-all hover:bg-white/5 hover:text-text [&[data-status=active]]:bg-accent-purple/12 [&[data-status=active]]:text-accent-purple"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M8 1a5 5 0 00-1.5 9.77V12.5a1.5 1.5 0 003 0v-1.73A5 5 0 008 1zm0 2a3 3 0 011.5 5.6V12.5a1.5 1.5 0 01-3 0V8.6A3 3 0 018 3z" fill="currentColor" />
+            <path d="M6.5 14.5h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+          </svg>
+          <span className="text-[13px] font-medium">Insights</span>
+        </Link>
+      </div>
+
       {/* Re-ingest button */}
       <div className="border-t border-border/40 px-3 py-2.5 shrink-0">
         <button

@@ -19,6 +19,12 @@ export const config = {
   // Auto-ingest polling
   autoIngestIntervalMs: 60_000,
 
+  // Insight extraction
+  insightModel: "claude-sonnet-4-6",
+  insightConcurrency: 3,
+  insightMaxTokens: 4096,
+  insightTranscriptMaxChars: 30_000,
+
   // Pagination
   defaultPageSize: 50,
   searchResultLimit: 100,

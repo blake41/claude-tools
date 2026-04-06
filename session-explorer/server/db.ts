@@ -124,9 +124,72 @@ db.exec(`
   END;
 `);
 
+// ── Insights Tables ─────────────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS insights (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    canonical_form TEXT,
+    canonical_hash TEXT,
+    context TEXT,
+    entities TEXT,
+    source TEXT DEFAULT 'parent',
+    observation_count INTEGER DEFAULT 1,
+    score REAL DEFAULT 1.0,
+    upvotes INTEGER DEFAULT 0,
+    downvotes INTEGER DEFAULT 0,
+    deleted_at TEXT,
+    extracted_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);
+  CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);
+  CREATE INDEX IF NOT EXISTS idx_insights_hash ON insights(canonical_hash);
+  CREATE INDEX IF NOT EXISTS idx_insights_score ON insights(score DESC);
+
+  CREATE TABLE IF NOT EXISTS insight_files (
+    insight_id INTEGER NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    PRIMARY KEY (insight_id, file_path)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_insight_files_path ON insight_files(file_path);
+
+  CREATE TABLE IF NOT EXISTS insight_sessions (
+    insight_id INTEGER NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    extracted_at TEXT NOT NULL,
+    PRIMARY KEY (insight_id, session_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+// Migration: add insights_extracted column to sessions
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN insights_extracted INTEGER DEFAULT 0`);
+} catch {
+  // Column already exists
+}
+
 // Migration: add message_type column to messages
 try {
   db.exec(`ALTER TABLE messages ADD COLUMN message_type TEXT DEFAULT 'text'`);
+} catch {
+  // Column already exists
+}
+
+// Migration: add source column to messages
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN source TEXT DEFAULT 'parent'`);
 } catch {
   // Column already exists
 }

@@ -33,6 +33,7 @@ export interface SessionSummary {
   summary: string | null;
   tags?: Tag[];
   files_changed?: ChangedFile[];
+  last_user_message?: string | null;
 }
 
 export interface Message {
@@ -125,4 +126,41 @@ export interface ChatResult {
   };
   explanation?: string;
   queries?: string[];
+}
+
+export interface Insight {
+  id: number;
+  session_id: string;
+  type: 'correction' | 'decision' | 'pattern' | 'discovery' | 'gotcha' | 'preference';
+  content: string;
+  canonical_form: string | null;
+  canonical_hash: string | null;
+  context: string | null;
+  entities: string[] | null;
+  source: 'parent' | 'subagent';
+  observation_count: number;
+  score: number;
+  upvotes: number;
+  downvotes: number;
+  extracted_at: string;
+  last_observed_at: string;
+  session_title: string | null;
+  workspace_name: string;
+  files: string[];
+}
+
+export interface InsightStats {
+  total: number;
+  type_distribution: Array<{ type: string; count: number }>;
+  top_files: Array<{ file_path: string; insight_count: number }>;
+  extraction_coverage: { total_sessions: number; extracted_sessions: number };
+}
+
+export interface InsightDetail extends Insight {
+  sessions: Array<{
+    session_id: string;
+    extracted_at: string;
+    title: string | null;
+    started_at: string;
+  }>;
 }

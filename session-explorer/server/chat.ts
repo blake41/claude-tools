@@ -43,6 +43,9 @@ messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role 
 tags: id INTEGER PRIMARY KEY, name TEXT UNIQUE, color TEXT, description TEXT, created_at TEXT
 session_tags: session_id TEXT, tag_id INTEGER, added_at TEXT
 session_files: id INTEGER PRIMARY KEY, session_id TEXT, file_path TEXT, file_name TEXT, operation TEXT (write|edit|read), timestamp TEXT, sequence INTEGER
+insights: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), type TEXT (correction|decision|gotcha|pattern|discovery|preference), content TEXT, canonical_form TEXT, canonical_hash TEXT, context TEXT, entities TEXT (JSON array), source TEXT (parent|subagent), observation_count INTEGER, score REAL, upvotes INTEGER, downvotes INTEGER, deleted_at TEXT, extracted_at TEXT, last_observed_at TEXT
+insight_files: insight_id INTEGER, file_path TEXT — PRIMARY KEY (insight_id, file_path)
+insight_sessions: insight_id INTEGER, session_id TEXT, extracted_at TEXT — junction table linking insights to all sessions where observed
 messages_fts: FTS5 virtual table on messages.content — JOIN via messages_fts.rowid = messages.id
 
 ## Data Profile
@@ -82,6 +85,19 @@ Time-bounded:
 
 Tool usage:
   SELECT * FROM messages WHERE message_type = 'tool_use' AND content LIKE 'ToolName:%'
+
+Most frequent corrections:
+  SELECT type, content, observation_count, score FROM insights
+  WHERE type = 'correction' AND deleted_at IS NULL ORDER BY observation_count DESC LIMIT 20
+
+Insights related to a topic:
+  SELECT content, type, observation_count FROM insights
+  WHERE content LIKE '%auth%' AND deleted_at IS NULL ORDER BY score DESC
+
+Files with the most insights:
+  SELECT file_path, COUNT(*) as count FROM insight_files
+  JOIN insights i ON i.id = insight_files.insight_id WHERE i.deleted_at IS NULL
+  GROUP BY file_path ORDER BY count DESC LIMIT 20
 
 ## Query Strategy
 

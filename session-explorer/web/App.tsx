@@ -6,6 +6,7 @@ import SessionDetail from "./components/SessionDetail";
 import Search from "./components/Search";
 import SessionCard from "./components/SessionCard";
 // AskView is now rendered inside the Search overlay's "Ask AI" tab
+import InsightsPage from "./components/InsightsPage";
 import {
   rootRoute,
   indexRoute,
@@ -15,6 +16,7 @@ import {
   fileRoute,
   askRoute,
   searchRoute,
+  insightsRoute,
   router,
 } from "./router";
 import type { Workspace, Tag, SessionSummary } from "./types";
@@ -546,3 +548,4 @@ tagRoute.update({ component: TagView });
 fileRoute.update({ component: FileView });
 askRoute.update({ component: () => null });
 searchRoute.update({ component: () => null });
+insightsRoute.update({ component: InsightsPage });

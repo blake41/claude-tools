@@ -3,6 +3,8 @@ import { useParams, useNavigate, useSearch } from "@tanstack/react-router";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
 import { renderMarkdown } from "../sessionFormat";
+import { INSIGHT_TYPE_COLORS } from "../insight-shared";
+import { useExtraction } from "../hooks/useExtraction";
 import SessionHeader from "./SessionHeader";
 import { sessionRoute } from "../router";
 
@@ -225,6 +227,114 @@ function FilesPanel({ sessionId }: { sessionId: string }) {
   );
 }
 
+function InsightsPanel({ sessionId }: { sessionId: string }) {
+  const navigate = useNavigate();
+  const [insights, setInsights] = useState<Array<{
+    id: number;
+    type: string;
+    content: string;
+    observation_count: number;
+    score: number;
+    files: string[];
+    source: string;
+    last_observed_at: string;
+  }>>([]);
+  const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const { extracting, startExtraction: handleExtractSession } = useExtraction(() => {
+    setLoaded(false); // force reload on next open
+  });
+
+  useEffect(() => {
+    if (!open || loaded) return;
+    fetch(`/api/sessions/${sessionId}/insights`)
+      .then((r) => r.json())
+      .then((data) => setInsights(data.insights || []))
+      .catch(() => setInsights([]))
+      .finally(() => setLoaded(true));
+  }, [sessionId, open, loaded]);
+
+  return (
+    <div className="mb-5 border border-border rounded-lg bg-bg-card overflow-hidden">
+      <button
+        className="flex items-center gap-2 w-full px-3.5 py-2.5 text-[13px] font-medium text-text-secondary transition-[background] duration-100 hover:bg-white/3"
+        onClick={() => setOpen(!open)}
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 12 12"
+          fill="none"
+          style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s" }}
+        >
+          <path d="M4 2L8 6L4 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <span>Insights</span>
+        {loaded && insights.length > 0 && (
+          <span className="inline-flex items-center gap-0.5 px-1.5 py-px rounded text-[10px] font-semibold text-accent-purple bg-accent-purple/12">
+            {insights.length}
+          </span>
+        )}
+      </button>
+      {open && !loaded && !extracting && (
+        <div className="px-3.5 py-3 text-xs text-text-dim border-t border-border flex items-center gap-2">
+          <div className="spinner w-3 h-3" />
+          Loading...
+        </div>
+      )}
+      {open && loaded && insights.length === 0 && (
+        <div className="px-3.5 py-3 text-xs text-text-dim border-t border-border flex items-center gap-2">
+          <span>No insights extracted for this session.</span>
+          <button
+            className="text-accent-purple hover:text-accent-purple/80 transition-colors disabled:opacity-40"
+            onClick={handleExtractSession}
+            disabled={extracting}
+          >
+            {extracting ? "Extracting..." : "Extract now"}
+          </button>
+        </div>
+      )}
+      {open && loaded && insights.length > 0 && (
+        <div className="border-t border-border px-3.5 pt-2 pb-3 flex flex-col gap-2">
+          {insights.map((insight) => (
+            <div key={insight.id} className="flex items-start gap-2">
+              <span
+                className="shrink-0 mt-0.5 inline-block px-1.5 py-px rounded-full text-[9px] font-semibold uppercase tracking-wide"
+                style={{
+                  background: `${INSIGHT_TYPE_COLORS[insight.type] || "#888"}18`,
+                  color: INSIGHT_TYPE_COLORS[insight.type] || "#888",
+                }}
+              >
+                {insight.type}
+              </span>
+              <div className="flex-1 min-w-0">
+                <p className="text-[12px] text-text leading-relaxed">{insight.content}</p>
+                {insight.files && insight.files.length > 0 && (
+                  <div className="flex items-center gap-1 mt-1 flex-wrap">
+                    {insight.files.slice(0, 3).map((f) => (
+                      <button
+                        key={f}
+                        className="inline-flex items-center px-1 py-px rounded text-[10px] font-mono text-accent-blue bg-accent-blue/8 hover:bg-accent-blue/15 max-w-[180px] truncate"
+                        onClick={() => navigate({ to: "/file", search: { path: f } })}
+                        title={f}
+                      >
+                        {f.split("/").pop()}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {insight.observation_count > 1 && (
+                  <span className="text-[10px] text-text-dim mt-0.5 inline-block">&times; {insight.observation_count} sessions</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SessionDetail() {
   const { id } = useParams({ from: sessionRoute.id });
   const navigate = useNavigate();
@@ -232,6 +342,26 @@ export default function SessionDetail() {
   const [session, setSession] = useState<SessionDetailType | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // -- User-only filter mode --
+  const [userOnly, setUserOnly] = useState(false);
+  const [anchorSequence, setAnchorSequence] = useState<number | null>(null);
+
+  // When userOnly turns off with an anchor, scroll to that message after render
+  useEffect(() => {
+    if (!userOnly && anchorSequence !== null) {
+      // Wait for React to render all messages back into DOM
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`msg-${anchorSequence}`);
+        if (el) {
+          el.scrollIntoView({ block: "center" });
+          el.classList.add("message-highlight");
+          setTimeout(() => el.classList.remove("message-highlight"), 2000);
+        }
+        setAnchorSequence(null);
+      });
+    }
+  }, [userOnly, anchorSequence]);
 
   // -- In-page search state --
   const [searchOpen, setSearchOpen] = useState(false);
@@ -474,6 +604,14 @@ export default function SessionDetail() {
         }
       }
 
+      // U to toggle user-only filter
+      if (!isInput && !searchOpen && e.key === "u") {
+        e.preventDefault();
+        setUserOnly((prev) => !prev);
+        setAnchorSequence(null);
+        return;
+      }
+
       // [ and ] for prev/next user message (only when not in an input)
       if (!isInput && !searchOpen) {
         if (e.key === "[") {
@@ -559,6 +697,17 @@ export default function SessionDetail() {
           </div>
 
           <div className="flex items-center gap-1">
+            {/* User-only filter toggle */}
+            <button
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[13px] rounded-md transition-all hover:text-text hover:bg-white/6 ${userOnly ? "text-accent-blue bg-accent-blue/10" : "text-text-secondary"}`}
+              onClick={() => { setUserOnly(!userOnly); setAnchorSequence(null); }}
+              title="Show only your messages  U"
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+                <path d="M8 8a3 3 0 100-6 3 3 0 000 6zM2 14c0-2.21 2.69-4 6-4s6 1.79 6 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {userOnly && <span className="text-[11px]">Mine</span>}
+            </button>
             {/* Search toggle button */}
             <button
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[13px] rounded-md transition-all hover:text-text hover:bg-white/6 ${searchOpen ? "text-accent-blue" : "text-text-secondary"}`}
@@ -672,21 +821,43 @@ export default function SessionDetail() {
 
       <FilesPanel sessionId={session.id} />
 
+      <InsightsPanel sessionId={session.id} />
+
       <div className="snippet-bubbles" style={{ gap: 10 }}>
         {session.messages.map((msg, i) => {
           const prev = i > 0 ? session.messages[i - 1] : null;
-          const isNewUserTurn = msg.role === "user" && msg.message_type !== "tool_result" && prev;
+          const isUserText = msg.role === "user" && msg.message_type !== "tool_result" && msg.message_type !== "system";
+          const isNewUserTurn = isUserText && prev;
+
+          // In user-only mode, skip non-user messages
+          if (userOnly && !isUserText) return null;
+
           return (
             <React.Fragment key={msg.id}>
-              {isNewUserTurn && (
+              {!userOnly && isNewUserTurn && (
                 <div className="w-full my-4 flex items-center">
                   <div className="flex-1 h-px bg-border/40" />
                 </div>
               )}
-              <MessageBubble
-                message={msg}
-                highlight={highlightMsg === String(msg.sequence)}
-              />
+              {userOnly && isUserText ? (
+                <div
+                  className="cursor-pointer transition-all hover:brightness-125"
+                  onClick={() => {
+                    setAnchorSequence(msg.sequence);
+                    setUserOnly(false);
+                  }}
+                >
+                  <MessageBubble
+                    message={msg}
+                    highlight={highlightMsg === String(msg.sequence)}
+                  />
+                </div>
+              ) : (
+                <MessageBubble
+                  message={msg}
+                  highlight={highlightMsg === String(msg.sequence)}
+                />
+              )}
             </React.Fragment>
           );
         })}
