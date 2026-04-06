@@ -304,7 +304,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
         </div>
       </div>
 
-      {/* Insights link */}
+      {/* Insights + Meta links */}
       <div className="border-t border-border/40 px-3 pt-2 pb-1 shrink-0">
         <Link
           to="/insights"
@@ -315,6 +315,18 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
             <path d="M6.5 14.5h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
           </svg>
           <span className="text-[13px] font-medium">Insights</span>
+        </Link>
+        <Link
+          to="/meta"
+          className="group flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text-secondary transition-all hover:bg-white/5 hover:text-text [&[data-status=active]]:bg-accent-purple/12 [&[data-status=active]]:text-accent-purple"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            <circle cx="5" cy="4" r="1.5" fill="currentColor" />
+            <circle cx="11" cy="8" r="1.5" fill="currentColor" />
+            <circle cx="7" cy="12" r="1.5" fill="currentColor" />
+          </svg>
+          <span className="text-[13px] font-medium">Meta</span>
         </Link>
       </div>
 

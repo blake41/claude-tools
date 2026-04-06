@@ -1503,6 +1503,161 @@ app.put("/api/settings/extraction", (req, res) => {
   res.json(getExtractionSettings());
 });
 
+// ── Meta Layer Routes ────────────────────────────────────────────
+
+import {
+  runMetaAnalysis,
+  getMetaSettings,
+  updateMetaSettings,
+  setupCronTrigger,
+  isAnalysisRunning,
+  getMetaRun,
+  listMetaRuns,
+  listProposalsFn,
+  getProposalFn,
+  reviewProposal,
+  markProposalApplied,
+  getProposalStats,
+} from "./meta/orchestrator.js";
+import { listSessionScores, getSessionScore, getScoreTrends } from "./meta/scoring.js";
+import { getSessionEvents, getSessionEventStats } from "./meta/events.js";
+import { createAmendmentBranch } from "./meta/git.js";
+import type { SkillAmendment } from "./meta/types.js";
+
+// Analysis triggers
+app.post("/api/meta/analyze", async (req, res) => {
+  if (isAnalysisRunning()) {
+    res.status(409).json({ error: "Analysis already running" });
+    return;
+  }
+  const { since, session_ids } = req.body || {};
+  res.status(202).json({ message: "Analysis started" });
+  runMetaAnalysis({ trigger: 'manual', sessionIds: session_ids, since }).catch(err => {
+    console.error("[meta] Manual analysis error:", err);
+  });
+});
+
+app.post("/api/meta/analyze/session/:id", async (req, res) => {
+  if (isAnalysisRunning()) {
+    res.status(409).json({ error: "Analysis already running" });
+    return;
+  }
+  res.status(202).json({ message: "Session analysis started" });
+  runMetaAnalysis({ trigger: 'hook', sessionIds: [req.params.id] }).catch(err => {
+    console.error("[meta] Hook analysis error:", err);
+  });
+});
+
+// Scoring
+app.get("/api/meta/scores", (req, res) => {
+  const limit = Number(req.query.limit) || 50;
+  const offset = Number(req.query.offset) || 0;
+  res.json(listSessionScores(limit, offset));
+});
+
+app.get("/api/meta/scores/trends", (req, res) => {
+  const days = Number(req.query.days) || 30;
+  res.json(getScoreTrends(days));
+});
+
+app.get("/api/meta/scores/:sessionId", (req, res) => {
+  const score = getSessionScore(req.params.sessionId);
+  if (!score) {
+    res.status(404).json({ error: "Score not found" });
+    return;
+  }
+  res.json(score);
+});
+
+// Events
+app.get("/api/meta/events/:sessionId", (req, res) => {
+  res.json(getSessionEvents(req.params.sessionId));
+});
+
+app.get("/api/meta/events/:sessionId/stats", (req, res) => {
+  res.json(getSessionEventStats(req.params.sessionId));
+});
+
+// Proposals
+app.get("/api/meta/proposals", (req, res) => {
+  const type = req.query.type as string | undefined;
+  const status = req.query.status as string | undefined;
+  const limit = Number(req.query.limit) || 50;
+  const offset = Number(req.query.offset) || 0;
+  res.json(listProposalsFn({ type, status, limit, offset }));
+});
+
+app.get("/api/meta/proposals/stats", (_req, res) => {
+  res.json(getProposalStats());
+});
+
+app.get("/api/meta/proposals/:id", (req, res) => {
+  const proposal = getProposalFn(Number(req.params.id));
+  if (!proposal) {
+    res.status(404).json({ error: "Proposal not found" });
+    return;
+  }
+  res.json(proposal);
+});
+
+app.post("/api/meta/proposals/:id/review", async (req, res) => {
+  const { status, note } = req.body;
+  if (!['approved', 'rejected', 'deferred'].includes(status)) {
+    res.status(400).json({ error: "Status must be approved, rejected, or deferred" });
+    return;
+  }
+  const proposal = reviewProposal(Number(req.params.id), status, note);
+  if (!proposal) {
+    res.status(404).json({ error: "Proposal not found" });
+    return;
+  }
+
+  // If approved skill_amendment, create git branch
+  if (status === 'approved') {
+    const p = proposal as Record<string, unknown>;
+    if (p.type === 'skill_amendment') {
+      try {
+        const detail = JSON.parse(p.detail as string) as SkillAmendment;
+        const branchName = await createAmendmentBranch(detail.skill_path, detail);
+        markProposalApplied(Number(req.params.id), branchName);
+      } catch (err) {
+        console.error("[meta] Git branch creation failed:", err);
+      }
+    }
+  }
+
+  res.json(proposal);
+});
+
+// Runs
+app.get("/api/meta/runs", (req, res) => {
+  const limit = Number(req.query.limit) || 20;
+  const offset = Number(req.query.offset) || 0;
+  res.json(listMetaRuns(limit, offset));
+});
+
+app.get("/api/meta/runs/:id", (req, res) => {
+  const run = getMetaRun(Number(req.params.id));
+  if (!run) {
+    res.status(404).json({ error: "Run not found" });
+    return;
+  }
+  res.json(run);
+});
+
+// Settings
+app.get("/api/meta/settings", (_req, res) => {
+  res.json(getMetaSettings());
+});
+
+app.put("/api/meta/settings", (req, res) => {
+  const updated = updateMetaSettings(req.body);
+  res.json(updated);
+});
+
+// Initialize cron trigger on server start
+setupCronTrigger();
+
 // SPA fallback — serve index.html for non-API routes
 app.get("*", (_req, res) => {
   res.sendFile(join(__dirname, "..", "dist", "web", "index.html"));

@@ -52,6 +52,34 @@ export const insightsRoute = createRoute({
   path: "/insights",
 });
 
+export const metaRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/meta",
+});
+
+export const metaProposalsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/meta/proposals",
+  validateSearch: (search: Record<string, unknown>): { type?: string } => ({
+    type: (search.type as string) || undefined,
+  }),
+});
+
+export const metaProposalDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/meta/proposals/$id",
+});
+
+export const metaScoresRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/meta/scores",
+});
+
+export const metaSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/meta/settings",
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   workspaceRoute,
@@ -61,6 +89,11 @@ const routeTree = rootRoute.addChildren([
   askRoute,
   searchRoute,
   insightsRoute,
+  metaRoute,
+  metaProposalsRoute,
+  metaProposalDetailRoute,
+  metaScoresRoute,
+  metaSettingsRoute,
 ]);
 
 export const router = createRouter({

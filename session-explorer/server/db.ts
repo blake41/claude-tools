@@ -202,5 +202,79 @@ db.exec(`DROP INDEX IF EXISTS idx_tool_calls_name`);
 // Rebuild FTS index to cover any data ingested before FTS5 was added
 db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
 
+// ── Meta Layer Tables ─────────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS session_scores (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    tool_efficiency REAL,
+    fix_convergence REAL,
+    context_discipline REAL,
+    verification_rigor REAL,
+    architectural_alignment REAL,
+    composite_score REAL,
+    raw_event_count INTEGER,
+    scored_at TEXT NOT NULL,
+    UNIQUE(session_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS proposals (
+    id INTEGER PRIMARY KEY,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    evidence_session_ids TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    score_impact TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    review_note TEXT,
+    applied_at TEXT,
+    applied_ref TEXT,
+    UNIQUE(type, title)
+  );
+
+  CREATE TABLE IF NOT EXISTS meta_runs (
+    id INTEGER PRIMARY KEY,
+    trigger TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    sessions_analyzed INTEGER,
+    proposals_created INTEGER,
+    error TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    sequence INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    tool TEXT,
+    target_file TEXT,
+    success INTEGER NOT NULL DEFAULT 1,
+    token_cost INTEGER,
+    timestamp TEXT NOT NULL,
+    metadata TEXT,
+    UNIQUE(session_id, sequence)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+  CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(type);
+  CREATE INDEX IF NOT EXISTS idx_session_scores_composite ON session_scores(composite_score);
+  CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
+  CREATE INDEX IF NOT EXISTS idx_proposals_type ON proposals(type);
+  CREATE INDEX IF NOT EXISTS idx_meta_runs_started ON meta_runs(started_at);
+`);
+
+// Migration: add events_extracted column to sessions
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN events_extracted INTEGER DEFAULT 0`);
+} catch {
+  // Column already exists
+}
+
 export default db;
 export { DB_PATH };

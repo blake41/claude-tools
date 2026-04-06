@@ -29,4 +29,13 @@ export const config = {
   defaultPageSize: 50,
   searchResultLimit: 100,
   fileSearchLimit: 50,
+
+  // Meta layer
+  metaScoringModel: "claude-haiku-4-5-20251001",
+  metaAnalysisModel: "claude-sonnet-4-6",
+  metaConcurrency: 3,
+  metaMaxTokens: 4096,
+  metaDefaultConfidenceThreshold: 0.7,
+  metaDefaultScoringThreshold: 3.5,
+  metaDefaultMinInvocations: 3,
 };
