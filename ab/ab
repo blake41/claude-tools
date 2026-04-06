@@ -20,9 +20,12 @@ set -euo pipefail
 CDP_PORT_USER=9222      # User's personal Chrome (for reauth cookie stealing)
 CDP_PORT_HEADLESS=9333  # Managed headless Chrome (automation target)
 CDP_PORT_HEADED=9444    # Managed headed Chrome (debugging/import)
+ACTIVE_CONTEXT_FILE="$HOME/.agent-browser/active-context"
 CDP_PORT=$CDP_PORT_HEADLESS
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CHROME_PROFILE="$HOME/.agent-browser/profile"
+CHROME_PROFILE_HEADLESS="$HOME/.agent-browser/profile"
+CHROME_PROFILE_HEADED="$HOME/.agent-browser/profile-headed"
+CHROME_PROFILE="$CHROME_PROFILE_HEADLESS"  # default, overridden when HEADED=1
 CHROME_PIDFILE="/tmp/ab-chrome-${CDP_PORT}.pid"
 AUTH_STATE="$HOME/.agent-browser/terra-auth.json"
 SEED_ORIGINS=("http://localhost:5173" "https://slack-feedback-staging.onrender.com" "https://terra.clay.com")
@@ -30,8 +33,19 @@ DASHBOARD_PORT=4848
 DASHBOARD_PIDFILE="$HOME/.agent-browser/dashboard.pid"
 
 # Headless by default. Set AB_HEADED=1 or pass --headed to route to headed Chrome.
+# Active context file overrides the default (set via `ab use <context>`).
 HEADED=0
-if [[ "${AB_HEADED:-}" == "1" ]]; then HEADED=1; fi
+if [[ "${AB_HEADED:-}" == "1" ]]; then
+  HEADED=1
+elif [[ -f "$ACTIVE_CONTEXT_FILE" ]]; then
+  _ctx="$(cat "$ACTIVE_CONTEXT_FILE")"
+  case "$_ctx" in
+    headed)   HEADED=1; CDP_PORT=$CDP_PORT_HEADED; CHROME_PROFILE="$CHROME_PROFILE_HEADED" ;;
+    personal) CDP_PORT=$CDP_PORT_USER ;;
+    headless) ;;  # already the default
+  esac
+  unset _ctx
+fi
 
 # --- Blocked commands ---
 if [[ "${1:-}" == "close" ]]; then
@@ -55,6 +69,15 @@ _launch_chrome() {
   local pidfile="/tmp/ab-chrome-${port}.pid"
 
   _port_is_up "$port" && return 0
+
+  # Auto-heal: if PID file exists but process is dead, prune it
+  if [[ -f "$pidfile" ]]; then
+    local stale_pid; stale_pid="$(cat "$pidfile")"
+    if ! kill -0 "$stale_pid" 2>/dev/null; then
+      rm -f "$pidfile"
+      echo "  Auto-healed stale Chrome PID file (PID $stale_pid)" >&2
+    fi
+  fi
 
   local headless_flag=""
   if [[ "$mode" == "headless" ]]; then
@@ -89,9 +112,11 @@ _launch_chrome() {
 _ensure_chrome() {
   local was_up=0
   if [[ "$HEADED" == "1" ]]; then
+    CHROME_PROFILE="$CHROME_PROFILE_HEADED"
     _port_is_up "$CDP_PORT_HEADED" && was_up=1
     _launch_chrome "$CDP_PORT_HEADED" headed || return 1
   else
+    CHROME_PROFILE="$CHROME_PROFILE_HEADLESS"
     _port_is_up "$CDP_PORT_HEADLESS" && was_up=1
     _launch_chrome "$CDP_PORT_HEADLESS" headless || return 1
     _dashboard_is_up || _dashboard_start 2>/dev/null
@@ -207,23 +232,111 @@ _seed() {
 }
 
 # --- Try to grab cookies from a Chrome on a given port ---
+# Uses CDP Network.getAllCookies via a page-level target to bypass Playwright's
+# isolated browser contexts. Playwright sessions create their own cookie jar;
+# the real cookies are only accessible through a page target with Network enabled.
 _grab_cookies_from_port() {
   local port="$1" tmp_state="$2" label="$3"
   _port_is_up "$port" || return 1
   echo "  Trying $label (port $port)..." >&2
-  if agent-browser --cdp "$port" --session reauth-tmp state save "$tmp_state" 2>/dev/null; then
-    pgrep -f "agent-browser-d.*reauth-tmp" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
-    rm -f ~/.agent-browser/reauth-tmp.sock 2>/dev/null
-    local count
-    count=$(python3 -c "import json; d=json.load(open('$tmp_state')); print(len(d.get('cookies',[])))" 2>/dev/null || echo 0)
-    if [[ "$count" -gt 0 ]]; then
-      echo "  ✓ Got $count cookies from $label" >&2
-      return 0
-    fi
+  local count
+  count=$(python3 -c "
+import json, sys, urllib.request, asyncio
+
+async def grab():
+    # Find first real page target (not devtools, extensions, or blobs)
+    pages = json.loads(urllib.request.urlopen('http://localhost:$port/json/list', timeout=3).read())
+    target = next((p for p in pages if p.get('type') == 'page'
+                    and not p.get('url','').startswith('devtools://')
+                    and not p.get('url','').startswith('chrome-extension://')
+                    and not p.get('url','').startswith('blob:')
+                    and 'webSocketDebuggerUrl' in p), None)
+    if not target:
+        print('0'); return
+
+    import websockets
+    async with websockets.connect(target['webSocketDebuggerUrl'], max_size=50*1024*1024) as ws:
+        await ws.send(json.dumps({'id': 0, 'method': 'Network.enable'}))
+        await ws.recv()
+        await ws.send(json.dumps({'id': 1, 'method': 'Network.getAllCookies'}))
+        result = json.loads(await ws.recv())
+        await ws.send(json.dumps({'id': 2, 'method': 'Network.disable'}))
+        await ws.recv()
+
+    cookies = result.get('result', {}).get('cookies', [])
+    state = {'cookies': [
+        {
+            'name': c['name'], 'value': c['value'], 'domain': c['domain'],
+            'path': c.get('path', '/'), 'expires': c.get('expires', -1),
+            'httpOnly': c.get('httpOnly', False), 'secure': c.get('secure', False),
+            'sameSite': c.get('sameSite', 'None'),
+        } for c in cookies
+    ], 'origins': []}
+    json.dump(state, open('$tmp_state', 'w'))
+    print(len(cookies))
+
+asyncio.run(grab())
+" 2>/dev/null || echo 0)
+  if [[ "$count" -gt 0 ]]; then
+    echo "  ✓ Got $count cookies from $label" >&2
+    return 0
   fi
-  pgrep -f "agent-browser-d.*reauth-tmp" 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
-  rm -f ~/.agent-browser/reauth-tmp.sock 2>/dev/null
   return 1
+}
+
+# --- Replicate Clerk cookies across seed domains via CDP ---
+# Clerk JWTs are domain-scoped. This copies them from localhost to each seed origin
+# so the headless browser is authenticated on staging/production too.
+_replicate_clerk_cookies() {
+  local state_file="$1"
+  echo "▶ Replicating Clerk cookies across domains..." >&2
+
+  # Generate an augmented state file with Clerk cookies duplicated for each seed domain
+  python3 -c "
+import json, sys
+
+state = json.load(open('$state_file'))
+cookies = state.get('cookies', [])
+
+# Find Clerk-related cookies
+clerk_names = {'__session', '__clerk_db_jwt', '__client_uat', 'clerk_active_context'}
+clerk_prefixes = ('__session_', '__clerk_db_jwt_', '__client_uat_')
+clerk_cookies = [c for c in cookies if c.get('name','') in clerk_names or any(c.get('name','').startswith(p) for p in clerk_prefixes)]
+
+if not clerk_cookies:
+    print('  No Clerk cookies found — skipping replication', file=sys.stderr)
+    sys.exit(0)
+
+# Target domains from seed origins
+origins = $( printf '['; for o in "${SEED_ORIGINS[@]}"; do printf '"%s",' "$o"; done | sed 's/,$//'; printf ']' )
+domains = set()
+for origin in origins:
+    domain = origin.replace('https://','').replace('http://','').split('/')[0]
+    # Skip localhost — already has the cookies
+    if 'localhost' in domain:
+        continue
+    domains.add(domain)
+
+# Duplicate each Clerk cookie for each target domain
+new_cookies = list(cookies)  # keep originals
+count = 0
+for domain in sorted(domains):
+    for c in clerk_cookies:
+        dup = dict(c)
+        dup['domain'] = domain
+        # Strip port-specific suffixes from name for cross-domain (keep both versions)
+        new_cookies.append(dup)
+        count += 1
+
+state['cookies'] = new_cookies
+json.dump(state, open('$state_file', 'w'))
+print(f'  ✓ Replicated {count} cookie entries across {len(domains)} domains', file=sys.stderr)
+" 2>&1 | cat >&2
+
+  # Re-load the augmented state into managed Chrome
+  agent-browser --cdp "$CDP_PORT" state load "$state_file" 2>/dev/null \
+    && echo "  ✓ Loaded augmented cookies" >&2 \
+    || echo "  ✗ Failed to reload augmented cookies" >&2
 }
 
 # --- Reauth: grab cookies with cascade fallback ---
@@ -267,6 +380,12 @@ _reauth() {
   agent-browser --cdp "$CDP_PORT" state load "$tmp_state" 2>/dev/null \
     && echo "  ✓ Loaded cookies into managed Chrome" >&2 \
     || { echo "  ✗ Failed to load cookies" >&2; rm -f "$tmp_state"; return 1; }
+
+  # Replicate Clerk cookies across all seed domains.
+  # Clerk stores auth as __session (JWT) scoped to the origin domain.
+  # Personal Chrome only has these for localhost, so we duplicate them
+  # onto each seed origin so the headless browser is authenticated everywhere.
+  _replicate_clerk_cookies "$tmp_state"
 
   # Update backup
   cp "$tmp_state" "$AUTH_STATE" 2>/dev/null
@@ -354,34 +473,27 @@ _import() {
   echo "✓ Import complete. Auth persisted in profile + backed up to terra-auth.json" >&2
 }
 
-# --- Heal: kill managed Chrome + daemons, start fresh ---
+# --- Heal: clean up stale daemons (smart) or nuke everything (--all) ---
 _heal() {
-  echo "▶ Healing..." >&2
+  local nuke=0 reset_profile=0
+  for arg in "$@"; do
+    case "$arg" in
+      --all) nuke=1 ;;
+      --reset-profile) reset_profile=1 ;;
+    esac
+  done
 
-  # Kill daemons
-  if pgrep -q "agent-browser-d" 2>/dev/null; then
-    pgrep "agent-browser-d" | while read -r pid; do
-      kill "$pid" 2>/dev/null && echo "  Killed daemon (PID $pid)" >&2 || true
-    done
-    sleep 1
-  fi
-  rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
-
-  # Clean session daemon sockets (except dashboard)
-  find ~/.agent-browser -name "ab-*.sock" -delete 2>/dev/null || true
-
-  # Kill managed Chrome
-  if [[ -f "$CHROME_PIDFILE" ]]; then
-    local p; p="$(cat "$CHROME_PIDFILE")"
-    kill -0 "$p" 2>/dev/null && { kill "$p" 2>/dev/null; echo "  Killed Chrome (PID $p)" >&2; sleep 1; }
-    rm -f "$CHROME_PIDFILE"
+  if [[ "$nuke" -eq 1 ]]; then
+    echo "▶ Healing (nuclear)..." >&2
+    _heal_nuke
+  else
+    echo "▶ Healing (smart)..." >&2
+    _heal_smart
   fi
 
   # Note: heal works inside Seatbelt sandbox — Chrome can relaunch with allowlisted write paths
 
-  local reset_profile=0
-  if [[ "${1:-}" == "--reset-profile" ]]; then
-    reset_profile=1
+  if [[ "$reset_profile" -eq 1 ]]; then
     echo "  Resetting profile..." >&2
     if [[ -d "$CHROME_PROFILE" ]]; then
       mv "$CHROME_PROFILE" "${CHROME_PROFILE}-backup-$(date +%s)" 2>/dev/null || true
@@ -390,7 +502,6 @@ _heal() {
 
   _ensure_chrome
 
-  # After heal, restore auth backup if profile was reset
   if [[ "$reset_profile" -eq 1 ]]; then
     _restore_auth
     _seed
@@ -399,10 +510,94 @@ _heal() {
   echo "✓ Healed" >&2
 }
 
+# Smart heal: only clean up stale daemons, leave active ones running
+_heal_smart() {
+  local cleaned=0
+
+  # Check default daemon
+  if [[ -f ~/.agent-browser/default.pid ]]; then
+    local p; p="$(cat ~/.agent-browser/default.pid)"
+    if ! kill -0 "$p" 2>/dev/null; then
+      rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
+      echo "  Cleaned stale default daemon (PID $p)" >&2
+      ((cleaned++)) || true
+    fi
+  fi
+
+  # Check session daemons — each has ab-*.pid, ab-*.sock, ab-*.stream
+  for pidfile in ~/.agent-browser/ab-*.pid; do
+    [[ -f "$pidfile" ]] || continue
+    local base; base="$(basename "$pidfile" .pid)"
+    local p; p="$(cat "$pidfile")"
+    if ! kill -0 "$p" 2>/dev/null; then
+      rm -f "$pidfile" ~/.agent-browser/"${base}.sock" ~/.agent-browser/"${base}.stream"
+      echo "  Cleaned stale session $base (PID $p)" >&2
+      ((cleaned++)) || true
+    fi
+  done
+
+  # Check for orphan sockets with no matching PID file
+  for sockfile in ~/.agent-browser/ab-*.sock; do
+    [[ -f "$sockfile" ]] || continue
+    local base; base="$(basename "$sockfile" .sock)"
+    if [[ ! -f ~/.agent-browser/"${base}.pid" ]]; then
+      rm -f "$sockfile"
+      echo "  Cleaned orphan socket $base" >&2
+      ((cleaned++)) || true
+    fi
+  done
+
+  # Check managed Chrome PID
+  if [[ -f "$CHROME_PIDFILE" ]]; then
+    local p; p="$(cat "$CHROME_PIDFILE")"
+    if ! kill -0 "$p" 2>/dev/null; then
+      rm -f "$CHROME_PIDFILE"
+      echo "  Cleaned stale Chrome PID file (PID $p)" >&2
+      ((cleaned++)) || true
+    fi
+  fi
+
+  if [[ "$cleaned" -eq 0 ]]; then
+    echo "  Nothing stale found" >&2
+  else
+    echo "  Cleaned $cleaned stale entries" >&2
+  fi
+}
+
+# Nuclear heal: kill everything and start fresh
+_heal_nuke() {
+  # Kill all daemons
+  if pgrep -q "agent-browser-d" 2>/dev/null; then
+    pgrep "agent-browser-d" | while read -r pid; do
+      kill "$pid" 2>/dev/null && echo "  Killed daemon (PID $pid)" >&2 || true
+    done
+    sleep 1
+  fi
+  rm -f ~/.agent-browser/default.pid ~/.agent-browser/default.sock
+
+  # Clean all session daemon files
+  find ~/.agent-browser -name "ab-*.sock" -delete 2>/dev/null || true
+  find ~/.agent-browser -name "ab-*.pid" -delete 2>/dev/null || true
+  find ~/.agent-browser -name "ab-*.stream" -delete 2>/dev/null || true
+
+  # Kill managed Chrome
+  if [[ -f "$CHROME_PIDFILE" ]]; then
+    local p; p="$(cat "$CHROME_PIDFILE")"
+    kill -0 "$p" 2>/dev/null && { kill "$p" 2>/dev/null; echo "  Killed Chrome (PID $p)" >&2; sleep 1; }
+    rm -f "$CHROME_PIDFILE"
+  fi
+}
+
 # --- Status ---
 _status() {
   _cdp_is_up && echo "CDP: ✓ port $CDP_PORT" || echo "CDP: ✗ port $CDP_PORT"
-  [[ "$HEADED" == "1" ]] && echo "Mode: headed" || echo "Mode: headless"
+  if [[ -f "$ACTIVE_CONTEXT_FILE" ]]; then
+    echo "Context: $(cat "$ACTIVE_CONTEXT_FILE") (via 'ab use')"
+  elif [[ "$HEADED" == "1" ]]; then
+    echo "Context: headed (via env/flag)"
+  else
+    echo "Context: headless (default)"
+  fi
   [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]] && echo "Session: ab-$AB_SUBAGENT_SESSION_ID" || echo "Session: (default)"
   local dc; dc=$(pgrep -c "agent-browser-d" 2>/dev/null || echo 0); echo "Daemons: $dc"
   if [[ -f "$CHROME_PIDFILE" ]]; then
@@ -415,11 +610,16 @@ _status() {
 }
 
 # --- Parse flags from args ---
+USER_CHROME=0
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --session-name|--session) shift 2 ;;  # stripped — we derive from AB_SUBAGENT_SESSION_ID
+    --session-name|--session)
+      # Use as seed — CCO_SESSION_ID prefix is added downstream (line 638)
+      export AB_SUBAGENT_SESSION_ID="$2"
+      shift 2 ;;
     --headed) HEADED=1; CDP_PORT=$CDP_PORT_HEADED; shift ;;
+    --user-chrome) USER_CHROME=1; CDP_PORT=$CDP_PORT_USER; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
@@ -434,13 +634,54 @@ if [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
   SESSION_ARGS=(--session "ab-${CCO_SESSION_ID:+${CCO_SESSION_ID:0:8}-}${AB_SUBAGENT_SESSION_ID}")
 fi
 
-# --- Warn if no AB_SUBAGENT_SESSION_ID ---
-if [[ -z "${AB_SUBAGENT_SESSION_ID:-}" && "${1:-}" != "heal" && "${1:-}" != "status" && "${1:-}" != "ensure" && "${1:-}" != "new-session" && "${1:-}" != "" ]]; then
+# --- Session identity display ---
+if [[ -n "${AB_SUBAGENT_SESSION_ID:-}" ]]; then
+  # Show the full unique session name so humans can verify isolation
+  _session_display="${SESSION_ARGS[1]:-ab-${AB_SUBAGENT_SESSION_ID}}"
+  echo -e "\033[90m[${_session_display}]\033[0m" >&2
+elif [[ "${1:-}" != "heal" && "${1:-}" != "status" && "${1:-}" != "ensure" && "${1:-}" != "new-session" && "${1:-}" != "use" && "${1:-}" != "console-tail" && "${1:-}" != "watch" && "${1:-}" != "" ]]; then
   echo "⚠ No AB_SUBAGENT_SESSION_ID set — session isolation disabled. Set AB_SUBAGENT_SESSION_ID for parallel safety." >&2
 fi
 
 # --- Main dispatch ---
 case "${1:-}" in
+  # --- Context switching ---
+  use)
+    case "${2:-}" in
+      personal|headless|headed)
+        echo "${2}" > "$ACTIVE_CONTEXT_FILE"
+        echo "✓ Active context: ${2}" >&2
+        case "${2}" in
+          personal) echo "  CDP port $CDP_PORT_USER (user's Chrome)" >&2 ;;
+          headless) echo "  CDP port $CDP_PORT_HEADLESS" >&2 ;;
+          headed)   echo "  CDP port $CDP_PORT_HEADED" >&2 ;;
+        esac
+        ;;
+      "")
+        if [[ -f "$ACTIVE_CONTEXT_FILE" ]]; then
+          echo "Active context: $(cat "$ACTIVE_CONTEXT_FILE")"
+        else
+          echo "Active context: headless (default)"
+        fi
+        ;;
+      *)
+        echo "Usage: ab use <personal|headless|headed>" >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+    ;;
+
+  # --- Console tailing ---
+  console-tail)
+    shift  # remove 'console-tail'
+    exec python3 "$HOME/Documents/Development/tools/ab/console-tail.py" "$@" "$CDP_PORT"
+    ;;
+  watch)
+    shift  # remove 'watch'
+    exec python3 "$HOME/Documents/Development/tools/ab/console-tail.py" --watch "$@" "$CDP_PORT"
+    ;;
+
   # --- Lifecycle ---
   heal)      _heal "${2:-}" ;;
   status)    _status ;;
@@ -476,8 +717,13 @@ case "${1:-}" in
 
   # --- Navigation (navigate/goto aliased to open) ---
   open|navigate|goto)
-    _ensure_chrome
-    _open_with_context "${2:-about:blank}"
+    if [[ "$USER_CHROME" == "1" ]]; then
+      # User Chrome: just navigate the active tab, don't manage Chrome lifecycle
+      agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" open "${2:-about:blank}"
+    else
+      _ensure_chrome
+      _open_with_context "${2:-about:blank}"
+    fi
     ;;
 
   # --- Recording (auth-safe: records the active tab directly) ---
@@ -485,7 +731,7 @@ case "${1:-}" in
   # tab via Page.captureScreenshot at 10fps. Unlike "record", it does NOT create
   # a fresh browser context, so localStorage/sessionStorage auth is preserved.
   record)
-    _ensure_chrome
+    [[ "$USER_CHROME" == "0" ]] && _ensure_chrome
     case "${2:-}" in
       start)
         [[ -z "${3:-}" ]] && { echo "Usage: ab record start <output.webm>" >&2; exit 1; }
@@ -503,7 +749,7 @@ case "${1:-}" in
 
   # --- Storage commands (replaces raw eval for localStorage) ---
   localStorage)
-    _ensure_chrome
+    [[ "$USER_CHROME" == "0" ]] && _ensure_chrome
     case "${2:-}" in
       get) agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval "localStorage.getItem('${3:-}')" ;;
       set) agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" eval "localStorage.setItem('${3:-}','${4:-}');'ok'" ;;
@@ -511,9 +757,13 @@ case "${1:-}" in
     esac
     ;;
 
-  # --- Blocked: eval/js/execute — use snapshot + refs instead ---
+  # --- Blocked: eval/js/execute — allowed only with --user-chrome ---
   eval|js|execute)
-    echo "✗ eval is blocked. Use the proper commands instead:" >&2
+    if [[ "$USER_CHROME" == "1" ]]; then
+      agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
+      exit $?
+    fi
+    echo "✗ eval is blocked on headless. Use --user-chrome to run JS in your browser, or:" >&2
     echo "  ab snapshot -i          # discover elements" >&2
     echo "  ab click @ref           # click by ref" >&2
     echo "  ab get text @ref        # read element text" >&2
@@ -523,10 +773,18 @@ case "${1:-}" in
     exit 1
     ;;
 
+  # --- JS click: bypasses CDP coordinate issues for React/virtualized elements ---
+  click-js)
+    [[ "$USER_CHROME" == "0" ]] && _ensure_chrome
+    shift # remove 'click-js'
+    python3 "$HOME/Documents/Development/tools/ab/cdp-click.py" "$CDP_PORT" "$@"
+    exit $?
+    ;;
+
   # --- Allowed agent-browser passthroughs (session-isolated) ---
   snapshot|screenshot|click|fill|type|select|check|press|scroll|\
   find|get|wait|highlight|hover|pdf|diff|set|keyboard|frame|console)
-    _ensure_chrome
+    [[ "$USER_CHROME" == "0" ]] && _ensure_chrome
     agent-browser --cdp "$CDP_PORT" "${SESSION_ARGS[@]}" "$@"
     rc=$?
     [[ $rc -ne 0 ]] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL($rc) $*" >> "$HOME/.agent-browser/failed-commands.log" 2>/dev/null
@@ -566,15 +824,27 @@ case "${1:-}" in
     echo "  record start <file> Record video of active tab (auth-safe)" >&2
     echo "  record stop         Stop recording" >&2
     echo "" >&2
+    echo "Debugging:" >&2
+    echo "  console-tail [pfx]  Stream console output via CDP (Ctrl-C to stop)" >&2
+    echo "    --level <l>       Filter: verbose|info|warn|error" >&2
+    echo "    --filter <pfx>    Only lines starting with prefix" >&2
+    echo "  watch               Errors + auto-screenshot → /tmp/ab-watch/" >&2
+    echo "" >&2
+    echo "Context:" >&2
+    echo "  use <ctx>           Switch: personal|headless|headed (persists)" >&2
+    echo "  use                 Show current context" >&2
+    echo "" >&2
     echo "Auth & Lifecycle:" >&2
     echo "  reauth              Grab cookies from personal Chrome" >&2
     echo "  import              Headed login (manual Google/Clerk auth)" >&2
     echo "  seed-url <url>      Seed localStorage on a single origin" >&2
-    echo "  heal                Kill everything, restart fresh" >&2
+    echo "  heal                Smart cleanup of stale daemons" >&2
+    echo "  heal --all          Kill everything, restart fresh" >&2
     echo "  status              Show health" >&2
     echo "  dashboard <cmd>     Dashboard management" >&2
     echo "" >&2
-    echo "Env: AB_SUBAGENT_SESSION_ID=name (session isolation), AB_HEADED=1 (headed mode)" >&2
+    echo "Env: AB_SUBAGENT_SESSION_ID=name (session isolation)" >&2
+    echo "Flags: --user-chrome (connect to user's Chrome on port $CDP_PORT_USER instead of headless)" >&2
     exit 1
     ;;
   *)
