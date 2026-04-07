@@ -207,9 +207,10 @@ interface SessionHeaderProps {
   session: SessionSummary;
   onTagsChange?: (tags: Tag[]) => void;
   showTitle?: boolean;
+  activityMode?: boolean;
 }
 
-export default function SessionHeader({ session, onTagsChange, showTitle }: SessionHeaderProps) {
+export default function SessionHeader({ session, onTagsChange, showTitle, activityMode }: SessionHeaderProps) {
   return (
     <div>
       {showTitle && (
@@ -218,13 +219,26 @@ export default function SessionHeader({ session, onTagsChange, showTitle }: Sess
 
       {/* Meta row: date, duration, session ID, branch, tags */}
       <div className={`flex items-center gap-2.5 text-xs flex-wrap${showTitle ? " mt-2" : ""}`}>
-        <span className="font-mono text-xs text-text-secondary">
-          {formatDate(session.started_at)}{" "}
-          {formatTime(session.started_at)}
-          {session.ended_at && ` – ${formatTime(session.ended_at)}`}
-        </span>
-        {session.ended_at && (
-          <span className="text-text-dim text-[11px]">{duration(session.started_at, session.ended_at)}</span>
+        {activityMode && session.ended_at ? (
+          <>
+            <span className="font-mono text-xs text-accent-blue font-semibold">
+              {formatTime(session.ended_at)}
+            </span>
+            <span className="text-text-dim text-[11px]">
+              {formatDate(session.started_at)} · {duration(session.started_at, session.ended_at)}
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="font-mono text-xs text-text-secondary">
+              {formatDate(session.started_at)}{" "}
+              {formatTime(session.started_at)}
+              {session.ended_at && ` – ${formatTime(session.ended_at)}`}
+            </span>
+            {session.ended_at && (
+              <span className="text-text-dim text-[11px]">{duration(session.started_at, session.ended_at)}</span>
+            )}
+          </>
         )}
         <button
           className="group/sid inline-flex items-center gap-0.5 font-mono text-[10px] text-text-dim/40 transition-colors hover:text-text-secondary"

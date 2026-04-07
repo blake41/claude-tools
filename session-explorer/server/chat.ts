@@ -60,6 +60,8 @@ messages_fts: FTS5 virtual table on messages.content — JOIN via messages_fts.r
 
 ## Query Recipes (use these patterns directly)
 
+IMPORTANT: Messages with message_type = 'subagent_prompt' are internal agent-to-subagent prompts, NOT real user messages. Always exclude them: AND m.message_type != 'subagent_prompt'
+
 Topic search (always use FTS5, not LIKE):
   SELECT DISTINCT s.id, s.title, s.started_at, s.summary, w.display_name
   FROM messages_fts fts

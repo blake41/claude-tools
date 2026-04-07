@@ -34,6 +34,7 @@ export interface SessionSummary {
   tags?: Tag[];
   files_changed?: ChangedFile[];
   last_user_message?: string | null;
+  last_user_message_at?: string | null;
 }
 
 export interface Message {

@@ -73,9 +73,10 @@ function FileCategoryPills({ files }: { files: ChangedFile[] }) {
 interface SessionCardProps {
   session: SessionSummary & { workspace_name?: string };
   onTagsChange?: (sessionId: string, tags: Tag[]) => void;
+  showLastMessage?: boolean;
 }
 
-export default function SessionCard({ session, onTagsChange }: SessionCardProps) {
+export default function SessionCard({ session, onTagsChange, showLastMessage }: SessionCardProps) {
   const navigate = useNavigate();
 
   return (
@@ -87,7 +88,25 @@ export default function SessionCard({ session, onTagsChange }: SessionCardProps)
         <SessionHeader
           session={session}
           onTagsChange={onTagsChange ? (newTags) => onTagsChange(session.id, newTags) : undefined}
+          activityMode={showLastMessage}
         />
+        {showLastMessage && session.last_user_message && (
+          <div className="mt-2 flex items-start gap-2">
+            <div className="shrink-0 mt-0.5 w-1 h-full min-h-[16px] rounded-full bg-[#f0883e]/60" />
+            <div className="min-w-0">
+              {session.last_user_message_at && (
+                <span className="text-[10px] font-mono text-[#f0883e]/70 mr-1">
+                  {new Date(session.last_user_message_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true })}
+                </span>
+              )}
+              <p className="text-[12px] text-[#f0883e] leading-relaxed line-clamp-2">
+                {session.last_user_message.length > 200
+                  ? session.last_user_message.slice(0, 200) + "..."
+                  : session.last_user_message}
+              </p>
+            </div>
+          </div>
+        )}
       </button>
       <div className={`session-row-files${!session.files_changed?.length ? " session-row-files--empty" : ""}`}>
         <FileCategoryPills files={session.files_changed || []} />

@@ -97,7 +97,8 @@ const listSessions = db.prepare(`
 
 const listSessionsByActivity = db.prepare(`
   SELECT s.id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary,
-    (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY sequence DESC LIMIT 1) as last_user_message
+    (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message,
+    (SELECT timestamp FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message_at
   FROM sessions s
   WHERE s.workspace_id = ?
   ORDER BY COALESCE(s.ended_at, s.started_at) DESC
@@ -117,7 +118,8 @@ const listAllSessions = db.prepare(`
 
 const listAllSessionsByActivity = db.prepare(`
   SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary,
-    (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY sequence DESC LIMIT 1) as last_user_message
+    (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message,
+    (SELECT timestamp FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message_at
   FROM sessions s
   ORDER BY COALESCE(s.ended_at, s.started_at) DESC
   LIMIT ? OFFSET ?
@@ -168,7 +170,7 @@ const searchMessagesFts = db.prepare(`
   FROM messages_fts
   JOIN messages m ON m.id = messages_fts.rowid
   JOIN sessions s ON m.session_id = s.id
-  WHERE messages_fts MATCH ?
+  WHERE messages_fts MATCH ? AND m.message_type != 'subagent_prompt'
   ORDER BY rank
   LIMIT 200
 `);
@@ -181,7 +183,7 @@ const searchMessagesFtsInWorkspace = db.prepare(`
   FROM messages_fts
   JOIN messages m ON m.id = messages_fts.rowid
   JOIN sessions s ON m.session_id = s.id
-  WHERE s.workspace_id = ? AND messages_fts MATCH ?
+  WHERE s.workspace_id = ? AND messages_fts MATCH ? AND m.message_type != 'subagent_prompt'
   ORDER BY rank
   LIMIT 200
 `);
@@ -194,7 +196,7 @@ const searchMessagesLike = db.prepare(`
          0 as rank
   FROM messages m
   JOIN sessions s ON m.session_id = s.id
-  WHERE m.content LIKE ?2
+  WHERE m.content LIKE ?2 AND m.message_type != 'subagent_prompt'
   ORDER BY m.timestamp DESC
   LIMIT 200
 `);
@@ -206,7 +208,7 @@ const searchMessagesLikeInWorkspace = db.prepare(`
          0 as rank
   FROM messages m
   JOIN sessions s ON m.session_id = s.id
-  WHERE s.workspace_id = ?3 AND m.content LIKE ?2
+  WHERE s.workspace_id = ?3 AND m.content LIKE ?2 AND m.message_type != 'subagent_prompt'
   ORDER BY m.timestamp DESC
   LIMIT 200
 `);

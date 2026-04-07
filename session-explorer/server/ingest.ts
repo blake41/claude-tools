@@ -276,13 +276,18 @@ function ingestSession(
         try {
           const subResult = stripSession(join(subagentDir, sf));
           for (const msg of subResult.messages) {
+            // Tag subagent user text messages as 'subagent_prompt' so they're
+            // excluded from queries that filter on message_type = 'text'
+            const messageType = (msg.role === 'user' && (msg.messageType || 'text') === 'text')
+              ? 'subagent_prompt'
+              : msg.messageType || 'text';
             insertMessage.run(
               sessionId,
               msg.role,
               msg.content,
               msg.timestamp,
               seqOffset + msg.sequence,
-              msg.messageType || 'text',
+              messageType,
               'subagent'
             );
           }
