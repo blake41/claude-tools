@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.clay.ab-server</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{HOME}}/.bun/bin/bun</string>
+		<string>run</string>
+		<string>{{HOME}}/Documents/Development/tools/ab/src/daemon.ts</string>
+	</array>
+	<key>StandardOutPath</key>
+	<string>/tmp/ab-server-out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/ab-server-error.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>{{HOME}}</string>
+		<key>PATH</key>
+		<string>{{HOME}}/.bun/bin:{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+</dict>
+</plist>
