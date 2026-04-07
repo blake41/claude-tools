@@ -6,6 +6,7 @@
  * serialized through an async queue so concurrent callers share results.
  */
 
+import * as path from "path";
 import type { ChromeConfig, ChromeTarget } from "./types";
 import {
   getState,
@@ -541,4 +542,76 @@ function getListeningPid(port: number): number | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Agent-browser session cleanup (for heal)
+// ---------------------------------------------------------------------------
+
+const AB_HOME = path.join(process.env.HOME ?? "", ".agent-browser");
+
+/**
+ * Clean up agent-browser daemon sessions without using `agent-browser close`.
+ *
+ * `agent-browser close --all` launches Chrome via the profile, which conflicts
+ * with the daemon's managed Chrome. For --cdp sessions, close doesn't need
+ * Chrome at all — we just need to kill the daemon PIDs and clean sidecar files.
+ */
+export async function cleanAgentBrowserSessions(): Promise<string[]> {
+  const fs = await import("fs");
+  const actions: string[] = [];
+
+  // Find all ab-*.pid files
+  let pidFiles: string[];
+  try {
+    const entries = fs.readdirSync(AB_HOME);
+    pidFiles = entries.filter((f: string) => f.startsWith("ab-") && f.endsWith(".pid"));
+  } catch {
+    actions.push("no ~/.agent-browser directory");
+    return actions;
+  }
+
+  // Kill each daemon PID
+  for (const pidFile of pidFiles) {
+    const pidPath = path.join(AB_HOME, pidFile);
+    try {
+      const raw = fs.readFileSync(pidPath, "utf-8").trim();
+      const pid = parseInt(raw, 10);
+      if (!Number.isNaN(pid)) {
+        try {
+          process.kill(pid, "SIGTERM");
+          actions.push(`killed PID ${pid} (${pidFile})`);
+        } catch {
+          actions.push(`PID ${pid} already dead (${pidFile})`);
+        }
+      }
+    } catch {
+      // File unreadable — will be cleaned up below
+    }
+  }
+
+  // Clean up sidecar files (.pid, .sock, .stream, .engine)
+  const sidecarExtensions = [".pid", ".sock", ".stream", ".engine"];
+  try {
+    const entries = fs.readdirSync(AB_HOME);
+    for (const entry of entries) {
+      if (!entry.startsWith("ab-")) continue;
+      if (!sidecarExtensions.some((ext) => entry.endsWith(ext))) continue;
+      const fullPath = path.join(AB_HOME, entry);
+      try {
+        fs.unlinkSync(fullPath);
+        actions.push(`removed ${entry}`);
+      } catch {
+        // Ignore — file may have been removed already
+      }
+    }
+  } catch {
+    // Directory read failed — already handled above
+  }
+
+  if (actions.length === 0) {
+    actions.push("no agent-browser sessions to clean");
+  }
+
+  return actions;
 }

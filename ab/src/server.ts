@@ -52,6 +52,7 @@ const HANDLER_TIMEOUT_MS = 30_000;
 const AuthLoginRequestSchema = z.object({
   sessionId: z.string().min(1),
   port: z.number().int().positive(),
+  email: z.string().email().optional(),
   slackUserId: z.string().optional(),
   apiBaseUrl: z.string().optional(),
   appBaseUrl: z.string().optional(),
@@ -121,7 +122,10 @@ async function handleEnsure(target: ChromeTarget): Promise<Response> {
 async function handleHeal(): Promise<Response> {
   const actions: string[] = [];
 
-  // Step 1: agent-browser close --all via shell
+  // Step 1: close all agent-browser sessions
+  // close --all sends the close command to each daemon session.
+  // For --cdp sessions (ours), this just disconnects — it does NOT kill
+  // our managed Chrome (browser.rs checks browser_process.is_some()).
   log.info("Heal: running agent-browser close --all");
   const closeResult = Bun.spawnSync(["agent-browser", "close", "--all"], {
     stdout: "ignore",

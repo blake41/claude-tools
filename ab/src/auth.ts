@@ -95,9 +95,10 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
   const { sessionId, port } = req;
   const apiBaseUrl = req.apiBaseUrl || DEFAULT_API_BASE;
   const appBaseUrl = req.appBaseUrl || DEFAULT_APP_BASE;
+  const email = req.email;
   const slackUserId = req.slackUserId;
 
-  log.info("Starting auth flow", { sessionId, port, apiBaseUrl, appBaseUrl, slackUserId });
+  log.info("Starting auth flow", { sessionId, port, apiBaseUrl, appBaseUrl, email, slackUserId });
 
   // -----------------------------------------------------------------------
   // Step 1: Check if already authenticated
@@ -118,21 +119,22 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
   // Step 2: POST /auth/dev-login to get a sign-in token
   // -----------------------------------------------------------------------
 
-  if (!slackUserId) {
-    return { ok: false, error: "slackUserId is required for dev-login" };
+  if (!email && !slackUserId) {
+    return { ok: false, error: "email or slackUserId is required for dev-login" };
   }
 
   let token: string;
-  let userEmail: string | undefined;
+  let userEmail: string | undefined = email;
 
   try {
     const loginUrl = `${apiBaseUrl}/auth/dev-login`;
-    log.info("Requesting dev-login token", { loginUrl, slackUserId });
+    const loginBody = email ? { email } : { slackUserId };
+    log.info("Requesting dev-login token", { loginUrl, ...loginBody });
 
     const resp = await fetch(loginUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slackUserId }),
+      body: JSON.stringify(loginBody),
       signal: AbortSignal.timeout(5_000),
     });
 
@@ -141,7 +143,21 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
       const msg = (body as Record<string, string>).message || `HTTP ${resp.status}`;
 
       if (resp.status === 404 && (body as Record<string, string>).error === "user_not_found") {
-        return { ok: false, error: "User not found. Must log in via Google OAuth first." };
+        const email = (body as Record<string, string>).email || "this user";
+        return {
+          ok: false,
+          error: `User ${email} has no Clerk account in this environment. `
+            + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
+        };
+      }
+
+      if ((body as Record<string, string>).error === "clerk_user_not_found") {
+        const email = (body as Record<string, string>).email || "this user";
+        return {
+          ok: false,
+          error: `User ${email} has no Clerk account in this environment. `
+            + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
+        };
       }
 
       log.error("dev-login request failed", { status: resp.status, msg });
@@ -188,19 +204,29 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
   }
 
   // -----------------------------------------------------------------------
-  // Step 5: Verify the browser is no longer on /dev-login
+  // Step 5: Poll for redirect — Clerk JS needs time to exchange the ticket,
+  // call setActive, and navigate away from /dev-login
   // -----------------------------------------------------------------------
 
-  const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
-  if (!verifyResult.ok) {
-    log.error("Could not read browser URL after exchange", { stderr: verifyResult.stderr });
-    return { ok: false, error: "Auth exchange failed: could not verify final URL" };
+  const pollDeadline = Date.now() + 15_000; // 15s max wait
+  let finalUrl = "";
+  while (Date.now() < pollDeadline) {
+    await new Promise((r) => setTimeout(r, 1_000));
+    const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
+    if (!verifyResult.ok) {
+      log.warn("Could not read browser URL during poll", { stderr: verifyResult.stderr });
+      continue;
+    }
+    finalUrl = verifyResult.stdout;
+    if (!finalUrl.includes("/dev-login")) {
+      break; // Redirected — auth succeeded
+    }
+    log.debug("Still on /dev-login, waiting...", { finalUrl });
   }
 
-  const finalUrl = verifyResult.stdout;
-  if (finalUrl.includes("/dev-login")) {
-    log.error("Browser still on /dev-login after exchange", { finalUrl });
-    return { ok: false, error: "Auth exchange failed: browser did not redirect after ticket exchange" };
+  if (finalUrl.includes("/dev-login") || !finalUrl) {
+    log.error("Browser still on /dev-login after 15s", { finalUrl });
+    return { ok: false, error: "Auth exchange timed out: browser did not redirect. Check the DevLogin component." };
   }
 
   log.info("Auth exchange succeeded", { finalUrl });

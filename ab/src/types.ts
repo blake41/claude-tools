@@ -81,6 +81,7 @@ export interface HealResponse {
 export interface AuthLoginRequest {
   sessionId: string;
   port: number;
+  email?: string;
   slackUserId?: string;
   apiBaseUrl?: string;
   appBaseUrl?: string;

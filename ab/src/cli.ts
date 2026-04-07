@@ -24,7 +24,11 @@ const CDP_PORT_HEADLESS = 9333;
 const CDP_PORT_HEADED = 9444;
 const CDP_PORT_USER = 9222;
 
-const DEFAULT_SLACK_USER_ID = process.env.AB_SLACK_USER_ID ?? "U0839QH8MMY"; // blake
+// Default user for dev-login auth. Uses email (more reliable than Slack ID
+// since email always maps to a Clerk account if the user has logged in once).
+// Override with AB_AUTH_EMAIL or AB_SLACK_USER_ID env vars.
+const DEFAULT_AUTH_EMAIL = process.env.AB_AUTH_EMAIL ?? "blake.johnson@clay.com";
+const DEFAULT_SLACK_USER_ID = process.env.AB_SLACK_USER_ID ?? "U08M03CDY73"; // blake (staging)
 
 const AB_DIR = path.resolve(import.meta.dir, "..");
 
@@ -196,6 +200,7 @@ async function cmdReauth(cdpPort: number, sessionName: string | null): Promise<n
   const result = await rpc.authLogin({
     sessionId: sessionName ?? "default",
     port: cdpPort,
+    email: DEFAULT_AUTH_EMAIL,
     slackUserId: DEFAULT_SLACK_USER_ID,
   });
   if (result.ok) {
@@ -254,6 +259,7 @@ async function cmdImport(): Promise<number> {
   const authResult = await rpc.authLogin({
     sessionId: "import",
     port: result.port,
+    email: DEFAULT_AUTH_EMAIL,
     slackUserId: DEFAULT_SLACK_USER_ID,
   });
 
@@ -584,6 +590,11 @@ function printUsage(): void {
   stderr("  --headed            Use headed Chrome (port 9444)");
   stderr("  --user-chrome       Use personal Chrome (port 9222), allows eval");
   stderr("  --session-name <n>  Override subagent session name");
+  stderr("");
+  stderr("Environment:");
+  stderr("  AB_SLACK_USER_ID    Override default Slack user for dev-login auth");
+  stderr("  AB_SUBAGENT_SESSION_ID  Override subagent session ID");
+  stderr("  CCO_SESSION_ID      Claude Code session ID (auto-set by sandbox)");
 }
 
 // ---------------------------------------------------------------------------
