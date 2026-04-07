@@ -11,11 +11,39 @@
  */
 
 import * as fs from "fs";
+import * as net from "net";
 import { SOCKET_PATH, startServer, type AbServer } from "./server";
 import * as supervisor from "./chrome-supervisor";
 import { Logger } from "./logger";
 
 const log = new Logger({ component: "daemon" });
+
+// ---------------------------------------------------------------------------
+// Live-daemon detection
+// ---------------------------------------------------------------------------
+
+function isSocketAlive(): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(SOCKET_PATH)) {
+      resolve(false);
+      return;
+    }
+    const client = net.createConnection({ path: SOCKET_PATH }, () => {
+      // Connected — a live daemon owns this socket
+      client.destroy();
+      resolve(true);
+    });
+    client.on("error", () => {
+      // Connection refused or broken pipe — socket is stale
+      resolve(false);
+    });
+    // Don't hang forever
+    client.setTimeout(1000, () => {
+      client.destroy();
+      resolve(false);
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Stale socket cleanup
@@ -81,6 +109,15 @@ async function main(): Promise<void> {
 
   // Prepare socket
   ensureSocketDir();
+
+  // Guard: don't stomp a live daemon's socket
+  if (await isSocketAlive()) {
+    log.error("Another ab-server daemon is already running — refusing to start", {
+      socket: SOCKET_PATH,
+    });
+    process.exit(1);
+  }
+
   cleanStaleSocket();
 
   // Start HTTP server on Unix socket
