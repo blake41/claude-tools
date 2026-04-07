@@ -7,6 +7,7 @@
  */
 
 import * as path from "path";
+import { existsSync, unlinkSync, rmSync, mkdirSync } from "fs";
 import type { ChromeConfig, ChromeTarget } from "./types";
 import {
   getState,
@@ -158,6 +159,7 @@ export async function ensure(
  */
 export async function kill(target: ChromeTarget): Promise<void> {
   const rt = runtime[target];
+  const config = CONFIGS[target];
   clearTimers(target);
 
   if (rt.proc) {
@@ -167,6 +169,12 @@ export async function kill(target: ChromeTarget): Promise<void> {
     await Promise.race([rt.proc.exited, sleep(5_000)]);
     rt.proc = null;
   }
+
+  // Clean up SingletonLock so next launch doesn't hit SIGTRAP
+  const lockPath = path.join(config.profilePath, "SingletonLock");
+  try {
+    if (existsSync(lockPath)) unlinkSync(lockPath);
+  } catch { /* best effort */ }
 
   markIdle(target);
 }
@@ -252,6 +260,36 @@ async function launchChrome(
         if (!getListeningPid(config.port)) break;
         await sleep(200);
       }
+    }
+  }
+
+  // --- Stale lock cleanup ---
+  // Chrome leaves SingletonLock when it crashes without cleanup. The lock is a
+  // symlink pointing to "hostname-PID". If the PID is dead, Chrome will crash
+  // with SIGTRAP (exit 133) on launch. Remove it unconditionally — we know no
+  // other Chrome should be using this profile because we just killed any occupant.
+  const lockPath = path.join(config.profilePath, "SingletonLock");
+  if (existsSync(lockPath)) {
+    try {
+      unlinkSync(lockPath);
+      log.info(`[${target}] Removed stale SingletonLock`);
+    } catch {
+      // Best effort — may fail if profile dir doesn't exist yet
+    }
+  }
+
+  // --- Profile corruption recovery ---
+  // If Chrome has been crash-looping (exit 133 = SIGTRAP, typically corrupt
+  // profile), nuke the profile and let Chrome create a fresh one. We detect
+  // this by checking if backoff has escalated, which means repeated crashes.
+  if (rt.backoffMs >= BACKOFF_MAX_MS) {
+    log.warn(`[${target}] Backoff at max — resetting profile to recover from possible corruption`);
+    try {
+      rmSync(config.profilePath, { recursive: true, force: true });
+      mkdirSync(config.profilePath, { recursive: true });
+      rt.backoffMs = BACKOFF_INITIAL_MS;
+    } catch (err) {
+      log.error(`[${target}] Failed to reset profile`, { err: String(err) });
     }
   }
 
