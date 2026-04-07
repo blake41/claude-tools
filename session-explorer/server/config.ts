@@ -17,7 +17,7 @@ export const config = {
   summaryMaxTokens: 300,
 
   // Auto-ingest polling
-  autoIngestIntervalMs: 60_000,
+  autoIngestIntervalMs: 30_000,
 
   // Insight extraction
   insightModel: "claude-sonnet-4-6",
