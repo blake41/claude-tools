@@ -29,49 +29,43 @@ allowed-tools: Bash(agent-browser:*), Bash(ab:*)
 **Parallel browser subagents are supported** via daemon-per-session isolation. Each subagent should run `export AB_SUBAGENT_SESSION_ID=$(ab new-session)` to get a unique session. This creates a separate daemon process with its own Chrome tab — no shared state, no races. **NEVER hardcode or share session IDs between parallel agents.**
 
 **If the browser is stuck ("CDP response channel closed", "connection refused", etc.):**
-1. Tell the user to run `ab heal` from their terminal
-2. If Chrome's profile is corrupted (heal doesn't fix it): `ab heal --reset-profile` (auto-restores auth from backup + re-seeds localStorage)
-3. Do NOT try to fix it yourself — you cannot spawn Chrome from inside the sandbox
+1. Run `ab heal` — this sends a heal request to the daemon which kills Chrome and restarts fresh
+2. Do NOT try to fix it yourself — you cannot spawn Chrome from inside the sandbox
 
 **If auth is missing (login screens, 401s):**
-1. Run `ab reauth` — grabs cookies from the user's personal Chrome automatically (no login needed)
-2. If reauth fails (personal Chrome not running or not logged in), tell the user to run `ab import` from their terminal for manual Google/Clerk login
-3. Auth persists in the profile AND gets backed up to `~/.agent-browser/terra-auth.json`
-4. `ab heal --reset-profile` auto-restores from this backup
+1. Run `ab reauth` — authenticates via dev-login through the daemon (no personal Chrome needed)
+2. If reauth fails, tell the user to run `ab import` from their terminal for manual Google/Clerk login in a headed Chrome window
+3. Auth persists in the Chrome profile managed by the daemon
 
-**App defaults (renderer=v4, etc.):**
-- `ab seed` sets localStorage defaults on all Terra origins (localhost, staging, prod)
-- Runs automatically during `ab import` and `ab heal --reset-profile`
-- Seeds: `terra:renderer=v4`
+**Use `ab` for all browser commands.** The `ab` CLI (source at `~/Documents/Development/tools/ab/src/cli.ts`) talks to the ab-server daemon which supervises Chrome on CDP port 9333. It handles session naming, tab isolation, and blocks dangerous commands. All examples below using `agent-browser` should be run as `ab <command>` (e.g., `ab open <url>`, `ab screenshot`, `ab eval "js"`).
 
-**Use `ab` for all browser commands.** The `ab` wrapper (source at `~/Documents/Development/tools/ab/ab`) manages Chrome via CDP on port 9333, handles session naming, daemon-per-session isolation, and blocks dangerous commands. All examples below using `agent-browser` should be run as `ab <command>` (e.g., `ab open <url>`, `ab screenshot`, `ab eval "js"`).
+## Testing Priority: Your Browser First
+
+**Always test in your own headless browser first** (the `ab` session). Only use the user's browser (headed mode) when you can't reproduce what they're reporting. The user's browser accumulates state — React Query cache, Zustand stores, HMR patches — that a clean headless session doesn't. When something "looks fixed to you but is still broken for the user," the divergence itself is diagnostic: it points to stale cached data or hot-reload state drift, not a code bug. In that case, suggest a hard refresh before assuming the fix didn't work.
 
 ## Local Setup
 
-`ab` manages a dedicated Chrome instance with `--remote-debugging-port=9333` and a separate profile (`~/.agent-browser/profile`). This is completely independent from the user's personal Chrome.
+The ab-server daemon (TypeScript/Bun) supervises a dedicated Chrome instance on CDP port 9333 with a separate profile (`~/.agent-browser/profile`). Managed by launchd (`com.clay.ab-server`). The `ab` CLI talks to the daemon over a Unix socket at `~/.agent-browser/ab-server.sock` .
 
-**Headless by default.** Chrome runs headless — no visible window, no tabs to accidentally close. To see the browser window (debugging), use `--headed` flag or `AB_HEADED=1` env var.
+**Headless by default.** Chrome runs headless — no visible window. Use `--headed` flag for a visible Chrome window on port 9444 (auto-closes after 10 min idle).
 
-**Dashboard** runs on port 4848 and provides a visual inspector for all browser sessions. Auto-starts with Chrome via `_ensure_chrome`. Manage with `ab dashboard <start|stop|restart|status>`.
+**Dashboard** provides a visual inspector for browser sessions. Manage with `ab dashboard <start|stop|restart|status>`.
 
-**Auto-start on login:** A launchd agent (`com.blake.chrome-dev`) runs `ab-startup.sh` on login, which starts Chrome headless + dashboard. No manual setup needed after reboot.
-
-The `cco-permissions` function (in `~/.config/fish/config.fish`) calls `ab ensure` BEFORE entering the cco sandbox. This launches Chrome, the dashboard, and connects the daemon. Inside the sandbox, `ab` detects it's sandboxed (via `CCO_SESSION_ID`) and reuses the existing Chrome — it cannot launch new processes.
+**Daemon lifecycle:**
+```bash
+launchctl start com.clay.ab-server    # Start daemon
+launchctl stop com.clay.ab-server     # Stop daemon
+ab status                             # Check daemon/Chrome health (JSON)
+```
 
 - **Chrome profile**: `~/.agent-browser/profile` (separate from user's Chrome)
-- **Auth backup**: `~/.agent-browser/terra-auth.json` (exported by `ab import`, restored by `ab heal --reset-profile`)
+- **Daemon socket**: `~/.agent-browser/ab-server.sock`
 - **Screenshots**: `/tmp/agent-browser/`
-- **Config**: `~/.agent-browser/config.json` (minimal — just profile path and screenshot dir)
-- **Chrome PID tracking**: `/tmp/ab-chrome-9333.pid`
-- **Dashboard PID**: `~/.agent-browser/dashboard.pid`
-- **Session daemon sockets**: `~/.agent-browser/ab-<session>-<id>.sock`
-- **Startup log**: `/tmp/ab-startup.log`
-- **Unknown commands log**: `~/.agent-browser/unknown-commands.log` (alias candidates from model training data)
-- **Failed commands log**: `~/.agent-browser/failed-commands.log` (valid commands that fail at agent-browser level)
+- **Config**: `~/.agent-browser/config.json`
 
-No flags needed for normal agent work — `ab` handles CDP connection, session naming, and auto-connect suppression.
+No flags needed for normal agent work — `ab` handles CDP connection and session naming.
 
-**Always set `AB_SUBAGENT_SESSION_ID`** for any browser command. Without it, commands use a fragile default tab that can break after `ab heal`. The pre-tool-use hook enforces this.
+**Always set `AB_SUBAGENT_SESSION_ID`** for any browser command. Without it, commands use a default session.
 
 ### Worktree Dev Servers & URLs
 
@@ -88,23 +82,19 @@ Worktrees run on unique ports to avoid collisions with the main dev server. Use 
 
 **Port discovery:** `node scripts/worktree-ports.js --print` (or `--json`) shows the assigned ports for the current worktree.
 
-**Auth seeding for worktree URLs:** `ab seed-url http://<worktree-name>.terra.localhost` to set localStorage defaults on the worktree origin.
-
 ## ab Command Reference
 
 | Command | Description | Run from |
 |---------|-------------|----------|
-| `ab open <url>` | Navigate (creates tab per `AB_SUBAGENT_SESSION_ID`) | sandbox or terminal |
-| `ab import` | Headed login → persist auth + export backup + seed | terminal only |
-| `ab reauth` | Grab cookies from personal Chrome (no login needed) | terminal or sandbox |
-| `ab seed` | Set localStorage defaults (`terra:renderer=v4`) on all origins | terminal only |
-| `ab dashboard <start\|stop\|restart\|status>` | Manage the visual dashboard (port 4848) | terminal or sandbox |
-| `ab heal` | Kill Chrome + daemons, restart fresh (profile intact) | terminal only |
-| `ab heal --reset-profile` | Reset profile + auto-restore auth backup + re-seed | terminal only |
+| `ab open <url>` | Navigate (creates tab per session) | sandbox or terminal |
+| `ab import` | Headed Chrome for manual Google/Clerk login | terminal only |
+| `ab reauth` | Re-authenticate via dev-login (through daemon) | terminal or sandbox |
+| `ab dashboard <start\|stop\|restart\|status>` | Manage the visual dashboard | terminal or sandbox |
+| `ab heal` | Kill Chrome, restart fresh (through daemon) | terminal or sandbox |
 | `ab record start <file.webm>` | Record video of active tab (auth-safe) | sandbox or terminal |
 | `ab record stop` | Stop recording and save video | sandbox or terminal |
-| `ab status` | Show CDP, Chrome, dashboard, daemon, and session health | sandbox or terminal |
-| `ab ensure` | Ensure Chrome + dashboard are running | terminal only |
+| `ab status` | Show daemon/Chrome health (JSON) | sandbox or terminal |
+| `ab ensure` | Ensure Chrome is running (through daemon) | terminal or sandbox |
 | `ab <cmd>` | Pass through to `agent-browser --cdp 9333` | sandbox or terminal |
 
 ---
@@ -633,8 +623,8 @@ When dealing with consistently slow websites, use `wait --load networkidle` afte
 
 Session isolation is handled automatically by `ab`:
 
-- **Cross-session**: Each `cco-permissions` invocation gets a unique `CCO_SESSION_ID`, which `ab` uses to generate a per-session name (e.g., `terra-a3f7b2c1`). Cookie/localStorage isolation via `--session-name`.
-- **Subagent daemon isolation**: `AB_SUBAGENT_SESSION_ID` gives each subagent its own daemon process and Chrome tab. Use `ab new-session` to generate unique IDs.
+- **Session naming**: `ab` combines `CCO_SESSION_ID` (if set) with `AB_SUBAGENT_SESSION_ID` to build a unique session name (e.g., `ab-a3f7b2c1-default`). Each session gets its own Chrome tab via `--session`.
+- **Subagent isolation**: `AB_SUBAGENT_SESSION_ID` gives each subagent its own tab. Use `ab new-session` to generate unique IDs.
 
 **Never run `agent-browser close`** — `ab` blocks this command. To reset browser state, use `ab heal` from a terminal.
 
