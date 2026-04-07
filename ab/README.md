@@ -1,33 +1,43 @@
-# ab — Browser Automation Wrapper for Claude Code
+# ab — Browser Automation for Claude Code Agents
 
-`ab` wraps `agent-browser` to provide safe, parallel browser automation for AI agents running in Claude Code sessions.
+`ab` is a daemon-backed CLI that provides safe, parallel browser automation for AI agents running in Claude Code sessions.
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │        Chrome (CDP port 9333)            │
-                    │        One process, shared auth          │
-                    │                                          │
-                    │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐   │
-                    │  │Tab 0 │ │Tab 1 │ │Tab 2 │ │Tab 3 │   │
-                    │  │blank │ │  /   │ │/admin│ │/cfg  │   │
-                    │  └──────┘ └──┬───┘ └──┬───┘ └──┬───┘   │
-                    │              │        │        │        │
-                    └──────────────┼────────┼────────┼────────┘
-                                   │        │        │
-                              ┌────┴───┐┌───┴───┐┌──┴────┐
-                              │daemon A││daemon B││daemon C│
-                              │ab-main ││ab-qa1  ││ab-qa2  │
-                              │ .sock  ││ .sock  ││ .sock  │
-                              └────┬───┘└───┬───┘└───┬───┘
-                                   │        │        │
-                              main thread  subagent  subagent
+┌──────────────────────────────────────────────────────┐
+│  ab-server daemon (Bun, managed by launchd)          │
+│  ~/.agent-browser/ab-server.sock                     │
+│                                                      │
+│  Chrome Supervisor          Auth (dev-login)          │
+│  ├─ headless (9333)         POST /auth/dev-login      │
+│  │   always-on              → mint Clerk token        │
+│  │   auto-restart           → exchange in browser     │
+│  └─ headed (9444)           → real Clerk session      │
+│      on-demand                                        │
+│      10min idle timeout                               │
+└──────────────────────────────────────────────────────┘
+        │ Unix socket
+        ▼
+┌──────────────────────────────────────────────────────┐
+│  ab CLI (thin TypeScript client)                     │
+│  Lifecycle → RPC to daemon                           │
+│  Automation → exec agent-browser directly            │
+└──────────────────────────────────────────────────────┘
+        │ Bun.spawn
+        ▼
+┌──────────────────────────────────────────────────────┐
+│  agent-browser daemons (one per session)             │
+│  ab-walker-005 ──► Chrome tab (headless)             │
+│  ab-walker-008 ──► Chrome tab (headless)             │
+│  ab-qa-headed  ──► Chrome tab (headed)               │
+│  Each: 10min idle → self-destruct                    │
+└──────────────────────────────────────────────────────┘
 ```
 
-**Key insight:** Each `AB_SUBAGENT_SESSION_ID` gets its own daemon process (`--session`) and its own Chrome tab (`tab new` on first open). Daemons are independent — no tab switching, no races.
+## Session Isolation
 
-## Session Isolation Model
+Each agent gets its own session — separate daemon, separate Chrome tab, no interference.
 
 ```
 SESSION NAME = ab-{CCO_SESSION_ID:0:8}-{AB_SUBAGENT_SESSION_ID}
@@ -35,15 +45,13 @@ SESSION NAME = ab-{CCO_SESSION_ID:0:8}-{AB_SUBAGENT_SESSION_ID}
 cco session A, main:      ab-a1b2c3d4-main     → daemon + tab
 cco session A, subagent:  ab-a1b2c3d4-f7e8d9   → daemon + tab
 cco session B, main:      ab-c3d4e5f6-main     → daemon + tab
-
-No collisions within a session  (different AB_SUBAGENT_SESSION_ID)
-No collisions across sessions   (different CCO_SESSION_ID prefix)
 ```
 
 ## Quick Start
 
 ```bash
-# Generate a unique session (subagents do this automatically)
+# Session ID is set automatically by the subagent hook.
+# For manual use:
 export AB_SUBAGENT_SESSION_ID=$(ab new-session)
 
 # Navigate
@@ -61,32 +69,62 @@ ab record start /tmp/demo.webm
 # ... interact ...
 ab record stop
 
-# Auth
-ab reauth               # grab cookies from personal Chrome
-ab heal                  # nuclear reset
+# Auth (automatic on first open, or manual)
+ab reauth               # authenticate via dev-login
+ab heal                  # kill all sessions, restart Chrome
+ab status               # daemon health + Chrome state
 ```
 
-## Safety Layers
+## Auth
 
-| Layer | What | How |
-|-------|------|-----|
-| `ab` wrapper | Whitelist-based CLI | Only listed commands pass through; unknown logged |
-| `ab-guard` hook | PreToolUse enforcement | Blocks bad patterns, injects safety rules |
-| `ab new-session` | Session generation | Unique ID per agent, no coordination needed |
-| CDP port 9333 | Port isolation | Avoids conflict with default 9222 |
-| `ab reauth` | Auth borrowing | Grabs cookies from personal Chrome safely |
-| `ab record` | Auth-safe video | Uses `video start/stop` (no new browser context) |
+Agents authenticate via **dev-login** — a Clerk sign-in token is minted by the backend and exchanged in the browser for a real session. No Google OAuth, no cookie stealing.
+
+See **[docs/dev-login-auth.md](docs/dev-login-auth.md)** for the full flow, configuration, and troubleshooting.
+
+## Daemon Management
+
+The daemon runs via launchd and auto-starts on login.
+
+```bash
+ab status                               # Show daemon state
+launchctl start com.clay.ab-server      # Start manually
+launchctl stop com.clay.ab-server       # Stop
+launchctl restart com.clay.ab-server    # Restart
+tail -f /tmp/ab-server-error.log        # Daemon logs (structured JSON)
+```
+
+Chrome is supervised with health checks every 5s and auto-restart with exponential backoff (1s → 30s cap). Agent-browser sessions self-destruct after 10 minutes of inactivity.
+
+## Install / Uninstall
+
+```bash
+cd ~/Documents/Development/tools/ab
+bun run install.ts           # Install daemon + CLI
+bun run install.ts --uninstall  # Uninstall, restore old ab
+```
 
 ## Files
 
 | Path | Purpose |
 |------|---------|
-| `~/.local/bin/ab` | Symlink to this script |
-| `~/.local/bin/ab-guard` | PreToolUse hook |
-| `~/.local/bin/ab-subagent-hook` | SubagentStart hook |
-| `~/.agent-browser/profile/` | Chrome profile (shared auth) |
-| `~/.agent-browser/terra-auth.json` | Auth backup |
-| `~/.agent-browser/ab-*.sock` | Per-session daemon sockets |
-| `~/.agent-browser/unknown-commands.log` | Alias candidates |
-| `~/.agent-browser/failed-commands.log` | Misuse patterns |
-| `/tmp/ab-chrome-9333.pid` | Chrome PID tracking |
+| `src/daemon.ts` | Daemon entry point |
+| `src/chrome-supervisor.ts` | Chrome lifecycle (launch, health, restart) |
+| `src/server.ts` | Unix socket HTTP server |
+| `src/auth.ts` | Dev-login auth flow |
+| `src/cli.ts` | CLI entry point (replaces old bash ab) |
+| `src/rpc.ts` | CLI → daemon RPC client |
+| `src/state.ts` | Chrome state machine |
+| `src/types.ts` | Shared types |
+| `src/logger.ts` | Structured JSON logger |
+| `com.clay.ab-server.plist` | launchd plist template |
+| `install.ts` | Install/uninstall script |
+| `console-tail.ts` | Stream browser console via CDP |
+| `cdp-click.ts` | JS-based click for virtualized lists |
+| `~/.agent-browser/ab-server.sock` | Daemon Unix socket |
+| `~/.local/bin/ab` | CLI shim |
+| `~/.local/bin/ab.bash.bak` | Old bash ab (rollback) |
+
+## Docs
+
+- **[docs/dev-login-auth.md](docs/dev-login-auth.md)** — Auth flow, configuration, troubleshooting
+- **[docs/agent-browser-reference/SKILL.md](docs/agent-browser-reference/SKILL.md)** — Agent-browser command reference
