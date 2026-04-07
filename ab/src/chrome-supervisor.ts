@@ -532,7 +532,7 @@ function clearTimers(target: ChromeTarget): void {
  * Return the PID of the process listening on `port`, or null if nothing is bound.
  */
 function getListeningPid(port: number): number | null {
-  const result = Bun.spawnSync(["lsof", "-i", `:${port}`, "-sTCP:LISTEN", "-t"]);
+  const result = Bun.spawnSync(["/usr/sbin/lsof", "-i", `:${port}`, "-sTCP:LISTEN", "-t"]);
   const raw = result.stdout.toString().trim();
   if (!raw) return null;
   const pid = parseInt(raw, 10);

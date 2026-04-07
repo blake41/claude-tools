@@ -25,7 +25,7 @@
 		<key>HOME</key>
 		<string>{{HOME}}</string>
 		<key>PATH</key>
-		<string>{{HOME}}/.bun/bin:{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<string>{{HOME}}/.bun/bin:{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin</string>
 	</dict>
 </dict>
 </plist>
