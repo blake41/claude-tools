@@ -52,6 +52,18 @@ export function newOpId(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Ring buffer — captures last N log entries for crash dumps
+// ---------------------------------------------------------------------------
+
+const LOG_RING_SIZE = 50;
+const logRing: LogEntry[] = [];
+
+/** Return a snapshot of recent log entries (most recent last). */
+export function getRecentLogs(): LogEntry[] {
+  return [...logRing];
+}
+
+// ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
 
@@ -96,6 +108,9 @@ export class Logger {
       ...(ctx ? { opId: ctx.opId } : {}),
       ...data,
     };
+
+    logRing.push(entry);
+    if (logRing.length > LOG_RING_SIZE) logRing.shift();
 
     Bun.write(Bun.stderr, JSON.stringify(entry) + "\n");
   }

@@ -15,9 +15,12 @@ import * as fs from "fs";
 import * as path from "path";
 import { SOCKET_PATH, startServer, type AbServer } from "./server";
 import * as supervisor from "./chrome-supervisor";
-import { Logger } from "./logger";
+import { Logger, getRecentLogs } from "./logger";
 
 const log = new Logger({ component: "daemon" });
+
+/** Timestamp set at the top of main() for uptime calculation. */
+let daemonStartedAt: number | null = null;
 
 /** PID lockfile — prevents TOCTOU race in daemon detection */
 const LOCK_PATH = path.join(
@@ -126,6 +129,7 @@ function startWatchdog(): void {
           ourPid: process.pid,
           lockPid,
         });
+        writeCrashDump("watchdog: PID lockfile mismatch");
         process.exit(1);
       }
     } catch {
@@ -146,6 +150,7 @@ function startWatchdog(): void {
         log.error("Failed to re-create socket — exiting for launchd restart", {
           err: String(err),
         });
+        writeCrashDump("watchdog: failed to re-create socket", err);
         process.exit(1);
       }
     }
@@ -186,6 +191,7 @@ function startWatchdog(): void {
       log.error("Watchdog: socket unresponsive after consecutive failures — exiting for launchd restart", {
         failures: watchdogFailures,
       });
+      writeCrashDump("watchdog: socket unresponsive");
       process.exit(1);
     }
   }, WATCHDOG_INTERVAL_MS);
@@ -199,6 +205,46 @@ function startWatchdog(): void {
     intervalMs: WATCHDOG_INTERVAL_MS,
     maxFailures: WATCHDOG_MAX_FAILURES,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Crash dumps
+// ---------------------------------------------------------------------------
+
+function writeCrashDump(reason: string, err?: unknown): void {
+  const dump = {
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    uptime: daemonStartedAt ? Math.floor((Date.now() - daemonStartedAt) / 1000) : null,
+    reason,
+    error: err ? String(err) : null,
+    runtime: supervisor.getRuntimeSnapshot(),
+    recentLogs: getRecentLogs(),
+  };
+  const dir = SOCKET_PATH.substring(0, SOCKET_PATH.lastIndexOf("/"));
+  const dumpPath = path.join(dir, `crash-${Date.now()}.json`);
+  try {
+    fs.writeFileSync(dumpPath, JSON.stringify(dump, null, 2));
+    log.error("Crash dump written", { path: dumpPath });
+  } catch {
+    // Can't write crash dump — nothing we can do
+  }
+}
+
+function cleanOldCrashDumps(): void {
+  const dir = SOCKET_PATH.substring(0, SOCKET_PATH.lastIndexOf("/"));
+  try {
+    const entries = fs.readdirSync(dir);
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    for (const entry of entries) {
+      if (!entry.startsWith("crash-") || !entry.endsWith(".json")) continue;
+      const tsStr = entry.slice(6, -5); // "crash-{timestamp}.json"
+      const ts = parseInt(tsStr, 10);
+      if (!Number.isNaN(ts) && ts < cutoff) {
+        fs.unlinkSync(path.join(dir, entry));
+      }
+    }
+  } catch { /* best effort */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +312,11 @@ function startEventLoopMonitor(): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  daemonStartedAt = Date.now();
   log.info("ab-server daemon starting", { pid: process.pid });
+
+  // Clean up old crash dumps (best effort)
+  cleanOldCrashDumps();
 
   // Prepare socket
   ensureSocketDir();
@@ -313,7 +363,14 @@ async function main(): Promise<void> {
   }
 }
 
+process.on("uncaughtException", (err) => {
+  log.error("Uncaught exception", { err: String(err) });
+  writeCrashDump("uncaughtException", err);
+  process.exit(1);
+});
+
 main().catch((err) => {
   log.error("Unhandled error in daemon main", { err: String(err) });
+  writeCrashDump("unhandled error in main()", err);
   process.exit(1);
 });

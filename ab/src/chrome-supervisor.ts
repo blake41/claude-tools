@@ -42,6 +42,7 @@ const SHARED_LAUNCH_ARGS: readonly string[] = [
   "--disable-machine-learning-model-loader",
   "--disable-client-side-phishing-detection",
   "--safebrowsing-disable-auto-update",
+  "--use-mock-keychain",
 ];
 
 const CONFIGS: Record<ChromeTarget, ChromeConfig> = {
@@ -141,6 +142,36 @@ function freshRuntime(): TargetRuntime {
     inflight: null,
     heartbeatWs: null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Runtime snapshot — for crash dumps
+// ---------------------------------------------------------------------------
+
+/** Capture the current runtime state of both Chrome targets for diagnostics. */
+export function getRuntimeSnapshot(): Record<string, unknown> {
+  const snapshot: Record<string, unknown> = {};
+  for (const target of ["headless", "headed"] as const) {
+    const rt = runtime[target];
+    const state = getState(target);
+    snapshot[target] = {
+      phase: state.phase,
+      ...(state.phase === "chrome_up" ? { pid: state.pid, port: state.port } : {}),
+      ...(state.phase === "chrome_crashed" ? { exitCode: state.exitCode } : {}),
+      procPid: rt.proc?.pid ?? null,
+      adoptedPid: rt.adoptedPid,
+      consecutiveFailures: rt.consecutiveFailures,
+      backoffMs: rt.backoffMs,
+      restartScheduled: rt.restartScheduled,
+      hasHealthTimer: rt.healthTimer !== null,
+      hasStableTimer: rt.stableTimer !== null,
+      hasIdleTimer: rt.idleTimer !== null,
+      hasRestartTimer: rt.restartTimer !== null,
+      hasHeartbeatWs: rt.heartbeatWs !== null,
+      hasInflight: rt.inflight !== null,
+    };
+  }
+  return snapshot;
 }
 
 // ---------------------------------------------------------------------------
