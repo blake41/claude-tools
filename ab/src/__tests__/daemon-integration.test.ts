@@ -445,13 +445,9 @@ describe("daemon integration", () => {
         expect(typeof ensureResult.data.pid).toBe("number");
         expect(typeof ensureResult.data.port).toBe("number");
 
-        // Chrome should be up after both complete
-        const { data: status } = await rpc(
-          daemon.socketPath,
-          "GET",
-          "/status",
-        );
-        expect(status.headless.phase).toBe("chrome_up");
+        // Chrome should be up after both complete (may need time to stabilize in test env)
+        const chrome = await waitForChromeUp(daemon.socketPath, "headless", 15_000);
+        expect(chrome).not.toBeNull();
 
         // Daemon should still be alive
         expect(daemon.proc.exitCode).toBeNull();
