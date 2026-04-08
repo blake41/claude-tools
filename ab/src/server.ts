@@ -17,7 +17,7 @@ import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
 import { authenticate, getAuthStatus } from "./auth";
-import { Logger } from "./logger";
+import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
 import type {
   ChromeTarget,
@@ -122,20 +122,10 @@ async function handleEnsure(target: ChromeTarget): Promise<Response> {
 async function handleHeal(): Promise<Response> {
   const actions: string[] = [];
 
-  // Step 1: close all agent-browser sessions
-  // close --all sends the close command to each daemon session.
-  // For --cdp sessions (ours), this just disconnects — it does NOT kill
-  // our managed Chrome (browser.rs checks browser_process.is_some()).
-  log.info("Heal: running agent-browser close --all");
-  const closeResult = Bun.spawnSync(["agent-browser", "close", "--all"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  actions.push(
-    closeResult.exitCode === 0
-      ? "agent-browser close --all succeeded"
-      : `agent-browser close --all exited ${closeResult.exitCode}`,
-  );
+  // Step 1: clean agent-browser sessions (pure filesystem ops — no external process)
+  log.info("Heal: cleaning agent-browser sessions");
+  const cleanActions = await supervisor.cleanAgentBrowserSessions();
+  actions.push(...cleanActions);
 
   // Step 2: stop all supervised chrome
   await supervisor.stopAll();
@@ -195,12 +185,11 @@ async function withTimeout(
       (timerId as NodeJS.Timeout).unref();
     }
   });
-  const result = await Promise.race([
-    Promise.resolve(handler()),
-    timeoutPromise,
-  ]);
-  if (timerId !== null) clearTimeout(timerId);
-  return result;
+  try {
+    return await Promise.race([Promise.resolve(handler()), timeoutPromise]);
+  } finally {
+    if (timerId !== null) clearTimeout(timerId);
+  }
 }
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -218,16 +207,16 @@ async function handleRequest(req: Request): Promise<Response> {
       return handleHealth();
     }
     if (method === "POST" && pathname === "/chrome/ensure") {
-      return await withTimeout(() => handleEnsure("headless"));
+      return await withOpId(newOpId(), () => withTimeout(() => handleEnsure("headless"))) as Response;
     }
     if (method === "POST" && pathname === "/chrome/ensure-headed") {
-      return await withTimeout(() => handleEnsure("headed"));
+      return await withOpId(newOpId(), () => withTimeout(() => handleEnsure("headed"))) as Response;
     }
     if (method === "POST" && pathname === "/heal") {
-      return await withTimeout(handleHeal);
+      return await withOpId(newOpId(), () => withTimeout(handleHeal)) as Response;
     }
     if (method === "POST" && pathname === "/auth/login") {
-      return await withTimeout(() => handleAuthLogin(req));
+      return await withOpId(newOpId(), () => withTimeout(() => handleAuthLogin(req))) as Response;
     }
     if (method === "POST" && pathname === "/chrome/touch-headed") {
       supervisor.touchHeaded();

@@ -7,7 +7,7 @@
  */
 
 import * as path from "path";
-import { existsSync, unlinkSync, rmSync, mkdirSync } from "fs";
+import { existsSync, unlinkSync, rmSync, mkdirSync, readdirSync } from "fs";
 import type { ChromeConfig, ChromeTarget } from "./types";
 import {
   getState,
@@ -16,7 +16,7 @@ import {
   markCrashed,
   markIdle,
 } from "./state";
-import { Logger } from "./logger";
+import { Logger, withOpId, newOpId } from "./logger";
 import { resetAuthState } from "./auth";
 
 const log = new Logger({ component: "chrome" });
@@ -79,11 +79,35 @@ const BACKOFF_STABLE_RESET_MS = 60_000;
 const HEADED_IDLE_TIMEOUT_MS = 10 * 60_000; // 10 minutes
 
 // ---------------------------------------------------------------------------
+// Operation queue — serializes all state-mutating operations
+// ---------------------------------------------------------------------------
+
+class SerialQueue {
+  private tail: Promise<void> = Promise.resolve();
+
+  enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.tail = this.tail.then(async () => {
+        try {
+          resolve(await fn());
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  }
+}
+
+const opQueue = new SerialQueue();
+
+// ---------------------------------------------------------------------------
 // Per-target runtime state (not persisted — lives in-process only)
 // ---------------------------------------------------------------------------
 
 interface TargetRuntime {
   proc: ReturnType<typeof Bun.spawn> | null;
+  /** PID of an adopted Chrome we don't own the process handle for */
+  adoptedPid: number | null;
   healthTimer: ReturnType<typeof setInterval> | null;
   consecutiveFailures: number;
   backoffMs: number;
@@ -94,6 +118,8 @@ interface TargetRuntime {
   restartScheduled: boolean;
   /** In-flight launch promise — deduplicates concurrent ensure calls */
   inflight: Promise<{ pid: number; port: number }> | null;
+  /** WebSocket heartbeat connection to Chrome's devtools endpoint */
+  heartbeatWs: WebSocket | null;
 }
 
 const runtime: Record<ChromeTarget, TargetRuntime> = {
@@ -104,6 +130,7 @@ const runtime: Record<ChromeTarget, TargetRuntime> = {
 function freshRuntime(): TargetRuntime {
   return {
     proc: null,
+    adoptedPid: null,
     healthTimer: null,
     consecutiveFailures: 0,
     backoffMs: BACKOFF_INITIAL_MS,
@@ -112,6 +139,7 @@ function freshRuntime(): TargetRuntime {
     restartTimer: null,
     restartScheduled: false,
     inflight: null,
+    heartbeatWs: null,
   };
 }
 
@@ -121,53 +149,58 @@ function freshRuntime(): TargetRuntime {
 
 /**
  * Ensure Chrome is running for `target`. If already up, returns immediately.
- * Concurrent calls coalesce — only one launch happens.
+ * Serialized through the operation queue — concurrent calls wait their turn.
  */
 export async function ensure(
   target: ChromeTarget,
 ): Promise<{ pid: number; port: number; alreadyRunning: boolean }> {
-  const state = getState(target);
-  if (state.phase === "chrome_up") {
-    return { pid: state.pid, port: state.port, alreadyRunning: true };
-  }
-
-  // Coalesce concurrent calls
-  const rt = runtime[target];
-  if (rt.inflight) {
-    const result = await rt.inflight;
-    // Re-verify Chrome is still up (could have been healed/killed while waiting)
-    const freshState = getState(target);
-    if (freshState.phase === "chrome_up") {
-      return { ...result, alreadyRunning: true };
-    }
-    // Chrome died while we were waiting — fall through to launch a new one
-  }
-
-  const promise = launchChrome(target);
-  rt.inflight = promise;
-
-  try {
-    const result = await promise;
-    return { ...result, alreadyRunning: false };
-  } finally {
-    rt.inflight = null;
-  }
+  return opQueue.enqueue(() =>
+    withOpId(newOpId(), async () => {
+      // Check if already up FIRST (fast path, no launch needed)
+      const state = getState(target);
+      if (state.phase === "chrome_up") {
+        return { pid: state.pid, port: state.port, alreadyRunning: true };
+      }
+      const result = await launchChrome(target);
+      return { ...result, alreadyRunning: false };
+    }),
+  ) as Promise<{ pid: number; port: number; alreadyRunning: boolean }>;
 }
 
 /**
  * Kill Chrome for a target. Cleans up health timers and idle timers.
  */
 export async function kill(target: ChromeTarget): Promise<void> {
+  return opQueue.enqueue(() =>
+    withOpId(newOpId(), () => doKill(target)),
+  ) as Promise<void>;
+}
+
+async function doKill(target: ChromeTarget): Promise<void> {
   const rt = runtime[target];
   const config = CONFIGS[target];
   clearTimers(target);
 
   if (rt.proc) {
-    log.info(`[${target}] Killing Chrome (PID ${rt.proc.pid})`);
-    rt.proc.kill();
+    const proc = rt.proc; // Capture before await — handleExit may null rt.proc
+    log.info(`[${target}] Killing Chrome (PID ${proc.pid})`);
+    proc.kill();
     // Wait for process exit (up to 5s)
-    await Promise.race([rt.proc.exited, sleep(5_000)]);
+    await Promise.race([proc.exited, sleep(5_000)]);
+    // If Chrome didn't exit gracefully, escalate to SIGKILL
+    if (proc.exitCode === null) {
+      log.warn(`[${target}] Chrome did not exit gracefully — sending SIGKILL`);
+      proc.kill(9); // SIGKILL
+      await Promise.race([proc.exited, sleep(2_000)]);
+    }
     rt.proc = null;
+  } else if (rt.adoptedPid) {
+    // Kill adopted Chrome we don't have a proc handle for
+    log.info(`[${target}] Killing adopted Chrome (PID ${rt.adoptedPid})`);
+    try {
+      process.kill(rt.adoptedPid, "SIGKILL");
+    } catch { /* already dead */ }
+    rt.adoptedPid = null;
   }
 
   // Clean up SingletonLock so next launch doesn't hit SIGTRAP
@@ -176,7 +209,9 @@ export async function kill(target: ChromeTarget): Promise<void> {
     if (existsSync(lockPath)) unlinkSync(lockPath);
   } catch { /* best effort */ }
 
-  markIdle(target);
+  if (getState(target).phase !== "idle") {
+    markIdle(target);
+  }
 }
 
 /**
@@ -184,36 +219,38 @@ export async function kill(target: ChromeTarget): Promise<void> {
  * Launches headless Chrome, starts health checks, then launches the dashboard.
  */
 export async function startSupervision(): Promise<void> {
-  if (process.platform !== "darwin") {
-    log.error("ab-server only supports macOS (Chrome path is macOS-specific)");
-    throw new Error("Unsupported platform: " + process.platform);
-  }
-
-  log.info("Starting Chrome supervision");
-
-  // Launch headless (always-on)
-  await ensure("headless");
-
-  // Start dashboard after headless is confirmed up
-  startDashboard();
-
-  log.info("Chrome supervision active");
+  return opQueue.enqueue(() =>
+    withOpId(newOpId(), async () => {
+      if (process.platform !== "darwin") {
+        log.error("ab-server only supports macOS");
+        throw new Error("Unsupported platform: " + process.platform);
+      }
+      log.info("Starting Chrome supervision");
+      const state = getState("headless");
+      if (state.phase !== "chrome_up") {
+        await launchChrome("headless");
+      }
+      startDashboard();
+      log.info("Chrome supervision active");
+    }),
+  ) as Promise<void>;
 }
 
 /**
  * Teardown all supervised Chrome instances. Call on daemon shutdown.
  */
 export async function stopAll(): Promise<void> {
-  log.info("Stopping all Chrome instances");
-
-  // Kill dashboard process if alive
-  if (dashboardProc && dashboardProc.exitCode === null) {
-    log.info("Killing dashboard process");
-    dashboardProc.kill();
-    dashboardProc = null;
-  }
-
-  await Promise.all([kill("headless"), kill("headed")]);
+  return opQueue.enqueue(() =>
+    withOpId(newOpId(), async () => {
+      log.info("Stopping all Chrome instances");
+      if (dashboardProc && dashboardProc.exitCode === null) {
+        log.info("Killing dashboard process");
+        dashboardProc.kill();
+        dashboardProc = null;
+      }
+      await Promise.all([doKill("headless"), doKill("headed")]);
+    }),
+  ) as Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,22 +268,42 @@ async function launchChrome(
 
   // --- Port conflict resolution ---
   // Check if something is already listening on our port before spawning.
+  const inCrashLoop = rt.backoffMs >= BACKOFF_MAX_MS;
   const existingCdp = await checkCdp(config.port);
-  if (existingCdp) {
+  if (existingCdp && !inCrashLoop) {
     // A responsive CDP is already on our port — adopt it instead of launching.
-    const pid = getListeningPid(config.port);
+    const pid = await getListeningPid(config.port);
     if (pid) {
       log.info(`[${target}] Adopting existing Chrome on port ${config.port}`, { pid });
       rt.proc = null; // We don't own the process handle
+      rt.adoptedPid = pid;
       markUp(target, pid, config.port);
       startHealthCheck(target);
+      startHeartbeat(target);
       resetStableTimer(target);
       if (target === "headed") resetIdleTimer(target);
       return { pid, port: config.port };
     }
+  } else if (inCrashLoop && existingCdp) {
+    // In a crash loop — don't adopt, kill the occupant so we go through
+    // the full recovery path (profile nuke below).
+    const stalePid = await getListeningPid(config.port);
+    if (stalePid) {
+      log.warn(`[${target}] Crash loop — killing existing Chrome (PID ${stalePid}) instead of adopting`);
+      try {
+        process.kill(stalePid, "SIGKILL");
+      } catch {
+        // Process may have already exited
+      }
+      const deadline = Date.now() + 3_000;
+      while (Date.now() < deadline) {
+        if (!(await getListeningPid(config.port))) break;
+        await sleep(200);
+      }
+    }
   } else {
     // Port might be bound by a non-responsive process — kill the occupant.
-    const stalePid = getListeningPid(config.port);
+    const stalePid = await getListeningPid(config.port);
     if (stalePid) {
       log.warn(`[${target}] Port ${config.port} occupied by unresponsive PID ${stalePid} — killing`);
       try {
@@ -257,7 +314,7 @@ async function launchChrome(
       // Wait up to 3s for the port to free up
       const deadline = Date.now() + 3_000;
       while (Date.now() < deadline) {
-        if (!getListeningPid(config.port)) break;
+        if (!(await getListeningPid(config.port))) break;
         await sleep(200);
       }
     }
@@ -304,14 +361,48 @@ async function launchChrome(
 
   const proc = Bun.spawn([CHROME_BIN, ...args], {
     stdout: "ignore",
-    stderr: "ignore",
+    stderr: "pipe",
   });
 
+  // Capture Chrome stderr for crash diagnostics
+  if (proc.stderr) {
+    const reader = proc.stderr.getReader();
+    const decoder = new TextDecoder();
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const lines = decoder.decode(value, { stream: true }).trim();
+          if (lines) {
+            for (const line of lines.split("\n")) {
+              log.info(`[${target}] chrome-stderr: ${line.trim()}`);
+            }
+          }
+        }
+      } catch {
+        // Stream closed — normal on exit
+      }
+    })();
+  }
+
   rt.proc = proc;
+  rt.adoptedPid = null; // No longer adopted — we own the process
 
   // Watch for unexpected exit
   proc.exited.then((exitCode) => {
-    handleExit(target, exitCode ?? 1);
+    const exitedPid = proc.pid;
+    opQueue.enqueue(() =>
+      withOpId(newOpId(), async () => {
+        // If a different Chrome is now running, this exit is stale
+        const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+        if (currentPid !== exitedPid && getState(target).phase !== "idle") {
+          log.info(`[${target}] Ignoring stale exit for PID ${exitedPid}`);
+          return;
+        }
+        handleExit(target, exitCode ?? 1);
+      }),
+    );
   });
 
   // Wait for CDP to respond (up to 15s)
@@ -333,6 +424,7 @@ async function launchChrome(
 
   // Start health checking
   startHealthCheck(target);
+  startHeartbeat(target);
 
   // Reset backoff — start a stable-uptime timer
   resetStableTimer(target);
@@ -360,6 +452,36 @@ function startHealthCheck(target: ChromeTarget): void {
   rt.consecutiveFailures = 0;
 
   rt.healthTimer = setInterval(async () => {
+    // Invariant 4: verify Chrome PID is still alive (catches OOM kills, adopted PIDs dying)
+    const currentState = getState(target);
+    if (currentState.phase === "chrome_up") {
+      const pid = rt.proc?.pid ?? rt.adoptedPid;
+      if (pid) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          log.error(`[${target}] Chrome PID ${pid} gone — marking crashed`, {
+            hadProc: !!rt.proc,
+            wasAdopted: !!rt.adoptedPid,
+          });
+          if (rt.healthTimer) clearInterval(rt.healthTimer);
+          rt.healthTimer = null;
+          const crashedPid = pid;
+          opQueue.enqueue(() =>
+            withOpId(newOpId(), async () => {
+              const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+              if (currentPid !== crashedPid) {
+                log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
+                return;
+              }
+              handleCrashDetected(target);
+            }),
+          );
+          return;
+        }
+      }
+    }
+
     const ok = await checkCdp(config.port);
     if (ok) {
       rt.consecutiveFailures = 0;
@@ -374,7 +496,17 @@ function startHealthCheck(target: ChromeTarget): void {
         log.error(`[${target}] Chrome unresponsive — marking crashed`);
         if (rt.healthTimer) clearInterval(rt.healthTimer);
         rt.healthTimer = null;
-        handleCrashDetected(target);
+        const crashedPid = rt.proc?.pid ?? rt.adoptedPid;
+        opQueue.enqueue(() =>
+          withOpId(newOpId(), async () => {
+            const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+            if (currentPid !== crashedPid) {
+              log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
+              return;
+            }
+            handleCrashDetected(target);
+          }),
+        );
       }
     }
   }, HEALTH_INTERVAL_MS);
@@ -409,6 +541,61 @@ async function waitForCdp(
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket heartbeat — instant Chrome death detection
+// ---------------------------------------------------------------------------
+
+async function startHeartbeat(target: ChromeTarget): Promise<void> {
+  const rt = runtime[target];
+  const config = CONFIGS[target];
+
+  // Close existing heartbeat if any
+  if (rt.heartbeatWs) {
+    try { rt.heartbeatWs.close(); } catch { /* ignore */ }
+    rt.heartbeatWs = null;
+  }
+
+  try {
+    const resp = await fetch(`http://127.0.0.1:${config.port}/json/version`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    const info = await resp.json() as { webSocketDebuggerUrl?: string };
+    if (!info.webSocketDebuggerUrl) return;
+
+    const ws = new WebSocket(info.webSocketDebuggerUrl);
+    rt.heartbeatWs = ws;
+
+    ws.onclose = () => {
+      if (rt.heartbeatWs !== ws) return; // Stale — we've moved on
+      const deadPid = rt.proc?.pid ?? rt.adoptedPid;
+      log.warn(`[${target}] Heartbeat WebSocket closed — Chrome may be dead`, { pid: deadPid });
+      rt.heartbeatWs = null;
+      // Enqueue crash detection — the queue + PID check handles staleness
+      if (deadPid) {
+        opQueue.enqueue(() =>
+          withOpId(newOpId(), async () => {
+            const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+            if (currentPid !== deadPid) return;
+            // Verify Chrome is actually dead before marking crashed
+            try {
+              process.kill(deadPid, 0);
+              return; // Still alive — WebSocket close was benign
+            } catch { /* PID dead — proceed to crash handling */ }
+            handleCrashDetected(target);
+          }),
+        );
+      }
+    };
+
+    ws.onerror = () => {
+      // Error triggers close event — let onclose handle it
+    };
+  } catch {
+    // CDP not ready or WebSocket failed — fall back to polling health check
+    log.debug(`[${target}] Heartbeat WebSocket setup failed — relying on polling`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Crash / exit handling
 // ---------------------------------------------------------------------------
 
@@ -422,7 +609,27 @@ function handleExit(target: ChromeTarget, exitCode: number): void {
   // If a restart is already scheduled (e.g. from handleCrashDetected), don't double-schedule
   if (rt.restartScheduled) return;
 
-  log.warn(`[${target}] Chrome exited`, { exitCode });
+  // Log profile diagnostics on non-zero exit to help root-cause crashes
+  const config = CONFIGS[target];
+  const diag: Record<string, unknown> = { exitCode };
+  if (exitCode !== 0) {
+    try {
+      const lockPath = path.join(config.profilePath, "SingletonLock");
+      diag.singletonLockExists = existsSync(lockPath);
+      const crashpadDir = path.join(config.profilePath, "Crashpad", "reports");
+      if (existsSync(crashpadDir)) {
+        const reports = readdirSync(crashpadDir);
+        diag.crashpadReports = reports.length;
+        if (reports.length > 0) {
+          const newest = reports.sort().pop();
+          diag.newestCrashReport = newest;
+        }
+      }
+    } catch {
+      // Best effort diagnostics
+    }
+  }
+  log.warn(`[${target}] Chrome exited`, diag);
   rt.proc = null;
   clearTimers(target);
   markCrashed(target, exitCode);
@@ -444,6 +651,13 @@ function handleCrashDetected(target: ChromeTarget): void {
   if (rt.proc) {
     rt.proc.kill();
     rt.proc = null;
+  } else if (rt.adoptedPid) {
+    // Kill adopted Chrome we don't have a proc handle for
+    try {
+      process.kill(rt.adoptedPid, "SIGKILL");
+      log.info(`[${target}] Killed adopted Chrome (PID ${rt.adoptedPid})`);
+    } catch { /* already dead */ }
+    rt.adoptedPid = null;
   }
 
   clearTimers(target);
@@ -565,17 +779,37 @@ function clearTimers(target: ChromeTarget): void {
     clearTimeout(rt.restartTimer);
     rt.restartTimer = null;
   }
+  // Close heartbeat WebSocket
+  if (rt.heartbeatWs) {
+    try { rt.heartbeatWs.close(); } catch { /* ignore */ }
+    rt.heartbeatWs = null;
+  }
+  // Invalidate any in-flight launch promise so ensure() doesn't await a stale one
+  rt.inflight = null;
 }
 
 /**
  * Return the PID of the process listening on `port`, or null if nothing is bound.
  */
-function getListeningPid(port: number): number | null {
-  const result = Bun.spawnSync(["/usr/sbin/lsof", "-i", `:${port}`, "-sTCP:LISTEN", "-t"]);
-  const raw = result.stdout.toString().trim();
-  if (!raw) return null;
-  const pid = parseInt(raw, 10);
-  return Number.isNaN(pid) ? null : pid;
+async function getListeningPid(port: number): Promise<number | null> {
+  const proc = Bun.spawn(["/usr/sbin/lsof", "-i", `:${port}`, "-sTCP:LISTEN", "-t"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  // Detach the exit promise so Bun reaps the child even if we don't await it
+  proc.exited.catch(() => {});
+  const timer = setTimeout(() => proc.kill(), 5_000);
+  try {
+    const raw = await new Response(proc.stdout).text();
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const pid = parseInt(trimmed, 10);
+    return Number.isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -603,13 +837,16 @@ export async function cleanAgentBrowserSessions(): Promise<string[]> {
   let pidFiles: string[];
   try {
     const entries = fs.readdirSync(AB_HOME);
-    pidFiles = entries.filter((f: string) => f.startsWith("ab-") && f.endsWith(".pid"));
+    pidFiles = entries.filter((f: string) =>
+      f.startsWith("ab-") && f.endsWith(".pid") && f !== "ab-server.pid",
+    );
   } catch {
     actions.push("no ~/.agent-browser directory");
     return actions;
   }
 
   // Kill each daemon PID
+  const signaledPids: number[] = [];
   for (const pidFile of pidFiles) {
     const pidPath = path.join(AB_HOME, pidFile);
     try {
@@ -618,7 +855,8 @@ export async function cleanAgentBrowserSessions(): Promise<string[]> {
       if (!Number.isNaN(pid)) {
         try {
           process.kill(pid, "SIGTERM");
-          actions.push(`killed PID ${pid} (${pidFile})`);
+          signaledPids.push(pid);
+          actions.push(`sent SIGTERM to PID ${pid} (${pidFile})`);
         } catch {
           actions.push(`PID ${pid} already dead (${pidFile})`);
         }
@@ -628,12 +866,35 @@ export async function cleanAgentBrowserSessions(): Promise<string[]> {
     }
   }
 
+  // Wait for signaled PIDs to exit (up to 2s), then escalate to SIGKILL
+  if (signaledPids.length > 0) {
+    const alive = new Set(signaledPids);
+    const deadline = Date.now() + 2_000;
+    while (alive.size > 0 && Date.now() < deadline) {
+      for (const pid of [...alive]) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive.delete(pid);
+        }
+      }
+      if (alive.size > 0) await sleep(100);
+    }
+    for (const pid of alive) {
+      try {
+        process.kill(pid, "SIGKILL");
+        actions.push(`escalated to SIGKILL for PID ${pid}`);
+      } catch { /* already dead */ }
+    }
+  }
+
   // Clean up sidecar files (.pid, .sock, .stream, .engine)
   const sidecarExtensions = [".pid", ".sock", ".stream", ".engine"];
   try {
     const entries = fs.readdirSync(AB_HOME);
     for (const entry of entries) {
       if (!entry.startsWith("ab-")) continue;
+      if (entry === "ab-server.sock" || entry === "ab-server.pid") continue; // Never touch daemon's own files
       if (!sidecarExtensions.some((ext) => entry.endsWith(ext))) continue;
       const fullPath = path.join(AB_HOME, entry);
       try {
