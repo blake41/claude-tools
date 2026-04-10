@@ -438,10 +438,9 @@ function SearchResultCard({
                       </svg>
                       Tool output
                     </div>
-                    <div
-                      className="snippet-tool-output"
-                      dangerouslySetInnerHTML={{ __html: formatToolContent(match.tool_content || match.snippet, query) }}
-                    />
+                    <div className="snippet-highlight">
+                      <SnippetText snippet={match.snippet} query={query} />
+                    </div>
                   </>
                 ) : (
                   <>
@@ -634,14 +633,22 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
         const hasMatch = [...fileTypeFilter].some(type => sessionHasFileType(r.files_changed, type));
         if (!hasMatch) return false;
       }
-      // Source filter: only hide sessions that can't possibly match
-      // File-match source: only show when "files" filter is active (or no source filter)
-      // Message sources: always show — snippet-level filtering in SearchResultCard
-      // handles which matches to display. We only have 3 matches per session from
-      // the server, so session-level filtering by role would hide sessions with
-      // valid matches that weren't in the top 3.
+      // Source filter: hide sessions whose matches don't include the selected source.
+      // Server-side role-diverse picking ensures user/assistant/tool matches are each
+      // represented in the top 3 when they exist, so this check is reliable.
       if (sourceFilter.size > 0) {
         if (r.match_source === 'files' && !sourceFilter.has("files")) return false;
+        const messageSourceTypes = new Set(["user", "assistant", "tool"]);
+        const activeMessageSources = [...sourceFilter].filter(s => messageSourceTypes.has(s));
+        if (activeMessageSources.length > 0 && r.match_source !== 'files') {
+          const hasVisibleMatch = r.matches.some((m) => {
+            if (sourceFilter.has("tool") && m.message_type !== 'text') return true;
+            if (sourceFilter.has("user") && m.role === "user" && m.message_type === 'text') return true;
+            if (sourceFilter.has("assistant") && m.role === "assistant" && m.message_type === 'text') return true;
+            return false;
+          });
+          if (!hasVisibleMatch) return false;
+        }
       }
       return true;
     });

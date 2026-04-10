@@ -37,7 +37,7 @@
 
 ## Session Isolation
 
-Each agent gets its own session — separate daemon, separate Chrome tab, no interference.
+Each agent gets its own session — separate agent-browser daemon, separate Chrome tab, no interference. All sessions share one Chrome process (managed by ab-server) but each gets a dedicated tab via CDP `Target.createTarget`.
 
 ```
 SESSION NAME = ab-{CCO_SESSION_ID:0:8}-{AB_SUBAGENT_SESSION_ID}
@@ -46,6 +46,12 @@ cco session A, main:      ab-a1b2c3d4-main     → daemon + tab
 cco session A, subagent:  ab-a1b2c3d4-f7e8d9   → daemon + tab
 cco session B, main:      ab-c3d4e5f6-main     → daemon + tab
 ```
+
+Isolation works at two levels:
+- **Within one Claude session:** Subagents get different `AB_SUBAGENT_SESSION_ID` → different tabs
+- **Across Claude sessions:** Different `CCO_SESSION_ID` → different daemon names even with the same session name
+
+Auth cookies are shared across tabs (same browser context), so `ab reauth` once and all sessions are authenticated.
 
 ## Quick Start
 

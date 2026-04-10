@@ -42,7 +42,13 @@ The resulting session is identical to logging in via Google OAuth — same cooki
 | `AB_API_BASE_URL` | `http://localhost:8000` | Where to POST /auth/dev-login. |
 | `AB_APP_BASE_URL` | `http://localhost:5173` | Where to navigate the ticket exchange URL. |
 
-For staging, both base URLs resolve to `https://slack-feedback-staging.onrender.com`.
+For staging, set both to `https://slack-feedback-staging.onrender.com`:
+
+```bash
+AB_API_BASE_URL=https://slack-feedback-staging.onrender.com \
+AB_APP_BASE_URL=https://slack-feedback-staging.onrender.com \
+ab reauth
+```
 
 ## Prerequisites
 

@@ -164,7 +164,7 @@ const getFollowingContext = db.prepare(`
 
 const searchMessagesFts = db.prepare(`
   SELECT m.session_id, m.role, m.message_type, m.timestamp, m.sequence,
-         snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 24) as snippet,
+         snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 48) as snippet,
          s.title, s.started_at, s.git_branch,
          rank
   FROM messages_fts
@@ -177,7 +177,7 @@ const searchMessagesFts = db.prepare(`
 
 const searchMessagesFtsInWorkspace = db.prepare(`
   SELECT m.session_id, m.role, m.message_type, m.timestamp, m.sequence,
-         snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 24) as snippet,
+         snippet(messages_fts, 0, '‹mark›', '‹/mark›', '…', 48) as snippet,
          s.title, s.started_at, s.git_branch,
          rank
   FROM messages_fts
@@ -235,12 +235,15 @@ function toFtsQuery(query: string): string {
     return phrase ? `"${phrase}"` : '""';
   }
 
-  // Default: AND between individual terms
+  // Default: NEAR for multi-word, plain match for single word
   const words = trimmed.split(/\s+/).filter(Boolean)
     .map(w => w.replace(/[^a-zA-Z0-9_.\-]/g, ''))
     .filter(w => w.length > 0);
   if (words.length === 0) return '""';
-  return words.map(w => `"${w.replace(/"/g, '""')}"`).join(' AND ');
+  if (words.length === 1) return `"${words[0].replace(/"/g, '""')}"`;
+  // NEAR keeps terms within 16 tokens so snippets show both matches
+  const quoted = words.map(w => `"${w.replace(/"/g, '""')}"`).join(' ');
+  return `NEAR(${quoted}, 16)`;
 }
 
 /** Check if query contains underscore-joined terms that FTS5 can't match as phrases */
@@ -621,8 +624,25 @@ app.get("/api/search", (req, res) => {
       return aConv - bConv;
     });
 
-    const picked: EnrichedMatch[] = [];
+    // Ensure role diversity: pick best match per source category first,
+    // then fill remaining slots by rank. This guarantees user, assistant,
+    // and tool matches are each represented when they exist.
+    const byCategory = new Map<string, typeof sorted[0]>();
     for (const row of sorted) {
+      const cat = isConversational(row.message_type)
+        ? (row.role === 'user' ? 'user' : 'assistant')
+        : 'tool';
+      if (!byCategory.has(cat)) byCategory.set(cat, row);
+    }
+    const seeds = new Set([...byCategory.values()]);
+    // Interleave seeds first, then remaining by rank
+    const diversified = [
+      ...sorted.filter(r => seeds.has(r)),
+      ...sorted.filter(r => !seeds.has(r)),
+    ];
+
+    const picked: EnrichedMatch[] = [];
+    for (const row of diversified) {
       if (picked.length >= maxMatchesPerSession) break;
 
       // Find conversational context (skip tool messages when looking for context)

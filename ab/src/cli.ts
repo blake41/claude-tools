@@ -104,7 +104,7 @@ async function runAgentBrowser(
   return execInherit(
     AGENT_BROWSER,
     abArgs(cdpPort, sessionName, args),
-    { AGENT_BROWSER_IDLE_TIMEOUT_MS: "600000" },
+    { AGENT_BROWSER_IDLE_TIMEOUT_MS: process.env.AGENT_BROWSER_IDLE_TIMEOUT_MS ?? "600000" },
   );
 }
 
@@ -202,6 +202,8 @@ async function cmdReauth(cdpPort: number, sessionName: string | null): Promise<n
     port: cdpPort,
     email: DEFAULT_AUTH_EMAIL,
     slackUserId: DEFAULT_SLACK_USER_ID,
+    apiBaseUrl: process.env.AB_API_BASE_URL,
+    appBaseUrl: process.env.AB_APP_BASE_URL,
   });
   if (result.ok) {
     stderr("Reauth complete");
@@ -220,10 +222,11 @@ async function cmdOpen(
   cdpPort: number,
   sessionName: string | null,
 ): Promise<number> {
-  // Set viewport on every open
+  // Create a dedicated tab for this session so parallel sessions don't collide.
+  // tab new sets the new tab as active, so subsequent commands target it.
+  await runAgentBrowser(cdpPort, sessionName, ["tab", "new", url]);
   await runAgentBrowser(cdpPort, sessionName, ["set", "viewport", "1440", "900", "2"]);
-  const result = await runAgentBrowser(cdpPort, sessionName, ["open", url]);
-  return result.exitCode;
+  return 0;
 }
 
 async function cmdImport(): Promise<number> {
@@ -261,6 +264,8 @@ async function cmdImport(): Promise<number> {
     port: result.port,
     email: DEFAULT_AUTH_EMAIL,
     slackUserId: DEFAULT_SLACK_USER_ID,
+    apiBaseUrl: process.env.AB_API_BASE_URL,
+    appBaseUrl: process.env.AB_APP_BASE_URL,
   });
 
   if (authResult.ok) {

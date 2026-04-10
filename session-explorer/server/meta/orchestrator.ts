@@ -274,5 +274,10 @@ export function markProposalApplied(id: number, ref: string) {
 }
 
 export function getProposalStats() {
-  return proposalStats.all();
+  const rows = proposalStats.all() as { type: string; status: string; count: number; avg_confidence: number }[];
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    counts[row.type] = (counts[row.type] ?? 0) + row.count;
+  }
+  return { counts };
 }

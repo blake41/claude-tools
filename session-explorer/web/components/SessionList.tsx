@@ -13,7 +13,9 @@ function formatDate(dateStr: string): string {
   });
 }
 
-function groupByDate(sessions: SessionSummary[]): Map<string, SessionSummary[]> {
+type SortMode = "start" | "activity";
+
+function groupByDate(sessions: SessionSummary[], sortMode: SortMode = "start"): Map<string, SessionSummary[]> {
   const groups = new Map<string, SessionSummary[]>();
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -21,7 +23,10 @@ function groupByDate(sessions: SessionSummary[]): Map<string, SessionSummary[]> 
   const weekAgo = new Date(today.getTime() - 7 * 86400000);
 
   for (const session of sessions) {
-    const d = new Date(session.started_at);
+    const dateStr = sortMode === "activity"
+      ? (session.ended_at || session.started_at)
+      : session.started_at;
+    const d = new Date(dateStr);
     const sessionDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
     let label: string;
@@ -32,7 +37,7 @@ function groupByDate(sessions: SessionSummary[]): Map<string, SessionSummary[]> 
     } else if (sessionDate >= weekAgo) {
       label = "This Week";
     } else {
-      label = formatDate(session.started_at);
+      label = formatDate(dateStr);
     }
 
     if (!groups.has(label)) groups.set(label, []);
@@ -66,6 +71,7 @@ export default function SessionList({ workspace }: SessionListProps) {
   const [progress, setProgress] = useState<{ total: number; completed: number; failed: number } | null>(null);
   const [summarizeDone, setSummarizeDone] = useState<{ completed: number; failed: number } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [sortMode, setSortMode] = useState<SortMode>("start");
   const limit = 200;
 
   // Cache sessions state on change
@@ -102,7 +108,8 @@ export default function SessionList({ workspace }: SessionListProps) {
       const newOffset = reset ? 0 : offset;
       setLoading(true);
       const page = Math.floor(newOffset / limit) + 1;
-      fetch(`/api/sessions?workspace=${workspace.id}&limit=${limit}&page=${page}`)
+      const sortParam = sortMode === "activity" ? "&sort=activity" : "";
+      fetch(`/api/sessions?workspace=${workspace.id}&limit=${limit}&page=${page}${sortParam}`)
         .then((r) => r.json())
         .then((data: { sessions: SessionSummary[]; pagination: { total: number } }) => {
           if (reset) {
@@ -116,17 +123,18 @@ export default function SessionList({ workspace }: SessionListProps) {
         .catch(() => setError("Failed to load sessions"))
         .finally(() => setLoading(false));
     },
-    [workspace.id, offset]
+    [workspace.id, offset, sortMode]
   );
 
   useEffect(() => {
-    if (!cached) {
+    if (!cached || sortMode !== "start") {
       setLoading(true);
     }
     setError(null);
-    const pages = cached ? Math.ceil(cached.offset / limit) || 1 : 1;
+    const pages = (cached && sortMode === "start") ? Math.ceil(cached.offset / limit) || 1 : 1;
     const fetchLimit = pages * limit;
-    fetch(`/api/sessions?workspace=${workspace.id}&limit=${fetchLimit}&page=1`)
+    const sortParam = sortMode === "activity" ? "&sort=activity" : "";
+    fetch(`/api/sessions?workspace=${workspace.id}&limit=${fetchLimit}&page=1${sortParam}`)
       .then((r) => r.json())
       .then((data: { sessions: SessionSummary[]; pagination: { total: number } }) => {
         setSessions(data.sessions);
@@ -135,7 +143,7 @@ export default function SessionList({ workspace }: SessionListProps) {
       })
       .catch(() => setError("Failed to load sessions"))
       .finally(() => setLoading(false));
-  }, [workspace.id]);
+  }, [workspace.id, sortMode]);
 
   // Poll summarization status
   useEffect(() => {
@@ -149,7 +157,8 @@ export default function SessionList({ workspace }: SessionListProps) {
             setProgress(null);
             setSummarizeDone({ completed: data.completed ?? 0, failed: data.failed ?? 0 });
             setTimeout(() => setSummarizeDone(null), 5000);
-            fetch(`/api/sessions?workspace=${workspace.id}&limit=${limit}&page=1`)
+            const sortParam = sortMode === "activity" ? "&sort=activity" : "";
+            fetch(`/api/sessions?workspace=${workspace.id}&limit=${limit}&page=1${sortParam}`)
               .then((r) => r.json())
               .then((d: { sessions: SessionSummary[]; pagination: { total: number } }) => {
                 setSessions(d.sessions);
@@ -245,7 +254,7 @@ export default function SessionList({ workspace }: SessionListProps) {
 
   const anyFilterActive = activeFilters.size > 0 || branchFilter !== "all" || tagFilter !== "all" || hasSummary;
 
-  const grouped = groupByDate(filteredSessions);
+  const grouped = groupByDate(filteredSessions, sortMode);
 
   return (
     <div ref={containerRef} className="px-10 py-8 max-w-[1200px]">
@@ -282,6 +291,21 @@ export default function SessionList({ workspace }: SessionListProps) {
           )}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <div className="view-toggle">
+            <button
+              className={sortMode === "start" ? "active" : ""}
+              onClick={() => setSortMode("start")}
+            >
+              Start time
+            </button>
+            <button
+              className={sortMode === "activity" ? "active" : ""}
+              onClick={() => setSortMode("activity")}
+            >
+              Last activity
+            </button>
+          </div>
+          <span className="w-px h-4 bg-border mx-1" />
           {(["code", "docs", "viz"] as const).map(f => (
             <button
               key={f}
@@ -348,6 +372,7 @@ export default function SessionList({ workspace }: SessionListProps) {
                   key={session.id}
                   session={session}
                   onTagsChange={handleTagsChange}
+                  showLastMessage={sortMode === "activity"}
                 />
               ))}
             </div>
