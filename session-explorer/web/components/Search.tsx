@@ -174,7 +174,7 @@ function FilterBar({
   branches: string[];
   workspaceFilter: string;
   setWorkspaceFilter: (v: string) => void;
-  workspaces: string[];
+  workspaces: Array<{ id: number; display_name: string }>;
 }) {
   const SOURCE_PILLS: Array<{ key: string; label: string }> = [
     { key: "user", label: "Your messages" },
@@ -238,7 +238,7 @@ function FilterBar({
         >
           <option value="all">All workspaces</option>
           {workspaces.map((w) => (
-            <option key={w} value={w}>{w}</option>
+            <option key={w.id} value={w.id}>{w.display_name}</option>
           ))}
         </select>
       )}
@@ -540,11 +540,16 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
   };
   const [branchFilter, setBranchFilter] = useState<string>("all");
   const [workspaceFilter, setWorkspaceFilter] = useState<string>("all");
+  const [allWorkspaces, setAllWorkspaces] = useState<Array<{ id: number; display_name: string }>>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
     inputRef.current?.focus();
+    fetch("/api/workspaces")
+      .then(r => r.json())
+      .then((ws: Array<{ id: number; display_name: string }>) => setAllWorkspaces(ws))
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -566,6 +571,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
       if (tab === "messages") {
         const params = new URLSearchParams({ q: query.trim(), sort });
         if (exact) params.set("exact", "1");
+        if (workspaceFilter !== "all") params.set("workspace", workspaceFilter);
         fetch(`/api/search?${params}`)
           .then((r) => r.json())
           .then((data) => {
@@ -597,7 +603,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, tab, sort, exact]);
+  }, [query, tab, sort, exact, workspaceFilter]);
 
   const handleTabChange = (newTab: "messages" | "files" | "ask") => {
     setTab(newTab);
@@ -607,7 +613,6 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
   };
 
   const branches = [...new Set(results.map((r) => r.git_branch).filter(Boolean) as string[])].sort();
-  const workspaces = [...new Set(results.map((r) => r.workspace_name).filter(Boolean) as string[])].sort();
 
   const DOC_EXTS = new Set([".md", ".mdx", ".txt", ".rst"]);
   const VIZ_EXTS = new Set([".html", ".htm", ".svg"]);
@@ -626,7 +631,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
     // Apply client-side filters
     let filtered = results.filter((r) => {
       if (minMatches > 0 && r.match_count < minMatches) return false;
-      if (workspaceFilter !== "all" && (r.workspace_name || "") !== workspaceFilter) return false;
+      // workspace filtering is server-side via the `workspace` query param
       if (branchFilter !== "all" && (r.git_branch || "") !== branchFilter) return false;
       // File type filter: session must have files of ANY selected type
       if (fileTypeFilter.size > 0) {
@@ -817,7 +822,7 @@ export default function Search({ onClose, onNavigate }: SearchProps) {
               branchFilter={branchFilter} setBranchFilter={setBranchFilter}
               branches={branches}
               workspaceFilter={workspaceFilter} setWorkspaceFilter={setWorkspaceFilter}
-              workspaces={workspaces}
+              workspaces={allWorkspaces}
             />
           </div>
         )}

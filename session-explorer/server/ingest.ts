@@ -8,13 +8,6 @@ import { stripSession } from "./strip.js";
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
-const DEFAULT_WORKSPACES = new Set([
-  "/Users/blake/Documents/Development/clay/terra/.claude/worktrees/v4-prototype",
-  "/Users/blake/Documents/Development/clay/terra",
-  "/Users/blake/Documents/Development/clay/slack-project",
-  "/Users/blake/Documents/Development/clay/slack-project-v4-prototype",
-]);
-
 // ── Types ─────────────────────────────────────────────────────────
 
 export interface IngestProgress {
@@ -368,10 +361,9 @@ export function reingestSession(sourcePath: string, workspaceId: number): boolea
 }
 
 export async function runIngestion(
-  options: { all?: boolean; force?: boolean } = {},
+  options: { force?: boolean } = {},
   onProgress?: (progress: IngestProgress) => void
 ): Promise<IngestProgress> {
-  const ingestAll = !!options.all;
   const forceReingest = !!options.force;
 
   if (!existsSync(CLAUDE_PROJECTS_DIR)) {
@@ -390,9 +382,6 @@ export async function runIngestion(
   console.log(`Found ${projectDirs.length} project directories`);
   if (forceReingest) {
     console.log(`Force mode: re-ingesting all sessions (clearing existing data)`);
-  }
-  if (!ingestAll) {
-    console.log(`Filtering to default workspaces (use --all to ingest everything)`);
   }
 
   // Count total JSONL files for progress reporting
@@ -434,11 +423,6 @@ export async function runIngestion(
 
     if (!workspacePath) {
       console.log(`  [SKIP] Could not resolve path for: ${dirName}`);
-      continue;
-    }
-
-    // Filter to default workspaces unless --all
-    if (!ingestAll && !DEFAULT_WORKSPACES.has(workspacePath)) {
       continue;
     }
 
@@ -493,7 +477,6 @@ const isDirectRun = process.argv[1] &&
 
 if (isDirectRun) {
   const options = {
-    all: process.argv.includes("--all"),
     force: process.argv.includes("--force"),
   };
   runIngestion(options)

@@ -1261,7 +1261,7 @@ app.post("/api/ingest", async (req, res) => {
 
   // Start ingestion in background
   ingestProgress = { total: 0, ingested: 0, skipped: 0, running: true };
-  runIngestion({ all: true }, (p) => { ingestProgress = p; })
+  runIngestion({}, (p) => { ingestProgress = p; })
     .then((final) => { ingestProgress = { ...final, running: false }; })
     .catch(() => { ingestProgress = { ...ingestProgress!, running: false }; });
 
@@ -1695,7 +1695,7 @@ app.listen(PORT, () => {
     try {
       // Phase 1: Ingest new sessions + reingest changed ones (file size check)
       ingestProgress = { total: 0, ingested: 0, skipped: 0, running: true };
-      const final = await runIngestion({ all: false }, (p) => { ingestProgress = p; });
+      const final = await runIngestion({}, (p) => { ingestProgress = p; });
       ingestProgress = { ...final, running: false };
 
       // Phase 2: Auto-summarize
