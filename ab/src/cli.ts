@@ -13,6 +13,7 @@
 
 import { spawn } from "child_process";
 import * as crypto from "crypto";
+import * as fs from "fs";
 import * as path from "path";
 import * as rpc from "./rpc";
 
@@ -33,6 +34,33 @@ const DEFAULT_SLACK_USER_ID = process.env.AB_SLACK_USER_ID ?? "U08M03CDY73"; // 
 const AB_DIR = path.resolve(import.meta.dir, "..");
 
 const AGENT_BROWSER = "agent-browser";
+
+// ---------------------------------------------------------------------------
+// Session file persistence
+// ---------------------------------------------------------------------------
+
+function sessionFilePath(): string | null {
+  const cco = process.env.CCO_SESSION_ID;
+  if (!cco) return null;
+  return `/tmp/.ab-session-${cco}`;
+}
+
+function readSessionFile(): string | null {
+  const fp = sessionFilePath();
+  if (!fp) return null;
+  try {
+    const content = fs.readFileSync(fp, "utf-8").trim();
+    return content || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionFile(id: string): void {
+  const fp = sessionFilePath();
+  if (!fp) return;
+  fs.writeFileSync(fp, id + "\n");
+}
 
 // ---------------------------------------------------------------------------
 // Session naming — must match bash convention exactly
@@ -280,6 +308,7 @@ async function cmdImport(): Promise<number> {
 
 function cmdNewSession(): number {
   const id = crypto.randomBytes(4).toString("hex");
+  writeSessionFile(id);
   process.stdout.write(id + "\n");
   return 0;
 }
@@ -423,10 +452,11 @@ async function main(): Promise<number> {
   const command = flags.args[0] ?? "";
   const rest = flags.args.slice(1);
 
-  // Resolve subagent session ID
+  // Resolve subagent session ID: flag > env var > session file > "default"
   const subagentId =
     flags.sessionNameOverride ??
     process.env.AB_SUBAGENT_SESSION_ID ??
+    readSessionFile() ??
     "default";
   const sessionName = buildSessionName(subagentId);
 
