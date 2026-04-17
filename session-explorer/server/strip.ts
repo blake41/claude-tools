@@ -16,6 +16,13 @@ export interface StrippedMessage {
   timestamp: string | null;
   sequence: number;
   messageType: "text" | "tool_use" | "tool_result" | "system";
+  // For tool_use and tool_result messages: the provider-assigned id that
+  // links them together. Null on plain text/system messages.
+  toolUseId?: string | null;
+  // For tool_use only: the tool name (e.g. "Bash") and the full input JSON
+  // so the UI can render per-tool views without re-parsing the content prefix.
+  toolName?: string | null;
+  toolInput?: string | null;
 }
 
 export interface FileReference {
@@ -292,6 +299,7 @@ export function stripSession(jsonlPath: string): {
                 timestamp: m.timestamp || null,
                 sequence: sequence++,
                 messageType: "tool_result",
+                toolUseId: (block as any).tool_use_id ?? null,
               });
             }
           }
@@ -349,12 +357,21 @@ export function stripSession(jsonlPath: string): {
         for (const block of content as ContentBlock[]) {
           if (block.type === "tool_use" && block.name) {
             const input = (block.input || {}) as Record<string, unknown>;
+            let toolInputJson: string | null = null;
+            try {
+              toolInputJson = JSON.stringify(input);
+            } catch {
+              // Circular / non-serializable — drop input, keep summary.
+            }
             messages.push({
               role: "assistant",
               content: `${block.name}: ${summarizeToolInput(block.name, input)}`,
               timestamp: m.timestamp || null,
               sequence: sequence++,
               messageType: "tool_use",
+              toolUseId: (block as { id?: string }).id ?? null,
+              toolName: block.name,
+              toolInput: toolInputJson,
             });
           }
         }

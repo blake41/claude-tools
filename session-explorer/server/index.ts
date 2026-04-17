@@ -88,15 +88,19 @@ const listWorkspaces = db.prepare(`
 `);
 
 const listSessions = db.prepare(`
-  SELECT id, started_at, ended_at, git_branch, title, message_count, user_message_count, summary
-  FROM sessions
-  WHERE workspace_id = ?
-  ORDER BY started_at DESC
+  SELECT s.id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary, s.summary_short,
+    (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND message_type = 'tool_use') as tool_call_count,
+    (SELECT COUNT(DISTINCT file_path) FROM session_files WHERE session_id = s.id) as file_count
+  FROM sessions s
+  WHERE s.workspace_id = ?
+  ORDER BY s.started_at DESC
   LIMIT ? OFFSET ?
 `);
 
 const listSessionsByActivity = db.prepare(`
-  SELECT s.id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary,
+  SELECT s.id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary, s.summary_short,
+    (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND message_type = 'tool_use') as tool_call_count,
+    (SELECT COUNT(DISTINCT file_path) FROM session_files WHERE session_id = s.id) as file_count,
     (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message,
     (SELECT timestamp FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message_at
   FROM sessions s
@@ -110,14 +114,18 @@ const countSessions = db.prepare(`
 `);
 
 const listAllSessions = db.prepare(`
-  SELECT id, workspace_id, started_at, ended_at, git_branch, title, message_count, user_message_count, summary
-  FROM sessions
-  ORDER BY started_at DESC
+  SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary, s.summary_short,
+    (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND message_type = 'tool_use') as tool_call_count,
+    (SELECT COUNT(DISTINCT file_path) FROM session_files WHERE session_id = s.id) as file_count
+  FROM sessions s
+  ORDER BY s.started_at DESC
   LIMIT ? OFFSET ?
 `);
 
 const listAllSessionsByActivity = db.prepare(`
-  SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary,
+  SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title, s.message_count, s.user_message_count, s.summary, s.summary_short,
+    (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND message_type = 'tool_use') as tool_call_count,
+    (SELECT COUNT(DISTINCT file_path) FROM session_files WHERE session_id = s.id) as file_count,
     (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message,
     (SELECT timestamp FROM messages WHERE session_id = s.id AND role = 'user' AND message_type = 'text' ORDER BY timestamp DESC, sequence DESC LIMIT 1) as last_user_message_at
   FROM sessions s
@@ -137,7 +145,7 @@ const getSession = db.prepare(`
 `);
 
 const getMessages = db.prepare(`
-  SELECT role, content, timestamp, sequence, message_type
+  SELECT role, content, timestamp, sequence, message_type, tool_use_id, tool_name, tool_input
   FROM messages
   WHERE session_id = ?
   ORDER BY sequence ASC
@@ -254,15 +262,16 @@ function hasUnderscoreTerms(query: string): boolean {
 // ── Summarization Prepared Statements ─────────────────────────────
 
 const getUnsummarizedSessions = db.prepare(`
-  SELECT id, title FROM sessions WHERE workspace_id = ? AND summary IS NULL AND message_count > 0
+  SELECT id, title FROM sessions
+  WHERE workspace_id = ? AND (summary IS NULL OR summary_short IS NULL) AND message_count > 0
 `);
 
 const getAllUnsummarizedSessions = db.prepare(`
-  SELECT id, title FROM sessions WHERE summary IS NULL AND message_count > 0
+  SELECT id, title FROM sessions WHERE (summary IS NULL OR summary_short IS NULL) AND message_count > 0
 `);
 
 const updateSessionSummary = db.prepare(`
-  UPDATE sessions SET summary = ? WHERE id = ?
+  UPDATE sessions SET summary = ?, summary_short = ? WHERE id = ?
 `);
 
 // ── Insight Stats Prepared Statements ─────────────────────────────
@@ -373,19 +382,21 @@ async function summarizeSession(sessionId: string): Promise<void> {
     messages: [
       {
         role: "user",
-        content: `Summarize this coding session as 2-3 bullet points. MAX 12 words per bullet.
+        content: `Summarize this coding session. Output a single one-line headline followed by 2-3 bullets.
 
-Format — output ONLY bullets, nothing else:
+Format — output ONLY this, nothing else:
+ONELINE: <past-tense verb + what + where, max 16 words, concrete. e.g. "Fixed FTS5 search ranking to use NEAR queries for multi-word matches">
 - Verb + what + where (e.g. "Added auto-ingest polling to session-explorer server")
 - Verb + what (e.g. "Fixed FTS5 search ranking for long queries")
 
 Rules:
+- ONELINE must stand on its own as the session's headline — specific, not generic. No trailing period required.
 - Start each bullet with a past-tense verb: Built, Fixed, Added, Decided, Explored, Debugged, Refactored
 - Max 12 words per bullet. Be terse. Cut filler words.
 - Use file names, feature names, and specific concepts
 - No sub-bullets, no multi-sentence bullets, no colons, no explanations
 - No preamble like "Summary:" or "Here are the bullets:"
-- If the session has no meaningful coding work, output a single bullet: "No substantive work"
+- If the session has no meaningful coding work, output exactly: "ONELINE: No substantive work\\n- No substantive work"
 
 Conversation:
 ${truncated}`,
@@ -393,12 +404,25 @@ ${truncated}`,
     ],
   });
 
-  const summary =
+  const raw =
     response.content[0].type === "text" ? response.content[0].text : "";
 
-  if (summary) {
-    updateSessionSummary.run(summary, sessionId);
+  if (!raw) return;
+
+  // Split into one-liner and bullets
+  const lines = raw.split("\n");
+  let oneLine = "";
+  const bulletLines: string[] = [];
+  for (const line of lines) {
+    const m = line.match(/^\s*ONELINE\s*:\s*(.*)$/i);
+    if (m && !oneLine) {
+      oneLine = m[1].trim();
+    } else if (line.trim().startsWith("-")) {
+      bulletLines.push(line);
+    }
   }
+  const bullets = bulletLines.join("\n").trim();
+  updateSessionSummary.run(bullets || null, oneLine || null, sessionId);
 }
 
 // ── Routes ─────────────────────────────────────────────────────────
@@ -498,7 +522,16 @@ app.get("/api/sessions/:id", (req, res) => {
     return;
   }
 
-  const rawMessages = getMessages.all(req.params.id) as Array<{ role: string; content: string; timestamp: string; sequence: number }>;
+  const rawMessages = getMessages.all(req.params.id) as Array<{
+    role: string;
+    content: string;
+    timestamp: string;
+    sequence: number;
+    message_type?: string;
+    tool_use_id?: string | null;
+    tool_name?: string | null;
+    tool_input?: string | null;
+  }>;
   const messages = rawMessages
     .map((m) => ({ ...m, content: cleanXmlNoise(m.content) }))
     .filter((m) => m.content.length > 0);

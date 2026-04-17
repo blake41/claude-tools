@@ -31,6 +31,9 @@ export interface SessionSummary {
   message_count: number;
   user_message_count: number;
   summary: string | null;
+  summary_short: string | null;
+  tool_call_count?: number;
+  file_count?: number;
   tags?: Tag[];
   files_changed?: ChangedFile[];
   last_user_message?: string | null;
@@ -44,6 +47,9 @@ export interface Message {
   timestamp: string | null;
   sequence: number;
   message_type?: string;
+  tool_use_id?: string | null;
+  tool_name?: string | null;
+  tool_input?: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {

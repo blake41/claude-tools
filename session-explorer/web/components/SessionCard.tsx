@@ -7,6 +7,45 @@ function basename(path: string): string {
   return path.split("/").pop() || path;
 }
 
+// ── Metric Row (tool calls, messages, files) ───────────────────────
+
+function MetricRow({ session }: { session: SessionSummary }) {
+  const tools = session.tool_call_count ?? 0;
+  const msgs = session.message_count ?? 0;
+  const files = session.file_count ?? session.files_changed?.length ?? 0;
+  if (tools === 0 && msgs === 0 && files === 0) return null;
+
+  return (
+    <div className="mt-2 flex items-center gap-3 text-[11px] text-text-dim font-mono">
+      {tools > 0 && (
+        <span className="inline-flex items-center gap-1" title={`${tools} tool calls`}>
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" className="text-[#d29922]/70">
+            <path d="M5.433 2.304A4 4 0 009.87 8.51l5.018 5.018a1.5 1.5 0 01-2.121 2.122L7.75 10.633A4 4 0 011.243 6.197l2.12 2.121a1.5 1.5 0 102.122-2.121z" />
+          </svg>
+          {tools}
+        </span>
+      )}
+      {msgs > 0 && (
+        <span className="inline-flex items-center gap-1" title={`${msgs} messages`}>
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+            <path d="M2 4.5A1.5 1.5 0 013.5 3h9A1.5 1.5 0 0114 4.5v5A1.5 1.5 0 0112.5 11H6l-3 3V4.5z" />
+          </svg>
+          {msgs}
+        </span>
+      )}
+      {files > 0 && (
+        <span className="inline-flex items-center gap-1" title={`${files} files touched`}>
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+            <path d="M3 2h6l4 4v8a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1z" />
+            <path d="M9 2v4h4" />
+          </svg>
+          {files}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ── File Category Panel ─────────────────────────────────────────────
 
 const MAX_FILES_PER_CAT = 5;
@@ -90,6 +129,7 @@ export default function SessionCard({ session, onTagsChange, showLastMessage }: 
           onTagsChange={onTagsChange ? (newTags) => onTagsChange(session.id, newTags) : undefined}
           activityMode={showLastMessage}
         />
+        <MetricRow session={session} />
         {showLastMessage && session.last_user_message && (
           <div className="mt-2 flex items-start gap-2">
             <div className="shrink-0 mt-0.5 w-1 h-full min-h-[16px] rounded-full bg-[#f0883e]/60" />

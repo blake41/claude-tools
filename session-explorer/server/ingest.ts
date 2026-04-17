@@ -107,8 +107,8 @@ const insertSession = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type, source)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type, source, tool_use_id, tool_name, tool_input)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const insertFile = db.prepare(`
@@ -233,7 +233,10 @@ function ingestSession(
         msg.timestamp,
         msg.sequence,
         msg.messageType || 'text',
-        'parent'
+        'parent',
+        msg.toolUseId ?? null,
+        msg.toolName ?? null,
+        msg.toolInput ?? null
       );
     }
 
@@ -281,7 +284,10 @@ function ingestSession(
               msg.timestamp,
               seqOffset + msg.sequence,
               messageType,
-              'subagent'
+              'subagent',
+              msg.toolUseId ?? null,
+              msg.toolName ?? null,
+              msg.toolInput ?? null
             );
           }
           for (const file of subResult.files) {

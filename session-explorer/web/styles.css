@@ -477,6 +477,202 @@ button {
   -webkit-box-orient: vertical;
 }
 
+/* ── Tool groups (collapsed chains of tool calls) ── */
+.tool-group {
+  align-self: stretch;
+  border: 1px solid rgba(63, 185, 80, 0.18);
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.tool-group-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-dim, #8b949e);
+}
+.tool-group-summary::-webkit-details-marker { display: none; }
+.tool-group-chevron {
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.4);
+  transition: transform 0.15s;
+  display: inline-block;
+}
+.tool-group[open] .tool-group-chevron { transform: rotate(90deg); }
+.tool-group-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #3fb950;
+}
+.tool-group-desc {
+  color: var(--color-text, #e6edf3);
+  font-size: 12px;
+}
+.tool-group-time {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  opacity: 0.5;
+}
+.tool-group-body {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* ── Individual tool call inside a group ── */
+.tool-mini {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.15);
+}
+.tool-mini-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+}
+.tool-mini-badge {
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.tool-mini-desc,
+.tool-mini-path {
+  color: rgba(255, 255, 255, 0.55);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.tool-mini-time {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  opacity: 0.4;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.tool-mini-body {
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.tool-mini-code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--color-text, #e6edf3);
+  background: rgba(0, 0, 0, 0.3);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+/* Edit diff */
+.tool-mini-diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: rgba(255, 255, 255, 0.04);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.tool-mini-diff pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.tool-mini-diff .diff-old {
+  background: rgba(230, 57, 70, 0.08);
+  color: #ffb4b4;
+}
+.tool-mini-diff .diff-new {
+  background: rgba(42, 157, 143, 0.1);
+  color: #a8dfb8;
+}
+@media (max-width: 600px) {
+  .tool-mini-diff { grid-template-columns: 1fr; }
+}
+/* TodoWrite checklist */
+.todo-list-mini {
+  list-style: none;
+  margin: 0;
+  padding: 6px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.todo-item-mini {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+  color: var(--color-text, #e6edf3);
+}
+.todo-icon-mini {
+  color: rgba(255, 255, 255, 0.4);
+  flex-shrink: 0;
+  font-size: 11px;
+  width: 12px;
+  text-align: center;
+}
+.todo-item-mini.todo-done { opacity: 0.5; }
+.todo-item-mini.todo-done span:last-child { text-decoration: line-through; }
+.todo-item-mini.todo-active .todo-icon-mini { color: #8bb8d8; }
+/* Inline tool result */
+.tool-result-inline {
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.tool-result-inline summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  padding: 5px 12px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.tool-result-inline summary::-webkit-details-marker { display: none; }
+.tool-result-inline summary::before {
+  content: "▶ ";
+  font-size: 8px;
+  opacity: 0.6;
+}
+.tool-result-inline[open] summary::before { content: "▼ "; }
+.tool-result-ok summary { color: #3fb950; background: rgba(63, 185, 80, 0.06); }
+.tool-result-err summary { color: #f85149; background: rgba(248, 81, 73, 0.08); }
+.tool-result-inline pre {
+  margin: 0;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  color: var(--color-text, #e6edf3);
+  background: rgba(0, 0, 0, 0.2);
+}
+
 /* Snippet highlight text (FTS matches) */
 .result-snippet .snippet-highlight {
   font-size: 13px;

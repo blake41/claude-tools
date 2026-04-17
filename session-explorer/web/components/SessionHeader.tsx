@@ -261,18 +261,29 @@ export default function SessionHeader({ session, onTagsChange, showTitle, activi
         )}
       </div>
 
-      {/* Summary bullets or message count fallback */}
-      {session.summary ? (
+      {/* One-line summary (prominent) + bullets (detail view only) */}
+      {session.summary_short && (
+        <p className="mt-2 text-[13px] leading-[1.5] text-text-primary font-medium">
+          {session.summary_short}
+        </p>
+      )}
+      {showTitle && session.summary ? (
+        <ul className={`text-[12px] leading-[1.6] text-text-secondary pl-4 list-disc space-y-0.5 ${session.summary_short ? "mt-1.5" : "mt-2"}`}>
+          {parseSummaryBullets(session.summary).map((line, i) => (
+            <li key={i}>{line}</li>
+          ))}
+        </ul>
+      ) : !session.summary_short && session.summary ? (
         <ul className="mt-2 text-[12px] leading-[1.6] text-text-primary pl-4 list-disc space-y-0.5">
           {parseSummaryBullets(session.summary).map((line, i) => (
             <li key={i}>{line}</li>
           ))}
         </ul>
-      ) : (
+      ) : !session.summary_short && !session.summary ? (
         <div className="mt-1.5 text-[11px] text-text-dim">
           {session.message_count} messages, {session.user_message_count} from you
         </div>
-      )}
+      ) : null}
 
       {/* Tag pills (read-only, when no onTagsChange) */}
       {!onTagsChange && session.tags && session.tags.length > 0 && (

@@ -195,6 +195,26 @@ try {
   // Column already exists
 }
 
+// Migration: add tool linkage columns to messages — tool_use_id pairs a
+// tool_use with its tool_result; tool_name/tool_input let the UI render
+// per-tool blocks (Edit diff, Bash code, TodoWrite checklist, etc.)
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN tool_use_id TEXT`);
+} catch {
+  // Column already exists
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN tool_name TEXT`);
+} catch {
+  // Column already exists
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN tool_input TEXT`);
+} catch {
+  // Column already exists
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_tool_use_id ON messages(tool_use_id)`);
+
 // Migration: drop legacy tool_calls table
 db.exec(`DROP TABLE IF EXISTS tool_calls`);
 db.exec(`DROP INDEX IF EXISTS idx_tool_calls_session`);
@@ -273,6 +293,13 @@ db.exec(`
 // Migration: add events_extracted column to sessions
 try {
   db.exec(`ALTER TABLE sessions ADD COLUMN events_extracted INTEGER DEFAULT 0`);
+} catch {
+  // Column already exists
+}
+
+// Migration: add summary_short column to sessions — one-line session summary
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summary_short TEXT`);
 } catch {
   // Column already exists
 }

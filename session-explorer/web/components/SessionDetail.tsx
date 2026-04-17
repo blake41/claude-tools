@@ -135,6 +135,328 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
   );
 }
 
+// ─── Tool grouping + per-tool rendering ───────────────────────────────────
+// Claude Code emits long runs of tool_use/tool_result messages between user
+// turns. Rendering each as its own snippet drowns the conversation. Instead:
+// collect consecutive tool_use/tool_result messages into a collapsed group
+// summarized as "Bash × 3" / "Read, Bash, Edit (7)", with results inlined
+// under their matching tool_use by tool_use_id.
+
+type GroupedItem =
+  | { kind: "text"; msg: Message }
+  | {
+      kind: "tools";
+      firstSeq: number;
+      lastTime: string | null;
+      items: Array<{ use: Message; result: Message | null }>;
+      allSequences: number[];
+    };
+
+function groupMessagesForRender(messages: Message[]): GroupedItem[] {
+  const out: GroupedItem[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i];
+    const isToolMsg = m.message_type === "tool_use" || m.message_type === "tool_result";
+    if (!isToolMsg) {
+      out.push({ kind: "text", msg: m });
+      i++;
+      continue;
+    }
+
+    const uses: Message[] = [];
+    const resultsById = new Map<string, Message>();
+    const orphanResults: Message[] = [];
+    const allSequences: number[] = [];
+    let lastTime: string | null = null;
+    let firstSeq = m.sequence;
+    let consumedAny = false;
+
+    while (i < messages.length) {
+      const t = messages[i];
+      if (t.message_type === "tool_use") {
+        uses.push(t);
+        allSequences.push(t.sequence);
+        lastTime = t.timestamp ?? lastTime;
+        if (!consumedAny) { firstSeq = t.sequence; consumedAny = true; }
+        i++;
+      } else if (t.message_type === "tool_result") {
+        if (t.tool_use_id) resultsById.set(t.tool_use_id, t);
+        else orphanResults.push(t);
+        allSequences.push(t.sequence);
+        lastTime = t.timestamp ?? lastTime;
+        if (!consumedAny) { firstSeq = t.sequence; consumedAny = true; }
+        i++;
+      } else {
+        break;
+      }
+    }
+
+    const items = uses.map((use, idx) => {
+      let result: Message | null = null;
+      if (use.tool_use_id && resultsById.has(use.tool_use_id)) {
+        result = resultsById.get(use.tool_use_id)!;
+      } else if (orphanResults[idx]) {
+        result = orphanResults[idx];
+      }
+      return { use, result };
+    });
+
+    out.push({ kind: "tools", firstSeq, lastTime, items, allSequences });
+  }
+  return out;
+}
+
+/** Parse a tool_use message's `tool_name` + `tool_input`. Falls back to
+ *  parsing the content prefix ("Bash: ls -la") for rows ingested before
+ *  the schema carried these fields. */
+function readToolCall(msg: Message): { name: string; input: Record<string, unknown> } {
+  let input: Record<string, unknown> = {};
+  if (msg.tool_input) {
+    try { input = JSON.parse(msg.tool_input) || {}; } catch { /* ignore */ }
+  }
+  if (msg.tool_name) return { name: msg.tool_name, input };
+  const match = msg.content.match(/^(\w+):\s*([\s\S]*)$/);
+  if (match) return { name: match[1], input: { __summary: match[2] } };
+  return { name: "Tool", input: { __summary: msg.content } };
+}
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + "\n… (truncated)" : s;
+}
+
+function ToolResultInline({ result }: { result: Message }) {
+  const isError = /error|failed|Error:/i.test(result.content.slice(0, 80));
+  return (
+    <details className={`tool-result-inline ${isError ? "tool-result-err" : "tool-result-ok"}`}>
+      <summary>{isError ? "⚠ Error" : "Result"}</summary>
+      <pre>{truncate(result.content, 1500)}</pre>
+    </details>
+  );
+}
+
+function ToolCallBlock({ use, result }: { use: Message; result: Message | null }) {
+  const { name, input } = readToolCall(use);
+  const time = use.timestamp ? formatTime(use.timestamp) : "";
+
+  const header = (label: string, badgeClass: string, right?: React.ReactNode) => (
+    <div className="tool-mini-header">
+      <span className={`tool-mini-badge ${badgeClass}`}>{label}</span>
+      {right}
+      {time && <span className="tool-mini-time">{time}</span>}
+    </div>
+  );
+
+  if (name === "Bash") {
+    const cmd = String(input.command ?? input.__summary ?? "");
+    const desc = String(input.description ?? "");
+    return (
+      <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-bash">
+        {header("Bash", "bg-[#1f2328] text-[#e6edf3]", desc && <span className="tool-mini-desc" title={desc}>{desc}</span>)}
+        <pre className="tool-mini-body tool-mini-code">{truncate(cmd, 800)}</pre>
+        {result && <ToolResultInline result={result} />}
+      </div>
+    );
+  }
+
+  if (name === "Edit" || name === "MultiEdit") {
+    const fp = String(input.file_path ?? "");
+    const oldStr = String(input.old_string ?? "");
+    const newStr = String(input.new_string ?? "");
+    return (
+      <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-edit">
+        {header(name, "bg-[#f4a261]/20 text-[#f4a261]", fp && <span className="tool-mini-path" title={fp}>{fp}</span>)}
+        {(oldStr || newStr) && (
+          <div className="tool-mini-diff">
+            <pre className="diff-old">{truncate(oldStr, 500)}</pre>
+            <pre className="diff-new">{truncate(newStr, 500)}</pre>
+          </div>
+        )}
+        {result && <ToolResultInline result={result} />}
+      </div>
+    );
+  }
+
+  if (name === "Write") {
+    const fp = String(input.file_path ?? "");
+    const content = String(input.content ?? "");
+    return (
+      <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-write">
+        {header("Write", "bg-[#2a9d8f]/20 text-[#2a9d8f]", fp && <span className="tool-mini-path" title={fp}>{fp}</span>)}
+        {content && <pre className="tool-mini-body tool-mini-code">{truncate(content, 600)}</pre>}
+        {result && <ToolResultInline result={result} />}
+      </div>
+    );
+  }
+
+  if (name === "TodoWrite" || name === "TaskCreate" || name === "TaskUpdate") {
+    const raw = input.todos;
+    let todos: Array<{ content?: string; subject?: string; status: string }> = [];
+    if (Array.isArray(raw)) todos = raw as any;
+    else if (typeof raw === "string") { try { todos = JSON.parse(raw); } catch { /* empty */ } }
+    if (todos.length === 0) {
+      const subject = String(input.subject ?? input.__summary ?? "");
+      return (
+        <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-todo">
+          {header(name, "bg-[#457b9d]/20 text-[#8bb8d8]")}
+          {subject && <div className="tool-mini-body text-[12px]">{subject}</div>}
+          {result && <ToolResultInline result={result} />}
+        </div>
+      );
+    }
+    return (
+      <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-todo">
+        {header("Tasks", "bg-[#457b9d]/20 text-[#8bb8d8]")}
+        <ul className="todo-list-mini">
+          {todos.map((t, idx) => {
+            const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "●" : "○";
+            const cls = t.status === "completed" ? "todo-done" : t.status === "in_progress" ? "todo-active" : "";
+            return (
+              <li key={idx} className={`todo-item-mini ${cls}`}>
+                <span className="todo-icon-mini">{icon}</span>
+                <span>{t.content ?? t.subject ?? ""}</span>
+              </li>
+            );
+          })}
+        </ul>
+        {result && <ToolResultInline result={result} />}
+      </div>
+    );
+  }
+
+  if (name === "Read" || name === "Glob" || name === "Grep") {
+    const preview = formatInputPreview(input);
+    // Hide result unless it's an error — cleaner reading
+    const isError = result ? /error|failed|Error:/i.test(result.content.slice(0, 80)) : false;
+    return (
+      <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-generic">
+        {header(name, "bg-[#2a2a2a] text-[#c9d1d9]", preview && <span className="tool-mini-path" title={preview}>{preview}</span>)}
+        {result && isError && <ToolResultInline result={result} />}
+      </div>
+    );
+  }
+
+  // Generic fallback — compact key:value preview, JSON available on expand
+  const preview = formatInputPreview(input);
+  const pretty = (() => {
+    try { return JSON.stringify(input, null, 2); } catch { return String(input.__summary ?? ""); }
+  })();
+  return (
+    <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-generic">
+      {header(name, "bg-[#2a2a2a] text-[#c9d1d9]", preview && <span className="tool-mini-path" title={preview}>{preview}</span>)}
+      {pretty && pretty !== "{}" && (
+        <details className="tool-mini-details">
+          <summary className="tool-mini-details-summary">params</summary>
+          <pre className="tool-mini-body tool-mini-code">{truncate(pretty, 400)}</pre>
+        </details>
+      )}
+      {result && <ToolResultInline result={result} />}
+    </div>
+  );
+}
+
+/** One-line key: value, key: value preview of a tool input object. */
+function formatInputPreview(input: Record<string, unknown>): string {
+  if (input.__summary !== undefined) return String(input.__summary);
+  const keys = Object.keys(input);
+  if (keys.length === 0) return "";
+  // Prioritize the params most useful at a glance
+  const priority = ["pattern", "file_path", "path", "query", "url", "command", "subject", "description"];
+  const ordered = [...keys].sort((a, b) => {
+    const ai = priority.indexOf(a);
+    const bi = priority.indexOf(b);
+    if (ai === -1 && bi === -1) return 0;
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+  const parts: string[] = [];
+  for (const k of ordered.slice(0, 4)) {
+    const v = input[k];
+    if (v === undefined || v === null || v === "") continue;
+    const s = typeof v === "string" ? v : JSON.stringify(v);
+    const short = s.length > 60 ? s.slice(0, 57) + "…" : s;
+    parts.push(`${k}: ${short}`);
+  }
+  return parts.join(", ");
+}
+
+function ToolGroupBlock({
+  group,
+  highlight,
+}: {
+  group: Extract<GroupedItem, { kind: "tools" }>;
+  highlight: boolean;
+}) {
+  const names = group.items.map((it) => readToolCall(it.use).name);
+  const unique = Array.from(new Set(names));
+  let summary: string;
+  if (unique.length === 1) {
+    summary = names.length > 1 ? `${unique[0]} × ${names.length}` : unique[0];
+  } else if (unique.length <= 3) {
+    summary = unique.join(", ") + (names.length > unique.length ? ` (${names.length})` : "");
+  } else {
+    summary = `${names.length} tool calls`;
+  }
+  const time = group.lastTime ? formatTime(group.lastTime) : "";
+
+  return (
+    <details
+      id={`msg-${group.firstSeq}`}
+      className={`tool-group ${highlight ? "message-highlight" : ""}`}
+      open={highlight}
+    >
+      <summary className="tool-group-summary">
+        <span className="tool-group-chevron">▶</span>
+        <span className="tool-group-label">Working</span>
+        <span className="tool-group-desc">{summary}</span>
+        {time && <span className="tool-group-time">{time}</span>}
+      </summary>
+      <div className="tool-group-body">
+        {group.items.map((it, idx) => (
+          <ToolCallBlock key={it.use.id ?? idx} use={it.use} result={it.result} />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function ToolsUsedChips({ messages }: { messages: Message[] }) {
+  const counts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const m of messages) {
+      if (m.message_type !== "tool_use") continue;
+      let name = m.tool_name;
+      if (!name) {
+        const match = m.content.match(/^(\w+):/);
+        if (match) name = match[1];
+      }
+      if (!name) continue;
+      map.set(name, (map.get(name) || 0) + 1);
+    }
+    return [...map.entries()].sort((a, b) => b[1] - a[1]);
+  }, [messages]);
+
+  if (counts.length === 0) return null;
+
+  return (
+    <div className="mb-5 flex items-center gap-1.5 flex-wrap">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-text-dim mr-1">
+        Tools used
+      </span>
+      {counts.map(([name, count]) => (
+        <span
+          key={name}
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-[#d29922]/10 text-[#d29922]/90 border border-[#d29922]/20"
+        >
+          {name}
+          <span className="font-mono text-[10px] text-[#d29922]/70">{count}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function FilesPanel({ sessionId }: { sessionId: string }) {
   const [files, setFiles] = useState<FileReference[]>([]);
   const [open, setOpen] = useState(false);
@@ -821,46 +1143,63 @@ export default function SessionDetail() {
 
       <FilesPanel sessionId={session.id} />
 
+      <ToolsUsedChips messages={session.messages} />
+
       <InsightsPanel sessionId={session.id} />
 
       <div className="snippet-bubbles" style={{ gap: 10 }}>
-        {session.messages.map((msg, i) => {
-          const prev = i > 0 ? session.messages[i - 1] : null;
-          const isUserText = msg.role === "user" && msg.message_type !== "tool_result" && msg.message_type !== "system";
-          const isNewUserTurn = isUserText && prev;
+        {(() => {
+          const grouped = groupMessagesForRender(session.messages);
+          const highlightSeq = highlightMsg ? Number(highlightMsg) : NaN;
+          let hasEmittedFirstUser = false;
 
-          // In user-only mode, skip non-user messages
-          if (userOnly && !isUserText) return null;
+          return grouped.map((item, idx) => {
+            if (item.kind === "tools") {
+              if (userOnly) return null;
+              const groupHighlight = !isNaN(highlightSeq) && item.allSequences.includes(highlightSeq);
+              return <ToolGroupBlock key={`g-${idx}`} group={item} highlight={groupHighlight} />;
+            }
 
-          return (
-            <React.Fragment key={msg.id}>
-              {!userOnly && isNewUserTurn && (
-                <div className="w-full my-4 flex items-center">
-                  <div className="flex-1 h-px bg-border/40" />
-                </div>
-              )}
-              {userOnly && isUserText ? (
-                <div
-                  className="cursor-pointer transition-all hover:brightness-125"
-                  onClick={() => {
-                    setAnchorSequence(msg.sequence);
-                    setUserOnly(false);
-                  }}
-                >
+            const msg = item.msg;
+            const isUserText =
+              msg.role === "user" &&
+              msg.message_type !== "tool_result" &&
+              msg.message_type !== "system";
+            const isNewUserTurn = isUserText && hasEmittedFirstUser;
+            if (isUserText) hasEmittedFirstUser = true;
+
+            if (userOnly && !isUserText) return null;
+
+            return (
+              <React.Fragment key={msg.id}>
+                {!userOnly && isNewUserTurn && (
+                  <div className="w-full my-4 flex items-center">
+                    <div className="flex-1 h-px bg-border/40" />
+                  </div>
+                )}
+                {userOnly && isUserText ? (
+                  <div
+                    className="cursor-pointer transition-all hover:brightness-125"
+                    onClick={() => {
+                      setAnchorSequence(msg.sequence);
+                      setUserOnly(false);
+                    }}
+                  >
+                    <MessageBubble
+                      message={msg}
+                      highlight={highlightMsg === String(msg.sequence)}
+                    />
+                  </div>
+                ) : (
                   <MessageBubble
                     message={msg}
                     highlight={highlightMsg === String(msg.sequence)}
                   />
-                </div>
-              ) : (
-                <MessageBubble
-                  message={msg}
-                  highlight={highlightMsg === String(msg.sequence)}
-                />
-              )}
-            </React.Fragment>
-          );
-        })}
+                )}
+              </React.Fragment>
+            );
+          });
+        })()}
       </div>
     </div>
   );

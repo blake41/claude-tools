@@ -205,6 +205,8 @@ export default function SessionList({ workspace }: SessionListProps) {
   const [branchFilter, setBranchFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("all");
   const [hasSummary, setHasSummary] = useState(false);
+  type DateRange = "all" | "today" | "yesterday" | "3d" | "2w" | "30d";
+  const [dateFilter, setDateFilter] = useState<DateRange>("all");
 
   const toggleFilter = (f: FileFilter) => {
     setActiveFilters(prev => {
@@ -229,6 +231,26 @@ export default function SessionList({ workspace }: SessionListProps) {
     return [...tagMap.values()].sort((a, b) => a.name.localeCompare(b.name));
   }, [sessions]);
 
+  const dateThreshold = useMemo(() => {
+    if (dateFilter === "all") return null;
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    switch (dateFilter) {
+      case "today":
+        return { min: today.getTime(), max: null as number | null };
+      case "yesterday": {
+        const y = today.getTime() - 86400000;
+        return { min: y, max: today.getTime() };
+      }
+      case "3d":
+        return { min: today.getTime() - 3 * 86400000, max: null };
+      case "2w":
+        return { min: today.getTime() - 14 * 86400000, max: null };
+      case "30d":
+        return { min: today.getTime() - 30 * 86400000, max: null };
+    }
+  }, [dateFilter]);
+
   const filteredSessions = useMemo(() => {
     return sessions.filter(s => {
       // File type filter
@@ -248,11 +270,19 @@ export default function SessionList({ workspace }: SessionListProps) {
       if (tagFilter !== "all" && !(s.tags || []).some(t => t.name === tagFilter)) return false;
       // Has summary filter
       if (hasSummary && !s.summary) return false;
+      // Date filter (client-side; compare on sort mode's anchor timestamp)
+      if (dateThreshold) {
+        const anchor = sortMode === "activity"
+          ? new Date(s.ended_at || s.started_at).getTime()
+          : new Date(s.started_at).getTime();
+        if (anchor < dateThreshold.min) return false;
+        if (dateThreshold.max !== null && anchor >= dateThreshold.max) return false;
+      }
       return true;
     });
-  }, [sessions, activeFilters, branchFilter, tagFilter, hasSummary]);
+  }, [sessions, activeFilters, branchFilter, tagFilter, hasSummary, dateThreshold, sortMode]);
 
-  const anyFilterActive = activeFilters.size > 0 || branchFilter !== "all" || tagFilter !== "all" || hasSummary;
+  const anyFilterActive = activeFilters.size > 0 || branchFilter !== "all" || tagFilter !== "all" || hasSummary || dateFilter !== "all";
 
   const grouped = groupByDate(filteredSessions, sortMode);
 
@@ -289,6 +319,28 @@ export default function SessionList({ workspace }: SessionListProps) {
               Done! {summarizeDone.completed} summarized{summarizeDone.failed > 0 ? `, ${summarizeDone.failed} failed` : ""}
             </span>
           )}
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap mb-2">
+          {([
+            { key: "all", label: "All" },
+            { key: "today", label: "Today" },
+            { key: "yesterday", label: "Yest" },
+            { key: "3d", label: "3d" },
+            { key: "2w", label: "2w" },
+            { key: "30d", label: "30d" },
+          ] as const).map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => setDateFilter(key)}
+              className={`text-[11px] px-2.5 py-1 rounded-md border transition-all ${
+                dateFilter === key
+                  ? "border-accent-blue/40 text-accent-blue bg-accent-blue/10"
+                  : "border-border/60 text-text-dim hover:text-text-secondary hover:border-border"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <div className="view-toggle">
