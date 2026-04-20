@@ -1174,6 +1174,43 @@ const changedFilesForSession = db.prepare(`
   ORDER BY sequence ASC
 `);
 
+const lastUserTurns = db.prepare(`
+  SELECT content, timestamp, sequence
+  FROM messages
+  WHERE session_id = ?
+    AND role = 'user'
+    AND message_type = 'text'
+  ORDER BY sequence DESC
+  LIMIT ?
+`);
+
+const finalAssistantTurn = db.prepare(`
+  SELECT content, timestamp, sequence
+  FROM messages
+  WHERE session_id = ?
+    AND role = 'assistant'
+    AND message_type = 'text'
+  ORDER BY sequence DESC
+  LIMIT 1
+`);
+
+const collapsedFilesForSession = db.prepare(`
+  SELECT file_path,
+         GROUP_CONCAT(DISTINCT operation) as ops,
+         MAX(sequence) as last_touched_seq
+  FROM session_files
+  WHERE session_id = ?
+    AND file_path NOT LIKE '%.png'
+    AND file_path NOT LIKE '%.jpg'
+    AND file_path NOT LIKE '%.jpeg'
+    AND file_path NOT LIKE '%.gif'
+    AND file_path NOT LIKE '%.webp'
+    AND file_path NOT LIKE '%.svg'
+  GROUP BY file_path
+  ORDER BY last_touched_seq DESC
+  LIMIT ?
+`);
+
 app.get("/api/files/search", (req, res) => {
   const query = req.query.q as string;
   if (!query || query.length < 2) {
@@ -1206,6 +1243,71 @@ app.get("/api/files/by-path", (req, res) => {
 app.get("/api/sessions/:id/files", (req, res) => {
   const files = filesForSession.all(req.params.id);
   res.json({ files });
+});
+
+app.get("/api/sessions/:id/resume-bundle", (req, res) => {
+  const session = getSession.get(req.params.id) as Record<string, unknown> | undefined;
+  if (!session) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+
+  const turnsLimit = Math.min(Math.max(Number(req.query.turns) || 5, 1), 20);
+  const filesLimit = Math.min(Math.max(Number(req.query.files) || 15, 1), 50);
+  const userCharLimit = Math.min(Math.max(Number(req.query.user_chars) || 1200, 200), 5000);
+  const assistantCharLimit = Math.min(Math.max(Number(req.query.assistant_chars) || 2000, 200), 8000);
+  const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+  const rawUserTurns = lastUserTurns.all(req.params.id, turnsLimit) as Array<{
+    content: string;
+    timestamp: string;
+    sequence: number;
+  }>;
+  const userTurns = rawUserTurns
+    .map((t) => ({ ...t, content: cleanXmlNoise(t.content) }))
+    .filter((t) => t.content.length > 0)
+    .reverse(); // chronological
+
+  const rawFinal = finalAssistantTurn.get(req.params.id) as
+    | { content: string; timestamp: string; sequence: number }
+    | undefined;
+  const finalAssistantContent = rawFinal ? cleanXmlNoise(rawFinal.content) : "";
+
+  const files = collapsedFilesForSession.all(req.params.id, filesLimit) as Array<{
+    file_path: string;
+    ops: string;
+    last_touched_seq: number;
+  }>;
+
+  res.json({
+    id: session.id,
+    source_path: session.source_path,
+    workspace_path: session.workspace_path,
+    workspace_name: session.workspace_name,
+    git_branch: session.git_branch,
+    started_at: session.started_at,
+    ended_at: session.ended_at,
+    title: session.title,
+    summary: session.summary,
+    summary_short: session.summary_short,
+    last_user_turns: userTurns.map((t) => ({
+      timestamp: t.timestamp,
+      sequence: t.sequence,
+      text: truncate(t.content, userCharLimit),
+    })),
+    final_assistant:
+      rawFinal && finalAssistantContent.length > 0
+        ? {
+            timestamp: rawFinal.timestamp,
+            sequence: rawFinal.sequence,
+            text: truncate(finalAssistantContent, assistantCharLimit),
+          }
+        : null,
+    files_touched: files.map((f) => ({
+      path: f.file_path,
+      ops: f.ops ? f.ops.split(",") : [],
+    })),
+  });
 });
 
 app.get("/api/files/view", (req, res) => {
