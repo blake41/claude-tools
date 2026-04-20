@@ -22,7 +22,8 @@ const log = new Logger({ component: "auth" });
 
 interface AuthState {
   authenticated: boolean;
-  user: { slackUserId: string; email: string } | null;
+  // slackUserId is optional because the caller may auth by email alone.
+  user: { slackUserId?: string; email: string } | null;
   timestamp: number | null;
 }
 

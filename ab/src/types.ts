@@ -89,7 +89,8 @@ export interface AuthLoginRequest {
 
 export interface AuthLoginResponse {
   ok: boolean;
-  user?: { slackUserId: string; email: string };
+  // slackUserId is optional because callers may auth by email alone.
+  user?: { slackUserId?: string; email: string };
   error?: string;
 }
 
@@ -100,6 +101,6 @@ export interface AuthLoginResponse {
 export interface AuthStatusResponse {
   ok: boolean;
   authenticated: boolean;
-  user: { slackUserId: string; email: string } | null;
+  user: { slackUserId?: string; email: string } | null;
   lastLogin: string | null;
 }

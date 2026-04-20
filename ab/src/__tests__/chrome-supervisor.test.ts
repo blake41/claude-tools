@@ -34,9 +34,7 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  // @ts-expect-error — restoring
   Bun.spawn = originalSpawn;
-  // @ts-expect-error — restoring
   Bun.spawnSync = originalSpawnSync;
   resetAll();
 });

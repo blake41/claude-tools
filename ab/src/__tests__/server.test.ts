@@ -165,7 +165,6 @@ async function rpc<T>(method: "GET" | "POST", path: string, body?: unknown): Pro
     method,
     headers,
     body: bodyStr,
-    // @ts-expect-error — Bun extension
     unix: TEST_SOCKET,
   });
 

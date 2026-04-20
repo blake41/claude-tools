@@ -39,7 +39,6 @@ async function rpc(
 ): Promise<{ status: number; data: any }> {
   const resp = await fetch(`http://localhost${pathname}`, {
     method,
-    // @ts-expect-error — Bun extension
     unix: socketPath,
     signal: AbortSignal.timeout(30_000),
   });
@@ -59,7 +58,6 @@ async function waitForDaemon(
   while (Date.now() < deadline) {
     try {
       const resp = await fetch("http://localhost/health", {
-        // @ts-expect-error — Bun extension
         unix: socketPath,
         signal: AbortSignal.timeout(1_000),
       });
@@ -197,7 +195,7 @@ async function collectStderr(
   proc: ReturnType<typeof Bun.spawn>,
   timeoutMs = 5_000,
 ): Promise<string> {
-  if (!proc.stderr) return "";
+  if (!proc.stderr || typeof proc.stderr === "number") return "";
   try {
     const resp = new Response(proc.stderr);
     const text = await Promise.race([

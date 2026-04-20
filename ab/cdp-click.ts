@@ -16,7 +16,7 @@
 
 async function findPageWs(port: number): Promise<string> {
   const res = await fetch(`http://localhost:${port}/json`);
-  const tabs: any[] = await res.json();
+  const tabs = (await res.json()) as { type: string; webSocketDebuggerUrl: string }[];
   const pages = tabs.filter((t) => t.type === "page");
   if (pages.length === 0) throw new Error("No page tabs found");
   return pages[0].webSocketDebuggerUrl;
@@ -127,3 +127,5 @@ try {
   console.error(`✗ ${e.message}`);
   process.exit(1);
 }
+
+export {};

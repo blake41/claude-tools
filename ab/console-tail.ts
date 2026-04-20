@@ -208,3 +208,5 @@ process.on("SIGINT", () => {
 });
 
 tailWithReconnect(port, prefix, levels, watch);
+
+export {};

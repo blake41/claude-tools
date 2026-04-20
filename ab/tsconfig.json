@@ -5,7 +5,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "types": ["bun"],
-    "strict": false,
+    "strict": true,
     "esModuleInterop": true,
     "allowJs": true,
     "skipLibCheck": true,

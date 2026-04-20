@@ -42,6 +42,8 @@ interface OpContext {
 const opContextStorage = new AsyncLocalStorage<OpContext>();
 
 /** Run `fn` with a correlation ID that appears in all log lines within the scope. */
+export function withOpId<T>(opId: string, fn: () => Promise<T>): Promise<T>;
+export function withOpId<T>(opId: string, fn: () => T): T;
 export function withOpId<T>(opId: string, fn: () => T | Promise<T>): T | Promise<T> {
   return opContextStorage.run({ opId }, fn);
 }

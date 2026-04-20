@@ -39,13 +39,11 @@ beforeEach(() => {
     }),
     kill: () => {},
   }));
-  // @ts-expect-error — replacing Bun.spawn for tests
   Bun.spawn = spawnMock;
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  // @ts-expect-error — restoring Bun.spawn
   Bun.spawn = originalSpawn;
   resetAuthState();
 });
