@@ -27,28 +27,83 @@ function cco-permissions
     # Captures surface name BEFORE claude starts (claude changes the terminal title)
     set -l extra_args
     set -l cmux_key_hash ""
-    if set -q CMUX_SURFACE_ID; and command -q cmux
+    if not set -q CMUX_SURFACE_ID
+        # Not in cmux — silent, this is the common bare-shell case
+    else if not command -q cmux
+        echo "cmux: CMUX_SURFACE_ID set but cmux CLI not on PATH — skipping auto-resume" >&2
+    else if not command -q cmux-session-key
+        echo "cmux: cmux-session-key helper missing from PATH — skipping auto-resume" >&2
+    else
         set -l identify (cmux identify 2>/dev/null)
-        if test -n "$identify"
+        if test -z "$identify"
+            echo "cmux: `cmux identify` returned nothing — skipping auto-resume" >&2
+        else
             set -l ws_ref (echo "$identify" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
             set -l sf_ref (echo "$identify" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
             set -l ws_name (cmux list-workspaces 2>/dev/null | grep "$ws_ref " | sed "s/^[* ]*$ws_ref  //" | sed 's/  \[selected\]//')
             set -l sf_name (cmux list-pane-surfaces 2>/dev/null | grep "$sf_ref " | sed "s/^[* ]*$sf_ref  //" | sed 's/  \[selected\]//')
-            if test -n "$ws_name" -a -n "$sf_name"
-                set -l is_human_name true
-                if string match -rq '^[~✳/]|^\S+\s+[~/]' "$sf_name"
-                    set is_human_name false
-                end
-                set cmux_key_hash (echo -n "$ws_name/$sf_name" | shasum -a 256 | string sub -l 16)
-                if test "$has_resume_flag" = false -a "$is_human_name" = true
+            if test -z "$ws_name" -o -z "$sf_name"
+                echo "cmux: could not resolve workspace/surface names (ws_ref=$ws_ref sf_ref=$sf_ref) — skipping auto-resume" >&2
+            else
+                # Derive normalized key + hash + human flag via the shared helper
+                # so cco-permissions and cmux-session-persist stay in lockstep.
+                set -l key_out (printf '%s\n%s\n' "$ws_name" "$sf_name" | cmux-session-key)
+                set -l cmux_norm_key $key_out[1]
+                set cmux_key_hash $key_out[2]
+                set -l is_human_name $key_out[3]
+
+                if test "$is_human_name" != "1"
+                    echo "cmux: '$cmux_norm_key' looks non-human — not auto-resuming"
+                else if test "$has_resume_flag" = true
+                    echo "cmux: '$cmux_norm_key' hash=$cmux_key_hash (--resume flag present, skipping lookup)"
+                else
                     set -l mapping_file ~/.cmux/claude-sessions/$cmux_key_hash
+                    set -l saved_sid ""
                     if test -f $mapping_file
-                        set -l saved_sid (cat $mapping_file)
-                        if test -n "$saved_sid"
-                            echo "Resuming session for '$ws_name/$sf_name': $saved_sid"
-                            set -a extra_args --resume $saved_sid
-                            set session_id $saved_sid
+                        set saved_sid (cat $mapping_file)
+                    else
+                        # Heal: no mapping under current name hash. Maybe the tab
+                        # was renamed within this cmux process. Look for any
+                        # by-session/ entry whose surface_ref + workspace_ref
+                        # match this tab; if so, the session is ours under a
+                        # stale name. Relink to the current hash.
+                        set -l by_session_dir ~/.cmux/claude-sessions/by-session
+                        if test -d $by_session_dir
+                            for f in $by_session_dir/*
+                                test -f $f; or continue
+                                set -l entry_ws (python3 -c "import sys,json; print(json.load(open('$f')).get('workspace_ref',''))" 2>/dev/null)
+                                set -l entry_sf (python3 -c "import sys,json; print(json.load(open('$f')).get('surface_ref',''))" 2>/dev/null)
+                                if test "$entry_ws" = "$ws_ref" -a "$entry_sf" = "$sf_ref"
+                                    set -l entry_sid (python3 -c "import sys,json; print(json.load(open('$f')).get('session_id',''))" 2>/dev/null)
+                                    set -l entry_key (python3 -c "import sys,json; print(json.load(open('$f')).get('key',''))" 2>/dev/null)
+                                    if test -n "$entry_sid"
+                                        echo "cmux: renamed tab detected ('$entry_key' → '$cmux_norm_key') — relinking session $entry_sid"
+                                        echo $entry_sid >$mapping_file
+                                        set saved_sid $entry_sid
+                                        break
+                                    end
+                                end
+                            end
                         end
+                    end
+                    if test -n "$saved_sid"
+                        # Validate the saved session actually exists on disk
+                        # before passing it to --resume. Stale mappings survive
+                        # session deletion (retention, manual cleanup, worktree
+                        # removal) and claude errors out on dead session IDs.
+                        set -l session_jsonl (find ~/.claude/projects -maxdepth 2 -name "$saved_sid.jsonl" -type f 2>/dev/null | head -1)
+                        if test -z "$session_jsonl"
+                            echo "cmux: saved session $saved_sid no longer exists on disk — removing stale mapping, starting fresh"
+                            rm -f $mapping_file
+                            set saved_sid ""
+                        end
+                    end
+                    if test -n "$saved_sid"
+                        echo "Resuming session for '$cmux_norm_key' (hash=$cmux_key_hash): $saved_sid"
+                        set -a extra_args --resume $saved_sid
+                        set session_id $saved_sid
+                    else if not test -f ~/.cmux/claude-sessions/$cmux_key_hash
+                        echo "cmux: no saved session for '$cmux_norm_key' (hash=$cmux_key_hash) — starting fresh"
                     end
                 end
             end
