@@ -8,8 +8,21 @@
 #   - dirs file (tools/sandbox/dirs)
 #   - ab (for browser preflight, optional)
 #   - cmux (for session auto-resume, optional)
+#
+# Flags (consumed here, not forwarded to claude):
+#   --no-sandbox    Skip Seatbelt entirely — run `claude` directly with the
+#                   usual CCO_SESSION_ID / cmux auto-resume / browser preflight
+#                   still in place. Use when the sandbox is getting in the way
+#                   of an exploratory session.
 
 function cco-permissions
+    # Pull out our own flags before touching $argv further.
+    set -l skip_sandbox false
+    if contains -- --no-sandbox $argv
+        set skip_sandbox true
+        set argv (string match -v -- --no-sandbox $argv)
+    end
+
     # Parse --resume/--continue from argv
     set -l session_id ""
     set -l has_resume_flag false
@@ -129,6 +142,16 @@ function cco-permissions
 
     if not contains $HOME/.local/bin $PATH
         set -x PATH $HOME/.local/bin $PATH
+    end
+
+    # --no-sandbox: skip Seatbelt + the expansion loop entirely.
+    # Everything else (CCO_SESSION_ID, auto-resume, --dangerously-skip-permissions)
+    # stays in place.
+    if $skip_sandbox
+        claude --dangerously-skip-permissions $extra_args $argv
+        set -e CCO_SESSION_ID
+        set -e CMUX_SESSION_KEY_HASH
+        return
     end
 
     # Build sandbox args from dirs file
