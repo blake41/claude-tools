@@ -12,7 +12,6 @@
  */
 
 import { spawn } from "child_process";
-import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as rpc from "./rpc";
@@ -36,39 +35,23 @@ const AB_DIR = path.resolve(import.meta.dir, "..");
 const AGENT_BROWSER = "agent-browser";
 
 // ---------------------------------------------------------------------------
-// Session file persistence
+// Session pid resolution — the single source of truth.
+//
+// pid := AB_SESSION_PID (set by subagent hook) ?? CCO_SESSION_ID (main thread)
+// file := /tmp/.ab-session-<pid>   (existence = initialized, content = pid)
+// session := ab-<pid>               (agent-browser session identity)
 // ---------------------------------------------------------------------------
 
-function sessionFilePath(): string | null {
-  const cco = process.env.CCO_SESSION_ID;
-  if (!cco) return null;
-  return `/tmp/.ab-session-${cco}`;
+export function resolvePid(): string | null {
+  return process.env.AB_SESSION_PID ?? process.env.CCO_SESSION_ID ?? null;
 }
 
-function readSessionFile(): string | null {
-  const fp = sessionFilePath();
-  if (!fp) return null;
-  try {
-    const content = fs.readFileSync(fp, "utf-8").trim();
-    return content || null;
-  } catch {
-    return null;
-  }
+export function sessionFilePath(pid: string | null = resolvePid()): string | null {
+  return pid ? `/tmp/.ab-session-${pid}` : null;
 }
 
-function writeSessionFile(id: string): void {
-  const fp = sessionFilePath();
-  if (!fp) return;
-  fs.writeFileSync(fp, id + "\n");
-}
-
-// ---------------------------------------------------------------------------
-// Session naming — must match bash convention exactly
-// ---------------------------------------------------------------------------
-
-function buildSessionName(subagentId: string): string {
-  const cco = process.env.CCO_SESSION_ID;
-  return `ab-${cco ? cco.slice(0, 8) + "-" : ""}${subagentId}`;
+export function buildSessionName(pid: string | null = resolvePid()): string {
+  return pid ? `ab-${pid}` : "ab-default";
 }
 
 // ---------------------------------------------------------------------------
@@ -143,15 +126,22 @@ async function runAgentBrowser(
 interface ParsedFlags {
   headed: boolean;
   userChrome: boolean;
-  sessionNameOverride: string | null;
   args: string[];
 }
 
-function parseFlags(argv: string[]): ParsedFlags {
+export class RemovedFlagError extends Error {
+  constructor(flag: string) {
+    super(
+      `${flag} is removed. Session identity now comes from the pid (AB_SESSION_PID in subagents, CCO_SESSION_ID on the main thread). Run 'ab new-session' to initialize.`,
+    );
+    this.name = "RemovedFlagError";
+  }
+}
+
+export function parseFlags(argv: string[]): ParsedFlags {
   const result: ParsedFlags = {
     headed: false,
     userChrome: false,
-    sessionNameOverride: null,
     args: [],
   };
 
@@ -165,8 +155,7 @@ function parseFlags(argv: string[]): ParsedFlags {
       result.userChrome = true;
       i++;
     } else if (arg === "--session-name" || arg === "--session") {
-      result.sessionNameOverride = argv[i + 1] ?? null;
-      i += 2;
+      throw new RemovedFlagError(arg);
     } else {
       result.args.push(arg);
       i++;
@@ -307,9 +296,155 @@ async function cmdImport(): Promise<number> {
 }
 
 function cmdNewSession(): number {
-  const id = crypto.randomBytes(4).toString("hex");
-  writeSessionFile(id);
-  process.stdout.write(id + "\n");
+  const pid = resolvePid();
+  if (!pid) {
+    stderr(
+      "Cannot initialize session: neither AB_SESSION_PID nor CCO_SESSION_ID is set.",
+    );
+    return 1;
+  }
+  const fp = sessionFilePath(pid)!;
+  if (!fs.existsSync(fp)) {
+    fs.writeFileSync(fp, pid + "\n");
+  }
+  process.stdout.write(pid + "\n");
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ab ps + ab gc — session inventory and cleanup.
+//
+// The filesystem (/tmp/.ab-session-*) is the source of truth. We don't query
+// the daemon for liveness — if a follow-up exposes a listSessions RPC we can
+// upgrade later. For now, file exists = live; mtime > STALE_AGE_MS = stale.
+// ---------------------------------------------------------------------------
+
+const SESSION_FILE_PREFIX = "/tmp/.ab-session-";
+const WRAPPER_PREFIX = "/tmp/ab-";
+const STALE_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface SessionEntry {
+  pid: string;
+  session: string;
+  owner: "self" | "self (main-thread)" | "subagent" | "other-cc" | "other-cc (subagent)";
+  mtimeIso: string;
+  ageSeconds: number;
+  stale: boolean;
+}
+
+export function listSessionEntries(now: Date = new Date()): SessionEntry[] {
+  const dir = "/tmp";
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const prefix = ".ab-session-";
+  const selfPid = resolvePid();
+  const cco = process.env.CCO_SESSION_ID;
+  const entries: SessionEntry[] = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const pid = name.slice(prefix.length);
+    if (!pid) continue;
+    const fp = `${dir}/${name}`;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fp);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    const ageMs = now.getTime() - stat.mtimeMs;
+    entries.push({
+      pid,
+      session: `ab-${pid}`,
+      owner: classifyOwner(pid, selfPid, cco),
+      mtimeIso: new Date(stat.mtimeMs).toISOString(),
+      ageSeconds: Math.max(0, Math.floor(ageMs / 1000)),
+      stale: ageMs > STALE_AGE_MS,
+    });
+  }
+  entries.sort((a, b) => {
+    // self first, then lexicographic by pid
+    if (a.owner === "self" && b.owner !== "self") return -1;
+    if (b.owner === "self" && a.owner !== "self") return 1;
+    return a.pid.localeCompare(b.pid);
+  });
+  return entries;
+}
+
+function classifyOwner(
+  pid: string,
+  selfPid: string | null,
+  cco: string | undefined,
+): SessionEntry["owner"] {
+  if (selfPid && pid === selfPid) return "self";
+  if (cco && pid === cco) return "self (main-thread)";
+  if (cco && pid.startsWith(cco + "-")) return "subagent";
+  return pid.includes("-") ? "other-cc (subagent)" : "other-cc";
+}
+
+function formatAge(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function cmdPs(args: string[]): number {
+  const json = args.includes("--json");
+  const entries = listSessionEntries();
+  if (json) {
+    process.stdout.write(JSON.stringify(entries, null, 2) + "\n");
+    return 0;
+  }
+  if (entries.length === 0) {
+    stderr("No active browser sessions.");
+    return 0;
+  }
+  const pidW = Math.max(3, ...entries.map((e) => e.pid.length));
+  const ownerW = Math.max(5, ...entries.map((e) => e.owner.length));
+  const header = `  ${"PID".padEnd(pidW)}  ${"OWNER".padEnd(ownerW)}  ${"AGE".padEnd(6)}  STATUS`;
+  process.stdout.write(header + "\n");
+  let anyStale = false;
+  for (const e of entries) {
+    const marker = e.owner === "self" ? "*" : " ";
+    const status = e.stale ? "stale" : "live";
+    if (e.stale) anyStale = true;
+    process.stdout.write(
+      `${marker} ${e.pid.padEnd(pidW)}  ${e.owner.padEnd(ownerW)}  ${formatAge(e.ageSeconds).padEnd(6)}  ${status}\n`,
+    );
+  }
+  if (anyStale) {
+    stderr("Run `ab gc` to prune stale sessions.");
+  }
+  return 0;
+}
+
+function cmdGc(args: string[]): number {
+  const dryRun = args.includes("--dry-run");
+  const entries = listSessionEntries();
+  const targets = entries.filter((e) => e.stale);
+  if (targets.length === 0) {
+    stderr("Nothing to prune.");
+    return 0;
+  }
+  for (const e of targets) {
+    const sessionFile = `${SESSION_FILE_PREFIX}${e.pid}`;
+    const wrapper = `${WRAPPER_PREFIX}${e.pid}`;
+    if (dryRun) {
+      process.stdout.write(`would remove: ${sessionFile}\n`);
+      if (fs.existsSync(wrapper)) {
+        process.stdout.write(`would remove: ${wrapper}\n`);
+      }
+    } else {
+      try { fs.unlinkSync(sessionFile); } catch { /* race: already gone */ }
+      try { fs.unlinkSync(wrapper); } catch { /* wrapper may not exist */ }
+      stderr(`removed: ${e.pid}`);
+    }
+  }
   return 0;
 }
 
@@ -447,18 +582,23 @@ const NEEDS_CHROME = new Set([
 async function main(): Promise<number> {
   // Parse flags from process.argv (skip bun and script path)
   const rawArgs = process.argv.slice(2);
-  const flags = parseFlags(rawArgs);
+  let flags: ParsedFlags;
+  try {
+    flags = parseFlags(rawArgs);
+  } catch (err) {
+    if (err instanceof RemovedFlagError) {
+      stderr(err.message);
+      return 2;
+    }
+    throw err;
+  }
 
   const command = flags.args[0] ?? "";
   const rest = flags.args.slice(1);
 
-  // Resolve subagent session ID: flag > env var > session file > "default"
-  const subagentId =
-    flags.sessionNameOverride ??
-    process.env.AB_SUBAGENT_SESSION_ID ??
-    readSessionFile() ??
-    "default";
-  const sessionName = buildSessionName(subagentId);
+  // Resolve session identity from pid (see resolvePid above).
+  const pid = resolvePid();
+  const sessionName = buildSessionName(pid);
 
   // Resolve CDP port based on flags
   let cdpPort: number;
@@ -507,6 +647,8 @@ async function main(): Promise<number> {
 
     // -- Standalone --
     if (command === "new-session") return cmdNewSession();
+    if (command === "ps") return cmdPs(rest);
+    if (command === "gc") return cmdGc(rest);
     if (command === "console-tail") return await cmdConsoleTail(rest, cdpPort);
     if (command === "watch") return await cmdWatch(rest, cdpPort);
     if (command === "click-js") return await cmdClickJs(rest, cdpPort);
@@ -617,28 +759,34 @@ function printUsage(): void {
   stderr("  localStorage get <key>          Read localStorage");
   stderr("  localStorage set <key> <value>  Write localStorage");
   stderr("");
+  stderr("Sessions:");
+  stderr("  new-session         Initialize session file for current pid (idempotent)");
+  stderr("  ps [--json]         List active browser sessions (pid, owner, age, status)");
+  stderr("  gc [--dry-run]      Prune stale session files and wrappers");
+  stderr("");
   stderr("Other:");
-  stderr("  new-session         Generate random session ID");
   stderr("  click-js <args>     JS-based click (for React virtualized lists)");
   stderr("");
   stderr("Flags:");
   stderr("  --headed            Use headed Chrome (port 9444)");
   stderr("  --user-chrome       Use personal Chrome (port 9222), allows eval");
-  stderr("  --session-name <n>  Override subagent session name");
   stderr("");
   stderr("Environment:");
   stderr("  AB_SLACK_USER_ID    Override default Slack user for dev-login auth");
-  stderr("  AB_SUBAGENT_SESSION_ID  Override subagent session ID");
+  stderr("  AB_SESSION_PID      Session pid (set by subagent hook; falls back to CCO_SESSION_ID)");
   stderr("  CCO_SESSION_ID      Claude Code session ID (auto-set by sandbox)");
 }
 
 // ---------------------------------------------------------------------------
-// Entry
+// Entry — only run when executed directly, not when imported as a module (e.g. tests).
 // ---------------------------------------------------------------------------
 
-main().then((code) => {
-  process.exit(code);
-}).catch((err) => {
-  process.stderr.write(String(err) + "\n");
-  process.exit(1);
-});
+// @ts-expect-error -- Bun exposes import.meta.main
+if (import.meta.main) {
+  main().then((code) => {
+    process.exit(code);
+  }).catch((err) => {
+    process.stderr.write(String(err) + "\n");
+    process.exit(1);
+  });
+}

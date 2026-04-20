@@ -1,2 +1,2 @@
-#!/usr/bin/env bun
-await import("/Users/blake/Documents/Development/tools/ab/src/cli.ts");
+#!/usr/bin/env bash
+exec bun /Users/blake/Documents/Development/tools/ab/src/cli.ts "$@"
