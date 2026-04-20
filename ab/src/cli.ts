@@ -42,16 +42,19 @@ const AGENT_BROWSER = "agent-browser";
 // session := ab-<pid>               (agent-browser session identity)
 // ---------------------------------------------------------------------------
 
-export function resolvePid(): string | null {
-  return process.env.AB_SESSION_PID ?? process.env.CCO_SESSION_ID ?? null;
+/** Literal pid used when neither AB_SESSION_PID nor CCO_SESSION_ID is set. */
+export const DEFAULT_PID = "default";
+
+export function resolvePid(): string {
+  return process.env.AB_SESSION_PID ?? process.env.CCO_SESSION_ID ?? DEFAULT_PID;
 }
 
-export function sessionFilePath(pid: string | null = resolvePid()): string | null {
-  return pid ? `/tmp/.ab-session-${pid}` : null;
+export function sessionFilePath(pid: string = resolvePid()): string {
+  return `/tmp/.ab-session-${pid}`;
 }
 
-export function buildSessionName(pid: string | null = resolvePid()): string {
-  return pid ? `ab-${pid}` : "ab-default";
+export function buildSessionName(pid: string = resolvePid()): string {
+  return `ab-${pid}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,13 +300,7 @@ async function cmdImport(): Promise<number> {
 
 function cmdNewSession(): number {
   const pid = resolvePid();
-  if (!pid) {
-    stderr(
-      "Cannot initialize session: neither AB_SESSION_PID nor CCO_SESSION_ID is set.",
-    );
-    return 1;
-  }
-  const fp = sessionFilePath(pid)!;
+  const fp = sessionFilePath(pid);
   if (!fs.existsSync(fp)) {
     fs.writeFileSync(fp, pid + "\n");
   }
@@ -377,10 +374,10 @@ export function listSessionEntries(now: Date = new Date()): SessionEntry[] {
 
 function classifyOwner(
   pid: string,
-  selfPid: string | null,
+  selfPid: string,
   cco: string | undefined,
 ): SessionEntry["owner"] {
-  if (selfPid && pid === selfPid) return "self";
+  if (pid === selfPid) return "self";
   if (cco && pid === cco) return "self (main-thread)";
   if (cco && pid.startsWith(cco + "-")) return "subagent";
   return pid.includes("-") ? "other-cc (subagent)" : "other-cc";

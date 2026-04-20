@@ -69,10 +69,10 @@ describe("resolvePid", () => {
     expect(resolvePid()).toBe("abc123");
   });
 
-  test("returns null when neither env var is set", () => {
+  test("falls back to literal 'default' when neither env var is set", () => {
     delete process.env.AB_SESSION_PID;
     delete process.env.CCO_SESSION_ID;
-    expect(resolvePid()).toBeNull();
+    expect(resolvePid()).toBe("default");
   });
 });
 
@@ -80,10 +80,7 @@ describe("sessionFilePath", () => {
   test("returns /tmp/.ab-session-<pid> for a given pid", () => {
     expect(sessionFilePath("abc123")).toBe("/tmp/.ab-session-abc123");
     expect(sessionFilePath("abc123-deadbeef")).toBe("/tmp/.ab-session-abc123-deadbeef");
-  });
-
-  test("returns null when pid is null", () => {
-    expect(sessionFilePath(null)).toBeNull();
+    expect(sessionFilePath("default")).toBe("/tmp/.ab-session-default");
   });
 });
 
@@ -91,10 +88,7 @@ describe("buildSessionName", () => {
   test("returns ab-<pid> for a given pid", () => {
     expect(buildSessionName("abc123")).toBe("ab-abc123");
     expect(buildSessionName("abc123-deadbeef")).toBe("ab-abc123-deadbeef");
-  });
-
-  test("returns ab-default when pid is null", () => {
-    expect(buildSessionName(null)).toBe("ab-default");
+    expect(buildSessionName("default")).toBe("ab-default");
   });
 });
 
@@ -176,10 +170,14 @@ describe("ab new-session (idempotency + pid wiring)", () => {
     expect(mtime1).toBe(mtime2);
   });
 
-  test("errors clearly when neither AB_SESSION_PID nor CCO_SESSION_ID is set", () => {
+  test("falls back to 'default' pid when neither env var is set", () => {
+    testPids.push("default");
+    // Pre-clean so the run exercises the write path deterministically.
+    try { fs.unlinkSync("/tmp/.ab-session-default"); } catch { /* ignore */ }
     const r = runAb(["new-session"], {});
-    expect(r.code).toBe(1);
-    expect(r.stderr).toContain("Cannot initialize session");
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toBe("default");
+    expect(fs.readFileSync("/tmp/.ab-session-default", "utf-8").trim()).toBe("default");
   });
 });
 
