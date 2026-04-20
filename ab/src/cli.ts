@@ -781,7 +781,6 @@ function printUsage(): void {
 // Entry — only run when executed directly, not when imported as a module (e.g. tests).
 // ---------------------------------------------------------------------------
 
-// @ts-expect-error -- Bun exposes import.meta.main
 if (import.meta.main) {
   main().then((code) => {
     process.exit(code);
