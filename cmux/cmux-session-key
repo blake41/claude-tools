@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""
+cmux-session-key — shared key/hash derivation for cmux session persistence.
+
+Reads two lines from stdin:
+  line 1: workspace_name (raw from `cmux list-workspaces`)
+  line 2: surface_name   (raw from `cmux list-pane-surfaces`)
+
+Writes three lines to stdout:
+  line 1: normalized key "<ws>/<sf>"
+  line 2: 16-char SHA256 hex hash of the normalized key
+  line 3: "1" if both names look human, "0" otherwise
+
+Normalization strips leading activity/spinner characters and surrounding
+whitespace so that a tab called "Debug X" and the same tab mid-animation
+("⠂ Debug X") hash to the same thing.
+
+Human-name check rejects claude's own terminal titles, shell prompts,
+and raw paths — names that would change as soon as claude starts.
+"""
+
+import hashlib
+import re
+import sys
+
+# Leading activity / spinner / decoration characters to strip before hashing.
+# - U+2800-U+28FF: Braille patterns (cmux uses these as spinner frames)
+# - ✳ U+2733: cmux's "active claude" marker
+# - ● ◐ ◓ ◑ ◒: misc activity dots
+# - *: selected/asterisk prefix
+# - ⚡ ⏳ ⏰: occasional status glyphs
+_STRIP_PREFIX = re.compile(r"^[\u2800-\u28ff\u2733\u25cf\u25d0\u25d3\u25d1\u25d2*\u26a1\u23f3\u23f0]+\s*")
+
+
+def normalize(name: str) -> str:
+    name = _STRIP_PREFIX.sub("", name)
+    return name.strip()
+
+
+def is_human(name: str) -> bool:
+    if not name:
+        return False
+    # Claude's default terminal title
+    if name == "Claude Code":
+        return False
+    # Wrapper invocation titles: "claude" alone, or "claude --flag..." / "claude -x".
+    # A human-named tab like "claude universe" is fine; only reject when the
+    # word "claude" is immediately followed by a CLI flag.
+    if name == "claude":
+        return False
+    if re.match(r"^claude\s+-", name):
+        return False
+    # Shell prompt leaking into the title: starts with a path
+    if name.startswith("~") or name.startswith("/"):
+        return False
+    # Shell prompt pattern: "<word> ~/..." or "<word> /..."
+    if re.match(r"^\S+\s+[~/]", name):
+        return False
+    return True
+
+
+def main() -> int:
+    data = sys.stdin.read().split("\n")
+    ws_raw = data[0] if len(data) > 0 else ""
+    sf_raw = data[1] if len(data) > 1 else ""
+    ws = normalize(ws_raw)
+    sf = normalize(sf_raw)
+    key = f"{ws}/{sf}"
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    human = "1" if (is_human(ws) and is_human(sf)) else "0"
+    sys.stdout.write(f"{key}\n{key_hash}\n{human}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
