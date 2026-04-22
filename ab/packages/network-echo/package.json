@@ -1,0 +1,12 @@
+{
+  "name": "@ab/network-echo",
+  "version": "0.1.0",
+  "description": "Dev-only fetch/XHR interceptor that echoes requests through console.log in a format ab console-tail recognizes.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src", "README.md"],
+  "sideEffects": false
+}
