@@ -12,6 +12,8 @@ import ProposalQueue from "./components/ProposalQueue";
 import ProposalDetail from "./components/ProposalDetail";
 import ScoreTrends from "./components/ScoreTrends";
 import MetaSettings from "./components/MetaSettings";
+import LibraryPage from "./components/library/LibraryPage";
+import LibraryDetail from "./components/library/LibraryDetail";
 import {
   rootRoute,
   indexRoute,
@@ -27,6 +29,8 @@ import {
   metaProposalDetailRoute,
   metaScoresRoute,
   metaSettingsRoute,
+  libraryRoute,
+  libraryDetailRoute,
   router,
 } from "./router";
 import type { Workspace, Tag, SessionSummary } from "./types";
@@ -564,3 +568,5 @@ metaProposalsRoute.update({ component: ProposalQueue });
 metaProposalDetailRoute.update({ component: ProposalDetail });
 metaScoresRoute.update({ component: ScoreTrends });
 metaSettingsRoute.update({ component: MetaSettings });
+libraryRoute.update({ component: LibraryPage });
+libraryDetailRoute.update({ component: LibraryDetail });
