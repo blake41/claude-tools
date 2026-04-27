@@ -60,18 +60,14 @@ export interface AlwaysOnUsage {
 export type UsageResult = UsageStats | AlwaysOnUsage;
 
 function fetchRowsForArtifact(artifact: LibraryArtifact): UsageRow[] {
-  if (artifact.type === "skill") {
-    return skillUsageStmt.all(artifact.name) as UsageRow[];
-  }
-  if (artifact.type === "agent") {
-    return agentUsageStmt.all(artifact.name) as UsageRow[];
-  }
-  if (artifact.type === "command") {
-    const exact = `/${artifact.name}`;
-    const prefix = `/${artifact.name} %`;
-    return commandUsageStmt.all(exact, prefix) as UsageRow[];
-  }
-  return [];
+  // Union all three event sources by name — see bulkUsageStats for rationale.
+  const exact = `/${artifact.name}`;
+  const prefix = `/${artifact.name} %`;
+  const rows: UsageRow[] = [];
+  rows.push(...(skillUsageStmt.all(artifact.name) as UsageRow[]));
+  rows.push(...(agentUsageStmt.all(artifact.name) as UsageRow[]));
+  rows.push(...(commandUsageStmt.all(exact, prefix) as UsageRow[]));
+  return rows;
 }
 
 export function isAlwaysOn(artifact: LibraryArtifact): boolean {
@@ -212,7 +208,17 @@ export function invalidateUsageCache(): void {
   commandAggCacheAt = 0;
 }
 
-export function bulkUsageStats(artifacts: LibraryArtifact[]): Map<string, { total: number; last_used: string | null }> {
+export interface UsageBucket {
+  total: number;
+  // Sum of direct invocations of every artifact that references this one
+  // (one-hop transitive credit, no cycle handling needed at depth 1). Lets
+  // commands like /architect-tasks — never typed directly but invoked inside
+  // /ship's body — surface their actual usage.
+  indirect_total: number;
+  last_used: string | null;
+}
+
+export function bulkUsageStats(artifacts: LibraryArtifact[]): Map<string, UsageBucket> {
   // One aggregate fetch per tool type, then map artifact → stats by name.
   const skillRows = skillAggStmt.all() as Array<{ name: string | null; total: number; last_used: string | null }>;
   const agentRows = agentAggStmt.all() as Array<{ name: string | null; total: number; last_used: string | null }>;
@@ -226,17 +232,44 @@ export function bulkUsageStats(artifacts: LibraryArtifact[]): Map<string, { tota
   }
   const commandByName = getCommandAgg();
 
-  const result = new Map<string, { total: number; last_used: string | null }>();
+  // Pass 1: direct invocations per artifact. Sum across ALL three event
+  // sources because Claude Code's harness routes commands through the Skill
+  // tool too — e.g. when /ship's body says "use architect-tasks", a
+  // Skill('architect-tasks') tool call fires even though architect-tasks
+  // lives in commands/. Looking up only one source per type undercounted
+  // those events. Slight double-count when the user types /foo and the
+  // harness then routes it through Skill('foo') in the same session;
+  // accepted as <5% noise.
+  const direct = new Map<string, { total: number; last_used: string | null }>();
   for (const a of artifacts) {
     if (isAlwaysOn(a)) {
-      result.set(a.id, { total: 0, last_used: null });
+      direct.set(a.id, { total: 0, last_used: null });
       continue;
     }
-    let lookup: { total: number; last_used: string | null } | undefined;
-    if (a.type === "skill") lookup = skillByName.get(a.name);
-    else if (a.type === "agent") lookup = agentByName.get(a.name);
-    else if (a.type === "command") lookup = commandByName.get(a.name);
-    result.set(a.id, lookup ?? { total: 0, last_used: null });
+    const sources = [
+      skillByName.get(a.name),
+      agentByName.get(a.name),
+      commandByName.get(a.name),
+    ];
+    let total = 0;
+    let last_used: string | null = null;
+    for (const s of sources) {
+      if (!s) continue;
+      total += s.total;
+      if (s.last_used && (!last_used || s.last_used > last_used)) last_used = s.last_used;
+    }
+    direct.set(a.id, { total, last_used });
+  }
+
+  // Pass 2: indirect = sum of direct totals of artifacts pointing at this one.
+  const result = new Map<string, UsageBucket>();
+  for (const a of artifacts) {
+    const own = direct.get(a.id) ?? { total: 0, last_used: null };
+    let indirect = 0;
+    for (const ref of a.referencedByList) {
+      indirect += direct.get(ref.targetId)?.total ?? 0;
+    }
+    result.set(a.id, { total: own.total, indirect_total: indirect, last_used: own.last_used });
   }
   return result;
 }

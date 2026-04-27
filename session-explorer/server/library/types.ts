@@ -16,6 +16,15 @@ export interface ThinWrapper {
   match: string;
 }
 
+// A resolved invocation reference — the body mentions another artifact by
+// name (e.g. "Run the /plan-to-beads command"), and that name matches a known
+// skill/command/agent in the library. Unresolved candidates are dropped.
+export interface ArtifactReference {
+  targetType: LibraryType;
+  targetName: string;
+  targetId: string;
+}
+
 export interface LibraryArtifact {
   id: string;
   type: LibraryType;
@@ -30,7 +39,18 @@ export interface LibraryArtifact {
   frontmatter: Record<string, unknown>;
   body: string;
   thinWrapper: ThinWrapper | null;
+  references: ArtifactReference[];
+  // Mirror of `references`, computed in the linker — every other artifact
+  // that points at this one (body refs + thin-wrapper inbound). The list
+  // endpoint exposes this so rows can show "← N" with names in a tooltip.
+  referencedByList: ArtifactReference[];
   parseError?: string;
+  /**
+   * Internal: candidate reference names extracted from the body during scan.
+   * Consumed and removed by the linker pass in cache.ts. Never exposed via
+   * the API — never survives a full loadLibrary().
+   */
+  _refCandidates?: string[];
 }
 
 export function encodeArtifactId(type: LibraryType, scope: LibraryScope, name: string): string {

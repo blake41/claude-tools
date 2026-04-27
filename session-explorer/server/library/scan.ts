@@ -3,7 +3,12 @@ import { join, relative, basename, dirname } from "path";
 import { homedir } from "os";
 import matter from "gray-matter";
 import db from "../db.js";
-import type { LibraryArtifact, LibraryScope, LibraryType, ThinWrapper } from "./types.js";
+import type {
+  LibraryArtifact,
+  LibraryScope,
+  LibraryType,
+  ThinWrapper,
+} from "./types.js";
 import { encodeArtifactId } from "./types.js";
 
 const HOME = homedir();
@@ -140,6 +145,22 @@ function detectThinWrapper(type: LibraryType, body: string): ThinWrapper | null 
   return null;
 }
 
+// Extract every slash-style reference from the body (e.g. "/plan-to-beads",
+// "/qa:contract:tests"). These are unresolved candidates — the cache layer
+// validates them against the actual library and drops anything that doesn't
+// match a real artifact. Char set is intentionally narrow (letters, digits,
+// hyphens, colons) so URLs, file paths, and code tokens like "/api" don't
+// have to be hand-blacklisted; instead they fail to resolve and disappear.
+function extractReferenceCandidates(body: string): string[] {
+  const out = new Set<string>();
+  const re = /\/([A-Za-z][A-Za-z0-9-]*(?::[A-Za-z][A-Za-z0-9-]*)*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    out.add(m[1]);
+  }
+  return [...out];
+}
+
 function deriveDescription(frontmatter: Record<string, unknown>, body: string): string | null {
   const fmDesc = frontmatter.description;
   if (typeof fmDesc === "string" && fmDesc.trim()) return fmDesc.trim();
@@ -205,6 +226,9 @@ function parseArtifact(
     frontmatter,
     body,
     thinWrapper: detectThinWrapper(type, body),
+    references: [],
+    referencedByList: [],
+    _refCandidates: extractReferenceCandidates(body),
     parseError,
   };
 }
@@ -315,6 +339,8 @@ function buildHookArtifact(filePath: string, name: string, scope: LibraryScope):
     frontmatter: truncated ? { truncated: true } : {},
     body,
     thinWrapper: null,
+    references: [],
+    referencedByList: [],
     parseError: undefined,
   };
 }
@@ -355,6 +381,34 @@ interface WorkspaceRow {
   display_name: string;
 }
 
+// Resolve a workspace path to its canonical "main repo" path. A git worktree
+// has `.git` as a file containing `gitdir: <main>/.git/worktrees/<name>`; the
+// main checkout has `.git` as a directory. Non-git paths return themselves.
+function resolveMainRepo(workspacePath: string): string {
+  const gitPath = join(workspacePath, ".git");
+  if (!existsSync(gitPath)) return workspacePath;
+  let stat: import("fs").Stats;
+  try {
+    stat = statSync(gitPath);
+  } catch {
+    return workspacePath;
+  }
+  if (stat.isDirectory()) return workspacePath;
+  if (!stat.isFile()) return workspacePath;
+  try {
+    const content = readFileSync(gitPath, "utf-8").trim();
+    const m = content.match(/^gitdir:\s*(.+)$/);
+    if (m) {
+      const gitdir = m[1].trim();
+      const idx = gitdir.indexOf("/.git/worktrees/");
+      if (idx > 0) return gitdir.slice(0, idx);
+    }
+  } catch {
+    // unreadable .git file — treat as standalone
+  }
+  return workspacePath;
+}
+
 function scanProjects(out: LibraryArtifact[]) {
   let rows: WorkspaceRow[] = [];
   try {
@@ -362,16 +416,29 @@ function scanProjects(out: LibraryArtifact[]) {
   } catch {
     return;
   }
+  // Group workspaces by their canonical main-repo path so worktrees of the
+  // same repo collapse to a single scanned copy.
+  const byMainRepo = new Map<string, WorkspaceRow[]>();
   for (const row of rows) {
-    if (!row.path || !existsSync(row.path)) continue;
-    const projectClaude = join(row.path, ".claude");
+    if (!row.path) continue;
+    const main = resolveMainRepo(row.path);
+    const list = byMainRepo.get(main) ?? [];
+    list.push(row);
+    byMainRepo.set(main, list);
+  }
+  for (const [mainRepo, group] of byMainRepo) {
+    // Prefer the row whose path is the main checkout itself; otherwise pick
+    // any worktree from the group (the file content is identical across them).
+    const canonical = group.find((r) => r.path === mainRepo) ?? group[0];
+    if (!canonical.path || !existsSync(canonical.path)) continue;
+    const projectClaude = join(canonical.path, ".claude");
     if (!existsSync(projectClaude)) continue;
     // Don't double-count globals: if a workspace path is the user's home, its .claude IS the global dir.
     if (projectClaude === CLAUDE_DIR) continue;
     const scope: LibraryScope = {
       kind: "project",
-      workspacePath: row.path,
-      workspaceName: row.display_name,
+      workspacePath: canonical.path,
+      workspaceName: canonical.display_name,
     };
     scanTypeDir(join(projectClaude, "skills"), "skill", scope, out);
     scanTypeDir(join(projectClaude, "agents"), "agent", scope, out);

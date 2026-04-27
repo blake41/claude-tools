@@ -326,6 +326,58 @@ function SortHeader({
   );
 }
 
+function RelationshipBadge({
+  kind,
+  count,
+  names,
+}: {
+  kind: "in" | "out";
+  count: number;
+  names: string[];
+}) {
+  const verb = kind === "out" ? "Invokes" : "Invoked by";
+  const tooltip = `${verb} ${count}:\n${names.map((n) => `• ${n}`).join("\n")}`;
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-1.5 py-px text-[10px] rounded bg-white/5 border border-border/40 text-text-secondary font-normal"
+      title={tooltip}
+    >
+      <svg width="9" height="9" viewBox="0 0 16 16" fill="none">
+        {kind === "out" ? (
+          <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        ) : (
+          <path d="M13 8H3M7 4l-4 4 4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        )}
+      </svg>
+      {count}
+    </span>
+  );
+}
+
+// Renders the Invocations cell. Direct = times the slash/skill/agent was
+// invoked at the harness level. Indirect = sum of direct invocations of
+// artifacts whose body references this one, attributing usage to commands
+// like /architect-tasks that run inside /ship rather than being typed.
+function InvocationCell({ item }: { item: LibraryListItem }) {
+  const direct = item.total_invocations ?? 0;
+  const indirect = item.indirect_invocations ?? 0;
+  if (direct === 0 && indirect === 0) return <>—</>;
+  const tooltipParts = [
+    `Direct: ${direct}`,
+    indirect > 0 ? `Indirect: ${indirect} (via ${item.referencedByList.map((r) => r.targetName).join(", ")})` : null,
+  ].filter(Boolean);
+  return (
+    <span title={tooltipParts.join("\n")} className="inline-flex items-baseline gap-1">
+      <span>{direct}</span>
+      {indirect > 0 && (
+        <span className="text-text-dim/70 text-[11px]" aria-label="indirect invocations">
+          +{indirect}↩
+        </span>
+      )}
+    </span>
+  );
+}
+
 function ArtifactRow({ item }: { item: LibraryListItem }) {
   return (
     <tr className="border-b border-border/20 hover:bg-white/3 transition-colors">
@@ -356,6 +408,30 @@ function ArtifactRow({ item }: { item: LibraryListItem }) {
                 {item.thinWrapper.targetName}
               </span>
             )}
+            {item.references.length > 0 && (
+              <RelationshipBadge
+                kind="out"
+                count={item.references.length}
+                names={item.references.map((r) => r.targetName)}
+              />
+            )}
+            {item.referencedByList.length > 0 && (
+              <RelationshipBadge
+                kind="in"
+                count={item.referencedByList.length}
+                names={item.referencedByList.map((r) => r.targetName)}
+              />
+            )}
+            {item.inspiration && (
+              <span
+                className="inline-flex items-center text-amber-400/80"
+                title={`Inspired by: ${item.inspiration}`}
+              >
+                <svg width="11" height="11" viewBox="0 0 16 16" fill="none">
+                  <path d="M8 1.5v2M3.5 3.5l1.4 1.4M12.5 3.5l-1.4 1.4M2 8h2M12 8h2M5.5 12.5h5M6 14h4M5 10.5a3 3 0 116 0c0 .8-.4 1.5-1 2h-4c-.6-.5-1-1.2-1-2z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+            )}
           </div>
           {item.description && (
             <div className="text-[12px] text-text-dim mt-0.5 line-clamp-1">{item.description}</div>
@@ -380,7 +456,7 @@ function ArtifactRow({ item }: { item: LibraryListItem }) {
         {item.last_used ? formatRelative(item.last_used) : "—"}
       </td>
       <td className="px-2 py-2.5 text-[12px] text-text-dim font-mono">
-        {item.total_invocations ?? "—"}
+        <InvocationCell item={item} />
       </td>
       <td className="px-2 py-2.5 text-[12px] text-text-dim font-mono">
         {new Date(item.created).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" })}

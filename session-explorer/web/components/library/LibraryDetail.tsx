@@ -138,6 +138,18 @@ export default function LibraryDetail() {
         </div>
       )}
 
+      {artifact.inspiration && (
+        <div className="mb-3 px-3 py-2 bg-amber-500/8 border border-amber-500/25 rounded-md flex items-start gap-2.5">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="text-amber-400 shrink-0 mt-0.5">
+            <path d="M8 1.5v2M3.5 3.5l1.4 1.4M12.5 3.5l-1.4 1.4M2 8h2M12 8h2M5.5 12.5h5M6 14h4M5 10.5a3 3 0 116 0c0 .8-.4 1.5-1 2h-4c-.6-.5-1-1.2-1-2z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="text-[12px] text-text-secondary flex-1">
+            <span className="text-text-dim">Inspired by:</span>{" "}
+            <InspirationText value={artifact.inspiration} />
+          </div>
+        </div>
+      )}
+
       <p className="font-mono text-[11px] text-text-dim mb-3">{artifact.sourcePath}</p>
 
       {/* Action buttons */}
@@ -243,7 +255,77 @@ export default function LibraryDetail() {
           <SiblingList items={artifact.wrappedBy} />
         </section>
       )}
+
+      {artifact.references.length > 0 && (
+        <section className="border-t border-border/40 pt-6 mt-6">
+          <h2 className="text-[12px] font-semibold uppercase tracking-wider text-text-dim mb-3">
+            Invokes
+            <span className="ml-1.5 text-text-dim normal-case font-normal tracking-normal">
+              ({artifact.references.length} other artifact{artifact.references.length === 1 ? "" : "s"} referenced in this body)
+            </span>
+          </h2>
+          <ReferenceList items={artifact.references} />
+        </section>
+      )}
+
+      {artifact.referencedBy && artifact.referencedBy.length > 0 && (
+        <section className="border-t border-border/40 pt-6 mt-6">
+          <h2 className="text-[12px] font-semibold uppercase tracking-wider text-text-dim mb-3">
+            Invoked by
+            <span className="ml-1.5 text-text-dim normal-case font-normal tracking-normal">
+              ({artifact.referencedBy.length} artifact{artifact.referencedBy.length === 1 ? "" : "s"} reference this one)
+            </span>
+          </h2>
+          <SiblingList items={artifact.referencedBy} />
+        </section>
+      )}
     </div>
+  );
+}
+
+function ReferenceList({ items }: { items: LibraryArtifact["references"] }) {
+  return (
+    <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+      {items.map((ref) => (
+        <li key={ref.targetId}>
+          <Link
+            to="/library/$id"
+            params={{ id: ref.targetId }}
+            className="flex items-center justify-between gap-3 px-3 py-2 bg-white/3 border border-border/30 rounded-md no-underline text-text hover:bg-white/8 hover:no-underline"
+          >
+            <div className="text-[13px] truncate font-medium font-mono">{ref.targetName}</div>
+            <span
+              className={`shrink-0 inline-block px-1.5 py-0.5 text-[10px] rounded border font-medium uppercase tracking-wider ${typeBadgeColor(ref.targetType)}`}
+            >
+              {ref.targetType}
+            </span>
+          </Link>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function InspirationText({ value }: { value: string }) {
+  const parts = value.split(/(https?:\/\/\S+)/g).filter(Boolean);
+  return (
+    <>
+      {parts.map((part, i) =>
+        /^https?:\/\//.test(part) ? (
+          <a
+            key={i}
+            href={part}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-amber-300 hover:underline break-all"
+          >
+            {part}
+          </a>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </>
   );
 }
 

@@ -5,7 +5,7 @@ import { homedir } from "os";
 import { join } from "path";
 import db from "../db.js";
 import { getArtifact, listArtifacts, loadLibrary, getStatus } from "./cache.js";
-import { computeUsage, bulkUsageStats } from "./usage.js";
+import { computeUsage, bulkUsageStats, type UsageBucket } from "./usage.js";
 import type { LibraryArtifact } from "./types.js";
 
 const router = express.Router();
@@ -15,9 +15,14 @@ const CLAUDE_DIR = join(HOME, ".claude");
 // Drop body + frontmatter from list responses to keep payload small. Every
 // other artifact field flows through automatically — adding a column to
 // LibraryArtifact requires no edits here.
-function summarize(a: LibraryArtifact, usage?: { total: number; last_used: string | null }) {
+function summarize(a: LibraryArtifact, usage?: { total: number; indirect_total: number; last_used: string | null }) {
   const { body: _body, frontmatter: _fm, ...rest } = a;
-  return { ...rest, total_invocations: usage?.total, last_used: usage?.last_used };
+  return {
+    ...rest,
+    total_invocations: usage?.total,
+    indirect_invocations: usage?.indirect_total,
+    last_used: usage?.last_used,
+  };
 }
 
 function scopeKey(scope: LibraryArtifact["scope"]): string {
@@ -70,7 +75,7 @@ router.get("/api/library", (req, res) => {
 
   // For sorts that require usage, hydrate it
   const wantsUsage = sort === "last_used" || sort === "invocations" || hasUsage;
-  let usageMap: Map<string, { total: number; last_used: string | null }> | null = null;
+  let usageMap: Map<string, UsageBucket> | null = null;
   if (wantsUsage) {
     usageMap = bulkUsageStats(items);
     if (hasUsage) {
@@ -163,7 +168,13 @@ router.get("/api/library/:id", (req, res) => {
       .map((a) => summarize(a));
   }
 
-  res.json({ ...artifact, siblings, wrappedBy });
+  // Reverse links: which artifacts reference (invoke) this one in their body.
+  const referencedBy = listArtifacts()
+    .filter((a) => a.references.some((r) => r.targetId === artifact.id))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((a) => summarize(a));
+
+  res.json({ ...artifact, siblings, wrappedBy, referencedBy });
 });
 
 router.get("/api/library/:id/usage", (req, res) => {

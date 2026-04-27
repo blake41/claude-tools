@@ -12,6 +12,12 @@ export interface ThinWrapper {
   match: string;
 }
 
+export interface ArtifactReference {
+  targetType: LibraryType;
+  targetName: string;
+  targetId: string;
+}
+
 export interface LibraryListItem {
   id: string;
   type: LibraryType;
@@ -24,8 +30,14 @@ export interface LibraryListItem {
   created: string;
   inspiration: string | null;
   thinWrapper: ThinWrapper | null;
+  references: ArtifactReference[];
+  referencedByList: ArtifactReference[];
   parseError?: string;
   total_invocations?: number;
+  // One-hop transitive credit: invocations of artifacts whose body
+  // references this one. Useful for orchestration commands that never get
+  // typed directly (e.g. /architect-tasks invoked inside /ship's body).
+  indirect_invocations?: number;
   last_used?: string | null;
 }
 
@@ -34,6 +46,7 @@ export interface LibraryArtifact extends LibraryListItem {
   body: string;
   siblings?: LibraryListItem[];
   wrappedBy?: LibraryListItem[];
+  referencedBy?: LibraryListItem[];
 }
 
 export interface LibraryListResponse {
