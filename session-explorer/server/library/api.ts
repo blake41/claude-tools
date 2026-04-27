@@ -132,11 +132,38 @@ router.get("/api/library", (req, res) => {
     });
   }
 
-  // Build facet counts (over the un-narrowed-by-this-facet set, but post-includePlugins).
-  // Namespace counts also constrain by the current type filter — without it,
-  // namespaces from other types (e.g. skills) inflate the picker when the user
-  // has narrowed to commands.
-  const all = listArtifacts().filter((a) => includePlugins || a.scope.kind !== "plugin");
+  // Build facet counts. Each facet respects every active filter EXCEPT the one
+  // it represents, so picker counts reflect what the user would unlock by
+  // selecting a different value (or clearing the current one). includePlugins
+  // and the search query always apply — they aren't picker facets.
+  const all = listArtifacts().filter((a) => {
+    if (!includePlugins && a.scope.kind === "plugin") return false;
+    if (q) {
+      if (
+        !a.name.toLowerCase().includes(q) &&
+        !(a.description ?? "").toLowerCase().includes(q) &&
+        !a.body.toLowerCase().includes(q)
+      ) return false;
+    }
+    return true;
+  });
+  const matchesType = (a: LibraryArtifact) => !type || a.type === type;
+  const matchesScope = (a: LibraryArtifact) => !scope || a.scope.kind === scope;
+  const matchesNs = (a: LibraryArtifact) => {
+    if (ns === "__none__") return !a.namespace;
+    if (ns) return a.namespace === ns;
+    return true;
+  };
+  const matchesInspiration = (a: LibraryArtifact) => {
+    if (inspiration === "__has__") return !!a.inspiration;
+    if (inspiration) {
+      return (
+        !!a.inspiration &&
+        (a.inspiration === inspiration || inspirationSource(a.inspiration).key === inspiration)
+      );
+    }
+    return true;
+  };
   const typeCounts: Record<string, number> = {};
   const scopeCounts: Record<string, number> = {};
   const namespaceCounts: Record<string, number> = {};
@@ -146,15 +173,20 @@ router.get("/api/library", (req, res) => {
   let noNamespaceCount = 0;
   let inspirationCount = 0;
   for (const a of all) {
-    typeCounts[a.type] = (typeCounts[a.type] ?? 0) + 1;
-    scopeCounts[a.scope.kind] = (scopeCounts[a.scope.kind] ?? 0) + 1;
-    if (type && a.type !== type) continue;
-    if (a.namespace) {
-      namespaceCounts[a.namespace] = (namespaceCounts[a.namespace] ?? 0) + 1;
-    } else {
-      noNamespaceCount++;
+    if (matchesScope(a) && matchesNs(a) && matchesInspiration(a)) {
+      typeCounts[a.type] = (typeCounts[a.type] ?? 0) + 1;
     }
-    if (a.inspiration) {
+    if (matchesType(a) && matchesNs(a) && matchesInspiration(a)) {
+      scopeCounts[a.scope.kind] = (scopeCounts[a.scope.kind] ?? 0) + 1;
+    }
+    if (matchesType(a) && matchesScope(a) && matchesInspiration(a)) {
+      if (a.namespace) {
+        namespaceCounts[a.namespace] = (namespaceCounts[a.namespace] ?? 0) + 1;
+      } else {
+        noNamespaceCount++;
+      }
+    }
+    if (matchesType(a) && matchesScope(a) && matchesNs(a) && a.inspiration) {
       const { key, label } = inspirationSource(a.inspiration);
       const g = (inspirationGroups[key] ??= { count: 0, labels: {} });
       g.count++;
