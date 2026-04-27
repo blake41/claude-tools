@@ -318,16 +318,18 @@ function FilterChip({
 }) {
   return (
     <button
-      className={`flex items-center justify-between px-2 py-1 rounded text-[12px] text-left transition-colors ${
+      className={`flex items-center justify-between px-2.5 py-1 rounded-full text-[12px] text-left transition-colors ${
         active
-          ? "bg-accent-purple/15 text-accent-purple"
+          ? "bg-accent-purple text-bg font-semibold"
           : "text-text-secondary hover:bg-white/5 hover:text-text"
       }`}
       onClick={onClick}
       title={title}
     >
       <span className="truncate">{label}</span>
-      {count != null && <span className="text-[10px] text-text-dim ml-2 shrink-0">{count}</span>}
+      {count != null && (
+        <span className={`text-[10px] ml-2 shrink-0 ${active ? "text-bg/70" : "text-text-dim"}`}>{count}</span>
+      )}
     </button>
   );
 }
