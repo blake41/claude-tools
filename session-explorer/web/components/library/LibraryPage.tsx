@@ -5,6 +5,7 @@ import {
   type LibraryListItem,
   type LibraryListResponse,
   type LibraryType,
+  HAS_INSPIRATION,
   NO_NAMESPACE,
   formatRelative,
   namespaceBadgeColor,
@@ -51,6 +52,7 @@ export default function LibraryPage() {
     if (search.type) params.set("type", search.type);
     if (search.scope) params.set("scope", search.scope);
     if (search.ns) params.set("ns", search.ns);
+    if (search.inspiration) params.set("inspiration", search.inspiration);
     if (search.q) params.set("q", search.q);
     if (sort) params.set("sort", sort);
     if (includePlugins) params.set("include_plugins", "1");
@@ -59,7 +61,7 @@ export default function LibraryPage() {
       .then((d: LibraryListResponse) => setData(d))
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [search.type, search.scope, search.ns, search.q, sort, includePlugins]);
+  }, [search.type, search.scope, search.ns, search.inspiration, search.q, sort, includePlugins]);
 
   function setSearchParam(patch: Partial<typeof search>) {
     navigate({
@@ -82,6 +84,7 @@ export default function LibraryPage() {
         if (search.type) params.set("type", search.type);
         if (search.scope) params.set("scope", search.scope);
         if (search.ns) params.set("ns", search.ns);
+        if (search.inspiration) params.set("inspiration", search.inspiration);
         if (search.q) params.set("q", search.q);
         if (sort) params.set("sort", sort);
         if (includePlugins) params.set("include_plugins", "1");
@@ -97,6 +100,8 @@ export default function LibraryPage() {
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count);
   }, [data]);
+
+  const inspirations = data?.facets.inspiration ?? [];
 
   return (
     <div className="flex h-full">
@@ -175,6 +180,37 @@ export default function LibraryPage() {
             Include plugins
           </label>
         </div>
+
+        {inspirations.length > 0 && (
+          <FilterGroup label={`Inspiration (${inspirations.length})`}>
+            <FilterChip
+              active={!search.inspiration}
+              onClick={() => setSearchParam({ inspiration: undefined })}
+              label="All"
+              count={null}
+            />
+            {(data?.facets.inspirationCount ?? 0) > 0 && (
+              <FilterChip
+                active={search.inspiration === HAS_INSPIRATION}
+                onClick={() => setSearchParam({ inspiration: HAS_INSPIRATION })}
+                label="Has inspiration"
+                count={data!.facets.inspirationCount}
+              />
+            )}
+            <div className={inspirations.length > 5 ? "max-h-[240px] overflow-y-auto pr-1" : ""}>
+              {inspirations.map((ins) => (
+                <FilterChip
+                  key={ins.key}
+                  active={search.inspiration === ins.key}
+                  onClick={() => setSearchParam({ inspiration: ins.key })}
+                  label={ins.label}
+                  count={ins.count}
+                  title={`${ins.label} (${ins.key})`}
+                />
+              ))}
+            </div>
+          </FilterGroup>
+        )}
 
         {(namespaces.length > 0 || (data?.facets.noNamespace ?? 0) > 0) && (
           <FilterGroup label={`Namespace (${namespaces.length})`}>
@@ -272,11 +308,13 @@ function FilterChip({
   onClick,
   label,
   count,
+  title,
 }: {
   active: boolean;
   onClick: () => void;
   label: string;
   count: number | null;
+  title?: string;
 }) {
   return (
     <button
@@ -286,6 +324,7 @@ function FilterChip({
           : "text-text-secondary hover:bg-white/5 hover:text-text"
       }`}
       onClick={onClick}
+      title={title}
     >
       <span className="truncate">{label}</span>
       {count != null && <span className="text-[10px] text-text-dim ml-2 shrink-0">{count}</span>}

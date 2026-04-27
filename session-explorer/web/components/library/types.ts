@@ -57,6 +57,8 @@ export interface LibraryListResponse {
     scope: Record<string, number>;
     namespace: Record<string, number>;
     noNamespace: number;
+    inspiration: Array<{ key: string; label: string; count: number }>;
+    inspirationCount: number;
   };
   status: { count: number; lastScanAt: string | null; durationMs: number };
 }
@@ -64,6 +66,10 @@ export interface LibraryListResponse {
 // Sentinel used in the `ns` query param to filter to artifacts that have no
 // namespace at all. The API recognizes this string explicitly.
 export const NO_NAMESPACE = "__none__";
+
+// Sentinel used in the `inspiration` query param to filter to artifacts that
+// have *any* inspiration source set. The API recognizes this string explicitly.
+export const HAS_INSPIRATION = "__has__";
 
 // Color buckets for namespace badges — picked deterministically by hashing the
 // namespace name so the same namespace always renders the same color.

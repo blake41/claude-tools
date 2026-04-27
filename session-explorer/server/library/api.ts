@@ -38,10 +38,34 @@ function toBool(v: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+// Group inspiration strings by source. Two skills imported from the same
+// upstream (e.g. Jeffrey's) should land under one chip even though their
+// per-skill URLs differ. Source key = host, plus owner segment for
+// multi-author hubs (github.com, skills.sh, gitlab.com). Label = the human
+// prefix before " — " in the inspiration string (falls back to host).
+const MULTI_AUTHOR_HOSTS = new Set(["github.com", "gitlab.com", "skills.sh"]);
+
+function inspirationSource(s: string): { key: string; label: string } {
+  const sepIdx = s.search(/\s+—\s+/);
+  const label = (sepIdx > 0 ? s.slice(0, sepIdx) : s).trim();
+  const urlMatch = s.match(/https?:\/\/[^\s]+/);
+  if (!urlMatch) return { key: s, label: label || s };
+  try {
+    const u = new URL(urlMatch[0]);
+    const host = u.hostname.replace(/^www\./, "");
+    const segs = u.pathname.split("/").filter(Boolean);
+    const key = MULTI_AUTHOR_HOSTS.has(host) && segs[0] ? `${host}/${segs[0]}` : host;
+    return { key, label: label || key };
+  } catch {
+    return { key: s, label: label || s };
+  }
+}
+
 router.get("/api/library", (req, res) => {
   const type = req.query.type as string | undefined;
   const scope = req.query.scope as string | undefined; // 'global' | 'plugin' | 'project'
   const ns = req.query.ns as string | undefined;
+  const inspiration = req.query.inspiration as string | undefined;
   const q = (req.query.q as string | undefined)?.toLowerCase();
   const sort = (req.query.sort as string | undefined) ?? "last_used";
   const includePlugins = toBool(req.query.include_plugins, false);
@@ -63,6 +87,15 @@ router.get("/api/library", (req, res) => {
   } else if (ns) {
     items = items.filter((a) => a.namespace === ns);
   }
+  if (inspiration === "__has__") {
+    items = items.filter((a) => !!a.inspiration);
+  } else if (inspiration) {
+    items = items.filter(
+      (a) =>
+        !!a.inspiration &&
+        (a.inspiration === inspiration || inspirationSource(a.inspiration).key === inspiration)
+    );
+  }
   if (q) {
     items = items.filter((a) => {
       return (
@@ -73,14 +106,12 @@ router.get("/api/library", (req, res) => {
     });
   }
 
-  // For sorts that require usage, hydrate it
-  const wantsUsage = sort === "last_used" || sort === "invocations" || hasUsage;
-  let usageMap: Map<string, UsageBucket> | null = null;
-  if (wantsUsage) {
-    usageMap = bulkUsageStats(items);
-    if (hasUsage) {
-      items = items.filter((a) => (usageMap!.get(a.id)?.total ?? 0) > 0);
-    }
+  // Always hydrate usage — every row's "Last used" and "Invocations" columns
+  // depend on it, regardless of sort. bulkUsageStats is cheap (one aggregate
+  // query per tool type + a 60s-cached slash-command scan).
+  const usageMap: Map<string, UsageBucket> = bulkUsageStats(items);
+  if (hasUsage) {
+    items = items.filter((a) => (usageMap.get(a.id)?.total ?? 0) > 0);
   }
 
   // Sort
@@ -90,12 +121,12 @@ router.get("/api/library", (req, res) => {
   } else if (sort === "created") {
     items.sort((a, b) => (b.created ?? "").localeCompare(a.created ?? ""));
   } else if (sort === "invocations") {
-    items.sort((a, b) => (usageMap!.get(b.id)?.total ?? 0) - (usageMap!.get(a.id)?.total ?? 0));
+    items.sort((a, b) => (usageMap.get(b.id)?.total ?? 0) - (usageMap.get(a.id)?.total ?? 0));
   } else {
     // last_used (default) — most-recently-used first; never-used go last
     items.sort((a, b) => {
-      const aLast = usageMap!.get(a.id)?.last_used ?? "";
-      const bLast = usageMap!.get(b.id)?.last_used ?? "";
+      const aLast = usageMap.get(a.id)?.last_used ?? "";
+      const bLast = usageMap.get(b.id)?.last_used ?? "";
       if (aLast === bLast) return a.name.localeCompare(b.name);
       return bLast.localeCompare(aLast);
     });
@@ -109,7 +140,11 @@ router.get("/api/library", (req, res) => {
   const typeCounts: Record<string, number> = {};
   const scopeCounts: Record<string, number> = {};
   const namespaceCounts: Record<string, number> = {};
+  // Per source-key: total count and label-frequency map (so we can pick the
+  // most common label as the display name when sub-skill labels diverge).
+  const inspirationGroups: Record<string, { count: number; labels: Record<string, number> }> = {};
   let noNamespaceCount = 0;
+  let inspirationCount = 0;
   for (const a of all) {
     typeCounts[a.type] = (typeCounts[a.type] ?? 0) + 1;
     scopeCounts[a.scope.kind] = (scopeCounts[a.scope.kind] ?? 0) + 1;
@@ -119,16 +154,34 @@ router.get("/api/library", (req, res) => {
     } else {
       noNamespaceCount++;
     }
+    if (a.inspiration) {
+      const { key, label } = inspirationSource(a.inspiration);
+      const g = (inspirationGroups[key] ??= { count: 0, labels: {} });
+      g.count++;
+      g.labels[label] = (g.labels[label] ?? 0) + 1;
+      inspirationCount++;
+    }
   }
+  const inspirationFacet = Object.entries(inspirationGroups)
+    .map(([key, g]) => {
+      // Pick the most common label; tie-break alphabetically for determinism.
+      const label = Object.entries(g.labels).sort(
+        (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+      )[0][0];
+      return { key, label, count: g.count };
+    })
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
   res.json({
-    items: items.map((a) => summarize(a, usageMap?.get(a.id))),
+    items: items.map((a) => summarize(a, usageMap.get(a.id))),
     total: items.length,
     facets: {
       type: typeCounts,
       scope: scopeCounts,
       namespace: namespaceCounts,
       noNamespace: noNamespaceCount,
+      inspiration: inspirationFacet,
+      inspirationCount,
     },
     status: getStatus(),
   });

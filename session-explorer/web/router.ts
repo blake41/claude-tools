@@ -84,6 +84,7 @@ export interface LibrarySearch {
   type?: string;
   scope?: string;
   ns?: string;
+  inspiration?: string;
   q?: string;
   sort?: string;
   include_plugins?: boolean;
@@ -96,6 +97,7 @@ export const libraryRoute = createRoute({
     type: (search.type as string) || undefined,
     scope: (search.scope as string) || undefined,
     ns: (search.ns as string) || undefined,
+    inspiration: (search.inspiration as string) || undefined,
     q: (search.q as string) || undefined,
     sort: (search.sort as string) || undefined,
     include_plugins: search.include_plugins === true || search.include_plugins === "true",
