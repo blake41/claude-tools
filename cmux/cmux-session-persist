@@ -1,11 +1,13 @@
 #!/bin/bash
-# Persist Claude session → cmux workspace/surface mapping on SessionStart.
-# Preferred path: CMUX_SESSION_KEY_HASH is already set by cco-permissions from
-# the pre-Claude surface name.
-# Fallback path: compute from `cmux identify` (for bare `claude` without cco).
+# Persist Claude session → cmux panel UUID mapping on SessionStart.
 #
-# Also writes a reverse index at by-session/<session_id> so `cco-permissions`
-# can heal renamed tabs by matching workspace_ref + surface_ref.
+# Identity: $CMUX_PANEL_ID (exported by cmux into every terminal).
+# This UUID survives renames, restarts, and auto-titles — it's tied to
+# the panel itself, not to any volatile string the panel happens to display.
+#
+# Writes:
+#   ~/.cmux/claude-sessions/<panel-uuid>            → <session_id>
+#   ~/.cmux/claude-sessions/by-session/<session_id> → JSON metadata (for history)
 
 MAPPING_DIR="$HOME/.cmux/claude-sessions"
 BY_SESSION_DIR="$MAPPING_DIR/by-session"
@@ -16,19 +18,19 @@ log() { echo "$(date '+%H:%M:%S') $1" >> "$LOG" 2>/dev/null; }
 
 log "INVOKED pid=$$ ppid=$PPID"
 
-# Must be inside cmux
-if [ -z "$CMUX_SURFACE_ID" ]; then log "SKIP: no CMUX_SURFACE_ID"; exit 0; fi
+if [ -z "$CMUX_PANEL_ID" ]; then
+  log "SKIP: no CMUX_PANEL_ID (not running inside cmux)"
+  exit 0
+fi
 
 # Read session_id from stdin JSON (Claude Code sends this on SessionStart)
 SESSION_ID=""
 if read -t 2 INPUT 2>/dev/null && [ -n "$INPUT" ]; then
   SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
   log "stdin: session_id=$SESSION_ID"
-else
-  log "stdin: empty or timed out"
 fi
 
-# Fallback for session ID: read from session file by PPID
+# Fallback: read from session file by PPID
 if [ -z "$SESSION_ID" ]; then
   SESSION_FILE="$HOME/.claude/sessions/$PPID.json"
   if [ -f "$SESSION_FILE" ]; then
@@ -37,82 +39,42 @@ if [ -z "$SESSION_ID" ]; then
   fi
 fi
 
-[ -z "$SESSION_ID" ] && { log "FAIL: no session_id found"; exit 0; }
+[ -z "$SESSION_ID" ] && { log "FAIL: no session_id"; exit 0; }
 
-# Always capture cmux refs so we can write the reverse index and (if needed)
-# recompute the key on the fallback path.
-WORKSPACE_REF=""
-SURFACE_REF=""
+# Primary mapping: panel UUID → session id.
+echo "$SESSION_ID" > "$MAPPING_DIR/$CMUX_PANEL_ID"
+log "OK: panel=$CMUX_PANEL_ID -> $SESSION_ID"
+
+# Secondary index: capture display names for cmux-session-history readability.
+# Failures here are non-fatal — the primary mapping above is the source of truth.
 WORKSPACE_NAME=""
 SURFACE_NAME=""
 if command -v cmux >/dev/null 2>&1; then
   IDENTIFY=$(cmux identify 2>/dev/null) || true
   if [ -n "$IDENTIFY" ]; then
-    WORKSPACE_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
-    SURFACE_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
-    WORKSPACE_NAME=$(cmux list-workspaces 2>/dev/null | grep "$WORKSPACE_REF " | sed "s/^[* ]*$WORKSPACE_REF  //" | sed 's/  \[selected\]//')
-    SURFACE_NAME=$(cmux list-pane-surfaces 2>/dev/null | grep "$SURFACE_REF " | sed "s/^[* ]*$SURFACE_REF  //" | sed 's/  \[selected\]//')
+    WS_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
+    SF_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
+    [ -n "$WS_REF" ] && WORKSPACE_NAME=$(cmux list-workspaces 2>/dev/null | grep "$WS_REF " | sed "s/^[* ]*$WS_REF  //" | sed 's/  \[selected\]//')
+    [ -n "$SF_REF" ] && SURFACE_NAME=$(cmux list-pane-surfaces 2>/dev/null | grep "$SF_REF " | sed "s/^[* ]*$SF_REF  //" | sed 's/  \[selected\]//')
   fi
 fi
 
-# Use pre-computed hash from cco-permissions (preferred — uses pre-Claude surface name).
-KEY_HASH="${CMUX_SESSION_KEY_HASH:-}"
-KEY_STRING=""
-HUMAN_FLAG=""
-
-# Fallback: compute from the names we just captured. This runs for bare
-# `claude` invocations (no cco-permissions wrapper) and is unavoidably
-# polluted by claude having already changed the terminal title.
-if [ -z "$KEY_HASH" ] && [ -n "$WORKSPACE_NAME" ] && [ -n "$SURFACE_NAME" ] && command -v cmux-session-key >/dev/null 2>&1; then
-  KEY_OUT=$(printf '%s\n%s\n' "$WORKSPACE_NAME" "$SURFACE_NAME" | cmux-session-key)
-  KEY_STRING=$(echo "$KEY_OUT" | sed -n '1p')
-  KEY_HASH=$(echo "$KEY_OUT" | sed -n '2p')
-  HUMAN_FLAG=$(echo "$KEY_OUT" | sed -n '3p')
-  log "computed key: $KEY_STRING (hash=$KEY_HASH human=$HUMAN_FLAG)"
-  # Don't write a by-name mapping for non-human names — those hashes are
-  # unstable (claude title / spinner frame) and would just pollute the store.
-  if [ "$HUMAN_FLAG" != "1" ]; then
-    log "SKIP by-name: fallback key '$KEY_STRING' is non-human"
-    KEY_HASH=""
-  fi
-fi
-
-# Write by-name mapping when we have a hash
-if [ -n "$KEY_HASH" ]; then
-  echo "$SESSION_ID" > "$MAPPING_DIR/$KEY_HASH"
-  log "OK: hash=$KEY_HASH -> $SESSION_ID"
-fi
-
-# Always write the by-session reverse index when we have cmux refs — this is
-# what lets cco-permissions heal renamed tabs (surface_ref stays stable within
-# a cmux process lifetime even when the human name changes).
-if [ -n "$SURFACE_REF" ] && [ -n "$WORKSPACE_REF" ]; then
-  SESSION_ID="$SESSION_ID" \
-  WORKSPACE_REF="$WORKSPACE_REF" \
-  SURFACE_REF="$SURFACE_REF" \
-  WORKSPACE_NAME="$WORKSPACE_NAME" \
-  SURFACE_NAME="$SURFACE_NAME" \
-  KEY_STRING="$KEY_STRING" \
-  KEY_HASH="$KEY_HASH" \
-  BY_SESSION_DIR="$BY_SESSION_DIR" \
-  python3 -c "
+SESSION_ID="$SESSION_ID" \
+PANEL_ID="$CMUX_PANEL_ID" \
+WORKSPACE_NAME="$WORKSPACE_NAME" \
+SURFACE_NAME="$SURFACE_NAME" \
+BY_SESSION_DIR="$BY_SESSION_DIR" \
+python3 -c "
 import json, os, time
 entry = {
     'session_id': os.environ['SESSION_ID'],
-    'workspace_ref': os.environ['WORKSPACE_REF'],
-    'surface_ref': os.environ['SURFACE_REF'],
+    'panel_id': os.environ['PANEL_ID'],
     'workspace_name': os.environ.get('WORKSPACE_NAME', ''),
     'surface_name': os.environ.get('SURFACE_NAME', ''),
-    'key': os.environ.get('KEY_STRING', ''),
-    'hash': os.environ.get('KEY_HASH', ''),
     'ts': time.time(),
 }
-path = os.path.join(os.environ['BY_SESSION_DIR'], os.environ['SESSION_ID'])
-with open(path, 'w') as f:
+with open(os.path.join(os.environ['BY_SESSION_DIR'], os.environ['SESSION_ID']), 'w') as f:
     json.dump(entry, f)
-" && log "by-session: wrote $SESSION_ID (ws_ref=$WORKSPACE_REF sf_ref=$SURFACE_REF)" \
-    || log "by-session: write FAILED for $SESSION_ID"
-fi
+" 2>/dev/null && log "by-session: wrote $SESSION_ID"
 
-[ -z "$KEY_HASH" ] && { log "FAIL: no key hash (by-session still written if refs available)"; exit 0; }
 exit 0
