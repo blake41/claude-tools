@@ -14,6 +14,10 @@
 #                   usual CCO_SESSION_ID / cmux auto-resume / browser preflight
 #                   still in place. Use when the sandbox is getting in the way
 #                   of an exploratory session.
+#   --name <name>   Set the cmux tab name to <name> before launching, so the
+#                   session is persisted under that name (instead of cmux's
+#                   auto-title showing the running command). Useful for fresh
+#                   tabs that haven't been renamed yet.
 
 function cco-permissions
     # Pull out our own flags before touching $argv further.
@@ -22,6 +26,24 @@ function cco-permissions
         set skip_sandbox true
         set argv (string match -v -- --no-sandbox $argv)
     end
+
+    set -l explicit_name ""
+    set -l prev ""
+    set -l filtered_argv
+    for i in $argv
+        if test "$prev" = "--name"
+            set explicit_name $i
+            set prev $i
+            continue
+        end
+        if test "$i" = "--name"
+            set prev $i
+            continue
+        end
+        set -a filtered_argv $i
+        set prev $i
+    end
+    set argv $filtered_argv
 
     # Parse --resume/--continue from argv
     set -l session_id ""
@@ -53,6 +75,16 @@ function cco-permissions
         else
             set -l ws_ref (echo "$identify" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
             set -l sf_ref (echo "$identify" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
+
+            # If --name was passed, rename the surface NOW so the human-name
+            # capture below picks up the new name. Otherwise an unnamed tab
+            # gets cmux's auto-title (the running command), which the human
+            # filter rejects, so the session never gets persisted by name.
+            if test -n "$explicit_name" -a -n "$sf_ref"
+                cmux rename-tab --surface $sf_ref -- $explicit_name >/dev/null 2>&1
+                or echo "cmux: rename-tab failed for $sf_ref → '$explicit_name'" >&2
+            end
+
             set -l ws_name (cmux list-workspaces 2>/dev/null | grep "$ws_ref " | sed "s/^[* ]*$ws_ref  //" | sed 's/  \[selected\]//')
             set -l sf_name (cmux list-pane-surfaces 2>/dev/null | grep "$sf_ref " | sed "s/^[* ]*$sf_ref  //" | sed 's/  \[selected\]//')
             if test -z "$ws_name" -o -z "$sf_name"
@@ -66,7 +98,14 @@ function cco-permissions
                 set -l is_human_name $key_out[3]
 
                 if test "$is_human_name" != "1"
-                    echo "cmux: '$cmux_norm_key' looks non-human — not auto-resuming"
+                    echo "cmux: '$cmux_norm_key' looks non-human — not auto-resuming."
+                    echo "      Rename the tab in cmux (right-click → Rename) to enable persistence,"
+                    echo "      then re-run cco-permissions. This session will not be saved by name."
+                    # Critical: wipe the hash so we don't export a non-human key to the
+                    # persist hook. If we exported it, SessionStart would write a mapping
+                    # under e.g. 'Keystone/Claude Code' (claude's auto-title), and on next
+                    # boot the user-named tab would never find its way back to that key.
+                    set cmux_key_hash ""
                 else if test "$has_resume_flag" = true
                     echo "cmux: '$cmux_norm_key' hash=$cmux_key_hash (--resume flag present, skipping lookup)"
                 else
@@ -148,9 +187,14 @@ function cco-permissions
     # Everything else (CCO_SESSION_ID, auto-resume, --dangerously-skip-permissions)
     # stays in place.
     if $skip_sandbox
+        # Tell the statusline we're NOT in seatbelt. Without this it falls
+        # back to "is CCO_SESSION_ID set?" which is true in both modes and
+        # would show the lock icon misleadingly.
+        set -gx CCO_SANDBOX_OFF 1
         claude --dangerously-skip-permissions $extra_args $argv
         set -e CCO_SESSION_ID
         set -e CMUX_SESSION_KEY_HASH
+        set -e CCO_SANDBOX_OFF
         return
     end
 

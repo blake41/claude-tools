@@ -50,6 +50,18 @@ def is_human(name: str) -> bool:
         return False
     if re.match(r"^claude\s+-", name):
         return False
+    # cmux auto-titles freshly-opened tabs with the running command, e.g.:
+    #   "cco-permissions --re ~/D/D/c/terra"
+    #   "claude --resume abc123 ~/D/D/c/terra"
+    #   "bun run dev:local"
+    # These look human at first glance but are ephemeral and will change as
+    # soon as the user renames the tab. Reject anything that looks like a
+    # shell command invocation: contains " --" (a long flag) or " ~/" (a
+    # home-rooted path arg) or " -<letter> " (a short flag).
+    if " --" in name or " ~/" in name:
+        return False
+    if re.search(r"\s-[a-zA-Z]\b", name):
+        return False
     # Shell prompt leaking into the title: starts with a path
     if name.startswith("~") or name.startswith("/"):
         return False
