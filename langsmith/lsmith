@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# lsmith - LangSmith CLI for AI agents
+# Read-only debug surface: project list, trace list, trace get, run get.
+# API surface lifted from langchain-ai/langsmith-cli (Go), reimplemented
+# in bash + cli-envelope.sh.
+
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="lsmith"
+CONFIG_DIR="${HOME}/.config/langsmith"
+API_BASE="${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}"
+
+# Resolve the API key into $RESOLVED_API_KEY. Returns 0/1; never calls
+# json_error itself, so callers in the parent shell can do the exit.
+RESOLVED_API_KEY=""
+load_api_key() {
+  if [[ -n "${LANGSMITH_API_KEY:-}" ]]; then
+    RESOLVED_API_KEY="$LANGSMITH_API_KEY"
+    return 0
+  fi
+  if [[ -f "$CONFIG_DIR/api-key" ]]; then
+    RESOLVED_API_KEY="$(cat "$CONFIG_DIR/api-key")"
+    return 0
+  fi
+  return 1
+}
+
+AUTH_FIX="Set LANGSMITH_API_KEY or write the key to ~/.config/langsmith/api-key. Get one at https://smith.langchain.com → Settings → API Keys"
+
+# api_get <command_name> <path> [query_string] — emits JSON body to stdout.
+# Caller must use: result=$(api_get ...) || { echo "$result"; exit 1; }
+# Errors inside this function fire json_error in a subshell, which only exits
+# the $(...) — the caller catches that via the `|| { echo; exit }` idiom.
+api_get() {
+  local cmd_name="$1"
+  local path="$2"
+  local query="${3:-}"
+  local url="${API_BASE}${path}"
+  [[ -n "$query" ]] && url="${url}?${query}"
+
+  local args=(
+    -H "x-api-key: $RESOLVED_API_KEY"
+    -H "Accept: application/json"
+  )
+  [[ -n "${LANGSMITH_WORKSPACE_ID:-}" ]] && args+=(-H "x-tenant-id: $LANGSMITH_WORKSPACE_ID")
+  args+=("$url")
+  safe_api_call "$cmd_name" "${args[@]}"
+}
+
+api_post() {
+  local cmd_name="$1"
+  local path="$2"
+  local body="$3"
+  local url="${API_BASE}${path}"
+
+  local args=(
+    -X POST
+    -H "x-api-key: $RESOLVED_API_KEY"
+    -H "Content-Type: application/json"
+    -H "Accept: application/json"
+    --data "$body"
+  )
+  [[ -n "${LANGSMITH_WORKSPACE_ID:-}" ]] && args+=(-H "x-tenant-id: $LANGSMITH_WORKSPACE_ID")
+  args+=("$url")
+  safe_api_call "$cmd_name" "${args[@]}"
+}
+
+# rethrow <var-name> — if the captured value looks like an error envelope from a
+# helper that ran in $(...), re-emit it and exit 1. Use after every command
+# substitution that might have produced an error JSON instead of a real result.
+rethrow() {
+  local val="$1"
+  if [[ -n "$val" ]] && echo "$val" | jq -e 'type == "object" and .ok == false' >/dev/null 2>&1; then
+    echo "$val"
+    exit 1
+  fi
+}
+
+# Resolve a project name to its session UUID.
+# Prints UUID on success. On any failure, prints the error envelope to stdout
+# and exits 1 — the caller catches this via the rethrow idiom.
+resolve_project_id() {
+  local name="$1"
+  local cmd_name="$2"
+  local query
+  query=$(jq -rn --arg n "$name" '"name=" + ($n | @uri) + "&limit=1"')
+  local body
+  body=$(api_get "$cmd_name" "/api/v1/sessions" "$query") || { echo "$body"; exit 1; }
+  rethrow "$body"
+  local id
+  id=$(echo "$body" | jq -r '(if type == "array" then . elif type == "object" then (.items // .runs // []) else [] end)[0].id // empty')
+  if [[ -z "$id" ]]; then
+    json_error "$cmd_name" "Project '$name' not found" "NOT_FOUND" \
+      "Run 'lsmith project list' to see available projects"
+  fi
+  echo "$id"
+}
+
+# Normalize project list response — API may return {items:[...]} or bare array.
+normalize_array() {
+  jq '(if type == "array" then . elif type == "object" then (.items // .runs // []) else [] end)'
+}
+
+cmd_project_list() {
+  local limit=20
+  local name_contains=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit="$2"; shift 2 ;;
+      --name-contains) name_contains="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME project list" "Unknown option: $1" "INVALID_ARG" \
+           "Usage: lsmith project list [--limit N] [--name-contains STRING]" ;;
+    esac
+  done
+
+  load_api_key || json_error "$TOOL_NAME project list" "No LangSmith API key found" "AUTH_MISSING" "$AUTH_FIX"
+
+  local query="limit=${limit}&sort_by=last_run_start_time&sort_by_desc=true&include_stats=true"
+  if [[ -n "$name_contains" ]]; then
+    local nc
+    nc=$(jq -rn --arg n "$name_contains" '$n | @uri')
+    query="${query}&name_contains=${nc}"
+  fi
+
+  local body
+  body=$(api_get "$TOOL_NAME project list" "/api/v1/sessions" "$query") || { echo "$body"; exit 1; }
+  rethrow "$body"
+
+  # Project items, keep just the fields agents care about.
+  local items
+  items=$(echo "$body" | normalize_array | jq '[.[] | {
+    id, name,
+    run_count: .run_count,
+    error_rate: .error_rate,
+    latency_p50: .latency_p50,
+    latency_p99: .latency_p99,
+    total_tokens: .total_tokens,
+    last_run_start_time: .last_run_start_time
+  }]')
+
+  local truncated
+  truncated=$(json_truncate "$items" 50)
+
+  local first_name
+  first_name=$(echo "$items" | jq -r '.[0].name // empty')
+  local na
+  if [[ -n "$first_name" ]]; then
+    na=$(next_actions \
+      "$(next_action "lsmith trace list --project \"$first_name\"" "List recent traces in '$first_name'")" \
+      "$(next_action "lsmith trace list --project \"$first_name\" --error" "List failed traces in '$first_name'")")
+  else
+    na=$(next_actions)
+  fi
+  json_ok "$TOOL_NAME project list" "$truncated" "$na"
+}
+
+cmd_trace_list() {
+  local project=""
+  local limit=20
+  local last_n_minutes=""
+  local error_only=""
+  local min_latency=""
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      --last-n-minutes) last_n_minutes="$2"; shift 2 ;;
+      --error) error_only="true"; shift ;;
+      --min-latency) min_latency="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME trace list" "Unknown option: $1" "INVALID_ARG" \
+           "Usage: lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--error] [--min-latency SECONDS] [--name STRING]" ;;
+    esac
+  done
+
+  [[ -z "$project" ]] && json_error "$TOOL_NAME trace list" "--project is required" "MISSING_ARG" \
+    "Run 'lsmith project list' to find a project name, then 'lsmith trace list --project NAME'"
+
+  load_api_key || json_error "$TOOL_NAME trace list" "No LangSmith API key found" "AUTH_MISSING" "$AUTH_FIX"
+
+  local session_id
+  session_id=$(resolve_project_id "$project" "$TOOL_NAME trace list") || { echo "$session_id"; exit 1; }
+  rethrow "$session_id"
+
+  # Default: last 7 days.
+  local start_time
+  if [[ -n "$last_n_minutes" ]]; then
+    start_time=$(date -u -v-"${last_n_minutes}"M +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+      || date -u -d "${last_n_minutes} minutes ago" +"%Y-%m-%dT%H:%M:%SZ")
+  else
+    start_time=$(date -u -v-7d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+      || date -u -d "7 days ago" +"%Y-%m-%dT%H:%M:%SZ")
+  fi
+
+  # Build query body. The /runs/query endpoint accepts a flexible filter spec;
+  # we keep to the documented field names from langsmith-cli.
+  local body_json
+  body_json=$(jq -n \
+    --arg session "$session_id" \
+    --argjson limit "$limit" \
+    --arg start_time "$start_time" \
+    '{
+      session: [$session],
+      is_root: true,
+      limit: $limit,
+      order: "desc",
+      start_time: $start_time
+    }')
+
+  if [[ -n "$error_only" ]]; then
+    body_json=$(echo "$body_json" | jq '. + {error: true}')
+  fi
+  if [[ -n "$min_latency" ]]; then
+    body_json=$(echo "$body_json" | jq --argjson ml "$min_latency" '. + {min_latency: $ml}')
+  fi
+  if [[ -n "$name" ]]; then
+    body_json=$(echo "$body_json" | jq --arg n "$name" '. + {name: [$n]}')
+  fi
+
+  local resp
+  resp=$(api_post "$TOOL_NAME trace list" "/api/v1/runs/query" "$body_json") || { echo "$resp"; exit 1; }
+  rethrow "$resp"
+
+  # Trim each trace down to the agent-useful summary fields. Full inputs/outputs
+  # available via `trace get`.
+  local items
+  items=$(echo "$resp" | jq '(if type == "array" then . elif type == "object" then (.runs // .items // []) else [] end) | [.[] | {
+    id, name,
+    trace_id,
+    run_type,
+    start_time, end_time,
+    status,
+    error,
+    total_tokens,
+    latency: (.latency // .total_time)
+  }]')
+
+  local truncated
+  truncated=$(json_truncate "$items" 50)
+
+  local first_id
+  first_id=$(echo "$items" | jq -r '.[0].id // empty')
+  local na
+  if [[ -n "$first_id" ]]; then
+    na=$(next_actions \
+      "$(next_action "lsmith trace get $first_id" "Inspect the most recent trace in detail")" \
+      "$(next_action "lsmith trace list --project \"$project\" --error" "Filter to failed traces only")" \
+      "$(next_action "lsmith trace list --project \"$project\" --last-n-minutes 60" "Narrow to the last hour")")
+  else
+    na=$(next_actions \
+      "$(next_action "lsmith trace list --project \"$project\" --last-n-minutes 1440" "Try a wider 24h window")")
+  fi
+  json_ok "$TOOL_NAME trace list" "$truncated" "$na"
+}
+
+cmd_trace_get() {
+  local trace_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --*) json_error "$TOOL_NAME trace get" "Unknown option: $1" "INVALID_ARG" \
+             "Usage: lsmith trace get <trace-id>" ;;
+      *) trace_id="$1"; shift ;;
+    esac
+  done
+  [[ -z "$trace_id" ]] && json_error "$TOOL_NAME trace get" "Trace ID required" "MISSING_ARG" \
+    "Usage: lsmith trace get <trace-id>"
+
+  load_api_key || json_error "$TOOL_NAME trace get" "No LangSmith API key found" "AUTH_MISSING" "$AUTH_FIX"
+
+  # A trace-id is the root run_id; same endpoint as run get, just framed
+  # differently in next_actions.
+  local body
+  body=$(api_get "$TOOL_NAME trace get" "/api/v1/runs/${trace_id}") || { echo "$body"; exit 1; }
+  rethrow "$body"
+
+  local na
+  na=$(next_actions \
+    "$(next_action "lsmith run get $trace_id" "Same record framed as a run (raw fields)")" \
+    "$(next_action "lsmith trace list --project \"<project>\"" "List sibling traces in the same project")")
+  json_ok "$TOOL_NAME trace get" "$body" "$na"
+}
+
+cmd_run_get() {
+  local run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --*) json_error "$TOOL_NAME run get" "Unknown option: $1" "INVALID_ARG" \
+             "Usage: lsmith run get <run-id>" ;;
+      *) run_id="$1"; shift ;;
+    esac
+  done
+  [[ -z "$run_id" ]] && json_error "$TOOL_NAME run get" "Run ID required" "MISSING_ARG" \
+    "Usage: lsmith run get <run-id>"
+
+  load_api_key || json_error "$TOOL_NAME run get" "No LangSmith API key found" "AUTH_MISSING" "$AUTH_FIX"
+
+  local body
+  body=$(api_get "$TOOL_NAME run get" "/api/v1/runs/${run_id}") || { echo "$body"; exit 1; }
+  rethrow "$body"
+
+  # If it has children, surface a hint to fetch them via the trace endpoint.
+  local trace_id
+  trace_id=$(echo "$body" | jq -r '.trace_id // empty')
+  local na
+  if [[ -n "$trace_id" && "$trace_id" != "$run_id" ]]; then
+    na=$(next_actions \
+      "$(next_action "lsmith trace get $trace_id" "Open the parent trace this run belongs to")")
+  else
+    na=$(next_actions)
+  fi
+  json_ok "$TOOL_NAME run get" "$body" "$na"
+}
+
+# Subcommand dispatch --------------------------------------------------------
+
+dispatch_project() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    list) cmd_project_list "$@" ;;
+    "")
+      cmd_tree "$TOOL_NAME project" "Project (session) commands" "$(jq -n '[
+        {name: "list", description: "List tracing projects, most-recently-active first", usage: "lsmith project list [--limit N] [--name-contains STRING]"}
+      ]')"
+      ;;
+    *) json_error "$TOOL_NAME project" "Unknown subcommand: $sub" "INVALID_ARG" \
+         "Run 'lsmith project' with no args to see available subcommands" ;;
+  esac
+}
+
+dispatch_trace() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    list) cmd_trace_list "$@" ;;
+    get)  cmd_trace_get "$@" ;;
+    "")
+      cmd_tree "$TOOL_NAME trace" "Trace (root run) commands" "$(jq -n '[
+        {name: "list", description: "List recent traces in a project (default 7-day window, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--error] [--min-latency SEC] [--name STRING]"},
+        {name: "get",  description: "Get a single trace by ID (full root-run record)", usage: "lsmith trace get <trace-id>"}
+      ]')"
+      ;;
+    *) json_error "$TOOL_NAME trace" "Unknown subcommand: $sub" "INVALID_ARG" \
+         "Run 'lsmith trace' with no args to see available subcommands" ;;
+  esac
+}
+
+dispatch_run() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    get) cmd_run_get "$@" ;;
+    "")
+      cmd_tree "$TOOL_NAME run" "Run commands (a run is one step of a trace)" "$(jq -n '[
+        {name: "get", description: "Get a single run by ID", usage: "lsmith run get <run-id>"}
+      ]')"
+      ;;
+    *) json_error "$TOOL_NAME run" "Unknown subcommand: $sub" "INVALID_ARG" \
+         "Run 'lsmith run' with no args to see available subcommands" ;;
+  esac
+}
+
+# Main -----------------------------------------------------------------------
+
+if [[ $# -lt 1 ]]; then
+  cmd_tree "$TOOL_NAME" "LangSmith CLI for AI agents (read-only debug surface)" "$(jq -n '[
+    {name: "project list", description: "List tracing projects",                                  usage: "lsmith project list [--limit N] [--name-contains STRING]"},
+    {name: "trace list",   description: "List recent traces in a project (default 7d, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--error] [--min-latency SEC] [--name STRING]"},
+    {name: "trace get",    description: "Get a single trace by ID",                                usage: "lsmith trace get <trace-id>"},
+    {name: "run get",      description: "Get a single run by ID",                                  usage: "lsmith run get <run-id>"}
+  ]')"
+  exit 0
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+  project) dispatch_project "$@" ;;
+  trace)   dispatch_trace "$@" ;;
+  run)     dispatch_run "$@" ;;
+  help|--help|-h)
+    cmd_tree "$TOOL_NAME" "LangSmith CLI for AI agents (read-only debug surface)" "$(jq -n '[]')"
+    ;;
+  *)
+    json_error "$TOOL_NAME" "Unknown command: $CMD" "INVALID_ARG" \
+      "Run 'lsmith' with no args to see available commands"
+    ;;
+esac
