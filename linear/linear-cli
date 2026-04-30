@@ -12,27 +12,32 @@ TOOL_NAME="linear-cli"
 CONFIG_DIR="${HOME}/.config/linear"
 API_URL="https://api.linear.app/graphql"
 
-# Get API key from config or environment
-get_api_key() {
+# Resolve the API key into $RESOLVED_API_KEY. Returns 0/1; never calls
+# json_error itself. Callers in the parent shell handle the missing-key case
+# via: load_api_key || json_error "$TOOL_NAME ..." "..." "AUTH_MISSING" "$AUTH_FIX"
+RESOLVED_API_KEY=""
+load_api_key() {
   if [[ -n "${LINEAR_API_KEY:-}" ]]; then
-    echo "$LINEAR_API_KEY"
-  elif [[ -f "$CONFIG_DIR/api-key" ]]; then
-    cat "$CONFIG_DIR/api-key"
-  else
-    json_error "$TOOL_NAME" "No Linear API key found" "AUTH_MISSING" "Set LINEAR_API_KEY or create ~/.config/linear/api-key. Get your key from: Linear Settings > Security & access > API keys"
+    RESOLVED_API_KEY="$LINEAR_API_KEY"
+    return 0
   fi
+  if [[ -f "$CONFIG_DIR/api-key" ]]; then
+    RESOLVED_API_KEY="$(cat "$CONFIG_DIR/api-key")"
+    return 0
+  fi
+  return 1
 }
 
-# Execute GraphQL query
+AUTH_FIX="Set LINEAR_API_KEY or create ~/.config/linear/api-key. Get your key from: Linear Settings > Security & access > API keys"
+
+# Execute GraphQL query. Caller must have run load_api_key in the parent shell.
 graphql() {
   local query="$1"
-  local api_key
-  api_key=$(get_api_key)
 
   local result
   result=$(curl -s -X POST \
     -H "Content-Type: application/json" \
-    -H "Authorization: $api_key" \
+    -H "Authorization: $RESOLVED_API_KEY" \
     --data "{\"query\": \"$query\"}" \
     "$API_URL")
 
@@ -83,9 +88,6 @@ process_description_images() {
   local image_dir="/tmp/linear-images"
   mkdir -p "$image_dir"
 
-  local api_key
-  api_key=$(get_api_key)
-
   local images_json="[]"
   local processed_desc="$description"
 
@@ -107,7 +109,7 @@ process_description_images() {
     if [[ ! -f "$cached_path" ]]; then
       local tmp_path="$image_dir/${hash}_raw"
       local http_code
-      http_code=$(curl -s -w '%{http_code}' -H "Authorization: $api_key" -o "$tmp_path" "$url")
+      http_code=$(curl -s -w '%{http_code}' -H "Authorization: $RESOLVED_API_KEY" -o "$tmp_path" "$url")
 
       if [[ "$http_code" == "200" && -f "$tmp_path" && -s "$tmp_path" ]]; then
         # Resize to max 1200px on longest edge (macOS sips)
@@ -244,12 +246,10 @@ cmd_cancel() {
   cmd_update "$issue_id" --state "Canceled"
 }
 
-# Execute a GraphQL mutation with proper variable escaping (like cmd_create)
+# Execute a GraphQL mutation. Caller must have run load_api_key in parent shell.
 graphql_mutation() {
   local query="$1"
   local variables="$2"
-  local api_key
-  api_key=$(get_api_key)
 
   local payload
   payload=$(jq -n --arg q "$query" --argjson vars "$variables" '{query: $q, variables: $vars}')
@@ -257,7 +257,7 @@ graphql_mutation() {
   local result
   result=$(curl -s -X POST \
     -H "Content-Type: application/json" \
-    -H "Authorization: $api_key" \
+    -H "Authorization: $RESOLVED_API_KEY" \
     --data "$payload" \
     "$API_URL")
 
@@ -680,9 +680,6 @@ cmd_create() {
     input=$(echo "$input" | jq --arg pid "$project_id" '. + {projectId: $pid}')
   fi
 
-  local api_key
-  api_key=$(get_api_key)
-
   local query='mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url state { name } assignee { name } } } }'
   local payload
   payload=$(jq -n --arg q "$query" --argjson vars "{\"input\": $input}" '{query: $q, variables: $vars}')
@@ -690,7 +687,7 @@ cmd_create() {
   local result
   result=$(curl -s -X POST \
     -H "Content-Type: application/json" \
-    -H "Authorization: $api_key" \
+    -H "Authorization: $RESOLVED_API_KEY" \
     --data "$payload" \
     "$API_URL")
 
@@ -801,6 +798,14 @@ fi
 
 CMD="$1"
 shift
+
+# Gate auth in the parent shell so json_error's exit propagates cleanly.
+# (Calling json_error inside $(get_api_key) only exits the subshell and the
+# error envelope ends up as a malformed header value — see history.)
+case "$CMD" in
+  help|--help|-h) ;;
+  *) load_api_key || json_error "$TOOL_NAME" "No Linear API key found" "AUTH_MISSING" "$AUTH_FIX" ;;
+esac
 
 case "$CMD" in
   me) cmd_me ;;
