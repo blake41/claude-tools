@@ -80,6 +80,35 @@ export const metaSettingsRoute = createRoute({
   path: "/meta/settings",
 });
 
+export interface LibrarySearch {
+  type?: string;
+  scope?: string;
+  ns?: string;
+  inspiration?: string;
+  q?: string;
+  sort?: string;
+  include_plugins?: boolean;
+}
+
+export const libraryRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/library",
+  validateSearch: (search: Record<string, unknown>): LibrarySearch => ({
+    type: (search.type as string) || undefined,
+    scope: (search.scope as string) || undefined,
+    ns: (search.ns as string) || undefined,
+    inspiration: (search.inspiration as string) || undefined,
+    q: (search.q as string) || undefined,
+    sort: (search.sort as string) || undefined,
+    include_plugins: search.include_plugins === true || search.include_plugins === "true",
+  }),
+});
+
+export const libraryDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/library/$id",
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   workspaceRoute,
@@ -94,6 +123,8 @@ const routeTree = rootRoute.addChildren([
   metaProposalDetailRoute,
   metaScoresRoute,
   metaSettingsRoute,
+  libraryRoute,
+  libraryDetailRoute,
 ]);
 
 export const router = createRouter({

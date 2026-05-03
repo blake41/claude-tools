@@ -1,29 +1,36 @@
 #!/bin/bash
-# Persist Claude session → cmux workspace/surface mapping on SessionStart
-# Uses CMUX_SESSION_KEY_HASH (set by cco-permissions from the pre-Claude surface name)
-# Falls back to computing the key from cmux identify (works for non-cco sessions)
+# Persist Claude session → cmux panel UUID mapping on SessionStart.
+#
+# Identity: $CMUX_PANEL_ID (exported by cmux into every terminal).
+# This UUID survives renames, restarts, and auto-titles — it's tied to
+# the panel itself, not to any volatile string the panel happens to display.
+#
+# Writes:
+#   ~/.cmux/claude-sessions/<panel-uuid>            → <session_id>
+#   ~/.cmux/claude-sessions/by-session/<session_id> → JSON metadata (for history)
 
 MAPPING_DIR="$HOME/.cmux/claude-sessions"
+BY_SESSION_DIR="$MAPPING_DIR/by-session"
 LOG="$HOME/.cmux/session-persist.log"
-mkdir -p "$MAPPING_DIR" 2>/dev/null
+mkdir -p "$BY_SESSION_DIR" 2>/dev/null
 
 log() { echo "$(date '+%H:%M:%S') $1" >> "$LOG" 2>/dev/null; }
 
 log "INVOKED pid=$$ ppid=$PPID"
 
-# Must be inside cmux
-if [ -z "$CMUX_SURFACE_ID" ]; then log "SKIP: no CMUX_SURFACE_ID"; exit 0; fi
+if [ -z "$CMUX_PANEL_ID" ]; then
+  log "SKIP: no CMUX_PANEL_ID (not running inside cmux)"
+  exit 0
+fi
 
 # Read session_id from stdin JSON (Claude Code sends this on SessionStart)
 SESSION_ID=""
 if read -t 2 INPUT 2>/dev/null && [ -n "$INPUT" ]; then
   SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
   log "stdin: session_id=$SESSION_ID"
-else
-  log "stdin: empty or timed out"
 fi
 
-# Fallback for session ID: read from session file by PPID
+# Fallback: read from session file by PPID
 if [ -z "$SESSION_ID" ]; then
   SESSION_FILE="$HOME/.claude/sessions/$PPID.json"
   if [ -f "$SESSION_FILE" ]; then
@@ -32,28 +39,42 @@ if [ -z "$SESSION_ID" ]; then
   fi
 fi
 
-[ -z "$SESSION_ID" ] && { log "FAIL: no session_id found"; exit 0; }
+[ -z "$SESSION_ID" ] && { log "FAIL: no session_id"; exit 0; }
 
-# Use pre-computed hash from cco-permissions (preferred — uses pre-Claude surface name)
-KEY_HASH="${CMUX_SESSION_KEY_HASH:-}"
+# Primary mapping: panel UUID → session id.
+echo "$SESSION_ID" > "$MAPPING_DIR/$CMUX_PANEL_ID"
+log "OK: panel=$CMUX_PANEL_ID -> $SESSION_ID"
 
-# Fallback: compute from cmux identify (for non-cco sessions like bare `claude`)
-if [ -z "$KEY_HASH" ] && command -v cmux >/dev/null 2>&1; then
+# Secondary index: capture display names for cmux-session-history readability.
+# Failures here are non-fatal — the primary mapping above is the source of truth.
+WORKSPACE_NAME=""
+SURFACE_NAME=""
+if command -v cmux >/dev/null 2>&1; then
   IDENTIFY=$(cmux identify 2>/dev/null) || true
   if [ -n "$IDENTIFY" ]; then
-    WORKSPACE_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
-    SURFACE_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
-    WORKSPACE_NAME=$(cmux list-workspaces 2>/dev/null | grep "$WORKSPACE_REF " | sed "s/^[* ]*$WORKSPACE_REF  //" | sed 's/  \[selected\]//')
-    SURFACE_NAME=$(cmux list-pane-surfaces 2>/dev/null | grep "$SURFACE_REF " | sed "s/^[* ]*$SURFACE_REF  //" | sed 's/  \[selected\]//')
-    if [ -n "$WORKSPACE_NAME" ] && [ -n "$SURFACE_NAME" ]; then
-      KEY="${WORKSPACE_NAME}/${SURFACE_NAME}"
-      KEY_HASH=$(echo -n "$KEY" | shasum -a 256 | cut -c1-16)
-      log "computed key: $KEY (hash=$KEY_HASH)"
-    fi
+    WS_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
+    SF_REF=$(echo "$IDENTIFY" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
+    [ -n "$WS_REF" ] && WORKSPACE_NAME=$(cmux list-workspaces 2>/dev/null | grep "$WS_REF " | sed "s/^[* ]*$WS_REF  //" | sed 's/  \[selected\]//')
+    [ -n "$SF_REF" ] && SURFACE_NAME=$(cmux list-pane-surfaces 2>/dev/null | grep "$SF_REF " | sed "s/^[* ]*$SF_REF  //" | sed 's/  \[selected\]//')
   fi
 fi
 
-[ -z "$KEY_HASH" ] && { log "FAIL: no key hash"; exit 0; }
+SESSION_ID="$SESSION_ID" \
+PANEL_ID="$CMUX_PANEL_ID" \
+WORKSPACE_NAME="$WORKSPACE_NAME" \
+SURFACE_NAME="$SURFACE_NAME" \
+BY_SESSION_DIR="$BY_SESSION_DIR" \
+python3 -c "
+import json, os, time
+entry = {
+    'session_id': os.environ['SESSION_ID'],
+    'panel_id': os.environ['PANEL_ID'],
+    'workspace_name': os.environ.get('WORKSPACE_NAME', ''),
+    'surface_name': os.environ.get('SURFACE_NAME', ''),
+    'ts': time.time(),
+}
+with open(os.path.join(os.environ['BY_SESSION_DIR'], os.environ['SESSION_ID']), 'w') as f:
+    json.dump(entry, f)
+" 2>/dev/null && log "by-session: wrote $SESSION_ID"
 
-echo "$SESSION_ID" > "$MAPPING_DIR/$KEY_HASH"
-log "OK: hash=$KEY_HASH -> $SESSION_ID"
+exit 0

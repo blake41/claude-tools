@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""
+cmux-session-history — show every Claude session that's been persisted, with
+its captured cmux workspace/surface name and a content hint, sorted by time.
+
+Usage:
+  cmux-session-history                    # all workspaces
+  cmux-session-history Keystone           # filter to one workspace
+  cmux-session-history --unmapped         # only sessions not currently mapped
+  cmux-session-history Keystone --unmapped
+
+A 📌 marker means the session_id is bound to some panel UUID (i.e. one of
+the tabs would auto-resume to it).
+"""
+
+import argparse
+import datetime
+import json
+import sys
+from pathlib import Path
+
+SESSIONS = Path.home() / ".cmux/claude-sessions"
+BY_SESSION = SESSIONS / "by-session"
+PROJECTS = Path.home() / ".claude/projects"
+
+
+def load_mapped_sids() -> dict[str, str]:
+    """session_id -> panel UUID of any mapping pointing at it."""
+    out = {}
+    if not SESSIONS.exists():
+        return out
+    # Panel UUID format: 8-4-4-4-12 hex with dashes (36 chars total)
+    for f in SESSIONS.iterdir():
+        if f.is_file() and len(f.name) == 36 and f.name.count("-") == 4:
+            try:
+                out[f.read_text().strip()] = f.name
+            except Exception:
+                continue
+    return out
+
+
+def first_user_message(sid: str) -> tuple[str, Path | None]:
+    """Find the session's jsonl file and extract its first user message."""
+    jsonl = next(PROJECTS.glob(f"*/{sid}.jsonl"), None)
+    if jsonl is None:
+        return "", None
+    try:
+        with open(jsonl) as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                msg = j.get("message", {}) or {}
+                if msg.get("role") != "user":
+                    continue
+                c = msg.get("content", "")
+                s = c if isinstance(c, str) else str(c)
+                return s[:90].replace("\n", " "), jsonl
+    except Exception:
+        pass
+    return "", jsonl
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("workspace", nargs="?", help="Filter to one workspace name (substring match, case-sensitive)")
+    ap.add_argument("--unmapped", action="store_true", help="Only show sessions with no by-name mapping")
+    args = ap.parse_args()
+
+    if not BY_SESSION.is_dir():
+        print(f"no by-session index at {BY_SESSION}", file=sys.stderr)
+        return 1
+
+    mapped = load_mapped_sids()
+    rows = []
+    for f in BY_SESSION.iterdir():
+        if not f.is_file():
+            continue
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        ws = d.get("workspace_name", "")
+        if args.workspace and args.workspace not in ws:
+            continue
+        sid = d.get("session_id", "")
+        if args.unmapped and sid in mapped:
+            continue
+        topic, jsonl = first_user_message(sid)
+        rows.append({
+            "ts": d.get("ts", 0),
+            "workspace": ws,
+            "surface": d.get("surface_name", ""),
+            "panel_id": d.get("panel_id", ""),
+            "sid": sid,
+            "mapped_panel": mapped.get(sid),
+            "topic": topic,
+            "jsonl_missing": jsonl is None,
+        })
+
+    rows.sort(key=lambda r: r["ts"])
+    for r in rows:
+        ts = datetime.datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
+        marker = "📌" if r["mapped_panel"] else "  "
+        missing = " ⚠ jsonl missing" if r["jsonl_missing"] else ""
+        ws_disp = f"{r['workspace']!r}" if not args.workspace else ""
+        panel_short = r["panel_id"][:8] if r["panel_id"] else "(no-panel)"
+        print(
+            f"{marker} {ts}  {panel_short:<10}  {r['sid']}  "
+            f"{ws_disp + ('/' if ws_disp else '')}{r['surface']!r}{missing}"
+        )
+        if r["topic"]:
+            print(f"               > {r['topic']}")
+
+    if not rows:
+        print("(no matching sessions)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

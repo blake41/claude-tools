@@ -7,6 +7,28 @@ interface SidebarProps {
   onSearchClick: () => void;
 }
 
+// Collapse preference is route-aware: library defaults to collapsed, the rest
+// default to expanded. Once the user toggles, that choice sticks per-route.
+function collapseStorageKey(pathname: string): string {
+  if (pathname.startsWith("/library")) return "sidebar-collapsed:library";
+  return "sidebar-collapsed:default";
+}
+
+function defaultCollapsedFor(pathname: string): boolean {
+  return pathname.startsWith("/library");
+}
+
+function readCollapsed(pathname: string): boolean {
+  try {
+    const stored = localStorage.getItem(collapseStorageKey(pathname));
+    if (stored === "1") return true;
+    if (stored === "0") return false;
+  } catch {
+    // ignore
+  }
+  return defaultCollapsedFor(pathname);
+}
+
 const PRESET_COLORS = [
   "#58a6ff", "#3fb950", "#bc8cff", "#d29922",
   "#f85149", "#79c0ff", "#d2a8ff", "#56d364",
@@ -38,6 +60,7 @@ function saveStarredIds(ids: Set<number>) {
 }
 
 export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
   const [tags, setTags] = useState<Tag[]>([]);
   const [showCreateTag, setShowCreateTag] = useState(false);
   const [newTagName, setNewTagName] = useState("");
@@ -48,6 +71,22 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   const [starredIds, setStarredIds] = useState<Set<number>>(loadStarredIds);
   const [showMore, setShowMore] = useState(false);
   const [filter, setFilter] = useState("");
+  const [collapsed, setCollapsedState] = useState<boolean>(() => readCollapsed(pathname));
+
+  // Re-evaluate collapse state when navigating between collapse buckets
+  // (library ↔ everything else). Respects user override stored per-bucket.
+  useEffect(() => {
+    setCollapsedState(readCollapsed(pathname));
+  }, [pathname]);
+
+  function setCollapsed(next: boolean) {
+    setCollapsedState(next);
+    try {
+      localStorage.setItem(collapseStorageKey(pathname), next ? "1" : "0");
+    } catch {
+      // ignore storage failures
+    }
+  }
 
   function toggleStar(id: number, e: React.MouseEvent) {
     e.preventDefault();
@@ -120,11 +159,70 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   const rest = filteredWorkspaces.filter(w => !starredIds.has(w.id));
   const hasStars = starred.length > 0;
 
+  if (collapsed) {
+    return (
+      <aside className="w-[44px] min-w-[44px] bg-[#101018] border-r border-border/50 flex flex-col items-center py-3 gap-1.5">
+        <button
+          className="p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8"
+          onClick={() => setCollapsed(false)}
+          title="Expand sidebar"
+        >
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M9 1L16.5 9L9 17L1.5 9L9 1Z" fill="#bc8cff" fillOpacity="0.25" stroke="#bc8cff" strokeWidth="1.5" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <button
+          className="p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8"
+          onClick={onSearchClick}
+          title="Search (⌘K)"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+            <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+        <div className="mt-1 flex flex-col gap-0.5 w-full items-center">
+          <Link
+            to="/library"
+            className="p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8 [&[data-status=active]]:text-accent-purple [&[data-status=active]]:bg-accent-purple/12"
+            title="Library"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M2.5 2.5h3v11h-3zM6.5 2.5h3v11h-3zM10.5 4.2l2.7-.7 2.5 9.4-2.7.7z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+            </svg>
+          </Link>
+          <Link
+            to="/insights"
+            className="p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8 [&[data-status=active]]:text-accent-purple [&[data-status=active]]:bg-accent-purple/12"
+            title="Insights"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M8 1a5 5 0 00-1.5 9.77V12.5a1.5 1.5 0 003 0v-1.73A5 5 0 008 1zm0 2a3 3 0 011.5 5.6V12.5a1.5 1.5 0 01-3 0V8.6A3 3 0 018 3z" fill="currentColor" />
+              <path d="M6.5 14.5h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+          </Link>
+          <Link
+            to="/meta"
+            className="p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8 [&[data-status=active]]:text-accent-purple [&[data-status=active]]:bg-accent-purple/12"
+            title="Meta"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              <circle cx="5" cy="4" r="1.5" fill="currentColor" />
+              <circle cx="11" cy="8" r="1.5" fill="currentColor" />
+              <circle cx="7" cy="12" r="1.5" fill="currentColor" />
+            </svg>
+          </Link>
+        </div>
+      </aside>
+    );
+  }
+
   return (
     <aside className="w-[230px] min-w-[230px] bg-[#101018] border-r border-border/50 flex flex-col overflow-hidden">
-      {/* Header: Diamond icon + Explorer + Search */}
-      <div className="flex items-center gap-2.5 px-4 pt-5 pb-3">
-        <Link to="/" className="flex items-center gap-2.5 no-underline text-inherit hover:no-underline flex-1">
+      {/* Header: Diamond icon + Explorer + Search + Collapse */}
+      <div className="flex items-center gap-1.5 px-4 pt-5 pb-3">
+        <Link to="/" className="flex items-center gap-2.5 no-underline text-inherit hover:no-underline flex-1 min-w-0">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
             <path d="M9 1L16.5 9L9 17L1.5 9L9 1Z" fill="#bc8cff" fillOpacity="0.25" stroke="#bc8cff" strokeWidth="1.5" strokeLinejoin="round" />
           </svg>
@@ -138,6 +236,15 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
             <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+        <button
+          className="shrink-0 p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8"
+          onClick={() => setCollapsed(true)}
+          title="Collapse sidebar"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M10 4L6 8l4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </button>
       </div>
@@ -304,8 +411,17 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
         </div>
       </div>
 
-      {/* Insights + Meta links */}
+      {/* Insights + Meta + Library links */}
       <div className="border-t border-border/40 px-3 pt-2 pb-1 shrink-0">
+        <Link
+          to="/library"
+          className="group flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text-secondary transition-all hover:bg-white/5 hover:text-text [&[data-status=active]]:bg-accent-purple/12 [&[data-status=active]]:text-accent-purple"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M2.5 2.5h3v11h-3zM6.5 2.5h3v11h-3zM10.5 4.2l2.7-.7 2.5 9.4-2.7.7z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+          </svg>
+          <span className="text-[13px] font-medium">Library</span>
+        </Link>
         <Link
           to="/insights"
           className="group flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text-secondary transition-all hover:bg-white/5 hover:text-text [&[data-status=active]]:bg-accent-purple/12 [&[data-status=active]]:text-accent-purple"

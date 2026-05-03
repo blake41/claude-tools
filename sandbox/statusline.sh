@@ -198,8 +198,14 @@ if [ -n "$output_style" ] && [ "$output_style" != "null" ]; then
 fi
 
 # Sandbox indicator
+# CCO_SESSION_ID is set in BOTH sandbox and --no-sandbox modes (it just means
+# "managed by cco-permissions"), so it can't be the only signal. Look for the
+# explicit CCO_SANDBOX_OFF flag that cco-permissions sets when --no-sandbox
+# is used. No CCO_SESSION_ID at all = bare claude, neither indicator applies.
 sandbox_indicator=""
-if [ -n "${CCO_SESSION_ID:-}" ]; then
+if [ -n "${CCO_SANDBOX_OFF:-}" ]; then
+  sandbox_indicator="🔓 no sandbox"
+elif [ -n "${CCO_SESSION_ID:-}" ]; then
   sandbox_indicator="🔒 sandbox"
 else
   sandbox_indicator="🔓 no sandbox"

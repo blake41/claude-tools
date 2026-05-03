@@ -9,6 +9,8 @@ import db from "./db.js";
 import { BackgroundJob } from "./background-job.js";
 import { config } from "./config.js";
 import chatRouter, { buildSystemPrompt, tools, executeSql, parseResult } from "./chat.js";
+import libraryRouter from "./library/api.js";
+import { loadLibrary } from "./library/cache.js";
 
 function cleanXmlNoise(text: string): string {
   return text
@@ -26,6 +28,7 @@ const PORT = config.port;
 app.use(cors());
 app.use(express.json());
 app.use(chatRouter);
+app.use(libraryRouter);
 
 // Serve static frontend in production
 app.use(express.static(join(__dirname, "..", "dist", "web")));
@@ -1822,6 +1825,14 @@ app.get("*", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Session Explorer API running on http://localhost:${PORT}`);
+
+  // Initial library scan (non-fatal on error)
+  try {
+    const result = loadLibrary();
+    console.log(`[library] loaded ${result.count} artifacts in ${result.durationMs}ms`);
+  } catch (err) {
+    console.error("[library] initial scan failed:", err);
+  }
 
   // ── Auto-ingest + auto-summarize polling ─────────────────────────
   setInterval(async () => {

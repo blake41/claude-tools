@@ -7,9 +7,22 @@
 #   - sandbox-request (symlinked to ~/.local/bin/)
 #   - dirs file (tools/sandbox/dirs)
 #   - ab (for browser preflight, optional)
-#   - cmux (for session auto-resume, optional)
+#   - cmux (for session auto-resume via $CMUX_PANEL_ID, optional)
+#
+# Flags (consumed here, not forwarded to claude):
+#   --no-sandbox    Skip Seatbelt entirely — run `claude` directly with the
+#                   usual CCO_SESSION_ID / cmux auto-resume / browser preflight
+#                   still in place. Use when the sandbox is getting in the way
+#                   of an exploratory session.
 
 function cco-permissions
+    # Pull out our own flags before touching $argv further.
+    set -l skip_sandbox false
+    if contains -- --no-sandbox $argv
+        set skip_sandbox true
+        set argv (string match -v -- --no-sandbox $argv)
+    end
+
     # Parse --resume/--continue from argv
     set -l session_id ""
     set -l has_resume_flag false
@@ -23,35 +36,26 @@ function cco-permissions
         set prev $i
     end
 
-    # Auto-resume from cmux workspace/surface mapping
-    # Captures surface name BEFORE claude starts (claude changes the terminal title)
+    # Auto-resume keyed by cmux's stable panel UUID ($CMUX_PANEL_ID).
+    # The UUID survives renames, restarts, and auto-titles — no name hashing,
+    # no human-name detection, no rename heal logic needed.
     set -l extra_args
-    set -l cmux_key_hash ""
-    if set -q CMUX_SURFACE_ID; and command -q cmux
-        set -l identify (cmux identify 2>/dev/null)
-        if test -n "$identify"
-            set -l ws_ref (echo "$identify" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['workspace_ref'])" 2>/dev/null)
-            set -l sf_ref (echo "$identify" | python3 -c "import sys,json; print(json.load(sys.stdin)['caller']['surface_ref'])" 2>/dev/null)
-            set -l ws_name (cmux list-workspaces 2>/dev/null | grep "$ws_ref " | sed "s/^[* ]*$ws_ref  //" | sed 's/  \[selected\]//')
-            set -l sf_name (cmux list-pane-surfaces 2>/dev/null | grep "$sf_ref " | sed "s/^[* ]*$sf_ref  //" | sed 's/  \[selected\]//')
-            if test -n "$ws_name" -a -n "$sf_name"
-                set -l is_human_name true
-                if string match -rq '^[~✳/]|^\S+\s+[~/]' "$sf_name"
-                    set is_human_name false
-                end
-                set cmux_key_hash (echo -n "$ws_name/$sf_name" | shasum -a 256 | string sub -l 16)
-                if test "$has_resume_flag" = false -a "$is_human_name" = true
-                    set -l mapping_file ~/.cmux/claude-sessions/$cmux_key_hash
-                    if test -f $mapping_file
-                        set -l saved_sid (cat $mapping_file)
-                        if test -n "$saved_sid"
-                            echo "Resuming session for '$ws_name/$sf_name': $saved_sid"
-                            set -a extra_args --resume $saved_sid
-                            set session_id $saved_sid
-                        end
-                    end
-                end
+    if test -n "$CMUX_PANEL_ID" -a "$has_resume_flag" != true
+        set -l mapping_file ~/.cmux/claude-sessions/$CMUX_PANEL_ID
+        if test -f $mapping_file
+            set -l saved_sid (cat $mapping_file)
+            # Validate the saved session still exists on disk
+            set -l session_jsonl (find ~/.claude/projects -maxdepth 2 -name "$saved_sid.jsonl" -type f 2>/dev/null | head -1)
+            if test -z "$session_jsonl"
+                echo "cmux: saved session $saved_sid no longer exists on disk — removing stale mapping, starting fresh"
+                rm -f $mapping_file
+            else
+                echo "Resuming session for panel $CMUX_PANEL_ID: $saved_sid"
+                set -a extra_args --resume $saved_sid
+                set session_id $saved_sid
             end
+        else
+            echo "cmux: no saved session for panel $CMUX_PANEL_ID — starting fresh"
         end
     end
 
@@ -68,12 +72,23 @@ function cco-permissions
     end
 
     set -gx CCO_SESSION_ID $session_id
-    if test -n "$cmux_key_hash"
-        set -gx CMUX_SESSION_KEY_HASH $cmux_key_hash
-    end
 
     if not contains $HOME/.local/bin $PATH
         set -x PATH $HOME/.local/bin $PATH
+    end
+
+    # --no-sandbox: skip Seatbelt + the expansion loop entirely.
+    # Everything else (CCO_SESSION_ID, auto-resume, --dangerously-skip-permissions)
+    # stays in place.
+    if $skip_sandbox
+        # Tell the statusline we're NOT in seatbelt. Without this it falls
+        # back to "is CCO_SESSION_ID set?" which is true in both modes and
+        # would show the lock icon misleadingly.
+        set -gx CCO_SANDBOX_OFF 1
+        claude --dangerously-skip-permissions $extra_args $argv
+        set -e CCO_SESSION_ID
+        set -e CCO_SANDBOX_OFF
+        return
     end
 
     # Build sandbox args from dirs file
@@ -162,5 +177,4 @@ function cco-permissions
     end
 
     set -e CCO_SESSION_ID
-    set -e CMUX_SESSION_KEY_HASH
 end

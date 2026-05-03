@@ -22,7 +22,8 @@ const log = new Logger({ component: "auth" });
 
 interface AuthState {
   authenticated: boolean;
-  user: { slackUserId: string; email: string } | null;
+  // slackUserId is optional because the caller may auth by email alone.
+  user: { slackUserId?: string; email: string } | null;
   timestamp: number | null;
 }
 
@@ -169,7 +170,12 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
       return { ok: false, error: 'dev-login returned invalid response: missing token' };
     }
     token = data.token;
-    userEmail = typeof data.email === 'string' ? data.email : undefined;
+    // Only override the request email if the server echoed a non-empty one.
+    // Terra's /auth/dev-login historically did not return email at all, which
+    // would clobber the request email we already have.
+    if (typeof data.email === 'string' && data.email) {
+      userEmail = data.email;
+    }
 
     log.info("Got dev-login token", { exchangeUrl: data.exchangeUrl });
   } catch (err) {

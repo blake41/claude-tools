@@ -65,8 +65,7 @@ async function rpcFetch<T>(opts: RpcOptions): Promise<T> {
       headers,
       body: bodyStr,
       signal: AbortSignal.timeout(timeout),
-      // Bun supports unix sockets via the `unix` option on fetch
-      // @ts-expect-error -- Bun extension, not in lib.dom.d.ts
+      // Bun supports unix sockets via the `unix` option on fetch.
       unix: SOCKET_PATH,
     });
   } catch (err: unknown) {

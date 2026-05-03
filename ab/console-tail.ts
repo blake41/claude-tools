@@ -31,6 +31,9 @@ const LEVELS_BY_SEVERITY: Record<string, Set<string>> = {
 const CONSOLE_TYPES = new Set(["log", "debug", "info", "warning", "error", "assert", "trace"]);
 const WATCH_DIR = "/tmp/ab-watch";
 const WATCH_DEBOUNCE_SECS = 2.0;
+const EXPAND_DEPTH = 3;
+const EXPAND_ARRAY_LIMIT = 20;
+const EXPAND_STRING_LIMIT = 200;
 
 function findTab(port: number, match = "localhost:5173"): string {
   // Synchronous fetch via Bun.spawnSync to keep the reconnect loop simple
@@ -45,12 +48,103 @@ function findTab(port: number, match = "localhost:5173"): string {
   throw new Error(`No page tabs on port ${port}`);
 }
 
-function formatArg(arg: any): string {
+// In-page safe stringifier. Shipped as a string body to Runtime.callFunctionOn
+// so it executes inside the browser on the target object (referenced by `this`).
+// Handles circular refs, non-serializable types, depth and array truncation.
+const SAFE_STRINGIFY_FN = `
+function safeStringify(depth, arrayLimit, stringLimit) {
+  const seen = new WeakSet();
+  function walk(v, d) {
+    if (v === null) return null;
+    const t = typeof v;
+    if (t === "string") return v.length > stringLimit ? v.slice(0, stringLimit) + "…" : v;
+    if (t === "number" || t === "boolean") return v;
+    if (t === "bigint") return String(v) + "n";
+    if (t === "undefined") return "__undefined__";
+    if (t === "function") return "[Function " + (v.name || "anonymous") + "]";
+    if (t === "symbol") return v.toString();
+    if (v instanceof Error) return { __error__: v.name, message: v.message, stack: v.stack };
+    if (d >= depth) {
+      if (Array.isArray(v)) return "[Array(" + v.length + ")]";
+      return "[" + (v.constructor && v.constructor.name || "Object") + "]";
+    }
+    if (seen.has(v)) return "[Circular]";
+    seen.add(v);
+    if (Array.isArray(v)) {
+      const truncated = v.length > arrayLimit;
+      const items = v.slice(0, arrayLimit).map((x) => walk(x, d + 1));
+      if (truncated) items.push("… +" + (v.length - arrayLimit) + " more");
+      return items;
+    }
+    if (v instanceof Date) return v.toISOString();
+    if (v instanceof Map) return { __map__: [...v.entries()].slice(0, arrayLimit).map(([k, val]) => [walk(k, d + 1), walk(val, d + 1)]) };
+    if (v instanceof Set) return { __set__: [...v].slice(0, arrayLimit).map((x) => walk(x, d + 1)) };
+    const out = {};
+    for (const k of Object.keys(v)) out[k] = walk(v[k], d + 1);
+    return out;
+  }
+  return JSON.stringify(walk(this, 0));
+}`;
+
+type PendingResolver = (msg: any) => void;
+const pending = new Map<number, PendingResolver>();
+
+function cdpCall<T = any>(ws: WebSocket, method: string, params?: any): Promise<T> {
+  const id = ++msgId;
+  return new Promise<T>((resolve, reject) => {
+    pending.set(id, (msg) => {
+      if (msg.error) reject(new Error(msg.error.message ?? String(msg.error)));
+      else resolve(msg.result);
+    });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+}
+
+async function expandArg(ws: WebSocket, arg: any): Promise<string> {
+  // Primitive: use the value directly.
   if ("value" in arg) {
     const v = arg.value;
     return typeof v === "string" ? v : String(v);
   }
-  return arg.description ?? JSON.stringify(arg);
+  // Object without an id (unserializable, already-released, etc.): fall back.
+  if (!arg.objectId) return arg.description ?? JSON.stringify(arg);
+  // Ask the browser to deep-serialize the object in-page.
+  try {
+    const result = await cdpCall<any>(ws, "Runtime.callFunctionOn", {
+      objectId: arg.objectId,
+      functionDeclaration: SAFE_STRINGIFY_FN,
+      arguments: [
+        { value: EXPAND_DEPTH },
+        { value: EXPAND_ARRAY_LIMIT },
+        { value: EXPAND_STRING_LIMIT },
+      ],
+      returnByValue: true,
+    });
+    if (result?.exceptionDetails) return arg.description ?? "[unserializable]";
+    const s = result?.result?.value;
+    return typeof s === "string" ? s : arg.description ?? "[unserializable]";
+  } catch {
+    return arg.description ?? "[unserializable]";
+  }
+}
+
+// Extract the topmost application frame from a CDP stackTrace.
+// CDP frames look like: { url, lineNumber, columnNumber, functionName }.
+// Line/column are 0-based in CDP; present them 1-based to match DevTools.
+function formatCallSite(stackTrace: any): string {
+  const frames: any[] = stackTrace?.callFrames ?? [];
+  for (const f of frames) {
+    const url: string = f.url ?? "";
+    if (!url) continue;
+    // Filter out devtools-internal and blank frames.
+    if (url.startsWith("chrome-extension://") || url.startsWith("devtools://")) continue;
+    const line = (f.lineNumber ?? 0) + 1;
+    const col = (f.columnNumber ?? 0) + 1;
+    // Trim the origin to keep lines short.
+    const short = url.replace(/^https?:\/\/[^/]+/, "");
+    return `${short}:${line}:${col}`;
+  }
+  return "";
 }
 
 function captureScreenshot(port: number): string | null {
@@ -78,6 +172,8 @@ async function tail(
   port: number
 ): Promise<void> {
   let lastScreenshot = 0;
+  // Serialize log output across async arg-expansion so lines land in arrival order.
+  let logQueue: Promise<void> = Promise.resolve();
 
   return new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
@@ -94,6 +190,17 @@ async function tail(
 
     ws.addEventListener("message", (event) => {
       const msg = JSON.parse(event.data as string);
+
+      // CDP responses have `id`; route them to the pending-call map.
+      if (typeof msg.id === "number") {
+        const resolver = pending.get(msg.id);
+        if (resolver) {
+          pending.delete(msg.id);
+          resolver(msg);
+        }
+        return;
+      }
+
       const method = msg.method;
       let isError = false;
 
@@ -102,20 +209,30 @@ async function tail(
         const level: string = params.type ?? "log";
         if (!CONSOLE_TYPES.has(level)) return;
         if (levels && !levels.has(level)) return;
-        const text = (params.args ?? []).map(formatArg).join(" ");
-        if (prefix && !text.startsWith(prefix)) return;
-        if (level === "log" || level === "info") {
-          console.log(text);
-        } else {
-          console.log(`[${level}] ${text}`);
-        }
+        const callSite = formatCallSite(params.stackTrace);
+        const args = params.args ?? [];
+        logQueue = logQueue.then(async () => {
+          const parts = await Promise.all(args.map((a: any) => expandArg(ws, a)));
+          const text = parts.join(" ");
+          if (prefix && !text.startsWith(prefix)) return;
+          const siteSuffix = callSite ? `  ← ${callSite}` : "";
+          if (level === "log" || level === "info") {
+            console.log(text + siteSuffix);
+          } else {
+            console.log(`[${level}] ${text}${siteSuffix}`);
+          }
+        });
         isError = level === "error";
       } else if (method === "Runtime.exceptionThrown") {
         if (levels && !levels.has("error")) return;
         const details = msg.params.exceptionDetails ?? {};
         const exc = details.exception ?? {};
         const desc = exc.description ?? details.text ?? "Unknown exception";
-        console.log(`[exception] ${desc}`);
+        const callSite = formatCallSite(details.stackTrace);
+        const siteSuffix = callSite ? `  ← ${callSite}` : "";
+        logQueue = logQueue.then(() => {
+          console.log(`[exception] ${desc}${siteSuffix}`);
+        });
         isError = true;
       } else if (method === "Log.entryAdded") {
         const entry = msg.params.entry ?? {};
@@ -124,7 +241,9 @@ async function tail(
         const text: string = entry.text ?? "";
         const source: string = entry.source ?? "";
         if (prefix && !text.startsWith(prefix)) return;
-        console.log(`[${source}] ${text}`);
+        logQueue = logQueue.then(() => {
+          console.log(`[${source}] ${text}`);
+        });
         isError = level === "error";
       } else if (method === "Runtime.executionContextDestroyed") {
         console.error("--- page navigated ---");
@@ -145,7 +264,12 @@ async function tail(
       }
     });
 
-    ws.addEventListener("close", () => resolve());
+    ws.addEventListener("close", () => {
+      // Reject any in-flight cdpCall promises so the tab-reconnect loop can restart cleanly.
+      for (const [, resolver] of pending) resolver({ error: { message: "socket closed" } });
+      pending.clear();
+      resolve();
+    });
     ws.addEventListener("error", (e) => reject(e));
   });
 }
@@ -208,3 +332,5 @@ process.on("SIGINT", () => {
 });
 
 tailWithReconnect(port, prefix, levels, watch);
+
+export {};
