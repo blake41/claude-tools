@@ -170,7 +170,12 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
       return { ok: false, error: 'dev-login returned invalid response: missing token' };
     }
     token = data.token;
-    userEmail = typeof data.email === 'string' ? data.email : undefined;
+    // Only override the request email if the server echoed a non-empty one.
+    // Terra's /auth/dev-login historically did not return email at all, which
+    // would clobber the request email we already have.
+    if (typeof data.email === 'string' && data.email) {
+      userEmail = data.email;
+    }
 
     log.info("Got dev-login token", { exchangeUrl: data.exchangeUrl });
   } catch (err) {

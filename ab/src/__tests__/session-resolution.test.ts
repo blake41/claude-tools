@@ -15,6 +15,7 @@ import {
   buildSessionName,
   parseFlags,
   resolvePid,
+  resolveReauthBaseUrls,
   sessionFilePath,
 } from "../cli";
 
@@ -105,6 +106,125 @@ describe("parseFlags", () => {
 
   test("throws RemovedFlagError on --session", () => {
     expect(() => parseFlags(["--session", "foo", "open"])).toThrow(RemovedFlagError);
+  });
+});
+
+describe("resolveReauthBaseUrls", () => {
+  test("no flags and no env → undefined (auth.ts defaults to localhost)", () => {
+    const r = resolveReauthBaseUrls([], {});
+    expect(r.apiBaseUrl).toBeUndefined();
+    expect(r.appBaseUrl).toBeUndefined();
+    expect(r.error).toBeUndefined();
+  });
+
+  test("--staging maps both URLs to staging", () => {
+    const r = resolveReauthBaseUrls(["--staging"], {});
+    expect(r.apiBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
+    expect(r.appBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
+  });
+
+  test("--dev maps both URLs to development render env", () => {
+    const r = resolveReauthBaseUrls(["--dev"], {});
+    expect(r.apiBaseUrl).toBe("https://slack-feedback-development.onrender.com");
+    expect(r.appBaseUrl).toBe("https://slack-feedback-development.onrender.com");
+  });
+
+  test("--local is explicit no-op (undefined → localhost defaults)", () => {
+    const r = resolveReauthBaseUrls(["--local"], {});
+    expect(r.apiBaseUrl).toBeUndefined();
+    expect(r.appBaseUrl).toBeUndefined();
+  });
+
+  test("env vars override preset", () => {
+    const r = resolveReauthBaseUrls(["--staging"], {
+      AB_API_BASE_URL: "https://custom-api.example.com",
+      AB_APP_BASE_URL: "https://custom-app.example.com",
+    });
+    expect(r.apiBaseUrl).toBe("https://custom-api.example.com");
+    expect(r.appBaseUrl).toBe("https://custom-app.example.com");
+  });
+
+  test("env vars apply without any preset flag", () => {
+    const r = resolveReauthBaseUrls([], {
+      AB_API_BASE_URL: "https://foo.example.com",
+      AB_APP_BASE_URL: "https://bar.example.com",
+    });
+    expect(r.apiBaseUrl).toBe("https://foo.example.com");
+    expect(r.appBaseUrl).toBe("https://bar.example.com");
+  });
+
+  test("--prod returns error (dev-login gated off in prod)", () => {
+    const r = resolveReauthBaseUrls(["--prod"], {});
+    expect(r.error).toContain("--prod is not supported");
+  });
+
+  test("--production returns same error", () => {
+    const r = resolveReauthBaseUrls(["--production"], {});
+    expect(r.error).toContain("--prod is not supported");
+  });
+
+  test("conflicting presets return error", () => {
+    const r = resolveReauthBaseUrls(["--staging", "--dev"], {});
+    expect(r.error).toContain("Conflicting env flags");
+  });
+
+  test("unrelated flags are ignored", () => {
+    const r = resolveReauthBaseUrls(["--verbose", "--staging"], {});
+    expect(r.apiBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
+    expect(r.error).toBeUndefined();
+  });
+
+  test("--host <hostname> sets both URLs to http://hostname", () => {
+    const r = resolveReauthBaseUrls(["--host", "worktree-foo.terra.localhost"], {});
+    expect(r.apiBaseUrl).toBe("http://worktree-foo.terra.localhost");
+    expect(r.appBaseUrl).toBe("http://worktree-foo.terra.localhost");
+    expect(r.error).toBeUndefined();
+  });
+
+  test("--host=<hostname> equals form works the same", () => {
+    const r = resolveReauthBaseUrls(["--host=worktree-bar.terra.localhost"], {});
+    expect(r.apiBaseUrl).toBe("http://worktree-bar.terra.localhost");
+    expect(r.appBaseUrl).toBe("http://worktree-bar.terra.localhost");
+  });
+
+  test("--host preserves explicit scheme", () => {
+    const r = resolveReauthBaseUrls(["--host", "https://my-host.example.com"], {});
+    expect(r.apiBaseUrl).toBe("https://my-host.example.com");
+    expect(r.appBaseUrl).toBe("https://my-host.example.com");
+  });
+
+  test("--host with no value → error", () => {
+    const r = resolveReauthBaseUrls(["--host"], {});
+    expect(r.error).toContain("--host requires a hostname");
+  });
+
+  test("--host=<empty> → error", () => {
+    const r = resolveReauthBaseUrls(["--host="], {});
+    expect(r.error).toContain("--host requires a hostname");
+  });
+
+  test("two --host with different values → error", () => {
+    const r = resolveReauthBaseUrls(["--host", "a.localhost", "--host", "b.localhost"], {});
+    expect(r.error).toContain("Conflicting --host values");
+  });
+
+  test("--host combined with --staging → error", () => {
+    const r = resolveReauthBaseUrls(["--host", "foo.terra.localhost", "--staging"], {});
+    expect(r.error).toContain("Cannot combine --host with --staging");
+  });
+
+  test("--host combined with --local is allowed (--local is no-op)", () => {
+    const r = resolveReauthBaseUrls(["--host", "foo.terra.localhost", "--local"], {});
+    expect(r.apiBaseUrl).toBe("http://foo.terra.localhost");
+    expect(r.error).toBeUndefined();
+  });
+
+  test("env vars still win over --host", () => {
+    const r = resolveReauthBaseUrls(["--host", "foo.terra.localhost"], {
+      AB_API_BASE_URL: "https://override.example.com",
+    });
+    expect(r.apiBaseUrl).toBe("https://override.example.com");
+    expect(r.appBaseUrl).toBe("http://foo.terra.localhost");
   });
 });
 

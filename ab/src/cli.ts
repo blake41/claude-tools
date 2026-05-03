@@ -216,14 +216,220 @@ async function cmdHeal(): Promise<number> {
   return 0;
 }
 
-async function cmdReauth(cdpPort: number, sessionName: string | null): Promise<number> {
+// ---------------------------------------------------------------------------
+// ab doctor — consolidated health check with concrete fix commands.
+// Walks the chain a user hits when something's off: daemon → Chrome → auth →
+// session files → agent-browser binary. Prints ✓ / ✗ with the exact command
+// to run next to any failure. Exit code 0 if everything passes, 1 otherwise.
+// ---------------------------------------------------------------------------
+
+async function cmdDoctor(): Promise<number> {
+  const checks: Array<{ label: string; ok: boolean; detail?: string; fix?: string }> = [];
+
+  let daemonUp = false;
+  let status: Awaited<ReturnType<typeof rpc.status>> | null = null;
+  try {
+    status = await rpc.status();
+    daemonUp = true;
+    checks.push({
+      label: "ab-server daemon",
+      ok: true,
+      detail: `uptime ${Math.floor(status.uptime)}s, v${status.version}`,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    checks.push({
+      label: "ab-server daemon",
+      ok: false,
+      detail: msg,
+      fix: "launchctl start com.clay.ab-server",
+    });
+  }
+
+  if (status) {
+    const headlessOk = status.headless.phase === "chrome_up";
+    checks.push({
+      label: "Chrome (headless, 9333)",
+      ok: headlessOk,
+      detail: status.headless.phase,
+      fix: headlessOk ? undefined : "ab ensure   # or: ab heal",
+    });
+
+    // Headed is on-demand — not running is normal, only flag if crashed.
+    const headedCrashed = status.headed.phase === "chrome_crashed";
+    checks.push({
+      label: "Chrome (headed, 9444)",
+      ok: !headedCrashed,
+      detail: status.headed.phase === "idle" ? "idle (on-demand)" : status.headed.phase,
+      fix: headedCrashed ? "ab heal" : undefined,
+    });
+  }
+
+  if (daemonUp) {
+    try {
+      const auth = await rpc.authStatus();
+      checks.push({
+        label: "dev-login auth",
+        ok: auth.authenticated,
+        detail: auth.authenticated
+          ? `${auth.user?.email || "unknown"} (last login ${auth.lastLogin ?? "?"})`
+          : "not authenticated",
+        fix: auth.authenticated ? undefined : "ab reauth",
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      checks.push({ label: "dev-login auth", ok: false, detail: msg, fix: "ab reauth" });
+    }
+  }
+
+  const pid = resolvePid();
+  const sessionFile = sessionFilePath(pid);
+  const sessionFileExists = fs.existsSync(sessionFile);
+  checks.push({
+    label: `session file (${sessionFile})`,
+    ok: sessionFileExists,
+    detail: sessionFileExists ? "present" : "missing",
+    fix: sessionFileExists ? undefined : "ab new-session",
+  });
+
+  // Wrapper only matters in subagents (where AB_SESSION_PID is set by the hook).
+  if (process.env.AB_SESSION_PID) {
+    const wrapper = `/tmp/ab-${pid}`;
+    const wrapperExists = fs.existsSync(wrapper);
+    checks.push({
+      label: `subagent wrapper (${wrapper})`,
+      ok: wrapperExists,
+      detail: wrapperExists ? "present" : "missing (SubagentStart hook didn't run?)",
+      fix: wrapperExists ? undefined : "Restart the subagent so SubagentStart installs the shim.",
+    });
+  }
+
+  const whichResult = await new Promise<number>((resolve) => {
+    const child = spawn("which", [AGENT_BROWSER], { stdio: "ignore" });
+    child.on("close", (code) => resolve(code ?? 1));
+    child.on("error", () => resolve(1));
+  });
+  checks.push({
+    label: `${AGENT_BROWSER} on PATH`,
+    ok: whichResult === 0,
+    fix: whichResult === 0 ? undefined : "bun install -g agent-browser (or check your PATH)",
+  });
+
+  const allOk = checks.every((c) => c.ok);
+  const labelW = Math.max(...checks.map((c) => c.label.length));
+  for (const c of checks) {
+    const mark = c.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
+    const detail = c.detail ? `  \x1b[90m${c.detail}\x1b[0m` : "";
+    process.stdout.write(`${mark} ${c.label.padEnd(labelW)}${detail}\n`);
+    if (!c.ok && c.fix) {
+      process.stdout.write(`    \x1b[33m→ ${c.fix}\x1b[0m\n`);
+    }
+  }
+  process.stdout.write(
+    allOk ? "\n\x1b[32mAll checks passed.\x1b[0m\n" : "\n\x1b[31mSome checks failed.\x1b[0m\n",
+  );
+  return allOk ? 0 : 1;
+}
+
+// Environment presets for `ab reauth`. Terra-specific: dev-login is a Terra
+// endpoint and exists only in non-production envs.
+const REAUTH_ENV_PRESETS: Record<string, string> = {
+  staging: "https://slack-feedback-staging.onrender.com",
+  dev: "https://slack-feedback-development.onrender.com",
+};
+
+export function resolveReauthBaseUrls(
+  args: string[],
+  env: { AB_API_BASE_URL?: string; AB_APP_BASE_URL?: string },
+): { apiBaseUrl: string | undefined; appBaseUrl: string | undefined; error?: string } {
+  let preset: string | undefined;
+  let host: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith("--")) continue;
+
+    // --host <value> or --host=<value>
+    if (arg === "--host" || arg.startsWith("--host=")) {
+      let hostValue: string | undefined;
+      if (arg === "--host") {
+        const next = args[i + 1];
+        if (next !== undefined && !next.startsWith("--")) {
+          hostValue = next;
+          i++;
+        }
+      } else {
+        hostValue = arg.slice("--host=".length);
+      }
+      if (!hostValue) {
+        return { apiBaseUrl: undefined, appBaseUrl: undefined, error: "--host requires a hostname" };
+      }
+      if (host && host !== hostValue) {
+        return { apiBaseUrl: undefined, appBaseUrl: undefined, error: `Conflicting --host values: ${host} and ${hostValue}` };
+      }
+      host = hostValue;
+      continue;
+    }
+
+    const name = arg.slice(2);
+    if (name in REAUTH_ENV_PRESETS) {
+      if (preset && preset !== name) {
+        return { apiBaseUrl: undefined, appBaseUrl: undefined, error: `Conflicting env flags: --${preset} and --${name}` };
+      }
+      preset = name;
+    } else if (name === "prod" || name === "production") {
+      return {
+        apiBaseUrl: undefined,
+        appBaseUrl: undefined,
+        error: "--prod is not supported: dev-login is disabled in production. Use `ab import` for headed Google login.",
+      };
+    } else if (name === "local") {
+      // Explicit no-op: use defaults (localhost) from auth.ts.
+      preset = "local";
+    }
+  }
+  if (host && preset && preset !== "local") {
+    return {
+      apiBaseUrl: undefined,
+      appBaseUrl: undefined,
+      error: `Cannot combine --host with --${preset}`,
+    };
+  }
+  // --host wins over presets. Prepend http:// if no scheme — portless URLs
+  // (e.g. worktree-foo.terra.localhost) are HTTP and the proxy handles upgrade.
+  const hostUrl = host
+    ? host.startsWith("http://") || host.startsWith("https://")
+      ? host
+      : `http://${host}`
+    : undefined;
+  const presetUrl = preset && preset !== "local" ? REAUTH_ENV_PRESETS[preset] : undefined;
+  const resolved = hostUrl ?? presetUrl;
+  // Env vars win over flags, flags win over undefined (→ auth.ts localhost defaults).
+  return {
+    apiBaseUrl: env.AB_API_BASE_URL ?? resolved,
+    appBaseUrl: env.AB_APP_BASE_URL ?? resolved,
+  };
+}
+
+async function cmdReauth(
+  rest: string[],
+  cdpPort: number,
+  sessionName: string | null,
+): Promise<number> {
+  const urls = resolveReauthBaseUrls(rest, {
+    AB_API_BASE_URL: process.env.AB_API_BASE_URL,
+    AB_APP_BASE_URL: process.env.AB_APP_BASE_URL,
+  });
+  if (urls.error) {
+    stderr(urls.error);
+    return 2;
+  }
   const result = await rpc.authLogin({
     sessionId: sessionName ?? "default",
     port: cdpPort,
     email: DEFAULT_AUTH_EMAIL,
     slackUserId: DEFAULT_SLACK_USER_ID,
-    apiBaseUrl: process.env.AB_API_BASE_URL,
-    appBaseUrl: process.env.AB_APP_BASE_URL,
+    apiBaseUrl: urls.apiBaseUrl,
+    appBaseUrl: urls.appBaseUrl,
   });
   if (result.ok) {
     stderr("Reauth complete");
@@ -463,6 +669,12 @@ async function cmdClickJs(args: string[], cdpPort: number): Promise<number> {
   return result.exitCode;
 }
 
+async function cmdClickXy(args: string[], cdpPort: number): Promise<number> {
+  const script = path.join(AB_DIR, "cdp-click-xy.ts");
+  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args]);
+  return result.exitCode;
+}
+
 async function cmdLocalStorage(
   subCmd: string,
   key: string,
@@ -638,9 +850,10 @@ async function main(): Promise<number> {
 
     // -- Daemon lifecycle --
     if (command === "status") return await cmdStatus();
+    if (command === "doctor") return await cmdDoctor();
     if (command === "ensure") return await cmdEnsure(flags.headed);
     if (command === "heal") return await cmdHeal();
-    if (command === "reauth") return await cmdReauth(cdpPort, sessionName);
+    if (command === "reauth") return await cmdReauth(rest, cdpPort, sessionName);
 
     // -- Standalone --
     if (command === "new-session") return cmdNewSession();
@@ -649,6 +862,7 @@ async function main(): Promise<number> {
     if (command === "console-tail") return await cmdConsoleTail(rest, cdpPort);
     if (command === "watch") return await cmdWatch(rest, cdpPort);
     if (command === "click-js") return await cmdClickJs(rest, cdpPort);
+    if (command === "click-xy") return await cmdClickXy(rest, cdpPort);
 
     // -- Interactive --
     if (command === "import") return await cmdImport();
@@ -745,10 +959,11 @@ function printUsage(): void {
   stderr("  watch               Errors + auto-screenshot");
   stderr("");
   stderr("Auth & Lifecycle:");
-  stderr("  reauth              Re-authenticate via daemon");
+  stderr("  reauth [--staging|--dev|--host <hostname>]  Re-authenticate via daemon (default: localhost)");
   stderr("  import              Headed login (manual Google/Clerk auth)");
   stderr("  heal                Kill all Chrome, restart fresh");
   stderr("  status              Show daemon status (JSON)");
+  stderr("  doctor              Human-readable health check with fix commands");
   stderr("  ensure              Ensure Chrome is running");
   stderr("  dashboard <cmd>     Dashboard management");
   stderr("");
@@ -763,6 +978,7 @@ function printUsage(): void {
   stderr("");
   stderr("Other:");
   stderr("  click-js <args>     JS-based click (for React virtualized lists)");
+  stderr("  click-xy <x> <y>    Compositor-level pixel click (cross-origin iframes, shadow DOM)");
   stderr("");
   stderr("Flags:");
   stderr("  --headed            Use headed Chrome (port 9444)");
