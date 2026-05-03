@@ -132,12 +132,24 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
     const loginBody = email ? { email } : { slackUserId };
     log.info("Requesting dev-login token", { loginUrl, ...loginBody });
 
-    const resp = await fetch(loginUrl, {
+    // Portless serves a per-machine self-signed TLS cert on :1355. Bun's fetch
+    // doesn't read the system keychain by default, so HTTP requests to a
+    // `.localhost` host that 302-redirect to portless's HTTPS endpoint fail
+    // with "self signed certificate in certificate chain". Accept the cert
+    // for any `.localhost` URL — we'll never reach this branch for staging/prod.
+    const loginHost = new URL(loginUrl).hostname;
+    const isLocalDev = loginHost === "localhost" || loginHost.endsWith(".localhost");
+    const fetchOpts: RequestInit & { tls?: { rejectUnauthorized: boolean } } = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(loginBody),
       signal: AbortSignal.timeout(5_000),
-    });
+    };
+    if (isLocalDev) {
+      fetchOpts.tls = { rejectUnauthorized: false };
+    }
+
+    const resp = await fetch(loginUrl, fetchOpts);
 
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
