@@ -174,17 +174,31 @@ describe("resolveReauthBaseUrls", () => {
     expect(r.error).toBeUndefined();
   });
 
-  test("--host <hostname> sets both URLs to http://hostname", () => {
+  test("--host <*.localhost> targets portless HTTPS:1355 directly", () => {
+    // Portless serves *.localhost subdomains on HTTPS:1355 with a self-signed
+    // cert. Going through HTTP:80 would 302 to the same URL but drop the POST
+    // body, so we address :1355 directly.
     const r = resolveReauthBaseUrls(["--host", "worktree-foo.terra.localhost"], {});
-    expect(r.apiBaseUrl).toBe("http://worktree-foo.terra.localhost");
-    expect(r.appBaseUrl).toBe("http://worktree-foo.terra.localhost");
+    expect(r.apiBaseUrl).toBe("https://worktree-foo.terra.localhost:1355");
+    expect(r.appBaseUrl).toBe("https://worktree-foo.terra.localhost:1355");
     expect(r.error).toBeUndefined();
   });
 
   test("--host=<hostname> equals form works the same", () => {
     const r = resolveReauthBaseUrls(["--host=worktree-bar.terra.localhost"], {});
-    expect(r.apiBaseUrl).toBe("http://worktree-bar.terra.localhost");
-    expect(r.appBaseUrl).toBe("http://worktree-bar.terra.localhost");
+    expect(r.apiBaseUrl).toBe("https://worktree-bar.terra.localhost:1355");
+    expect(r.appBaseUrl).toBe("https://worktree-bar.terra.localhost:1355");
+  });
+
+  test("--host bare `localhost` stays HTTP (no portless involved)", () => {
+    const r = resolveReauthBaseUrls(["--host", "localhost"], {});
+    expect(r.apiBaseUrl).toBe("http://localhost");
+    expect(r.appBaseUrl).toBe("http://localhost");
+  });
+
+  test("--host non-localhost domain stays HTTP", () => {
+    const r = resolveReauthBaseUrls(["--host", "example.com"], {});
+    expect(r.apiBaseUrl).toBe("http://example.com");
   });
 
   test("--host preserves explicit scheme", () => {
@@ -215,7 +229,7 @@ describe("resolveReauthBaseUrls", () => {
 
   test("--host combined with --local is allowed (--local is no-op)", () => {
     const r = resolveReauthBaseUrls(["--host", "foo.terra.localhost", "--local"], {});
-    expect(r.apiBaseUrl).toBe("http://foo.terra.localhost");
+    expect(r.apiBaseUrl).toBe("https://foo.terra.localhost:1355");
     expect(r.error).toBeUndefined();
   });
 
@@ -224,7 +238,7 @@ describe("resolveReauthBaseUrls", () => {
       AB_API_BASE_URL: "https://override.example.com",
     });
     expect(r.apiBaseUrl).toBe("https://override.example.com");
-    expect(r.appBaseUrl).toBe("http://foo.terra.localhost");
+    expect(r.appBaseUrl).toBe("https://foo.terra.localhost:1355");
   });
 });
 

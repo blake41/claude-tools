@@ -394,12 +394,18 @@ export function resolveReauthBaseUrls(
       error: `Cannot combine --host with --${preset}`,
     };
   }
-  // --host wins over presets. Prepend http:// if no scheme — portless URLs
-  // (e.g. worktree-foo.terra.localhost) are HTTP and the proxy handles upgrade.
+  // --host wins over presets. For bare hostnames, pick the right scheme:
+  //   - `*.localhost` subdomains → portless serves HTTPS on :1355 and issues a
+  //     302 from :80; following the redirect drops the POST body, so address
+  //     :1355 directly. The portless TLS cert is self-signed; auth.ts already
+  //     accepts that for `.localhost` hosts.
+  //   - bare `localhost` → plain HTTP on the default port (no portless).
   const hostUrl = host
     ? host.startsWith("http://") || host.startsWith("https://")
       ? host
-      : `http://${host}`
+      : host.endsWith(".localhost")
+        ? `https://${host}:1355`
+        : `http://${host}`
     : undefined;
   const presetUrl = preset && preset !== "local" ? REAUTH_ENV_PRESETS[preset] : undefined;
   const resolved = hostUrl ?? presetUrl;
