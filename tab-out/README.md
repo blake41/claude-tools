@@ -53,8 +53,21 @@ tab-out/
 │   └── icons/
 └── native-host/
     ├── snapshots-host.py       # Native messaging host (~80 LOC, Python stdlib)
-    └── install.sh              # Installs the manifest under ~/Library/...
+    └── install.sh              # Copies host to ~/.tab-out/bin/ + installs manifest
 ```
+
+After install, runtime state lives outside the repo:
+
+```
+~/.tab-out/
+├── bin/snapshots-host.py       # Where Chrome actually executes from
+└── snapshots/                  # One <profileId>.json per profile
+```
+
+The host script is **deployed out of `~/.tab-out/bin/`** rather than run in
+place from the repo because macOS TCC blocks Chrome from spawning scripts
+under `~/Documents/` without explicit user consent — and there's no API for
+an extension to prompt for it. Living under `~/.tab-out/` sidesteps it.
 
 ## Group-by modes
 
@@ -175,6 +188,10 @@ cat ~/.tab-out/snapshots/<uuid>.json | jq .
 # - Check ~/.tab-out/snapshots/ has more than one .json
 # - Check ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/
 #   contains com.zarazhangrui.tab_out_snapshots.json with your extension ID
+# - Open the service worker console (chrome://extensions → "service worker"
+#   under Tab Out) and look for [tab-out] log lines. "Native host has exited"
+#   means TCC is blocking the host script — re-run native-host/install.sh,
+#   which deploys to ~/.tab-out/bin/ (outside ~/Documents/).
 ```
 
 ## Source provenance

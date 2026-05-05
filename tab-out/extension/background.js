@@ -67,32 +67,35 @@ async function updateBadge() {
 
 // ─── Cross-profile snapshot writer ────────────────────────────────────────────
 
-let snapshotWriteTimer = null;
-
 /**
- * Debounced snapshot push. Tab events fire many times during navigation
- * (especially onUpdated); we only need the last state ~1.5s after the
- * dust settles. If the native host isn't installed, sendNativeMessage
- * fails silently — that's fine, cross-profile is opt-in.
+ * Snapshot push. Originally debounced via setTimeout, but MV3 service workers
+ * can be killed before a pending timer fires — so we write immediately on
+ * each event instead and rate-limit with a 300ms guard. sendNativeMessage
+ * spawns a fresh process per call (~10ms), so per-event writes are cheap.
+ *
+ * Errors are LOGGED, not swallowed — open the service worker DevTools
+ * (chrome://extensions → "service worker") to see them.
  */
-function scheduleSnapshotWrite() {
-  if (snapshotWriteTimer) clearTimeout(snapshotWriteTimer);
-  snapshotWriteTimer = setTimeout(async () => {
-    snapshotWriteTimer = null;
-    try {
-      const tabs = await chrome.tabs.query({});
-      await writeOwnSnapshot(tabs);
-    } catch {
-      // Native host probably not installed yet — see native-host/install.sh.
-    }
-  }, 1500);
+let lastSnapshotWriteAt = 0;
+
+async function pushSnapshotNow() {
+  const now = Date.now();
+  if (now - lastSnapshotWriteAt < 300) return;  // coalesce bursts
+  lastSnapshotWriteAt = now;
+  try {
+    const tabs = await chrome.tabs.query({});
+    const result = await writeOwnSnapshot(tabs);
+    console.log('[tab-out] snapshot written:', result, '(', tabs.length, 'tabs )');
+  } catch (err) {
+    console.error('[tab-out] snapshot write failed:', err && err.message ? err.message : err);
+  }
 }
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
 
 function onTabsChanged() {
   updateBadge();
-  scheduleSnapshotWrite();
+  pushSnapshotNow();
 }
 
 // Update badge when the extension is first installed

@@ -6,6 +6,13 @@
 #
 # Find your extension ID at chrome://extensions (Developer mode on, look for
 # the "ID: ..." line on the Tab Out tile). The ID is a 32-char a-p string.
+#
+# IMPORTANT — host script location:
+#   The host runs OUT of ~/.tab-out/bin/, not from the repo. macOS TCC blocks
+#   Chrome from spawning scripts under ~/Documents/ (and a few other dirs)
+#   without explicit user consent — and there's no way for an extension to
+#   prompt for it. So we copy the script to a location Chrome can always
+#   reach. The copy happens on every install and is idempotent.
 
 set -euo pipefail
 
@@ -23,13 +30,20 @@ if ! [[ "$EXT_ID" =~ ^[a-p]{32}$ ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HOST_SCRIPT="$REPO_ROOT/native-host/snapshots-host.py"
+SOURCE_SCRIPT="$REPO_ROOT/native-host/snapshots-host.py"
 HOST_NAME="com.zarazhangrui.tab_out_snapshots"
 
-if [[ ! -f "$HOST_SCRIPT" ]]; then
-  echo "Error: $HOST_SCRIPT not found"
+if [[ ! -f "$SOURCE_SCRIPT" ]]; then
+  echo "Error: $SOURCE_SCRIPT not found"
   exit 1
 fi
+
+# Copy the host script outside ~/Documents/ to dodge macOS TCC sandboxing.
+INSTALL_DIR="$HOME/.tab-out/bin"
+HOST_SCRIPT="$INSTALL_DIR/snapshots-host.py"
+mkdir -p "$INSTALL_DIR"
+cp "$SOURCE_SCRIPT" "$HOST_SCRIPT"
+chmod +x "$HOST_SCRIPT"
 
 case "$(uname)" in
   Darwin)
@@ -45,7 +59,6 @@ case "$(uname)" in
 esac
 
 mkdir -p "$MANIFEST_DIR"
-chmod +x "$HOST_SCRIPT"
 
 MANIFEST_PATH="$MANIFEST_DIR/$HOST_NAME.json"
 cat > "$MANIFEST_PATH" <<EOF
@@ -60,12 +73,13 @@ cat > "$MANIFEST_PATH" <<EOF
 }
 EOF
 
-echo "Installed native messaging host manifest:"
-echo "  $MANIFEST_PATH"
-echo
-echo "Snapshot directory: $HOME/.tab-out/snapshots/"
+echo "Host script: $HOST_SCRIPT"
+echo "Manifest:    $MANIFEST_PATH"
+echo "Snapshots:   $HOME/.tab-out/snapshots/"
 echo
 echo "Next steps:"
 echo "  1. Reload Tab Out at chrome://extensions"
-echo "  2. Run this script in EACH Chrome profile you want included,"
-echo "     using that profile's extension ID."
+echo "  2. Open a new tab — that triggers the first snapshot write."
+echo "  3. To include another Chrome profile: load the same extension folder"
+echo "     unpacked in that profile (the path-derived ID stays the same, so"
+echo "     this manifest already covers it)."
