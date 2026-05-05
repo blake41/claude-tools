@@ -28,6 +28,7 @@ tools/
 ├── git-prune-merged/     # Rebase-aware branch cleanup
 ├── watch-deploy/         # Render deploy watcher with notifications
 ├── tmux/                 # Tmux process monitoring for AI agents
+├── tab-out/              # Tab Out Chrome extension (custom fork) + cross-profile native host
 ├── cli-over-mcp.md       # Pattern: replacing MCP with CLI scripts
 ├── render-config.md      # Render CLI setup docs
 └── MIGRATION.md          # Migration notes
@@ -57,6 +58,7 @@ tools/
 | iMessage | `~/.local/bin/imsg` | Full Disk Access required |
 | git-prune-merged | `~/.local/bin/git-prune-merged` | — |
 | watch-deploy | `~/.local/bin/watch-deploy` | — |
+| Tab Out | Chrome extension (`tools/tab-out/extension/`) + native host at `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.zarazhangrui.tab_out_snapshots.json` | `~/.tab-out/snapshots/` |
 
 ## Quick Reference
 
