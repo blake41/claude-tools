@@ -449,6 +449,13 @@ async function cmdReauth(
   return 0;
 }
 
+// Default viewport applied by `ab open` when AB_VIEWPORT_* are unset.
+// Pinned to 1440x900@2x because that matches Clerk's auth UI breakpoints
+// and most apps' desktop layouts. Override per-session via env vars.
+const DEFAULT_VIEWPORT_W = process.env.AB_VIEWPORT_W ?? "1440";
+const DEFAULT_VIEWPORT_H = process.env.AB_VIEWPORT_H ?? "900";
+const DEFAULT_VIEWPORT_SCALE = process.env.AB_VIEWPORT_SCALE ?? "2";
+
 async function cmdOpen(
   url: string,
   cdpPort: number,
@@ -457,7 +464,18 @@ async function cmdOpen(
   // Create a dedicated tab for this session so parallel sessions don't collide.
   // tab new sets the new tab as active, so subsequent commands target it.
   await runAgentBrowser(cdpPort, sessionName, ["tab", "new", url]);
-  await runAgentBrowser(cdpPort, sessionName, ["set", "viewport", "1440", "900", "2"]);
+  // Apply viewport unless explicitly skipped. Override defaults via
+  // AB_VIEWPORT_W / AB_VIEWPORT_H / AB_VIEWPORT_SCALE; set AB_VIEWPORT=skip
+  // to leave Chrome's native window size in place.
+  if (process.env.AB_VIEWPORT !== "skip") {
+    await runAgentBrowser(cdpPort, sessionName, [
+      "set",
+      "viewport",
+      DEFAULT_VIEWPORT_W,
+      DEFAULT_VIEWPORT_H,
+      DEFAULT_VIEWPORT_SCALE,
+    ]);
+  }
   return 0;
 }
 
@@ -994,6 +1012,10 @@ function printUsage(): void {
   stderr("  AB_SLACK_USER_ID    Override default Slack user for dev-login auth");
   stderr("  AB_SESSION_PID      Session pid (set by subagent hook; falls back to CCO_SESSION_ID)");
   stderr("  CCO_SESSION_ID      Claude Code session ID (auto-set by sandbox)");
+  stderr("  AB_VIEWPORT_W       Viewport width applied by 'ab open' (default 1440)");
+  stderr("  AB_VIEWPORT_H       Viewport height applied by 'ab open' (default 900)");
+  stderr("  AB_VIEWPORT_SCALE   Viewport DPR applied by 'ab open' (default 2)");
+  stderr("  AB_VIEWPORT=skip    Skip auto-viewport on 'ab open' (use Chrome native size)");
 }
 
 // ---------------------------------------------------------------------------
