@@ -231,6 +231,44 @@ button {
   text-decoration-color: var(--color-accent-blue);
 }
 
+/* ---- Collapsible long content ---- */
+.collapsible-wrap {
+  position: relative;
+}
+.collapsible-wrap.collapsed {
+  max-height: 20rem;
+  overflow: hidden;
+}
+.collapsible-fade {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 4rem;
+  background: linear-gradient(transparent, var(--color-bg-card));
+  pointer-events: none;
+}
+/* User bubbles have a slightly different bg */
+.type-user .collapsible-fade {
+  background: linear-gradient(transparent, color-mix(in srgb, var(--color-accent-blue) 10%, var(--color-bg-card)));
+}
+.collapsible-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 4px 0;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-accent-blue);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: center;
+  opacity: 0.7;
+  transition: opacity 0.1s;
+}
+.collapsible-btn:hover { opacity: 1; }
+
 /* ---- Scrollbar ---- */
 ::-webkit-scrollbar {
   width: 8px;

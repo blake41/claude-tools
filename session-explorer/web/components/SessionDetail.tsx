@@ -82,6 +82,36 @@ function ToolBlock({ label, content, timestamp, highlight, sequence }: {
   );
 }
 
+const COLLAPSE_PX = 320; // ~20 lines at 14px/1.5lh
+
+function CollapsibleContent({ html, className }: { html: string; className?: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [overflows, setOverflows] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setOverflows(el.scrollHeight > COLLAPSE_PX + 10);
+  }, [html]);
+
+  return (
+    <>
+      <div
+        ref={ref}
+        className={`message-content collapsible-wrap${overflows && !expanded ? " collapsed" : ""} ${className ?? ""}`}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {overflows && !expanded && <div className="collapsible-fade" />}
+      {overflows && (
+        <button className="collapsible-btn" onClick={() => setExpanded((e) => !e)}>
+          {expanded ? "Show less" : `Show more`}
+        </button>
+      )}
+    </>
+  );
+}
+
 function MessageBubble({ message, highlight }: { message: Message; highlight?: boolean }) {
   const isToolResult = message.role === "user" && message.message_type === "tool_result";
   const isToolUse = message.message_type === "tool_use";
@@ -131,10 +161,7 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
           <span className="font-mono text-[10px] opacity-50 font-normal ml-1.5">{formatTime(message.timestamp)}</span>
         )}
       </div>
-      <div
-        className="message-content"
-        dangerouslySetInnerHTML={{ __html: renderMarkdown(displayContent) }}
-      />
+      <CollapsibleContent html={renderMarkdown(displayContent)} />
     </div>
   );
 }
