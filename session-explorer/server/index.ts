@@ -151,7 +151,7 @@ const getMessages = db.prepare(`
   SELECT role, content, timestamp, sequence, message_type, tool_use_id, tool_name, tool_input
   FROM messages
   WHERE session_id = ?
-  ORDER BY sequence ASC
+  ORDER BY timestamp ASC, sequence ASC
 `);
 
 // Fetch the matched message's content for a readable preview

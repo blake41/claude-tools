@@ -15,7 +15,7 @@ export interface StrippedMessage {
   content: string;
   timestamp: string | null;
   sequence: number;
-  messageType: "text" | "tool_use" | "tool_result" | "system";
+  messageType: "text" | "tool_use" | "tool_result" | "system" | "subagent_prompt";
   // For tool_use and tool_result messages: the provider-assigned id that
   // links them together. Null on plain text/system messages.
   toolUseId?: string | null;
@@ -221,6 +221,14 @@ export function stripSession(jsonlPath: string): {
       break;
     }
   }
+
+  // Sort by timestamp so sequence numbers reflect chronological order,
+  // not file order — rewind/replay can make file order non-chronological.
+  msgs.sort((a, b) => {
+    if (!a.timestamp) return 1;
+    if (!b.timestamp) return -1;
+    return a.timestamp.localeCompare(b.timestamp);
+  });
 
   // ── Extract file references and tool calls from tool_use blocks ──
   const fileMap = new Map<string, FileReference>(); // key: "filePath|operation"
