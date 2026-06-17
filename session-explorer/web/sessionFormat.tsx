@@ -65,6 +65,44 @@ export function renderMarkdown(text: string): string {
   // Horizontal rules
   html = html.replace(/^---+$/gm, "<hr />");
 
+  // Tables — must run before paragraph conversion
+  // Matches: header row | separator row | body rows
+  html = html.replace(
+    /^(\|.+\|)\n\|[-| :]+\|\n((?:\|.+\|\n?)*)/gm,
+    (_match, headerRow, bodyRows) => {
+      const parseRow = (row: string) =>
+        row
+          .split("|")
+          .slice(1, -1)
+          .map((c) => c.trim());
+
+      const headers = parseRow(headerRow);
+      const rows = bodyRows
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map(parseRow);
+
+      const th = headers.map((h) => `<th>${h}</th>`).join("");
+      const tbody = rows
+        .map((cells: string[]) => `<tr>${cells.map((c: string) => `<td>${c}</td>`).join("")}</tr>`)
+        .join("");
+
+      return `<table class="md-table"><thead><tr>${th}</tr></thead><tbody>${tbody}</tbody></table>`;
+    }
+  );
+
+  // Blockquotes
+  html = html.replace(
+    /((?:^&gt; .+\n?)+)/gm,
+    (block) => {
+      const inner = block
+        .replace(/^&gt; /gm, "")
+        .trimEnd();
+      return `<blockquote>${inner}</blockquote>`;
+    }
+  );
+
   // Links
   html = html.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
