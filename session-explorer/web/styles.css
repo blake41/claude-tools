@@ -351,8 +351,10 @@ button {
 .collapsible-wrap.collapsed {
   max-height: 20rem;
   overflow: hidden;
+  position: relative;
 }
-.collapsible-fade {
+.collapsible-wrap.collapsed::after {
+  content: '';
   position: absolute;
   bottom: 0;
   left: 0;
@@ -361,8 +363,7 @@ button {
   background: linear-gradient(transparent, var(--color-bg-card));
   pointer-events: none;
 }
-/* User bubbles have a slightly different bg */
-.type-user .collapsible-fade {
+.type-user .collapsible-wrap.collapsed::after {
   background: linear-gradient(transparent, color-mix(in srgb, var(--color-accent-blue) 10%, var(--color-bg-card)));
 }
 .collapsible-btn {

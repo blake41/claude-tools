@@ -140,7 +140,6 @@ function CollapsibleContent({ html, className }: { html: string; className?: str
         dangerouslySetInnerHTML={{ __html: html }}
       />
       <MermaidHost containerRef={ref} />
-      {overflows && !expanded && <div className="collapsible-fade" />}
       {overflows && (
         <button className="collapsible-btn" onClick={() => setExpanded((e) => !e)}>
           {expanded ? "Show less" : `Show more`}
