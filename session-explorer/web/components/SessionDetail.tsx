@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { useParams, useNavigate, useSearch } from "@tanstack/react-router";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
-import { renderMarkdown } from "../sessionFormat";
+import { renderMarkdown, cleanUserContent } from "../sessionFormat";
 import { INSIGHT_TYPE_COLORS } from "../insight-shared";
 import { useExtraction } from "../hooks/useExtraction";
 import SessionHeader from "./SessionHeader";
@@ -85,10 +85,10 @@ function ToolBlock({ label, content, timestamp, highlight, sequence }: {
 function MessageBubble({ message, highlight }: { message: Message; highlight?: boolean }) {
   const isToolResult = message.role === "user" && message.message_type === "tool_result";
   const isToolUse = message.message_type === "tool_use";
-  const isSystem = message.message_type === "system";
+  const isSystem = message.message_type === "system" || message.message_type === "subagent_prompt";
   const isUser = message.role === "user" && !isToolResult && !isSystem;
 
-  // System message (skill loaded, system context)
+  // System message (skill loaded, system context, subagent prompts)
   if (isSystem) {
     return (
       <details
@@ -97,7 +97,7 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
       >
         <summary>
           <svg width="14" height="14" viewBox="0 0 16 16" fill="#bc8cff"><path d="M8.5 1.5a1 1 0 00-1 0L2.1 4.75a1 1 0 000 1.73l5.4 3.25a1 1 0 001 0l5.4-3.25a1 1 0 000-1.73zM2.1 9.52l5.4 3.25a1 1 0 001 0l5.4-3.25" stroke="#bc8cff" strokeWidth="1" fill="none"/></svg>
-          {message.content.replace(/^\[|\]$/g, '')}
+          {message.message_type === "subagent_prompt" ? "Subagent prompt" : message.content.replace(/^\[|\]$/g, '')}
         </summary>
       </details>
     );
@@ -116,6 +116,10 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
     return <ToolBlock label={label} content={content} timestamp={message.timestamp} highlight={highlight} sequence={message.sequence} />;
   }
 
+  // Clean harness noise from user content before rendering
+  const displayContent = isUser ? cleanUserContent(message.content) : message.content;
+  if (!displayContent) return null;
+
   return (
     <div
       id={`msg-${message.sequence}`}
@@ -129,7 +133,7 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
       </div>
       <div
         className="message-content"
-        dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+        dangerouslySetInnerHTML={{ __html: renderMarkdown(displayContent) }}
       />
     </div>
   );

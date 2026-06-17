@@ -7,6 +7,25 @@
  */
 import React from "react";
 
+// ── Strip harness noise from user message content ───────────────
+// Claude Code injects many XML-tagged blocks into user turns that are
+// not typed by the user: system reminders, hook outputs, tool caveats,
+// diagnostic notices, etc. Strip them before rendering.
+const HARNESS_TAG_RE =
+  /<(system-reminder|local-command-caveat|task-notification|command-name|command-message|command-args|local-command-stdout|local-command-stderr|bash-input|bash-stdout|bash-stderr|new-diagnostics|ide_opened_file|user-prompt-submit-hook)[^>]*>[\s\S]*?<\/\1>/gi;
+
+// Also strip bare SYSTEM NOTIFICATION blocks (no XML wrapper)
+const SYSTEM_NOTIFICATION_RE =
+  /\[SYSTEM NOTIFICATION - NOT USER INPUT\][\s\S]*?(?=\n\n|\n?$)/g;
+
+export function cleanUserContent(text: string): string {
+  return text
+    .replace(HARNESS_TAG_RE, "")
+    .replace(SYSTEM_NOTIFICATION_RE, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // ── Escape HTML ──────────────────────────────────────────────────
 function esc(text: string): string {
   return text
