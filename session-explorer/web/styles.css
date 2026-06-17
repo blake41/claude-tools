@@ -231,6 +231,59 @@ button {
   text-decoration-color: var(--color-accent-blue);
 }
 
+/* ---- Assistant turn block ---- */
+.assistant-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.assistant-turn-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 4px 2px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  opacity: 0.75;
+  transition: opacity 0.12s;
+  border-radius: 4px;
+}
+.assistant-turn-header:hover { opacity: 1; }
+.assistant-turn-label {
+  font-weight: 600;
+  color: var(--color-claude-text, #c4b5a0);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.assistant-turn-summary {
+  color: var(--color-text-dim);
+  font-size: 11px;
+}
+.assistant-turn-time {
+  color: var(--color-text-dim);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  margin-left: auto;
+}
+.assistant-turn-chevron {
+  font-size: 11px;
+  color: var(--color-text-dim);
+  transition: transform 0.15s;
+  margin-left: 4px;
+}
+.assistant-turn-chevron.collapsed { transform: rotate(-90deg); }
+.assistant-turn-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 /* ---- Collapsible long content ---- */
 .collapsible-wrap {
   position: relative;

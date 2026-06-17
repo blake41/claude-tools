@@ -166,6 +166,132 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
   );
 }
 
+// ─── Assistant turn grouping ─────────────────────────────────────────────
+// Groups consecutive non-user items (text bubbles + tool groups) between
+// two user turns into a single collapsible AssistantTurn block, mirroring
+// the claude-devtools "Claude · N tool calls, N messages" header pattern.
+
+type TurnItem =
+  | { kind: "user"; item: GroupedItem }
+  | {
+      kind: "assistant";
+      items: GroupedItem[];
+      msgCount: number;
+      toolCount: number;
+      lastTime: string | null;
+      firstSeq: number;
+    };
+
+function buildTurns(grouped: GroupedItem[]): TurnItem[] {
+  const turns: TurnItem[] = [];
+  let assistantBatch: GroupedItem[] = [];
+
+  function flushAssistant() {
+    if (assistantBatch.length === 0) return;
+    let msgCount = 0, toolCount = 0;
+    let lastTime: string | null = null;
+    let firstSeq = Infinity;
+    for (const g of assistantBatch) {
+      if (g.kind === "text") {
+        msgCount++;
+        const seq = g.msg.sequence ?? Infinity;
+        if (seq < firstSeq) firstSeq = seq;
+        if (g.msg.timestamp) lastTime = g.msg.timestamp;
+      } else {
+        toolCount += g.items.length;
+        const seq = g.firstSeq ?? Infinity;
+        if (seq < firstSeq) firstSeq = seq;
+        if (g.lastTime) lastTime = g.lastTime;
+      }
+    }
+    turns.push({
+      kind: "assistant",
+      items: assistantBatch,
+      msgCount,
+      toolCount,
+      lastTime,
+      firstSeq: firstSeq === Infinity ? 0 : firstSeq,
+    });
+    assistantBatch = [];
+  }
+
+  for (const g of grouped) {
+    const isUserText =
+      g.kind === "text" &&
+      g.msg.role === "user" &&
+      g.msg.message_type !== "tool_result" &&
+      g.msg.message_type !== "system" &&
+      g.msg.message_type !== "subagent_prompt";
+
+    if (isUserText) {
+      flushAssistant();
+      turns.push({ kind: "user", item: g });
+    } else {
+      assistantBatch.push(g);
+    }
+  }
+  flushAssistant();
+  return turns;
+}
+
+function AssistantTurnBlock({
+  turn,
+  highlight,
+  userOnly,
+  highlightSeq,
+}: {
+  turn: TurnItem & { kind: "assistant" };
+  highlight: boolean;
+  userOnly: boolean;
+  highlightSeq: number;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+
+  const parts: string[] = [];
+  if (turn.msgCount > 0) parts.push(`${turn.msgCount} message${turn.msgCount !== 1 ? "s" : ""}`);
+  if (turn.toolCount > 0) parts.push(`${turn.toolCount} tool call${turn.toolCount !== 1 ? "s" : ""}`);
+  const summary = parts.join(", ");
+
+  return (
+    <div className={`assistant-turn ${highlight ? "message-highlight" : ""}`}>
+      <button
+        className="assistant-turn-header"
+        onClick={() => setCollapsed((c) => !c)}
+        title={collapsed ? "Expand" : "Collapse"}
+      >
+        <span className="assistant-turn-label">Claude</span>
+        {summary && <span className="assistant-turn-summary">· {summary}</span>}
+        {turn.lastTime && (
+          <span className="assistant-turn-time">{formatTime(turn.lastTime)}</span>
+        )}
+        <span className={`assistant-turn-chevron ${collapsed ? "collapsed" : ""}`}>▾</span>
+      </button>
+      {!collapsed && (
+        <div className="assistant-turn-body">
+          {turn.items.map((g, idx) => {
+            if (g.kind === "tools") {
+              if (userOnly) return null;
+              const groupHighlight = !isNaN(highlightSeq) && g.allSequences.includes(highlightSeq);
+              return <ToolGroupBlock key={`tg-${idx}`} group={g} highlight={groupHighlight} />;
+            }
+            const msg = g.msg;
+            if (msg.message_type === "system" || msg.message_type === "subagent_prompt") {
+              return <MessageBubble key={msg.sequence} message={msg} highlight={!isNaN(highlightSeq) && msg.sequence === highlightSeq} />;
+            }
+            return (
+              <MessageBubble
+                key={msg.sequence}
+                message={msg}
+                highlight={!isNaN(highlightSeq) && msg.sequence === highlightSeq}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Tool grouping + per-tool rendering ───────────────────────────────────
 // Claude Code emits long runs of tool_use/tool_result messages between user
 // turns. Rendering each as its own snippet drowns the conversation. Instead:
@@ -1181,34 +1307,44 @@ export default function SessionDetail() {
       <div className="snippet-bubbles" style={{ gap: 10 }}>
         {(() => {
           const grouped = groupMessagesForRender(session.messages);
+          const turns = buildTurns(grouped);
           const highlightSeq = highlightMsg ? Number(highlightMsg) : NaN;
           let hasEmittedFirstUser = false;
 
-          return grouped.map((item, idx) => {
-            if (item.kind === "tools") {
+          return turns.map((turn, idx) => {
+            if (turn.kind === "assistant") {
               if (userOnly) return null;
-              const groupHighlight = !isNaN(highlightSeq) && item.allSequences.includes(highlightSeq);
-              return <ToolGroupBlock key={`g-${idx}`} group={item} highlight={groupHighlight} />;
+              const turnHighlight =
+                !isNaN(highlightSeq) &&
+                turn.items.some((g) =>
+                  g.kind === "tools"
+                    ? g.allSequences.includes(highlightSeq)
+                    : g.msg.sequence === highlightSeq
+                );
+              return (
+                <AssistantTurnBlock
+                  key={`at-${idx}`}
+                  turn={turn}
+                  highlight={turnHighlight}
+                  userOnly={userOnly}
+                  highlightSeq={highlightSeq}
+                />
+              );
             }
 
-            const msg = item.msg;
-            const isUserText =
-              msg.role === "user" &&
-              msg.message_type !== "tool_result" &&
-              msg.message_type !== "system";
-            const isNewUserTurn = isUserText && hasEmittedFirstUser;
-            if (isUserText) hasEmittedFirstUser = true;
-
-            if (userOnly && !isUserText) return null;
+            // user turn
+            const msg = (turn.item as { kind: "text"; msg: Message }).msg;
+            const isNewUserTurn = hasEmittedFirstUser;
+            hasEmittedFirstUser = true;
 
             return (
-              <React.Fragment key={msg.id}>
+              <React.Fragment key={msg.sequence}>
                 {!userOnly && isNewUserTurn && (
                   <div className="w-full my-4 flex items-center">
                     <div className="flex-1 h-px bg-border/40" />
                   </div>
                 )}
-                {userOnly && isUserText ? (
+                {userOnly ? (
                   <div
                     className="cursor-pointer transition-all hover:brightness-125"
                     onClick={() => {
