@@ -54,11 +54,77 @@ interface RawMessage {
   sessionId?: string;
   gitBranch?: string;
   timestamp?: string;
+  uuid?: string;
+  parentUuid?: string;
   message?: {
     role?: string;
     content?: string | ContentBlock[];
   };
   [key: string]: unknown;
+}
+
+/**
+ * Filter msgs to only the canonical (active) branch.
+ *
+ * Claude Code stores ALL turns including rewound/abandoned branches.
+ * Each message has a uuid and parentUuid forming a tree. The active
+ * branch is the path from root to the deepest leaf — everything else
+ * is an orphaned branch from a rewind.
+ *
+ * If uuid/parentUuid are missing (older sessions), return msgs as-is.
+ */
+function canonicalBranch(msgs: RawMessage[]): RawMessage[] {
+  // Need at least some messages with uuid to reconstruct
+  const withIds = msgs.filter((m) => m.uuid);
+  if (withIds.length < 2) return msgs;
+
+  const byUuid = new Map<string, RawMessage>();
+  const childrenOf = new Map<string, string[]>(); // parentUuid → [child uuids]
+
+  for (const m of withIds) {
+    if (m.uuid) byUuid.set(m.uuid, m);
+  }
+  for (const m of withIds) {
+    if (!m.uuid) continue;
+    const parent = m.parentUuid ?? "__root__";
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent)!.push(m.uuid);
+  }
+
+  // Find the deepest leaf node by walking up from each leaf
+  let deepestLeaf: string | null = null;
+  let maxDepth = -1;
+  for (const uuid of byUuid.keys()) {
+    const children = childrenOf.get(uuid);
+    if (!children || children.length === 0) {
+      let trueDepth = 0;
+      let cur: string | undefined = uuid;
+      while (cur) {
+        trueDepth++;
+        const msg = byUuid.get(cur);
+        cur = msg?.parentUuid && byUuid.has(msg.parentUuid) ? msg.parentUuid : undefined;
+      }
+      if (trueDepth > maxDepth) {
+        maxDepth = trueDepth;
+        deepestLeaf = uuid;
+      }
+    }
+  }
+
+  if (!deepestLeaf) return msgs;
+
+  // Walk from leaf back to root, collecting canonical UUIDs
+  const canonical = new Set<string>();
+  let cur: string | undefined = deepestLeaf;
+  while (cur) {
+    canonical.add(cur);
+    const msg = byUuid.get(cur);
+    cur = msg?.parentUuid && byUuid.has(msg.parentUuid) ? msg.parentUuid : undefined;
+  }
+
+  // Return only messages whose uuid is on the canonical path,
+  // plus any messages without a uuid (preserve legacy format)
+  return msgs.filter((m) => !m.uuid || canonical.has(m.uuid));
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -222,13 +288,18 @@ export function stripSession(jsonlPath: string): {
     }
   }
 
-  // Sort by timestamp so sequence numbers reflect chronological order,
-  // not file order — rewind/replay can make file order non-chronological.
-  msgs.sort((a, b) => {
+  // Filter to canonical branch — drop rewound/abandoned turns.
+  // Must run before sorting so the tree walk uses file order for tie-breaking.
+  const canonical = canonicalBranch(msgs);
+  // Sort canonical branch by timestamp for correct sequence assignment.
+  canonical.sort((a, b) => {
     if (!a.timestamp) return 1;
     if (!b.timestamp) return -1;
     return a.timestamp.localeCompare(b.timestamp);
   });
+  // Reassign msgs to the filtered, sorted slice.
+  msgs.length = 0;
+  msgs.push(...canonical);
 
   // ── Extract file references and tool calls from tool_use blocks ──
   const fileMap = new Map<string, FileReference>(); // key: "filePath|operation"
