@@ -1,21 +1,5 @@
 #!/usr/bin/env bun
 // @bun
-var __create = Object.create;
-var __getProtoOf = Object.getPrototypeOf;
-var __defProp = Object.defineProperty;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __toESM = (mod, isNodeMode, target) => {
-  target = mod != null ? __create(__getProtoOf(mod)) : {};
-  const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
-  for (let key of __getOwnPropNames(mod))
-    if (!__hasOwnProp.call(to, key))
-      __defProp(to, key, {
-        get: () => mod[key],
-        enumerable: true
-      });
-  return to;
-};
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
 var __require = import.meta.require;
 
@@ -24,6 +8,79 @@ import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { createInterface } from "readline";
 var require_execute = __commonJS((exports, module) => {
+  function pickFormat() {
+    const explicit = process.env.DB_SAFE_FORMAT;
+    if (explicit === "table" || explicit === "ndjson" || explicit === "json" || explicit === "pretty") {
+      return explicit;
+    }
+    return process.stdout.isTTY ? "table" : "ndjson";
+  }
+  function isRowArray(v) {
+    return Array.isArray(v) && v.length > 0 && v.every((r) => r !== null && typeof r === "object" && !Array.isArray(r));
+  }
+  function stringifyCell(v) {
+    if (v === null)
+      return "null";
+    if (v === undefined)
+      return "";
+    if (v instanceof Date)
+      return v.toISOString();
+    if (typeof v === "bigint")
+      return v.toString();
+    if (typeof v === "object")
+      return JSON.stringify(v);
+    return String(v);
+  }
+  function renderTable(rows) {
+    if (rows.length === 0)
+      return "(no rows)";
+    const cols = Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
+    const cells = rows.map((r) => cols.map((c) => stringifyCell(r[c])));
+    const MAX = 80;
+    const widths = cols.map((c, i) => Math.min(MAX, Math.max(c.length, ...cells.map((row) => row[i].length))));
+    const truncate = (s, w) => s.length > w ? s.slice(0, w - 1) + "\u2026" : s.padEnd(w);
+    const header = cols.map((c, i) => c.padEnd(widths[i])).join(" | ");
+    const sep = widths.map((w) => "-".repeat(w)).join("-+-");
+    const body = cells.map((row) => row.map((v, i) => truncate(v, widths[i])).join(" | ")).join(`
+`);
+    const count = `(${rows.length} ${rows.length === 1 ? "row" : "rows"})`;
+    return `${header}
+${sep}
+${body}
+${count}`;
+  }
+  function emitSuccess(result, format) {
+    if (format === "ndjson" && isRowArray(result)) {
+      console.log(JSON.stringify({ ok: true, command: "db-safe", rows: result.length }));
+      for (const row of result)
+        console.log(JSON.stringify(row));
+      return;
+    }
+    if (format === "table" && isRowArray(result)) {
+      console.log(renderTable(result));
+      return;
+    }
+    const envelope = { ok: true, command: "db-safe", result, next_actions: [] };
+    console.log(format === "pretty" ? JSON.stringify(envelope, null, 2) : JSON.stringify(envelope));
+  }
+  function emitError(message, code, fix, format) {
+    if (format === "table") {
+      process.stderr.write(`ERROR (${code}): ${message}
+`);
+      if (fix)
+        process.stderr.write(`  ${fix}
+`);
+      return;
+    }
+    const envelope = {
+      ok: false,
+      command: "db-safe",
+      error: { message, code },
+      fix,
+      next_actions: []
+    };
+    console.log(format === "pretty" ? JSON.stringify(envelope, null, 2) : JSON.stringify(envelope));
+  }
   function loadConfig(configPath) {
     const raw = readFileSync(configPath, "utf-8");
     return JSON.parse(raw);
@@ -201,21 +258,12 @@ Use JSON-compatible format: { "key": "value" }`);
     const env = process.env.DB_SAFE_ENV || process.argv[3];
     const query2 = process.env.DB_SAFE_QUERY || process.argv[4];
     const configPath = process.env.DB_SAFE_CONFIG || process.argv[5];
+    const format = pickFormat();
     const config = loadConfig(configPath);
     const envConfig = config.environments[env];
     if (!envConfig) {
       const available = Object.keys(config.environments).join(", ");
-      const output = {
-        ok: false,
-        command: "db-safe",
-        error: {
-          message: `Unknown environment: ${env}`,
-          code: "BAD_ENV"
-        },
-        fix: `Available environments: ${available}`,
-        next_actions: []
-      };
-      console.log(JSON.stringify(output));
+      emitError(`Unknown environment: ${env}`, "BAD_ENV", `Available environments: ${available}`, format);
       process.exit(1);
     }
     const label = envConfig.label || env;
@@ -241,25 +289,9 @@ Use JSON-compatible format: { "key": "value" }`);
         const writeToken2 = isWrite ? `db-safe-${Date.now()}-${Math.random().toString(36).slice(2, 10)}` : undefined;
         result = await executePrisma(url2, query2, writeToken2);
       }
-      const output = {
-        ok: true,
-        command: "db-safe",
-        result,
-        next_actions: []
-      };
-      console.log(JSON.stringify(output, null, 2));
+      emitSuccess(result, format);
     } catch (err) {
-      const output = {
-        ok: false,
-        command: "db-safe",
-        error: {
-          message: err.message || String(err),
-          code: "QUERY_ERROR"
-        },
-        fix: "Check your query syntax and database connectivity.",
-        next_actions: []
-      };
-      console.log(JSON.stringify(output));
+      emitError(err.message || String(err), "QUERY_ERROR", "Check your query syntax and database connectivity.", format);
       process.exit(1);
     }
   }

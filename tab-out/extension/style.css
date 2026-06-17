@@ -285,25 +285,21 @@ header {
   margin-top: 36px;
 }
 .cross-profile-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
 }
-.cross-profile-card {
-  background: var(--card-bg);
-  border: 1px solid var(--warm-gray);
-  border-radius: 10px;
-  padding: 12px 14px;
-}
-.cross-profile-card-head {
+.cross-profile-block-head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--warm-gray);
 }
 .cross-profile-name {
   font-family: 'Newsreader', serif;
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 500;
   color: var(--ink);
 }
@@ -312,42 +308,19 @@ header {
   color: var(--muted);
   letter-spacing: 0.3px;
 }
-.cross-profile-tab-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 6px;
+.cross-profile-missions {
+  /* Inherits .missions grid layout from the main section */
 }
-.cross-profile-tab {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--ink);
-  padding: 4px 6px;
-  border-radius: 4px;
-  cursor: pointer;
+/* Visually distinguish read-only cards from your own */
+.mission-card.readonly {
+  opacity: 0.92;
+}
+.mission-card.readonly::before {
+  background: var(--accent-slate) !important;
+}
+.page-chip-readonly {
   text-decoration: none;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cross-profile-tab:hover {
-  background: rgba(0, 0, 0, 0.04);
-}
-.cross-profile-tab img {
-  width: 14px;
-  height: 14px;
-  flex-shrink: 0;
-}
-.cross-profile-tab-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cross-profile-overflow {
-  font-size: 11px;
-  color: var(--muted);
-  padding: 4px 6px;
+  color: inherit;
 }
 .own-profile-meta {
   color: var(--muted);
@@ -1313,4 +1286,28 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   color: var(--muted);
   opacity: 0.6;
   flex-shrink: 0;
+}
+
+
+/* ----------------------------------------------------------------
+   DRAG-AND-DROP — chip → window card
+   Source chip dims; destination window card highlights on dragover.
+   ---------------------------------------------------------------- */
+
+.page-chip-draggable {
+  cursor: grab;
+}
+
+.page-chip-draggable:active {
+  cursor: grabbing;
+}
+
+.page-chip.dragging {
+  opacity: 0.4;
+}
+
+.window-card.drop-target-active {
+  outline: 2px dashed var(--accent-amber);
+  outline-offset: 4px;
+  background: rgba(200, 113, 58, 0.04);
 }

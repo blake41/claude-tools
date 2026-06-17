@@ -29,6 +29,111 @@ interface Config {
 }
 
 // ---------------------------------------------------------------------------
+// Output formats — db-safe serves humans (TTY) and agents (piped) with the
+// same command. Default: table at the terminal, NDJSON when piped. Override
+// with --format on either side.
+// ---------------------------------------------------------------------------
+
+type Format = "table" | "ndjson" | "json" | "pretty";
+
+function pickFormat(): Format {
+  const explicit = process.env.DB_SAFE_FORMAT;
+  if (
+    explicit === "table" ||
+    explicit === "ndjson" ||
+    explicit === "json" ||
+    explicit === "pretty"
+  ) {
+    return explicit;
+  }
+  return process.stdout.isTTY ? "table" : "ndjson";
+}
+
+function isRowArray(v: unknown): v is Record<string, unknown>[] {
+  return (
+    Array.isArray(v) &&
+    v.length > 0 &&
+    v.every(
+      (r) => r !== null && typeof r === "object" && !Array.isArray(r)
+    )
+  );
+}
+
+function stringifyCell(v: unknown): string {
+  if (v === null) return "null";
+  if (v === undefined) return "";
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === "bigint") return v.toString();
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+function renderTable(rows: Record<string, unknown>[]): string {
+  if (rows.length === 0) return "(no rows)";
+  const cols = Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
+  const cells = rows.map((r) => cols.map((c) => stringifyCell(r[c])));
+  const MAX = 80;
+  const widths = cols.map((c, i) =>
+    Math.min(MAX, Math.max(c.length, ...cells.map((row) => row[i].length)))
+  );
+  const truncate = (s: string, w: number) =>
+    s.length > w ? s.slice(0, w - 1) + "…" : s.padEnd(w);
+  const header = cols.map((c, i) => c.padEnd(widths[i])).join(" | ");
+  const sep = widths.map((w) => "-".repeat(w)).join("-+-");
+  const body = cells
+    .map((row) => row.map((v, i) => truncate(v, widths[i])).join(" | "))
+    .join("\n");
+  const count = `(${rows.length} ${rows.length === 1 ? "row" : "rows"})`;
+  return `${header}\n${sep}\n${body}\n${count}`;
+}
+
+function emitSuccess(result: unknown, format: Format): void {
+  if (format === "ndjson" && isRowArray(result)) {
+    console.log(
+      JSON.stringify({ ok: true, command: "db-safe", rows: result.length })
+    );
+    for (const row of result) console.log(JSON.stringify(row));
+    return;
+  }
+  if (format === "table" && isRowArray(result)) {
+    console.log(renderTable(result));
+    return;
+  }
+  // Non-row-array results, or json/pretty formats: emit JSON envelope.
+  const envelope = { ok: true, command: "db-safe", result, next_actions: [] };
+  console.log(
+    format === "pretty"
+      ? JSON.stringify(envelope, null, 2)
+      : JSON.stringify(envelope)
+  );
+}
+
+function emitError(
+  message: string,
+  code: string,
+  fix: string,
+  format: Format
+): void {
+  if (format === "table") {
+    process.stderr.write(`ERROR (${code}): ${message}\n`);
+    if (fix) process.stderr.write(`  ${fix}\n`);
+    return;
+  }
+  const envelope = {
+    ok: false,
+    command: "db-safe",
+    error: { message, code },
+    fix,
+    next_actions: [],
+  };
+  console.log(
+    format === "pretty"
+      ? JSON.stringify(envelope, null, 2)
+      : JSON.stringify(envelope)
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Config & URL resolution
 // ---------------------------------------------------------------------------
 
@@ -274,22 +379,18 @@ async function main() {
   const query = process.env.DB_SAFE_QUERY || process.argv[4];
   const configPath = process.env.DB_SAFE_CONFIG || process.argv[5];
 
+  const format = pickFormat();
   const config = loadConfig(configPath);
   const envConfig = config.environments[env];
 
   if (!envConfig) {
     const available = Object.keys(config.environments).join(", ");
-    const output = {
-      ok: false,
-      command: "db-safe",
-      error: {
-        message: `Unknown environment: ${env}`,
-        code: "BAD_ENV",
-      },
-      fix: `Available environments: ${available}`,
-      next_actions: [],
-    };
-    console.log(JSON.stringify(output));
+    emitError(
+      `Unknown environment: ${env}`,
+      "BAD_ENV",
+      `Available environments: ${available}`,
+      format
+    );
     process.exit(1);
   }
 
@@ -323,25 +424,14 @@ async function main() {
       result = await executePrisma(url, query, writeToken);
     }
 
-    const output = {
-      ok: true,
-      command: "db-safe",
-      result,
-      next_actions: [],
-    };
-    console.log(JSON.stringify(output, null, 2));
+    emitSuccess(result, format);
   } catch (err: any) {
-    const output = {
-      ok: false,
-      command: "db-safe",
-      error: {
-        message: err.message || String(err),
-        code: "QUERY_ERROR",
-      },
-      fix: "Check your query syntax and database connectivity.",
-      next_actions: [],
-    };
-    console.log(JSON.stringify(output));
+    emitError(
+      err.message || String(err),
+      "QUERY_ERROR",
+      "Check your query syntax and database connectivity.",
+      format
+    );
     process.exit(1);
   }
 }

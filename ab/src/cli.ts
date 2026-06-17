@@ -338,9 +338,34 @@ const REAUTH_ENV_PRESETS: Record<string, string> = {
   dev: "https://slack-feedback-development.onrender.com",
 };
 
+/**
+ * Detect whether a browser URL is a Terra worktree origin (*.terra.localhost
+ * or terra.localhost itself) and return the portless HTTPS base URL if so.
+ * Returns undefined for non-Terra URLs.
+ */
+function detectWorktreeOrigin(browserUrl: string | undefined): string | undefined {
+  if (!browserUrl) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(browserUrl);
+  } catch {
+    return undefined;
+  }
+  const hostname = parsed.hostname;
+  // Match terra.localhost itself or any *.terra.localhost subdomain
+  if (hostname === "terra.localhost" || hostname.endsWith(".terra.localhost")) {
+    // Use the browser's actual origin verbatim — portless serves standard
+    // HTTPS (:443), so a bare https origin is correct and any non-standard
+    // port the browser used is preserved.
+    return parsed.origin;
+  }
+  return undefined;
+}
+
 export function resolveReauthBaseUrls(
   args: string[],
   env: { AB_API_BASE_URL?: string; AB_APP_BASE_URL?: string },
+  browserUrl?: string,
 ): { apiBaseUrl: string | undefined; appBaseUrl: string | undefined; error?: string } {
   let preset: string | undefined;
   let host: string | undefined;
@@ -395,25 +420,51 @@ export function resolveReauthBaseUrls(
     };
   }
   // --host wins over presets. For bare hostnames, pick the right scheme:
-  //   - `*.localhost` subdomains → portless serves HTTPS on :1355 and issues a
-  //     302 from :80; following the redirect drops the POST body, so address
-  //     :1355 directly. The portless TLS cert is self-signed; auth.ts already
-  //     accepts that for `.localhost` hosts.
+  //   - `*.localhost` subdomains → portless serves standard HTTPS (:443);
+  //     :80 issues a 302 and following the redirect drops the POST body, so
+  //     address https directly. The portless TLS cert is self-signed;
+  //     auth.ts already accepts that for `.localhost` hosts.
   //   - bare `localhost` → plain HTTP on the default port (no portless).
   const hostUrl = host
     ? host.startsWith("http://") || host.startsWith("https://")
       ? host
       : host.endsWith(".localhost")
-        ? `https://${host}:1355`
+        ? `https://${host}`
         : `http://${host}`
     : undefined;
   const presetUrl = preset && preset !== "local" ? REAUTH_ENV_PRESETS[preset] : undefined;
-  const resolved = hostUrl ?? presetUrl;
-  // Env vars win over flags, flags win over undefined (→ auth.ts localhost defaults).
+  // Auto-detect from browser URL when no explicit flag/preset was given.
+  // Explicit flags (--host, --staging, --dev, --local) always win over auto-detect.
+  const autoDetected = (hostUrl === undefined && presetUrl === undefined)
+    ? detectWorktreeOrigin(browserUrl)
+    : undefined;
+  const resolved = hostUrl ?? presetUrl ?? autoDetected;
+  // Env vars win over flags, flags win over auto-detect, auto-detect wins over undefined (→ auth.ts localhost defaults).
   return {
     apiBaseUrl: env.AB_API_BASE_URL ?? resolved,
     appBaseUrl: env.AB_APP_BASE_URL ?? resolved,
   };
+}
+
+/**
+ * Query the browser's current URL via agent-browser, capturing stdout.
+ * Returns undefined if the query fails or times out.
+ */
+async function getBrowserCurrentUrl(cdpPort: number, sessionName: string | null): Promise<string | undefined> {
+  const args = abArgs(cdpPort, sessionName, ["get", "url"]);
+  const proc = Bun.spawn(["agent-browser", ...args], { stdout: "pipe", stderr: "pipe" });
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("timeout")), 5_000),
+  );
+  try {
+    await Promise.race([proc.exited, timeout]);
+  } catch {
+    proc.kill();
+    return undefined;
+  }
+  if (proc.exitCode !== 0) return undefined;
+  const url = await new Response(proc.stdout).text().then(s => s.trim());
+  return url || undefined;
 }
 
 async function cmdReauth(
@@ -421,10 +472,14 @@ async function cmdReauth(
   cdpPort: number,
   sessionName: string | null,
 ): Promise<number> {
+  // Auto-detect: query the browser's current URL to pick up worktree origins
+  // when no explicit --host/--staging/--dev flag is set.
+  const browserUrl = await getBrowserCurrentUrl(cdpPort, sessionName);
+
   const urls = resolveReauthBaseUrls(rest, {
     AB_API_BASE_URL: process.env.AB_API_BASE_URL,
     AB_APP_BASE_URL: process.env.AB_APP_BASE_URL,
-  });
+  }, browserUrl);
   if (urls.error) {
     stderr(urls.error);
     return 2;
@@ -983,7 +1038,7 @@ function printUsage(): void {
   stderr("  watch               Errors + auto-screenshot");
   stderr("");
   stderr("Auth & Lifecycle:");
-  stderr("  reauth [--staging|--dev|--host <hostname>]  Re-authenticate via daemon (default: localhost)");
+  stderr("  reauth [--staging|--dev|--host <hostname>]  Re-authenticate via daemon (default: auto-detects *.terra.localhost from browser URL, falls back to localhost)");
   stderr("  import              Headed login (manual Google/Clerk auth)");
   stderr("  heal                Kill all Chrome, restart fresh");
   stderr("  status              Show daemon status (JSON)");

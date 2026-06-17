@@ -23,7 +23,8 @@ function cco-permissions
         set argv (string match -v -- --no-sandbox $argv)
     end
 
-    # Parse --resume/--continue from argv
+    # Parse --resume/--continue from argv so we can track the resumed session
+    # id for CCO_SESSION_ID and the sandbox-expansion restart loop below.
     set -l session_id ""
     set -l has_resume_flag false
     set -l prev ""
@@ -36,26 +37,29 @@ function cco-permissions
         set prev $i
     end
 
-    # Auto-resume keyed by cmux's stable panel UUID ($CMUX_PANEL_ID).
-    # The UUID survives renames, restarts, and auto-titles — no name hashing,
-    # no human-name detection, no rename heal logic needed.
+    # Auto-resume the session cmux recorded for this surface. cmux's own
+    # auto-resume (terminal.autoResumeAgentSessions) is disabled on purpose:
+    # it types bare `claude --resume`, which runs OUTSIDE this seatbelt
+    # sandbox. Instead we read cmux's native hook file — it maps each stable
+    # surface UUID to the live Claude session id — and resume through cco so
+    # the restored session stays sandboxed.
     set -l extra_args
-    if test -n "$CMUX_PANEL_ID" -a "$has_resume_flag" != true
-        set -l mapping_file ~/.cmux/claude-sessions/$CMUX_PANEL_ID
-        if test -f $mapping_file
-            set -l saved_sid (cat $mapping_file)
-            # Validate the saved session still exists on disk
-            set -l session_jsonl (find ~/.claude/projects -maxdepth 2 -name "$saved_sid.jsonl" -type f 2>/dev/null | head -1)
-            if test -z "$session_jsonl"
-                echo "cmux: saved session $saved_sid no longer exists on disk — removing stale mapping, starting fresh"
-                rm -f $mapping_file
-            else
-                echo "Resuming session for panel $CMUX_PANEL_ID: $saved_sid"
-                set -a extra_args --resume $saved_sid
-                set session_id $saved_sid
+    if test -n "$CMUX_SURFACE_ID" -a "$has_resume_flag" != true
+        set -l hook_file ~/.cmuxterm/claude-hook-sessions.json
+        if test -f $hook_file
+            set -l saved_sid (jq -r --arg s "$CMUX_SURFACE_ID" \
+                '.activeSessionsBySurface[$s].sessionId // empty' $hook_file 2>/dev/null)
+            if test -n "$saved_sid"
+                # Resume only if the transcript still exists on disk.
+                set -l session_jsonl (find ~/.claude/projects -maxdepth 2 -name "$saved_sid.jsonl" -type f 2>/dev/null | head -1)
+                if test -n "$session_jsonl"
+                    echo "cmux: resuming surface session → $saved_sid"
+                    set -a extra_args --resume $saved_sid
+                    set session_id $saved_sid
+                else
+                    echo "cmux: recorded session $saved_sid no longer on disk — starting fresh"
+                end
             end
-        else
-            echo "cmux: no saved session for panel $CMUX_PANEL_ID — starting fresh"
         end
     end
 

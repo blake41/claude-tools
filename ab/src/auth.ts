@@ -79,9 +79,9 @@ async function runAgentBrowser(
  * Check whether the browser is already on an authenticated page.
  * An authenticated page is a Clay URL that is NOT /dev-login or /sign-in.
  */
-function isAuthenticatedUrl(url: string): boolean {
+export function isAuthenticatedUrl(url: string): boolean {
   if (!url) return false;
-  const clayPatterns = ["localhost:5173", "onrender.com", "terra.clay.com"];
+  const clayPatterns = ["localhost:5173", "onrender.com", "terra.clay.com", ".terra.localhost", "terra.localhost"];
   const isClay = clayPatterns.some((p) => url.includes(p));
   if (!isClay) return false;
   const unauthPaths = ["/dev-login", "/sign-in"];
@@ -103,17 +103,48 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
 
   // -----------------------------------------------------------------------
   // Step 1: Check if already authenticated
+  //
+  // The short-circuit is origin-aware: being authenticated on worktree-A
+  // must not skip auth for worktree-B. We compare the browser URL's origin
+  // against the target appBaseUrl origin. When no appBaseUrl is provided, the
+  // target is localhost:5173 (the DEFAULT_APP_BASE), so we check that.
   // -----------------------------------------------------------------------
 
   const urlResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
   if (urlResult.ok && isAuthenticatedUrl(urlResult.stdout)) {
-    log.info("Browser already on authenticated page — skipping login", { url: urlResult.stdout });
-    authState = {
-      authenticated: true,
-      user: authState.user, // preserve existing user info
-      timestamp: Date.now(),
-    };
-    return { ok: true, user: authState.user ?? undefined };
+    // Determine target origin for the comparison.
+    const targetBase = appBaseUrl || DEFAULT_APP_BASE;
+    let targetOrigin: string;
+    try {
+      targetOrigin = new URL(targetBase).origin;
+    } catch {
+      targetOrigin = targetBase;
+    }
+
+    let browserOrigin: string;
+    try {
+      browserOrigin = new URL(urlResult.stdout).origin;
+    } catch {
+      browserOrigin = "";
+    }
+
+    if (browserOrigin === targetOrigin) {
+      log.info("Browser already on authenticated page for same origin — skipping login", {
+        url: urlResult.stdout,
+        targetOrigin,
+      });
+      authState = {
+        authenticated: true,
+        user: authState.user, // preserve existing user info
+        timestamp: Date.now(),
+      };
+      return { ok: true, user: authState.user ?? undefined };
+    }
+
+    log.info("Browser is authenticated but on a different origin — proceeding with login", {
+      browserOrigin,
+      targetOrigin,
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -132,7 +163,7 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
     const loginBody = email ? { email } : { slackUserId };
     log.info("Requesting dev-login token", { loginUrl, ...loginBody });
 
-    // Portless serves a per-machine self-signed TLS cert on :1355. Bun's fetch
+    // Portless serves a per-machine self-signed TLS cert (standard 443). Bun's fetch
     // doesn't read the system keychain by default, so HTTP requests to a
     // `.localhost` host that 302-redirect to portless's HTTPS endpoint fail
     // with "self signed certificate in certificate chain". Accept the cert

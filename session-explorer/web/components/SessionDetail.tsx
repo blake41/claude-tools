@@ -82,6 +82,43 @@ function ToolBlock({ label, content, timestamp, highlight, sequence }: {
   );
 }
 
+// ── Mermaid hydration ────────────────────────────────────────────────────────
+// renderMarkdown emits <div class="mermaid-placeholder" data-mermaid="base64">
+// MermaidHost finds these after mount and renders them in-place.
+function MermaidHost({ containerRef }: { containerRef: React.RefObject<HTMLDivElement | null> }) {
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const placeholders = Array.from(el.querySelectorAll<HTMLElement>(".mermaid-placeholder[data-mermaid]"));
+    if (placeholders.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      const mermaid = (await import("mermaid")).default;
+      mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
+      for (const ph of placeholders) {
+        if (cancelled) break;
+        const encoded = ph.dataset.mermaid ?? "";
+        try {
+          const code = decodeURIComponent(escape(atob(encoded)));
+          const id = `mmd-${Math.random().toString(36).slice(2)}`;
+          const { svg } = await mermaid.render(id, code);
+          const wrapper = document.createElement("div");
+          wrapper.className = "mermaid-rendered";
+          wrapper.innerHTML = svg;
+          ph.replaceWith(wrapper);
+        } catch (e) {
+          ph.textContent = `[Mermaid error: ${e}]`;
+          ph.className = "mermaid-error";
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [containerRef]);
+
+  return null;
+}
+
 const COLLAPSE_PX = 320; // ~20 lines at 14px/1.5lh
 
 function CollapsibleContent({ html, className }: { html: string; className?: string }) {
@@ -102,6 +139,7 @@ function CollapsibleContent({ html, className }: { html: string; className?: str
         className={`message-content collapsible-wrap${overflows && !expanded ? " collapsed" : ""} ${className ?? ""}`}
         dangerouslySetInnerHTML={{ __html: html }}
       />
+      <MermaidHost containerRef={ref} />
       {overflows && !expanded && <div className="collapsible-fade" />}
       {overflows && (
         <button className="collapsible-btn" onClick={() => setExpanded((e) => !e)}>
@@ -399,6 +437,46 @@ function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "\n… (truncated)" : s;
 }
 
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** LCS-based unified diff — returns HTML string with styled lines */
+function lcsDiff(oldStr: string, newStr: string): string {
+  const oldLines = oldStr.split("\n");
+  const newLines = newStr.split("\n");
+  const m = oldLines.length, n = newLines.length;
+
+  // Fallback for large diffs
+  if (m * n > 50000) {
+    const dels = oldLines.map(l => `<div class="diff-del">− ${escHtml(l)}</div>`).join("");
+    const adds = newLines.map(l => `<div class="diff-add">+ ${escHtml(l)}</div>`).join("");
+    return dels + adds;
+  }
+
+  // DP table: backward LCS
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--)
+    for (let j = n - 1; j >= 0; j--)
+      dp[i][j] = oldLines[i] === newLines[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
+
+  let html = "";
+  let i = 0, j = 0;
+  while (i < m || j < n) {
+    if (i < m && j < n && oldLines[i] === newLines[j]) {
+      html += `<div class="diff-ctx">  ${escHtml(oldLines[i])}</div>`;
+      i++; j++;
+    } else if (j < n && (i >= m || dp[i][j+1] >= dp[i+1][j])) {
+      html += `<div class="diff-add">+ ${escHtml(newLines[j])}</div>`;
+      j++;
+    } else {
+      html += `<div class="diff-del">− ${escHtml(oldLines[i])}</div>`;
+      i++;
+    }
+  }
+  return html;
+}
+
 function ToolResultInline({ result }: { result: Message }) {
   const isError = /error|failed|Error:/i.test(result.content.slice(0, 80));
   return (
@@ -437,14 +515,12 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
     const fp = String(input.file_path ?? "");
     const oldStr = String(input.old_string ?? "");
     const newStr = String(input.new_string ?? "");
+    const diffHtml = (oldStr || newStr) ? lcsDiff(oldStr, newStr) : null;
     return (
       <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-edit">
         {header(name, "bg-[#f4a261]/20 text-[#f4a261]", fp && <span className="tool-mini-path" title={fp}>{fp}</span>)}
-        {(oldStr || newStr) && (
-          <div className="tool-mini-diff">
-            <pre className="diff-old">{truncate(oldStr, 500)}</pre>
-            <pre className="diff-new">{truncate(newStr, 500)}</pre>
-          </div>
+        {diffHtml && (
+          <div className="diff-view" dangerouslySetInnerHTML={{ __html: diffHtml }} />
         )}
         {result && <ToolResultInline result={result} />}
       </div>

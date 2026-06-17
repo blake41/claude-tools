@@ -44,6 +44,7 @@ model_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;147m'; fi; }  
 version_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;180m'; fi; } # soft yellow
 cc_version_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;249m'; fi; } # light gray
 style_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;245m'; fi; } # gray
+session_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;110m'; fi; } # dusty blue
 rst() { if [ "$use_color" -eq 1 ]; then printf '\033[0m'; fi; }
 
 # git utilities
@@ -98,6 +99,7 @@ extract_json_string() {
 # ---- basics ----
 if [ "$HAS_JQ" -eq 1 ]; then
   current_dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // "unknown"' 2>/dev/null | sed "s|^$HOME|~|g")
+  model_name=$(echo "$input" | jq -r '.model.display_name // .model.id // ""' 2>/dev/null)
   session_id=$(echo "$input" | jq -r '.session_id // ""' 2>/dev/null)
   cc_version=$(echo "$input" | jq -r '.version // ""' 2>/dev/null)
   output_style=$(echo "$input" | jq -r '.output_style.name // ""' 2>/dev/null)
@@ -114,6 +116,7 @@ else
   # Fallback to unknown if all extraction failed
   [ -z "$current_dir" ] && current_dir="unknown"
   current_dir=$(echo "$current_dir" | sed "s|^$HOME|~|g")
+  model_name=$(extract_json_string "$input" "display_name" "")
   session_id=$(extract_json_string "$input" "session_id" "")
   # CC version is at the root level
   cc_version=$(echo "$input" | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
@@ -184,19 +187,17 @@ fi
 } >> "$LOG_FILE" 2>/dev/null
 
 # ---- render statusline ----
-# Line 1: Core info (directory, git, model, claude code version, output style)
+# Line 1: Location (directory, git) and model
 printf '📁 %s%s%s' "$(dir_color)" "$current_dir" "$(rst)"
+if [ -n "$model_name" ] && [ "$model_name" != "null" ]; then
+  printf '  🤖 %s%s%s' "$(model_color)" "$model_name" "$(rst)"
+fi
 if [ -n "$git_branch" ]; then
   printf '  🌿 %s%s%s' "$(git_color)" "$git_branch" "$(rst)"
   [ -n "$git_dirty" ] && printf "$git_dirty"
 fi
-if [ -n "$cc_version" ] && [ "$cc_version" != "null" ]; then
-  printf '  📟 %sv%s%s' "$(cc_version_color)" "$cc_version" "$(rst)"
-fi
-if [ -n "$output_style" ] && [ "$output_style" != "null" ]; then
-  printf '  🎨 %s%s%s' "$(style_color)" "$output_style" "$(rst)"
-fi
 
+# Line 2: Session metadata (session id, claude code version, output style, sandbox)
 # Sandbox indicator
 # CCO_SESSION_ID is set in BOTH sandbox and --no-sandbox modes (it just means
 # "managed by cco-permissions"), so it can't be the only signal. Look for the
@@ -210,9 +211,23 @@ elif [ -n "${CCO_SESSION_ID:-}" ]; then
 else
   sandbox_indicator="🔓 no sandbox"
 fi
-printf '  %s' "$sandbox_indicator"
 
-# Line 2: Context and session time
+line_meta=""
+if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then
+  line_meta="🆔 $(session_color)${session_id}$(rst)"
+fi
+if [ -n "$cc_version" ] && [ "$cc_version" != "null" ]; then
+  [ -n "$line_meta" ] && line_meta="${line_meta}  "
+  line_meta="${line_meta}📟 $(cc_version_color)v${cc_version}$(rst)"
+fi
+if [ -n "$output_style" ] && [ "$output_style" != "null" ]; then
+  [ -n "$line_meta" ] && line_meta="${line_meta}  "
+  line_meta="${line_meta}🎨 $(style_color)${output_style}$(rst)"
+fi
+[ -n "$line_meta" ] && line_meta="${line_meta}  "
+line_meta="${line_meta}${sandbox_indicator}"
+
+# Line 3: Context and session time
 line2=""
 if [ -n "$context_pct" ]; then
   context_bar=$(progress_bar "$context_remaining_pct" 10)
@@ -226,6 +241,9 @@ fi
 line3=""
 
 # Print lines
+if [ -n "$line_meta" ]; then
+  printf '\n%s' "$line_meta"
+fi
 if [ -n "$line2" ]; then
   printf '\n%s' "$line2"
 fi

@@ -34,15 +34,94 @@ function esc(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
+// ── Syntax highlighting ─────────────────────────────────────────
+const KW: Record<string, Set<string>> = {};
+const TS_KW = new Set(["import","export","from","const","let","var","function","class","interface","type","enum","return","if","else","for","while","do","switch","case","break","continue","try","catch","finally","throw","new","this","super","extends","implements","async","await","public","private","protected","static","readonly","abstract","as","typeof","instanceof","in","of","keyof","void","never","unknown","any","null","undefined","true","false","default","declare"]);
+KW["typescript"] = KW["ts"] = KW["tsx"] = KW["javascript"] = KW["js"] = KW["jsx"] = TS_KW;
+KW["python"] = KW["py"] = new Set(["def","class","import","from","as","if","elif","else","for","while","try","except","finally","raise","return","yield","with","pass","break","continue","and","or","not","in","is","lambda","global","nonlocal","del","assert","True","False","None","async","await"]);
+KW["go"] = new Set(["package","import","func","var","const","type","struct","interface","map","chan","go","select","defer","return","if","else","for","range","switch","case","break","continue","fallthrough","goto","nil","true","false","make","new","append","len","cap","delete","close","panic","recover","print","println"]);
+KW["rust"] = new Set(["fn","let","mut","const","static","struct","enum","impl","trait","use","mod","pub","crate","super","self","type","where","match","if","else","loop","while","for","in","return","break","continue","true","false","async","await","move","ref","dyn","Box","Vec","Option","Result","Some","None","Ok","Err"]);
+
+function syntaxHL(raw: string, lang: string): string {
+  const keywords = KW[lang] ?? new Set<string>();
+  const lines = raw.split("\n");
+  return lines.map(line => {
+    let out = "";
+    let i = 0;
+    while (i < line.length) {
+      const rest = line.slice(i);
+
+      // line comment
+      if (rest.startsWith("//") || (rest.startsWith("#") && (lang === "python" || lang === "py" || lang === "bash" || lang === "sh"))) {
+        out += `<span style="color:#71717a;font-style:italic">${esc(rest)}</span>`;
+        break;
+      }
+
+      // string literals
+      const q = rest[0];
+      if (q === '"' || q === "'" || q === "`") {
+        let end = rest.indexOf(q, 1);
+        while (end !== -1 && rest[end - 1] === "\\") end = rest.indexOf(q, end + 1);
+        const str = end === -1 ? rest : rest.slice(0, end + 1);
+        out += `<span style="color:#4ade80">${esc(str)}</span>`;
+        i += str.length;
+        continue;
+      }
+
+      // number
+      const num = /^(\d+\.?\d*)/.exec(rest);
+      if (num && (i === 0 || /\W/.test(line[i - 1]))) {
+        out += `<span style="color:#fb923c">${esc(num[1])}</span>`;
+        i += num[1].length;
+        continue;
+      }
+
+      // word / keyword
+      const word = /^([a-zA-Z_$][a-zA-Z0-9_$]*)/.exec(rest);
+      if (word) {
+        const w = word[1];
+        if (keywords.has(w)) {
+          out += `<span style="color:#c084fc;font-weight:500">${esc(w)}</span>`;
+        } else if (w[0] === w[0].toUpperCase() && w.length > 1 && /[a-z]/.test(w)) {
+          out += `<span style="color:#facc15">${esc(w)}</span>`;
+        } else {
+          out += esc(w);
+        }
+        i += w.length;
+        continue;
+      }
+
+      out += esc(rest[0]);
+      i++;
+    }
+    return out;
+  }).join("\n");
+}
+
 // ── Full markdown → HTML (for message bodies) ───────────────────
 export function renderMarkdown(text: string): string {
-  let html = esc(text);
-
-  // Code blocks (``` ... ```)
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, code) => {
-    const langLabel = lang ? `<span class="code-lang">${lang}</span>` : "";
-    return `<div class="code-block">${langLabel}<pre><code>${code.trimEnd()}</code></pre></div>`;
+  // Extract code blocks BEFORE escaping so syntax highlighting sees raw text
+  const codeSlots: string[] = [];
+  let src = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    const trimmed = code.trimEnd();
+    // Mermaid diagrams: emit a data attribute placeholder picked up by MermaidBlock
+    if (lang === "mermaid") {
+      const encoded = btoa(unescape(encodeURIComponent(trimmed)));
+      const block = `<div class="mermaid-placeholder" data-mermaid="${encoded}"></div>`;
+      codeSlots.push(block);
+      return `\x00CB${codeSlots.length - 1}\x00`;
+    }
+    const highlighted = lang ? syntaxHL(trimmed, lang) : esc(trimmed);
+    const langLabel = lang ? `<span class="code-lang">${esc(lang)}</span>` : "";
+    const block = `<div class="code-block">${langLabel}<pre><code>${highlighted}</code></pre></div>`;
+    codeSlots.push(block);
+    return `\x00CB${codeSlots.length - 1}\x00`;
   });
+
+  let html = esc(src);
+
+  // Restore code blocks (placeholders survived escaping since \x00 isn't escaped)
+  html = html.replace(/\x00CB(\d+)\x00/g, (_, i) => codeSlots[Number(i)]);
 
   // Inline code
   html = html.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');

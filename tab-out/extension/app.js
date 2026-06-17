@@ -777,14 +777,21 @@ function checkTabOutDupes() {
    ---------------------------------------------------------------- */
 
 /**
- * renderTabChip(tab, urlCounts, hostHint)
+ * renderTabChip(tab, urlCounts, hostHint, opts)
  *
  * Builds the HTML for a single tab chip (favicon + title + dupe badge +
  * save/close hover actions). hostHint is used for cleanTitle() to strip
  * the domain from titles; pass the group's hostname when known, or leave
  * empty to use the tab's own hostname.
+ *
+ * opts.readOnly = true → render as a plain anchor that opens the URL in
+ *   the current profile (used for cross-profile snapshot tabs, where we
+ *   can't focus or close the original tab).
  */
-function renderTabChip(tab, urlCounts = {}, hostHint = '') {
+function renderTabChip(tab, urlCounts = {}, hostHint = '', opts = {}) {
+  const readOnly = !!opts.readOnly;
+  const draggable = !readOnly && !!opts.draggable && Number.isInteger(tab.id);
+
   let tabHost = '';
   let tabPort = '';
   try { const u = new URL(tab.url); tabHost = u.hostname; tabPort = u.port; } catch {}
@@ -800,7 +807,17 @@ function renderTabChip(tab, urlCounts = {}, hostHint = '') {
   const safeTitle = label.replace(/"/g, '&quot;');
   const faviconUrl = tabHost ? `https://www.google.com/s2/favicons?domain=${tabHost}&sz=16` : '';
 
-  return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+  if (readOnly) {
+    return `<a class="page-chip page-chip-readonly clickable${chipClass}" href="${safeUrl}" target="_blank" rel="noopener noreferrer" title="${safeTitle}">
+      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+      <span class="chip-text">${label}</span>${dupeTag}
+    </a>`;
+  }
+
+  const draggableAttrs = draggable ? ` draggable="true" data-tab-id="${tab.id}"` : '';
+  const draggableClass = draggable ? ' page-chip-draggable' : '';
+
+  return `<div class="page-chip clickable${chipClass}${draggableClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}"${draggableAttrs}>
     ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
     <span class="chip-text">${label}</span>${dupeTag}
     <div class="chip-actions">
@@ -819,30 +836,8 @@ function renderTabChip(tab, urlCounts = {}, hostHint = '') {
    OVERFLOW CHIPS ("+N more" expand button in domain cards)
    ---------------------------------------------------------------- */
 
-function buildOverflowChips(hiddenTabs, urlCounts = {}) {
-  const hiddenChips = hiddenTabs.map(tab => {
-    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
-    const count    = urlCounts[tab.url] || 1;
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = label.replace(/"/g, '&quot;');
-    let domain = '';
-    try { domain = new URL(tab.url).hostname; } catch {}
-    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
-      <div class="chip-actions">
-        <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
-        </button>
-        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-url="${safeUrl}" title="Close this tab">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-    </div>`;
-  }).join('');
+function buildOverflowChips(hiddenTabs, urlCounts = {}, opts = {}) {
+  const hiddenChips = hiddenTabs.map(tab => renderTabChip(tab, urlCounts, '', opts)).join('');
 
   return `
     <div class="page-chips-overflow" style="display:none">${hiddenChips}</div>
@@ -862,7 +857,9 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
  * Builds the HTML for one domain group card.
  * group = { domain: string, tabs: [{ url, title, id, windowId, active }] }
  */
-function renderDomainCard(group) {
+function renderDomainCard(group, opts = {}) {
+  const readOnly = !!opts.readOnly;
+
   const tabs      = group.tabs || [];
   const tabCount  = tabs.length;
   const isLanding = group.domain === '__landing-pages__';
@@ -896,25 +893,29 @@ function renderDomainCard(group) {
   const visibleTabs = uniqueTabs.slice(0, 8);
   const extraCount  = uniqueTabs.length - visibleTabs.length;
 
-  const pageChips = visibleTabs.map(tab => renderTabChip(tab, urlCounts, group.domain)).join('')
-    + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
+  const pageChips = visibleTabs.map(tab => renderTabChip(tab, urlCounts, group.domain, opts)).join('')
+    + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts, opts) : '');
 
-  let actionsHtml = `
-    <button class="action-btn close-tabs" data-action="close-domain-tabs" data-domain-id="${stableId}">
-      ${ICONS.close}
-      Close all ${tabCount} tab${tabCount !== 1 ? 's' : ''}
-    </button>`;
-
-  if (hasDupes) {
-    const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
-    actionsHtml += `
-      <button class="action-btn" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
-        Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
+  let actionsHtml = '';
+  if (!readOnly) {
+    actionsHtml = `
+      <button class="action-btn close-tabs" data-action="close-domain-tabs" data-domain-id="${stableId}">
+        ${ICONS.close}
+        Close all ${tabCount} tab${tabCount !== 1 ? 's' : ''}
       </button>`;
+    if (hasDupes) {
+      const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
+      actionsHtml += `
+        <button class="action-btn" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
+          Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
+        </button>`;
+    }
   }
 
+  const actionsBlock = actionsHtml ? `<div class="actions">${actionsHtml}</div>` : '';
+
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}">
+    <div class="mission-card domain-card${readOnly ? ' readonly' : ''} ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -923,7 +924,7 @@ function renderDomainCard(group) {
           ${dupeBadge}
         </div>
         <div class="mission-pages">${pageChips}</div>
-        <div class="actions">${actionsHtml}</div>
+        ${actionsBlock}
       </div>
       <div class="mission-meta">
         <div class="mission-page-count">${tabCount}</div>
@@ -946,7 +947,9 @@ function renderDomainCard(group) {
  *   hostBuckets?: { domain, tabs }[],  // present in window-host mode
  * }
  */
-function renderWindowCard(group) {
+function renderWindowCard(group, opts = {}) {
+  const readOnly = !!opts.readOnly;
+
   const tabs       = group.tabs || [];
   const tabCount   = tabs.length;
   const nested     = Array.isArray(group.hostBuckets) && group.hostBuckets.length > 0;
@@ -976,6 +979,10 @@ function renderWindowCard(group) {
       </span>`
     : '';
 
+  // Chips inside writable window cards are draggable — drop onto another window
+  // card to call chrome.tabs.move(). Cross-profile (readOnly) cards aren't.
+  const chipOpts = { ...opts, draggable: !readOnly };
+
   let body;
   if (nested) {
     // window-host mode: one sub-section per host inside this window
@@ -987,8 +994,8 @@ function renderWindowCard(group) {
       }
       const visible = uniqueTabs.slice(0, 6);
       const extra   = uniqueTabs.length - visible.length;
-      const chips = visible.map(t => renderTabChip(t, urlCounts, bucket.domain)).join('')
-        + (extra > 0 ? buildOverflowChips(uniqueTabs.slice(6), urlCounts) : '');
+      const chips = visible.map(t => renderTabChip(t, urlCounts, bucket.domain, chipOpts)).join('')
+        + (extra > 0 ? buildOverflowChips(uniqueTabs.slice(6), urlCounts, chipOpts) : '');
       return `
         <div class="window-subsection">
           <div class="window-subhead">
@@ -1007,29 +1014,40 @@ function renderWindowCard(group) {
     }
     const visible = uniqueTabs.slice(0, 8);
     const extra   = uniqueTabs.length - visible.length;
-    const chips = visible.map(t => renderTabChip(t, urlCounts, '')).join('')
-      + (extra > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
+    const chips = visible.map(t => renderTabChip(t, urlCounts, '', chipOpts)).join('')
+      + (extra > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts, chipOpts) : '');
     body = `<div class="mission-pages">${chips}</div>`;
   }
 
-  let actionsHtml = `
-    <button class="action-btn close-tabs" data-action="close-window-tabs" data-window-key="${group.windowId}">
-      ${ICONS.close}
-      Close all ${tabCount} tab${tabCount !== 1 ? 's' : ''}
-    </button>`;
-
-  if (hasDupes) {
-    const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
+  let actionsHtml = '';
+  if (!readOnly) {
+    if (!group.isCurrent) {
+      actionsHtml += `
+        <button class="action-btn" data-action="focus-window" data-window-key="${group.windowId}" title="Bring this window to the front">
+          ${ICONS.focus}
+          Bring to front
+        </button>`;
+    }
     actionsHtml += `
-      <button class="action-btn" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
-        Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
+      <button class="action-btn close-tabs" data-action="close-window-tabs" data-window-key="${group.windowId}">
+        ${ICONS.close}
+        Close all ${tabCount} tab${tabCount !== 1 ? 's' : ''}
       </button>`;
+
+    if (hasDupes) {
+      const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
+      actionsHtml += `
+        <button class="action-btn" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
+          Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
+        </button>`;
+    }
   }
 
+  const actionsBlock = actionsHtml ? `<div class="actions">${actionsHtml}</div>` : '';
   const currentTag = group.isCurrent ? `<span class="window-current-tag">current</span>` : '';
 
   return `
-    <div class="mission-card window-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-window-key="${group.windowId}">
+    <div class="mission-card window-card${readOnly ? ' readonly' : ''} ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-window-key="${group.windowId}">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -1039,7 +1057,7 @@ function renderWindowCard(group) {
           ${dupeBadge}
         </div>
         ${body}
-        <div class="actions">${actionsHtml}</div>
+        ${actionsBlock}
       </div>
       <div class="mission-meta">
         <div class="mission-page-count">${tabCount}</div>
@@ -1638,6 +1656,20 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
+  // ---- Bring a window to the front (chrome.windows.update + focused: true) ----
+  if (action === 'focus-window') {
+    const windowKey = parseInt(actionEl.dataset.windowKey, 10);
+    if (!Number.isInteger(windowKey)) return;
+    try {
+      await chrome.windows.update(windowKey, { focused: true });
+      showToast('Window brought to front');
+    } catch (err) {
+      console.warn('[tab-out] focus window failed:', err);
+      showToast('Could not focus window');
+    }
+    return;
+  }
+
   // ---- Close all tabs in a window group ----
   if (action === 'close-window-tabs') {
     const windowKey = actionEl.dataset.windowKey;
@@ -1720,6 +1752,91 @@ document.addEventListener('click', async (e) => {
   }
 });
 
+/* ----------------------------------------------------------------
+   DRAG-AND-DROP — move tabs between windows
+
+   Chip drag → window-card drop: chrome.tabs.move(tabId, { windowId, index }).
+   Read-only chips (cross-profile) aren't draggable; read-only window cards
+   don't accept drops. Drop on a chip → insert at that chip's tab index.
+   Drop on the card body (not on a chip) → append at the end.
+   ---------------------------------------------------------------- */
+
+let _dragState = null; // { tabId: number, sourceWindowKey: string }
+
+document.addEventListener('dragstart', (e) => {
+  const chip = e.target.closest('.page-chip-draggable[data-tab-id]');
+  if (!chip) return;
+  const tabId = parseInt(chip.dataset.tabId, 10);
+  if (!Number.isInteger(tabId)) return;
+  const sourceCard = chip.closest('.window-card[data-window-key]');
+  _dragState = {
+    tabId,
+    sourceWindowKey: sourceCard ? sourceCard.dataset.windowKey : null,
+  };
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move';
+    // Need a payload for Firefox-compat, even though we read state from _dragState
+    try { e.dataTransfer.setData('text/plain', String(tabId)); } catch {}
+  }
+  chip.classList.add('dragging');
+});
+
+document.addEventListener('dragend', (e) => {
+  const chip = e.target.closest('.page-chip');
+  if (chip) chip.classList.remove('dragging');
+  document.querySelectorAll('.drop-target-active').forEach(el => el.classList.remove('drop-target-active'));
+  _dragState = null;
+});
+
+document.addEventListener('dragover', (e) => {
+  if (!_dragState) return;
+  const card = e.target.closest('.window-card[data-window-key]:not(.readonly)');
+  if (!card) return;
+  // Must preventDefault to permit drop
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  if (!card.classList.contains('drop-target-active')) {
+    document.querySelectorAll('.drop-target-active').forEach(el => el.classList.remove('drop-target-active'));
+    card.classList.add('drop-target-active');
+  }
+});
+
+document.addEventListener('drop', async (e) => {
+  if (!_dragState) return;
+  const card = e.target.closest('.window-card[data-window-key]:not(.readonly)');
+  if (!card) return;
+  e.preventDefault();
+
+  const { tabId } = _dragState;
+  _dragState = null;
+  document.querySelectorAll('.drop-target-active').forEach(el => el.classList.remove('drop-target-active'));
+
+  const destWindowId = parseInt(card.dataset.windowKey, 10);
+  if (!Number.isInteger(destWindowId) || !Number.isInteger(tabId)) return;
+
+  // Drop position: if dropped on a specific chip, insert at that chip's tab index;
+  // otherwise append to the end of the destination window.
+  let destIndex = -1;
+  const targetChip = e.target.closest('.page-chip[data-tab-id]');
+  if (targetChip && parseInt(targetChip.dataset.tabId, 10) !== tabId) {
+    try {
+      const t = await chrome.tabs.get(parseInt(targetChip.dataset.tabId, 10));
+      if (t && Number.isInteger(t.index)) destIndex = t.index;
+    } catch { /* fall through to append */ }
+  }
+
+  try {
+    await chrome.tabs.move(tabId, { windowId: destWindowId, index: destIndex });
+  } catch (err) {
+    console.warn('[tab-out] tab move failed:', err);
+    showToast('Could not move tab');
+    return;
+  }
+
+  await renderStaticDashboard();
+});
+
+
 // ---- Archive toggle — expand/collapse the archive section ----
 document.addEventListener('click', (e) => {
   const toggle = e.target.closest('#archiveToggle');
@@ -1770,8 +1887,10 @@ document.addEventListener('input', async (e) => {
    Section stays hidden when:
      - native host isn't installed (read fails silently)
      - no other profile has written a snapshot yet
-   Tabs are read-only; clicking opens the URL in this profile (Chrome
-   has no extension API to focus a tab in a different profile).
+   Foreign tabs are read-only — clicking opens the URL in *this* profile
+   (Chrome has no extension API to focus a tab in another profile). The
+   cards mirror the active group-by mode so the visual language matches
+   the main "Open tabs" section.
    ---------------------------------------------------------------- */
 
 function escapeHtml(s) {
@@ -1782,35 +1901,82 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
-function renderCrossProfileCard(snapshot) {
-  const tabs = Array.isArray(snapshot.tabs) ? snapshot.tabs : [];
+/**
+ * buildOtherWindowGroups(tabs, opts)
+ *
+ * Same shape as buildWindowGroups(), but for tabs from a foreign profile's
+ * snapshot. We can't call chrome.windows.getAll() for the other profile,
+ * so window order = order of first appearance in the snapshot's tab list.
+ * windowId is namespaced ("other-<id>-<idx>") so it doesn't collide with
+ * our own window IDs in the DOM.
+ */
+function buildOtherWindowGroups(tabs, opts = {}) {
+  const { withHosts = false, namespace = 'other' } = opts;
+
+  const windowOrder = [];
+  const tabsByWindow = new Map();
+  for (const tab of tabs) {
+    const wId = tab.windowId == null ? 0 : tab.windowId;
+    if (!tabsByWindow.has(wId)) {
+      tabsByWindow.set(wId, []);
+      windowOrder.push(wId);
+    }
+    tabsByWindow.get(wId).push(tab);
+  }
+
+  return windowOrder.map((wId, i) => {
+    const winTabs = tabsByWindow.get(wId);
+    const group = {
+      kind: 'window',
+      windowId: `${namespace}-${wId}-${i}`,
+      label: `Window ${i + 1}`,
+      isCurrent: false,
+      tabs: winTabs,
+    };
+    if (withHosts) {
+      const bucketMap = new Map();
+      for (const tab of winTabs) {
+        let host = '';
+        try {
+          if (tab.url && tab.url.startsWith('file://')) host = 'local-files';
+          else host = new URL(tab.url).hostname;
+        } catch {}
+        if (!host) host = 'unknown';
+        if (!bucketMap.has(host)) bucketMap.set(host, { domain: host, tabs: [] });
+        bucketMap.get(host).tabs.push(tab);
+      }
+      group.hostBuckets = Array.from(bucketMap.values()).sort((a, b) => b.tabs.length - a.tabs.length);
+    }
+    return group;
+  });
+}
+
+function renderCrossProfileBlock(snapshot, mode) {
+  const tabs = (Array.isArray(snapshot.tabs) ? snapshot.tabs : []).filter(t => t && t.url);
   const tabCount = tabs.length;
   const hostCount = new Set(tabs.map(t => {
     try { return new URL(t.url).hostname; } catch { return ''; }
   }).filter(Boolean)).size;
-
   const updated = timeAgo(snapshot.updatedAt);
   const labelRaw = (snapshot.profileLabel || '').trim();
   const label = labelRaw || ('Profile ' + String(snapshot.profileId || '').slice(0, 4));
+  const namespace = `other-${String(snapshot.profileId || 'unknown').replace(/[^a-z0-9]/gi, '').slice(0, 8)}`;
 
-  const visible  = tabs.slice(0, 8);
-  const overflow = tabs.length - visible.length;
+  let groups;
+  if (mode === 'host') {
+    groups = buildHostGroups(tabs);
+  } else {
+    groups = buildOtherWindowGroups(tabs, {
+      withHosts: mode === 'window-host',
+      namespace,
+    });
+  }
 
-  const tabRows = visible.map(t => {
-    let host = '';
-    try { host = new URL(t.url).hostname; } catch {}
-    const safeUrl   = escapeHtml(t.url || '');
-    const display   = escapeHtml(t.title || t.url || '');
-    const titleAttr = escapeHtml(t.title || t.url || '');
-    const favicon   = host
-      ? `<img src="https://www.google.com/s2/favicons?domain=${escapeHtml(host)}&sz=16" alt="" onerror="this.style.display='none'">`
-      : '';
-    return `<a class="cross-profile-tab" href="${safeUrl}" target="_blank" rel="noopener noreferrer" title="${titleAttr}">${favicon}<span class="cross-profile-tab-text">${display}</span></a>`;
-  }).join('');
-
-  const overflowRow = overflow > 0
-    ? `<div class="cross-profile-overflow">+${overflow} more</div>`
-    : '';
+  const cards = groups
+    .map(g => g.kind === 'window'
+      ? renderWindowCard(g, { readOnly: true })
+      : renderDomainCard(g, { readOnly: true }))
+    .join('');
 
   const meta = [
     `${tabCount} tab${tabCount !== 1 ? 's' : ''}`,
@@ -1819,15 +1985,12 @@ function renderCrossProfileCard(snapshot) {
   ].filter(Boolean).join(' · ');
 
   return `
-    <div class="cross-profile-card">
-      <div class="cross-profile-card-head">
+    <div class="cross-profile-block">
+      <div class="cross-profile-block-head">
         <span class="cross-profile-name">${escapeHtml(label)}</span>
         <span class="cross-profile-meta">${escapeHtml(meta)}</span>
       </div>
-      <div class="cross-profile-tab-list">
-        ${tabRows}
-        ${overflowRow}
-      </div>
+      <div class="missions cross-profile-missions">${cards}</div>
     </div>`;
 }
 
@@ -1842,7 +2005,8 @@ async function renderCrossProfileSection() {
     return;
   }
 
-  cardsEl.innerHTML = snapshots.map(renderCrossProfileCard).join('');
+  const mode = await getGroupMode();
+  cardsEl.innerHTML = snapshots.map(s => renderCrossProfileBlock(s, mode)).join('');
   section.style.display = 'block';
 }
 

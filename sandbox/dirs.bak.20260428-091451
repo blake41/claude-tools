@@ -2,7 +2,7 @@
 # Paths Claude can write to. Everything else is read-only at the kernel level.
 # Suffix :ro for read-only access (can read but not modify)
 # WARNING: Do not add ~ or ~/* — that defeats the entire sandbox.
-# NOTE: ~/.config/cco/dirs is a symlink to this file — both paths read the same content.
+# NOTE: This file lives in tools/sandbox/ which is :ro — Claude can't edit it
 
 # === Project code ===
 ~/Documents/Development/
@@ -26,19 +26,6 @@
 ~/.codex
 ~/.local/state/interview/
 ~/.config/interview/
-~/Library/Preferences/.wrangler/logs
-~/.cache
-~/.playwriter
-~/.cache/uv
-~/.agent
-/Users/blake/Library/Preferences/.wrangler
-~/.config/last30days
-~/Documents/Last30Days
-~/.yarn
-~/.peekaboo
-~/.local/share/tennis-warehouse-pp-cli/
-~/.roughdraft/
-~/Library/Developer/CoreSimulator/
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
@@ -48,6 +35,4 @@
 
 # === Read-only (Claude can see but not modify) ===
 ~/Library/Preferences:ro
-~/.config/cco:ro
-~/.local/bin
 ~/Documents/Development/tools/sandbox:ro

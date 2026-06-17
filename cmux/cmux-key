@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+cmux-key — derive a stable identity for a cmux panel from its persisted state.
+
+Panel UUIDs ($CMUX_PANEL_ID) are NOT stable across cmux restarts. cmux
+regenerates them when relaunching the app. What IS stable is the (title,
+directory) pair for each panel — cmux preserves both verbatim across
+restart and reboot.
+
+This script reads cmux's session-state JSON, finds the panel matching the
+given UUID (or $CMUX_PANEL_ID), and emits the stable identity.
+
+Usage:
+  cmux-key                                # uses $CMUX_PANEL_ID, prints JSON
+  cmux-key <panel-uuid>                   # uses given UUID, prints JSON
+  cmux-key --key                          # prints just the hash
+  cmux-key --field title|directory|key    # prints just one field
+
+Output (JSON form):
+  {"panel_id": "...", "title": "...", "directory": "...", "key": "<16-hex>"}
+
+Exit codes:
+  0  success
+  1  panel not found in cmux JSON
+  2  cmux JSON missing or unparseable
+  3  no panel UUID given (and $CMUX_PANEL_ID unset)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+CMUX_STATE = Path.home() / "Library/Application Support/cmux/session-com.cmuxterm.app.json"
+
+
+def derive_key(title: str, directory: str) -> str:
+    """Stable 16-hex-char hash of (title, directory).
+
+    Using the displayed `title` (which falls back to an auto-derived label
+    when the user hasn't renamed) is good enough: cmux preserves it across
+    restart, and collisions only happen when two unnamed terminals sit in
+    the same directory — at which point neither has a "real" identity to
+    preserve anyway.
+    """
+    h = hashlib.sha256(f"{title}\x00{directory}".encode("utf-8")).hexdigest()
+    return h[:16]
+
+
+def find_panel(state: dict, panel_id: str) -> dict | None:
+    """Walk the cmux JSON looking for a panel with the given id.
+
+    Schema (as of cmux v1):
+        windows[].tabManager.workspaces[].panels[].{id, title, customTitle, directory, ...}
+    """
+    for window in state.get("windows", []) or []:
+        tab_manager = window.get("tabManager", {}) or {}
+        for workspace in tab_manager.get("workspaces", []) or []:
+            for panel in workspace.get("panels", []) or []:
+                if panel.get("id") == panel_id:
+                    return panel
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("panel_id", nargs="?", help="Panel UUID (defaults to $CMUX_PANEL_ID)")
+    ap.add_argument("--field", choices=["title", "directory", "key", "panel_id"],
+                    help="Print just one field instead of full JSON")
+    ap.add_argument("--key", action="store_true", help="Shortcut for --field key")
+    args = ap.parse_args()
+
+    panel_id = args.panel_id or os.environ.get("CMUX_PANEL_ID")
+    if not panel_id:
+        print("cmux-key: no panel id (set $CMUX_PANEL_ID or pass as arg)", file=sys.stderr)
+        return 3
+
+    if not CMUX_STATE.is_file():
+        print(f"cmux-key: cmux state file missing at {CMUX_STATE}", file=sys.stderr)
+        return 2
+
+    try:
+        state = json.loads(CMUX_STATE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cmux-key: failed to read cmux state: {exc}", file=sys.stderr)
+        return 2
+
+    panel = find_panel(state, panel_id)
+    if panel is None:
+        print(f"cmux-key: panel {panel_id} not found in cmux state", file=sys.stderr)
+        return 1
+
+    title = panel.get("title") or ""
+    directory = panel.get("directory") or ""
+    key = derive_key(title, directory)
+
+    out = {"panel_id": panel_id, "title": title, "directory": directory, "key": key}
+
+    if args.key:
+        args.field = "key"
+    if args.field:
+        print(out[args.field])
+    else:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

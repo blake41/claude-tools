@@ -21,6 +21,7 @@
     "esbuild": "^0.27.4",
     "express": "^4.21.0",
     "gray-matter": "^4.0.3",
+    "mermaid": "11.15.0",
     "nuqs": "^2.8.9",
     "p-queue": "^9.1.0"
   },

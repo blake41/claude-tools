@@ -315,6 +315,35 @@ button {
   gap: 6px;
 }
 
+/* ---- LCS diff view ---- */
+.diff-view {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 0;
+  max-height: 320px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.diff-del {
+  color: #f7768e;
+  background: rgba(247, 118, 142, 0.08);
+  padding: 0 10px;
+  display: block;
+}
+.diff-add {
+  color: #9ece6a;
+  background: rgba(158, 206, 106, 0.08);
+  padding: 0 10px;
+  display: block;
+}
+.diff-ctx {
+  color: var(--color-text-dim);
+  padding: 0 10px;
+  display: block;
+}
+
 /* ---- Collapsible long content ---- */
 .collapsible-wrap {
   position: relative;

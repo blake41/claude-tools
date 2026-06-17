@@ -1,0 +1,92 @@
+[2026-06-03 11:00:44] Status line triggered (cc-statusline v1.4.0)
+[2026-06-03 11:00:44] Input:
+{
+  "session_id": "abc123-de45-6789-f012-3456789abcde",
+  "version": "1.0.0",
+  "cwd": "/Users/blake/Documents/Development/clay/terra",
+  "workspace": {
+    "current_dir": "/Users/blake/Documents/Development/clay/terra"
+  },
+  "output_style": {
+    "name": "default"
+  },
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 50000,
+      "cache_read_input_tokens": 10000
+    }
+  }
+}
+[2026-06-03 11:00:44] Using jq for JSON parsing
+---
+[2026-06-03 11:00:44] Extracted: dir=~/Documents/Development/clay/terra, model=, version=, git=worktree-workflow-model-phase-0, context=70%, cost=, cost_ph=, tokens=, tpm=, session_pct=
+[2026-06-03 11:01:47] Status line triggered (cc-statusline v1.4.0)
+[2026-06-03 11:01:47] Input:
+{
+  "session_id": "abc123-de45-6789-f012-3456789abcde",
+  "version": "1.0.0",
+  "cwd": "/Users/blake/Documents/Development/clay/terra",
+  "workspace": {
+    "current_dir": "/Users/blake/Documents/Development/clay/terra"
+  },
+  "output_style": {
+    "name": "default"
+  },
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 50000,
+      "cache_read_input_tokens": 10000
+    }
+  }
+}
+[2026-06-03 11:01:47] Using jq for JSON parsing
+---
+[2026-06-03 11:01:47] Extracted: dir=~/Documents/Development/clay/terra, model=, version=, git=worktree-workflow-model-phase-0, context=70%, cost=, cost_ph=, tokens=, tpm=, session_pct=
+[2026-06-03 11:11:05] Status line triggered (cc-statusline v1.4.0)
+[2026-06-03 11:11:05] Input:
+{
+  "session_id": "f7b7075f-ecb1-4c4c-99f9-8f562470000",
+  "version": "1.0.0",
+  "cwd": "/Users/blake/Documents/Development/clay/terra",
+  "workspace": {
+    "current_dir": "/Users/blake/Documents/Development/clay/terra/.claude/worktrees/surface-model-phase-0"
+  },
+  "output_style": {
+    "name": "default"
+  },
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 10000,
+      "cache_read_input_tokens": 0
+    }
+  }
+}
+[2026-06-03 11:11:05] Using jq for JSON parsing
+---
+[2026-06-03 11:11:05] Extracted: dir=~/Documents/Development/clay/terra/.claude/worktrees/surface-model-phase-0, model=, version=, git=worktree-workflow-model-phase-0, context=95%, cost=, cost_ph=, tokens=, tpm=, session_pct=
+[2026-06-03 11:11:09] Status line triggered (cc-statusline v1.4.0)
+[2026-06-03 11:11:09] Input:
+{
+  "session_id": "f7b7075f-ecb1-4c4c-99f9-8f562470000",
+  "version": "1.0.0",
+  "cwd": "/Users/blake/Documents/Development/clay/terra",
+  "workspace": {
+    "current_dir": "/Users/blake/Documents/Development/clay/terra/.claude/worktrees/surface-model-phase-0"
+  },
+  "output_style": {
+    "name": "default"
+  },
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 10000,
+      "cache_read_input_tokens": 0
+    }
+  }
+}
+[2026-06-03 11:11:09] Using jq for JSON parsing
+---
+[2026-06-03 11:11:09] Extracted: dir=~/Documents/Development/clay/terra/.claude/worktrees/surface-model-phase-0, model=, version=, git=worktree-workflow-model-phase-0, context=95%, cost=, cost_ph=, tokens=, tpm=, session_pct=

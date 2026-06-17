@@ -22,10 +22,10 @@ find_config() {
 
 cmd_help() {
   cat <<'HELP'
-db-safe: Safe database CLI for AI agent workflows
+db-safe: Safe database CLI for humans and AI agents
 
 USAGE
-  db-safe <command> <environment> "<query>"
+  db-safe [--format <fmt>] <command> <environment> "<query>"
 
 COMMANDS
   read <env> "<query>"     Execute a Prisma read query (agent-safe)
@@ -34,6 +34,16 @@ COMMANDS
   sql:write <env> "<sql>"  Execute raw SQL write (requires human TTY)
   help                     Show this help
 
+OUTPUT FORMAT
+  -f, --format <fmt>       Override output format. Options:
+                             table   psql-style aligned table (default at TTY)
+                             ndjson  header line + one JSON row per line (default piped)
+                             json    single-line JSON envelope
+                             pretty  multi-line indented JSON envelope
+
+  Default: 'table' when stdout is a terminal, 'ndjson' when piped/redirected.
+  Errors render readably in 'table' mode; otherwise as JSON envelopes.
+
 ENVIRONMENTS
   Defined in .db-safe.json in your project root.
 
@@ -41,6 +51,8 @@ EXAMPLES
   db-safe sql staging "SELECT count(*) FROM accounts"
   db-safe read staging "prisma.account.findMany({ take: 5 })"
   db-safe sql:write production "UPDATE accounts SET segment = 'enterprise' WHERE account_id = '001xxx'"
+  db-safe --format json sql staging "SELECT 1 as n"   # force compact JSON
+  db-safe --format table sql staging "SELECT 1 as n"  # force table even when piped
 
 CONFIG
   Create .db-safe.json in your project root:
@@ -60,6 +72,38 @@ SAFETY
 HELP
 }
 
+# Parse --format / -f flag from anywhere in argv. Pass through via env var.
+# Everything else stays positional (command, env, query).
+FORMAT=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--format)
+      if [[ $# -lt 2 ]]; then
+        json_error "$TOOL_NAME" "Missing value for $1" "MISSING_FORMAT" "Usage: --format <table|ndjson|json|pretty>"
+      fi
+      FORMAT="$2"
+      shift 2
+      ;;
+    --format=*)
+      FORMAT="${1#--format=}"
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+if [[ -n "$FORMAT" ]]; then
+  case "$FORMAT" in
+    table|ndjson|json|pretty) export DB_SAFE_FORMAT="$FORMAT" ;;
+    *) json_error "$TOOL_NAME" "Unknown format: $FORMAT" "BAD_FORMAT" "Valid: table, ndjson, json, pretty" ;;
+  esac
+fi
+
 # Validate args
 case "${1:-}" in
   help|--help|-h)
@@ -69,7 +113,7 @@ case "${1:-}" in
   read|write|sql|sql:write)
     ;;
   "")
-    cmd_tree "$TOOL_NAME" "Safe database CLI for AI agent workflows" "$(jq -n '[
+    cmd_tree "$TOOL_NAME" "Safe database CLI for humans and AI agents" "$(jq -n '[
       {"name": "read",      "description": "Prisma read query (agent-safe)",      "usage": "db-safe read <env> \"<query>\""},
       {"name": "write",     "description": "Prisma write query (requires human)", "usage": "db-safe write <env> \"<query>\""},
       {"name": "sql",       "description": "Raw SQL read (agent-safe)",           "usage": "db-safe sql <env> \"<sql>\""},
