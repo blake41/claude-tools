@@ -245,28 +245,38 @@ function AssistantTurnBlock({
   userOnly: boolean;
   highlightSeq: number;
 }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  // Find the last assistant text message — shown by default
+  const lastTextItem = [...turn.items].reverse().find(
+    (g) => g.kind === "text" && g.msg.role === "assistant" && g.msg.message_type === "text"
+  );
+  const hasHidden = turn.items.length > 1 || (turn.items.length === 1 && !lastTextItem);
 
   const parts: string[] = [];
-  if (turn.msgCount > 0) parts.push(`${turn.msgCount} message${turn.msgCount !== 1 ? "s" : ""}`);
   if (turn.toolCount > 0) parts.push(`${turn.toolCount} tool call${turn.toolCount !== 1 ? "s" : ""}`);
+  if (turn.msgCount > 1) parts.push(`${turn.msgCount} messages`);
   const summary = parts.join(", ");
 
   return (
     <div className={`assistant-turn ${highlight ? "message-highlight" : ""}`}>
       <button
         className="assistant-turn-header"
-        onClick={() => setCollapsed((c) => !c)}
-        title={collapsed ? "Expand" : "Collapse"}
+        onClick={() => setExpanded((e) => !e)}
+        title={expanded ? "Collapse reasoning" : "Show reasoning + tool calls"}
       >
         <span className="assistant-turn-label">Claude</span>
         {summary && <span className="assistant-turn-summary">· {summary}</span>}
         {turn.lastTime && (
           <span className="assistant-turn-time">{formatTime(turn.lastTime)}</span>
         )}
-        <span className={`assistant-turn-chevron ${collapsed ? "collapsed" : ""}`}>▾</span>
+        {hasHidden && (
+          <span className={`assistant-turn-chevron ${expanded ? "" : "collapsed"}`}>▾</span>
+        )}
       </button>
-      {!collapsed && (
+
+      {/* Expanded: show everything */}
+      {expanded && (
         <div className="assistant-turn-body">
           {turn.items.map((g, idx) => {
             if (g.kind === "tools") {
@@ -275,9 +285,6 @@ function AssistantTurnBlock({
               return <ToolGroupBlock key={`tg-${idx}`} group={g} highlight={groupHighlight} />;
             }
             const msg = g.msg;
-            if (msg.message_type === "system" || msg.message_type === "subagent_prompt") {
-              return <MessageBubble key={msg.sequence} message={msg} highlight={!isNaN(highlightSeq) && msg.sequence === highlightSeq} />;
-            }
             return (
               <MessageBubble
                 key={msg.sequence}
@@ -288,6 +295,16 @@ function AssistantTurnBlock({
           })}
         </div>
       )}
+
+      {/* Collapsed: show only the final text message */}
+      {!expanded && lastTextItem && lastTextItem.kind === "text" && (
+        <MessageBubble
+          message={lastTextItem.msg}
+          highlight={!isNaN(highlightSeq) && lastTextItem.msg.sequence === highlightSeq}
+        />
+      )}
+
+      {/* Collapsed: no final text message (turn was all tool calls) — show nothing extra */}
     </div>
   );
 }
