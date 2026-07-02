@@ -60,8 +60,11 @@ Subagents got no `[BROWSER INSTANCE]` line and either guessed a stranger's wrapp
 ```bash
 ab new-session            # initialize the session file for the current pid (idempotent)
 ab ps                     # list live pids/wrappers (owner + age)
+ab close                  # tear down THIS session's tab + reap its /tmp markers (no-op if Chrome is down; never boots Chrome)
 ab gc                     # reap wrapper/session files older than 24h
-ab heal                   # kill Chrome, restart fresh — also the only thing that closes tabs
+ab heal                   # kill Chrome, restart fresh — closes EVERY session's tabs
 ```
 
-- Wrapper/tab accumulation is reaped by `ab gc` (24h) for files; tabs only close on `ab heal`. Do **not** `ab heal` while another CC session is live on the shared Chrome — it kills that session's tabs too.
+- **Targeted teardown:** `ab close` closes only the calling session's tab and removes its `/tmp` markers, so `ab ps` reflects it immediately. This is the clean "I'm done" path — a backgrounded agent should call it on a terminal verdict (but **not** while it may still be resumed).
+- **Nuclear:** `ab heal` kills Chrome entirely and closes **every** session's tabs. Do **not** `ab heal` while another CC session is live on the shared Chrome.
+- **Passive:** `ab gc` reaps `/tmp` wrapper/session *files* older than 24h; it does not touch Chrome tabs.

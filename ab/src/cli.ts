@@ -847,13 +847,15 @@ const PASSTHROUGH_COMMANDS = new Set([
   "set",
   "keyboard",
   "frame",
+  "close", // tear down this session's tab — see the explicit handler; never boots Chrome
 ]);
 
 const BLOCKED_COMMANDS = new Set(["eval", "js", "execute"]);
 
 /** Commands that require a managed Chrome instance (ensureChromePort). */
 const NEEDS_CHROME = new Set([
-  ...PASSTHROUGH_COMMANDS,
+  // `close` is intentionally excluded: it should tear down, never boot Chrome.
+  ...[...PASSTHROUGH_COMMANDS].filter((c) => c !== "close"),
   "open",
   "navigate",
   "goto",
@@ -971,6 +973,33 @@ async function main(): Promise<number> {
     // -- Dashboard --
     if (command === "dashboard") {
       return await cmdDashboard(rest[0] ?? "", cdpPort, sessionName);
+    }
+
+    // -- Close: tear down this session's tab. Never boots Chrome — if no
+    //    browser is running there is nothing to close (no-op success). This is
+    //    the targeted alternative to `ab heal`, which nukes every session's tabs. --
+    if (command === "close") {
+      let running = false;
+      try {
+        const st = await rpc.status();
+        const state = flags.headed ? st.headed : st.headless;
+        running = state.phase === "chrome_up";
+        if (running && "port" in state) cdpPort = state.port;
+      } catch {
+        running = false; // daemon down → nothing to close
+      }
+      let exitCode = 0;
+      if (running) {
+        const result = await runAgentBrowser(cdpPort, sessionName, flags.args);
+        exitCode = result.exitCode;
+      } else {
+        gray("No browser running — nothing to close.");
+      }
+      // Reap this session's own /tmp markers so `ab ps` reflects the teardown
+      // immediately instead of waiting for the 24h gc.
+      try { fs.unlinkSync(`${SESSION_FILE_PREFIX}${pid}`); } catch { /* already gone */ }
+      try { fs.unlinkSync(`${WRAPPER_PREFIX}${pid}`); } catch { /* may not exist */ }
+      return exitCode;
     }
 
     // -- Passthrough commands --
