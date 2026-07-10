@@ -77,7 +77,7 @@ const BACKOFF_MAX_MS = 30_000;
 const BACKOFF_STABLE_RESET_MS = 60_000;
 
 // Headed idle timeout
-const HEADED_IDLE_TIMEOUT_MS = 10 * 60_000; // 10 minutes
+const HEADED_IDLE_TIMEOUT_MS = 90 * 60_000; // 90 minutes (covers oracle Pro runs up to 60m)
 
 // ---------------------------------------------------------------------------
 // Operation queue — serializes all state-mutating operations
