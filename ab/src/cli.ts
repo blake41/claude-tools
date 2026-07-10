@@ -1041,7 +1041,15 @@ function cmdPs(args: string[]): number {
  * exits immediately after (idle timeout).
  */
 async function teardownSession(sessionPid: string, cdpPort: number): Promise<void> {
-  await runAgentBrowser(cdpPort, buildSessionName(sessionPid), ["close"]);
+  // Bare `close` only shuts down the per-session daemon — in attached-CDP
+  // mode it never closes the Chrome tab (verified 2026-07-10 via
+  // `/json/list`: the tab survives). `tab close` is what closes the
+  // daemon's tab, so run it first, then `close` to end the daemon. If the
+  // daemon had already idle-exited, the respawned daemon may not re-adopt
+  // the orphan tab, so the tab-close is best-effort for dead-daemon reaps.
+  const sessionName = buildSessionName(sessionPid);
+  await runAgentBrowser(cdpPort, sessionName, ["tab", "close"]);
+  await runAgentBrowser(cdpPort, sessionName, ["close"]);
 }
 
 /** Guard regex for orphan-wrapper sweep: hex-ish session pid shapes only.
