@@ -27,6 +27,7 @@ import type {
   HealResponse,
   ChromeState,
 } from "./types";
+import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS, headlessTarget } from "./types";
 
 const log = new Logger({ component: "daemon" });
 
@@ -58,6 +59,11 @@ const AuthLoginRequestSchema = z.object({
   appBaseUrl: z.string().optional(),
 });
 
+const ChromeEnsureRequestSchema = z.object({
+  timeoutMs: z.number().int().positive().optional(),
+  shard: z.number().int().min(0).max(HEADLESS_POOL_SIZE - 1).optional(),
+});
+
 // ---------------------------------------------------------------------------
 // Route handler helpers
 // ---------------------------------------------------------------------------
@@ -82,28 +88,32 @@ function portFromState(state: ChromeState): number | null {
 
 function handleStatus(): Response {
   const states = getAllStates();
+  const headlessPool = HEADLESS_TARGETS.map((target) => states[target]);
   const body: StatusResponse & { ok: true; version: string } = {
     ok: true,
     version: VERSION,
     uptime: Math.floor((Date.now() - startedAt) / 1000),
-    headless: states.headless,
+    headless: headlessPool[0],
     headed: states.headed,
+    headlessPool,
   };
   return json(body);
 }
 
 function handleHealth(): Response {
   const states = getAllStates();
+  const headlessPool = HEADLESS_TARGETS.map((target) => ({
+    phase: states[target].phase,
+    port: portFromState(states[target]),
+  }));
   const body: HealthResponse = {
     ok: true,
-    headless: {
-      phase: states.headless.phase,
-      port: portFromState(states.headless),
-    },
+    headless: headlessPool[0],
     headed: {
       phase: states.headed.phase,
       port: portFromState(states.headed),
     },
+    headlessPool,
   };
   return json(body);
 }
@@ -115,8 +125,44 @@ async function handleEnsure(target: ChromeTarget): Promise<Response> {
     pid: result.pid,
     port: result.port,
     alreadyRunning: result.alreadyRunning,
+    profileFresh: result.profileFresh,
   };
   return json(body);
+}
+
+/**
+ * POST /chrome/ensure body is optional — existing callers send no body at
+ * all (defaults to shard 0). Parse it leniently: empty body -> {}, invalid
+ * JSON or an out-of-range shard -> 400.
+ */
+async function parseChromeEnsureBody(
+  req: Request,
+): Promise<{ shard?: number; timeoutMs?: number } | { error: string }> {
+  const text = await req.text();
+  if (!text) return {};
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { error: "Invalid JSON body" };
+  }
+
+  const parsed = ChromeEnsureRequestSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
+    return { error: `Validation failed: ${issues.join(", ")}` };
+  }
+  return parsed.data;
+}
+
+async function handleEnsureHeadless(req: Request): Promise<Response> {
+  const parsed = await parseChromeEnsureBody(req);
+  if ("error" in parsed) {
+    return json({ ok: false, error: parsed.error }, 400);
+  }
+  const shard = parsed.shard ?? 0;
+  return handleEnsure(headlessTarget(shard));
 }
 
 async function handleHeal(): Promise<Response> {
@@ -207,7 +253,7 @@ async function handleRequest(req: Request): Promise<Response> {
       return handleHealth();
     }
     if (method === "POST" && pathname === "/chrome/ensure") {
-      return await withOpId(newOpId(), () => withTimeout(() => handleEnsure("headless"))) as Response;
+      return await withOpId(newOpId(), () => withTimeout(() => handleEnsureHeadless(req))) as Response;
     }
     if (method === "POST" && pathname === "/chrome/ensure-headed") {
       return await withOpId(newOpId(), () => withTimeout(() => handleEnsure("headed"))) as Response;

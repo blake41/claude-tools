@@ -111,8 +111,16 @@ export async function health(): Promise<HealthResponse> {
   return rpcFetch({ method: "GET", path: "/health" });
 }
 
-export async function ensureChrome(): Promise<ChromeEnsureResponse> {
-  return rpcFetch({ method: "POST", path: "/chrome/ensure" });
+/**
+ * `opts.shard` selects which headless pool shard to ensure (server default:
+ * shard 0). Omit it entirely to preserve today's no-body request shape.
+ */
+export async function ensureChrome(opts?: { shard?: number }): Promise<ChromeEnsureResponse> {
+  return rpcFetch({
+    method: "POST",
+    path: "/chrome/ensure",
+    body: opts?.shard !== undefined ? { shard: opts.shard } : undefined,
+  });
 }
 
 export async function ensureChromeHeaded(): Promise<ChromeEnsureResponse> {

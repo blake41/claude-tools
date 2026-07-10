@@ -1,11 +1,12 @@
 /**
  * Chrome instance state machine for the ab-server daemon.
  *
- * Each Chrome target (headless, headed) has independent state.
- * All transitions are logged with timestamps.
+ * Each Chrome target (the headed target, plus every headless pool shard)
+ * has independent state. All transitions are logged with timestamps.
  */
 
 import type { ChromeState, ChromeTarget } from "./types";
+import { ALL_TARGETS } from "./types";
 import { Logger } from "./logger";
 
 const log = new Logger({ component: "chrome" });
@@ -19,10 +20,15 @@ export interface ChromeInstance {
   state: ChromeState;
 }
 
-const instances: Record<ChromeTarget, ChromeInstance> = {
-  headless: { target: "headless", state: { phase: "idle" } },
-  headed: { target: "headed", state: { phase: "idle" } },
-};
+function buildInstances(): Record<ChromeTarget, ChromeInstance> {
+  const built: Record<ChromeTarget, ChromeInstance> = {} as Record<ChromeTarget, ChromeInstance>;
+  for (const target of ALL_TARGETS) {
+    built[target] = { target, state: { phase: "idle" } };
+  }
+  return built;
+}
+
+const instances: Record<ChromeTarget, ChromeInstance> = buildInstances();
 
 // ---------------------------------------------------------------------------
 // Read
@@ -33,10 +39,11 @@ export function getState(target: ChromeTarget): ChromeState {
 }
 
 export function getAllStates(): Record<ChromeTarget, ChromeState> {
-  return {
-    headless: instances.headless.state,
-    headed: instances.headed.state,
-  };
+  const result: Record<ChromeTarget, ChromeState> = {} as Record<ChromeTarget, ChromeState>;
+  for (const target of ALL_TARGETS) {
+    result[target] = instances[target].state;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +120,8 @@ export function markIdle(target: ChromeTarget): void {
 // ---------------------------------------------------------------------------
 
 export function resetAll(): void {
-  instances.headless.state = { phase: "idle" };
-  instances.headed.state = { phase: "idle" };
+  for (const target of ALL_TARGETS) {
+    instances[target].state = { phase: "idle" };
+  }
   log.info("All Chrome states reset to idle");
 }

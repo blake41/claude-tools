@@ -6,7 +6,7 @@
  * cli.ts and rpc.ts depend on.
  */
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
-import { resetAll, markUp } from "../state";
+import { resetAll, markUp, getAllStates } from "../state";
 import type {
   StatusResponse,
   HealthResponse,
@@ -14,6 +14,7 @@ import type {
   HealResponse,
   AuthLoginResponse,
 } from "../types";
+import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS, headlessTarget } from "../types";
 
 // ---------------------------------------------------------------------------
 // Test socket path — isolated from the real daemon
@@ -42,6 +43,11 @@ const AuthLoginRequestSchema = z.object({
   appBaseUrl: z.string().optional(),
 });
 
+const ChromeEnsureRequestSchema = z.object({
+  timeoutMs: z.number().int().positive().optional(),
+  shard: z.number().int().min(0).max(HEADLESS_POOL_SIZE - 1).optional(),
+});
+
 let server: ReturnType<typeof Bun.serve>;
 let startedAt: number;
 const VERSION = "0.1.0";
@@ -68,38 +74,72 @@ beforeAll(() => {
 
       // Mirror server.ts routes exactly
       if (method === "GET" && pathname === "/status") {
-        const states = resetAll(), allStates = { headless: { phase: "idle" as const }, headed: { phase: "idle" as const } };
-        // Use actual state module
-        const { getAllStates } = require("../state");
         const st = getAllStates();
+        const headlessPool = HEADLESS_TARGETS.map((target) => st[target]);
         return json({
           ok: true,
           version: VERSION,
           uptime: Math.floor((Date.now() - startedAt) / 1000),
-          headless: st.headless,
+          headless: headlessPool[0],
           headed: st.headed,
+          headlessPool,
         });
       }
 
       if (method === "GET" && pathname === "/health") {
-        const { getAllStates } = require("../state");
         const st = getAllStates();
+        const headlessPool = HEADLESS_TARGETS.map((target) => ({
+          phase: st[target].phase,
+          port: st[target].phase === "chrome_up" ? st[target].port : null,
+        }));
         return json({
           ok: true,
-          headless: { phase: st.headless.phase, port: st.headless.phase === "chrome_up" ? st.headless.port : null },
+          headless: headlessPool[0],
           headed: { phase: st.headed.phase, port: st.headed.phase === "chrome_up" ? st.headed.port : null },
+          headlessPool,
         });
       }
 
       if (method === "POST" && pathname === "/chrome/ensure") {
-        // Fake ensure — just mark up and return
-        markUp("headless", 12345, 9333);
-        return json({ ok: true, pid: 12345, port: 9333, alreadyRunning: false });
+        return (async () => {
+          const text = await req.text();
+          let raw: unknown = {};
+          if (text) {
+            try {
+              raw = JSON.parse(text);
+            } catch {
+              return json({ ok: false, error: "Invalid JSON body" }, 400);
+            }
+          }
+          const parsed = ChromeEnsureRequestSchema.safeParse(raw);
+          if (!parsed.success) {
+            const issues = parsed.error.issues.map((i: z.ZodIssue) => `${i.path.join(".")}: ${i.message}`);
+            return json({ ok: false, error: `Validation failed: ${issues.join(", ")}` }, 400);
+          }
+          const shard = parsed.data.shard ?? 0;
+          const target = headlessTarget(shard);
+          const port = 9333 + shard;
+          const alreadyRunning = getAllStates()[target].phase === "chrome_up";
+          // Fake ensure — just mark up and return. Mirrors the real
+          // supervisor.ensure() contract: profileFresh is false once the
+          // shard is already up, true otherwise (this test harness has no
+          // real profile dir to check, so it reports "fresh" for any actual
+          // launch, matching ensure()'s non-adopted-launch default).
+          markUp(target, 12345 + shard, port);
+          return json({
+            ok: true,
+            pid: 12345 + shard,
+            port,
+            alreadyRunning,
+            profileFresh: !alreadyRunning,
+          });
+        })();
       }
 
       if (method === "POST" && pathname === "/chrome/ensure-headed") {
+        const alreadyRunning = getAllStates().headed.phase === "chrome_up";
         markUp("headed", 67890, 9444);
-        return json({ ok: true, pid: 67890, port: 9444, alreadyRunning: false });
+        return json({ ok: true, pid: 67890, port: 9444, alreadyRunning, profileFresh: !alreadyRunning });
       }
 
       if (method === "POST" && pathname === "/heal") {
@@ -177,7 +217,7 @@ async function rpc<T>(method: "GET" | "POST", path: string, body?: unknown): Pro
 // ---------------------------------------------------------------------------
 
 describe("server RPC contract", () => {
-  test("GET /status returns { ok, version, uptime, headless, headed }", async () => {
+  test("GET /status returns { ok, version, uptime, headless, headed, headlessPool }", async () => {
     const { status, data } = await rpc<StatusResponse & { ok: boolean; version: string }>("GET", "/status");
 
     expect(status).toBe(200);
@@ -186,14 +226,22 @@ describe("server RPC contract", () => {
     expect(typeof data.uptime).toBe("number");
     expect(data.uptime).toBeGreaterThanOrEqual(0);
 
-    // headless and headed are ChromeState objects
+    // headless and headed are ChromeState objects (back-compat alias for pool[0])
     expect(data.headless).toBeDefined();
     expect(data.headed).toBeDefined();
     expect(typeof data.headless.phase).toBe("string");
     expect(typeof data.headed.phase).toBe("string");
+
+    // headlessPool is additive — one entry per shard, index 0 matches headless
+    expect(Array.isArray(data.headlessPool)).toBe(true);
+    expect(data.headlessPool.length).toBe(HEADLESS_POOL_SIZE);
+    expect(data.headlessPool[0]).toEqual(data.headless);
+    for (const state of data.headlessPool) {
+      expect(typeof state.phase).toBe("string");
+    }
   });
 
-  test("GET /health returns { ok, headless: { phase, port }, headed: { phase, port } }", async () => {
+  test("GET /health returns { ok, headless: { phase, port }, headed: { phase, port }, headlessPool }", async () => {
     const { status, data } = await rpc<HealthResponse>("GET", "/health");
 
     expect(status).toBe(200);
@@ -203,17 +251,21 @@ describe("server RPC contract", () => {
     // port is number | null
     expect(data.headless.port === null || typeof data.headless.port === "number").toBe(true);
     expect(data.headed.port === null || typeof data.headed.port === "number").toBe(true);
+
+    expect(Array.isArray(data.headlessPool)).toBe(true);
+    expect(data.headlessPool.length).toBe(HEADLESS_POOL_SIZE);
+    expect(data.headlessPool[0]).toEqual(data.headless);
   });
 
   test("GET /health with chrome_up returns port number", async () => {
-    markUp("headless", 12345, 9333);
+    markUp("headless-0", 12345, 9333);
 
     const { data } = await rpc<HealthResponse>("GET", "/health");
     expect(data.headless.phase).toBe("chrome_up");
     expect(data.headless.port).toBe(9333);
   });
 
-  test("POST /chrome/ensure returns { ok, pid, port, alreadyRunning }", async () => {
+  test("POST /chrome/ensure returns { ok, pid, port, alreadyRunning, profileFresh }", async () => {
     const { status, data } = await rpc<ChromeEnsureResponse>("POST", "/chrome/ensure");
 
     expect(status).toBe(200);
@@ -221,10 +273,55 @@ describe("server RPC contract", () => {
     expect(typeof data.pid).toBe("number");
     expect(typeof data.port).toBe("number");
     expect(typeof data.alreadyRunning).toBe("boolean");
+    expect(typeof data.profileFresh).toBe("boolean");
 
     // cli.ts reads these fields
     expect(data.pid).toBeGreaterThan(0);
     expect(data.port).toBeGreaterThan(0);
+  });
+
+  test("POST /chrome/ensure reports profileFresh: true on first launch, false once already running", async () => {
+    const first = await rpc<ChromeEnsureResponse>("POST", "/chrome/ensure", { shard: 2 });
+    expect(first.data.alreadyRunning).toBe(false);
+    expect(first.data.profileFresh).toBe(true);
+
+    const second = await rpc<ChromeEnsureResponse>("POST", "/chrome/ensure", { shard: 2 });
+    expect(second.data.alreadyRunning).toBe(true);
+    expect(second.data.profileFresh).toBe(false);
+  });
+
+  test("POST /chrome/ensure with no body defaults to shard 0 (port 9333)", async () => {
+    const { status, data } = await rpc<ChromeEnsureResponse>("POST", "/chrome/ensure");
+
+    expect(status).toBe(200);
+    expect(data.port).toBe(9333);
+  });
+
+  test("POST /chrome/ensure with { shard: 1 } boots shard 1 (port 9334)", async () => {
+    const { status, data } = await rpc<ChromeEnsureResponse>("POST", "/chrome/ensure", { shard: 1 });
+
+    expect(status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(data.port).toBe(9334);
+  });
+
+  test("POST /chrome/ensure with out-of-range shard returns 400", async () => {
+    const { status, data } = await rpc<{ ok: boolean; error: string }>("POST", "/chrome/ensure", {
+      shard: HEADLESS_POOL_SIZE, // one past the last valid index
+    });
+
+    expect(status).toBe(400);
+    expect(data.ok).toBe(false);
+    expect(data.error).toContain("Validation failed");
+  });
+
+  test("POST /chrome/ensure with negative shard returns 400", async () => {
+    const { status, data } = await rpc<{ ok: boolean; error: string }>("POST", "/chrome/ensure", {
+      shard: -1,
+    });
+
+    expect(status).toBe(400);
+    expect(data.ok).toBe(false);
   });
 
   test("POST /chrome/ensure-headed returns same shape", async () => {
@@ -235,6 +332,7 @@ describe("server RPC contract", () => {
     expect(typeof data.pid).toBe("number");
     expect(typeof data.port).toBe("number");
     expect(typeof data.alreadyRunning).toBe("boolean");
+    expect(typeof data.profileFresh).toBe("boolean");
   });
 
   test("POST /heal returns { ok, actions: string[] }", async () => {

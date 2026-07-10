@@ -12,12 +12,19 @@ import * as fs from "fs";
 import * as path from "path";
 import {
   RemovedFlagError,
+  assignShard,
   buildSessionName,
   parseFlags,
+  pickLeastLoadedShard,
+  readShardAssignment,
+  resolveOrAssignShard,
   resolvePid,
   resolveReauthBaseUrls,
+  resolveTeardownShard,
   sessionFilePath,
+  shardForPort,
 } from "../cli";
+import type { SessionEntry } from "../cli";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
 
@@ -306,6 +313,257 @@ describe("resolveReauthBaseUrls", () => {
     expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
     expect(r.error).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit 2 — sticky shard mapping (chrome-pool-plan.md Unit 2, decisions 3 & 6)
+//
+// readShardAssignment / assignShard / resolveOrAssignShard / resolveTeardownShard
+// are pure/marker-only (no RPC), so they're tested directly here rather than
+// through a subprocess. assignShard and pickLeastLoadedShard both take the
+// candidate pool as an explicit parameter (SessionEntry[] / number[]) instead
+// of always scanning real /tmp state — this machine runs other real ab
+// sessions concurrently (see ps.test.ts's safety notes), so a test that
+// asserted an *absolute* shard index from a live /tmp scan would be flaky by
+// construction. Fabricating the peer list keeps these deterministic while
+// still exercising the exact counting/tie-break logic assignShard uses in
+// production (its default parameter *is* the real listSessionEntries() scan).
+// ---------------------------------------------------------------------------
+
+const SHARD_TEST_PREFIX = `abtest-shard-${process.pid}-${Date.now()}`;
+
+function shardMarkerPath(pid: string): string {
+  return `/tmp/.ab-session-${pid}`;
+}
+
+function writeMarker(pid: string, body: string): void {
+  fs.writeFileSync(shardMarkerPath(pid), body);
+}
+
+function mkEntry(pid: string, shard: number | null, state: SessionEntry["state"] = "active"): SessionEntry {
+  return {
+    pid,
+    session: `ab-${pid}`,
+    owner: "other-cc",
+    mtimeIso: new Date().toISOString(),
+    ageSeconds: 0,
+    state,
+    daemonPid: null,
+    shard,
+  };
+}
+
+describe("readShardAssignment", () => {
+  const pid = `${SHARD_TEST_PREFIX}-read`;
+
+  afterEach(() => {
+    try { fs.unlinkSync(shardMarkerPath(pid)); } catch { /* ignore */ }
+  });
+
+  test("returns null when the marker file doesn't exist", () => {
+    expect(readShardAssignment(pid)).toBeNull();
+  });
+
+  test("returns null for a legacy pid-only marker (no second line)", () => {
+    writeMarker(pid, pid + "\n");
+    expect(readShardAssignment(pid)).toBeNull();
+  });
+
+  test("returns the shard index from a well-formed second line", () => {
+    writeMarker(pid, `${pid}\nshard=2\n`);
+    expect(readShardAssignment(pid)).toBe(2);
+  });
+
+  test("returns null for a garbled second line (treated as unassigned)", () => {
+    writeMarker(pid, `${pid}\nnotashard!!\n`);
+    expect(readShardAssignment(pid)).toBeNull();
+  });
+
+  test("returns null for a non-numeric shard value", () => {
+    writeMarker(pid, `${pid}\nshard=abc\n`);
+    expect(readShardAssignment(pid)).toBeNull();
+  });
+});
+
+describe("pickLeastLoadedShard", () => {
+  test("picks the shard with the fewest sessions", () => {
+    expect(pickLeastLoadedShard([2, 0, 1])).toBe(1);
+  });
+
+  test("ties break to the lowest index when no identity is given (back-compat)", () => {
+    expect(pickLeastLoadedShard([0, 0, 0])).toBe(0);
+    expect(pickLeastLoadedShard([3, 1, 1])).toBe(1);
+  });
+
+  test("single-shard pool always picks shard 0", () => {
+    expect(pickLeastLoadedShard([5])).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 3 — burst tiebreak must not collapse onto shard 0. When N sessions
+  // start simultaneously they all see the same zero-count snapshot; breaking
+  // every tie to the lowest index means every one of them picks shard 0,
+  // reproducing the exact single-Chrome contention incident the pool exists
+  // to fix. The fix: among tied shards, pick deterministically by
+  // hash(identity) % tiedCount. These three literal pid strings were hashed
+  // directly (`bun -e` running the same djb2 algorithm as the implementation)
+  // to get real, verified outputs rather than assuming/guessing them:
+  //   hash("abtest-tiebreak-a") % 3 === 0
+  //   hash("abtest-tiebreak-c") % 3 === 1
+  //   hash("abtest-tiebreak-b") % 3 === 2
+  // ---------------------------------------------------------------------------
+
+  test("non-tied case picks the true minimum even with an identity given (hash tiebreak never applies)", () => {
+    expect(pickLeastLoadedShard([2, 0, 1], "abtest-tiebreak-b")).toBe(1);
+  });
+
+  test("tied shards spread across different identities instead of collapsing onto shard 0", () => {
+    expect(pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-a")).toBe(0);
+    expect(pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-c")).toBe(1);
+    expect(pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-b")).toBe(2);
+  });
+
+  test("same identity is stable across repeated calls under the same load", () => {
+    const first = pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-b");
+    const second = pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-b");
+    expect(second).toBe(first);
+  });
+});
+
+describe("shardForPort (chrome-pool-plan Fix 2)", () => {
+  test("maps a pool port back to its shard index", () => {
+    expect(shardForPort(9333, 3)).toBe(0);
+    expect(shardForPort(9334, 3)).toBe(1);
+    expect(shardForPort(9335, 3)).toBe(2);
+  });
+
+  test("a port outside the pool's range resolves to shard 0 (legacy single Chrome)", () => {
+    expect(shardForPort(9333, 3)).toBe(0);
+    expect(shardForPort(9999, 3)).toBe(0);
+    expect(shardForPort(1, 3)).toBe(0);
+  });
+});
+
+describe("assignShard", () => {
+  const pidA = `${SHARD_TEST_PREFIX}-assign-a`;
+  const pidB = `${SHARD_TEST_PREFIX}-assign-b`;
+  const pidC = `${SHARD_TEST_PREFIX}-assign-c`;
+
+  afterEach(() => {
+    for (const pid of [pidA, pidB, pidC]) {
+      try { fs.unlinkSync(shardMarkerPath(pid)); } catch { /* ignore */ }
+    }
+  });
+
+  test("with no peers, assigns the shard the hash tiebreak picks for this pid, and persists it", () => {
+    // Fix 3: with an all-zero load snapshot every shard is tied, so the
+    // result is whatever pickLeastLoadedShard's hash tiebreak picks for
+    // pidA — not hardcoded to 0. Ground truth for the tiebreak itself is
+    // covered by pickLeastLoadedShard's own dedicated tests (fixed literal
+    // pids with hand-verified hash outputs); this test verifies assignShard
+    // wires the counting + persistence around that correctly.
+    const expected = pickLeastLoadedShard([0, 0, 0], pidA);
+    const shard = assignShard(pidA, 3, []);
+    expect(shard).toBe(expected);
+    expect(readShardAssignment(pidA)).toBe(expected);
+  });
+
+  test("spreads sessions by excluding previously-assigned peers from the load count", () => {
+    const a = assignShard(pidA, 3, []);
+    expect(a).toBe(pickLeastLoadedShard([0, 0, 0], pidA));
+
+    const countsForB = [0, 0, 0];
+    countsForB[a] = 1;
+    const b = assignShard(pidB, 3, [mkEntry(pidA, a)]);
+    expect(b).toBe(pickLeastLoadedShard(countsForB, pidB));
+
+    const countsForC = [0, 0, 0];
+    countsForC[a] += 1;
+    countsForC[b] += 1;
+    const c = assignShard(pidC, 3, [mkEntry(pidA, a), mkEntry(pidB, b)]);
+    expect(c).toBe(pickLeastLoadedShard(countsForC, pidC));
+  });
+
+  test("does not count stale peers toward load", () => {
+    // Both peers claim shard 0, but are stale — every shard has zero
+    // non-stale sessions, so this is the same all-tied case as "no peers".
+    const expected = pickLeastLoadedShard([0, 0, 0], pidA);
+    const shard = assignShard(pidA, 3, [
+      mkEntry(pidB, 0, "stale"),
+      mkEntry(pidC, 0, "stale"),
+    ]);
+    expect(shard).toBe(expected);
+  });
+
+  test("does not count the assigning session's own (stale) entry", () => {
+    // Self-entry excluded -> all shards at 0 load -> same all-tied case.
+    const expected = pickLeastLoadedShard([0, 0, 0], pidA);
+    const shard = assignShard(pidA, 3, [mkEntry(pidA, 1, "idle")]);
+    expect(shard).toBe(expected);
+  });
+
+  test("non-tied case still picks the true minimum shard regardless of pid hash", () => {
+    const shard = assignShard(pidA, 3, [mkEntry(pidB, 0), mkEntry(pidC, 2)]);
+    expect(shard).toBe(1); // shard 1 has 0 sessions vs 1 each on 0 and 2 — no tie
+  });
+});
+
+describe("resolveOrAssignShard", () => {
+  const pid = `${SHARD_TEST_PREFIX}-resolve-or-assign`;
+
+  afterEach(() => {
+    try { fs.unlinkSync(shardMarkerPath(pid)); } catch { /* ignore */ }
+  });
+
+  test("assigns on first resolution, then a second resolution reuses the persisted value", () => {
+    const first = resolveOrAssignShard(pid, 3);
+    const second = resolveOrAssignShard(pid, 3);
+    expect(second).toBe(first);
+    expect(readShardAssignment(pid)).toBe(first);
+  });
+
+  test("clamps an existing out-of-range marker instead of reassigning", () => {
+    writeMarker(pid, `${pid}\nshard=7\n`);
+    expect(resolveOrAssignShard(pid, 3)).toBe(1); // 7 % 3
+    expect(readShardAssignment(pid)).toBe(1); // rewritten
+  });
+});
+
+describe("resolveTeardownShard", () => {
+  const pid = `${SHARD_TEST_PREFIX}-teardown`;
+
+  afterEach(() => {
+    try { fs.unlinkSync(shardMarkerPath(pid)); } catch { /* ignore */ }
+  });
+
+  test("missing marker resolves to shard 0 without creating one", () => {
+    expect(resolveTeardownShard(pid, 3)).toBe(0);
+    expect(fs.existsSync(shardMarkerPath(pid))).toBe(false);
+  });
+
+  test("legacy pid-only marker resolves to shard 0", () => {
+    writeMarker(pid, pid + "\n");
+    expect(resolveTeardownShard(pid, 3)).toBe(0);
+  });
+
+  test("garbled second line resolves to shard 0 (treated as unassigned)", () => {
+    writeMarker(pid, `${pid}\n???\n`);
+    expect(resolveTeardownShard(pid, 3)).toBe(0);
+  });
+
+  test("in-range shard resolves as-is without rewriting the marker", () => {
+    writeMarker(pid, `${pid}\nshard=2\n`);
+    const before = fs.statSync(shardMarkerPath(pid)).mtimeMs;
+    expect(resolveTeardownShard(pid, 3)).toBe(2);
+    const after = fs.statSync(shardMarkerPath(pid)).mtimeMs;
+    expect(after).toBe(before);
+  });
+
+  test("out-of-range shard clamps to shard % poolSize and rewrites the marker", () => {
+    writeMarker(pid, `${pid}\nshard=7\n`);
+    expect(resolveTeardownShard(pid, 3)).toBe(1); // 7 % 3
+    expect(readShardAssignment(pid)).toBe(1);
   });
 });
 

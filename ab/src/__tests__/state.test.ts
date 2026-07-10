@@ -16,6 +16,7 @@ import {
   resetAll,
 } from "../state";
 import type { ChromeState } from "../types";
+import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS } from "../types";
 
 // Reset before each test to avoid cross-contamination
 beforeEach(() => {
@@ -51,26 +52,47 @@ function assertValidState(state: ChromeState): void {
 describe("state machine contract", () => {
   test("initial state is idle for both targets", () => {
     const states = getAllStates();
-    expect(states.headless).toEqual({ phase: "idle" });
+    expect(states["headless-0"]).toEqual({ phase: "idle" });
     expect(states.headed).toEqual({ phase: "idle" });
   });
 
   test("getAllStates returns both targets", () => {
     const states = getAllStates();
-    expect("headless" in states).toBe(true);
+    expect("headless-0" in states).toBe(true);
     expect("headed" in states).toBe(true);
   });
 
+  test("getAllStates includes every headless pool shard (default pool size 3)", () => {
+    // Default AB_HEADLESS_POOL_SIZE (unset in this test run) is 3 shards.
+    expect(HEADLESS_POOL_SIZE).toBe(3);
+    const states = getAllStates();
+    for (const target of HEADLESS_TARGETS) {
+      expect(states[target]).toEqual({ phase: "idle" });
+    }
+    expect(HEADLESS_TARGETS).toEqual(["headless-0", "headless-1", "headless-2"]);
+  });
+
+  test("pool shards are independent — marking shard 1 up does not affect shard 0 or shard 2", () => {
+    markUp("headless-1", 55555, 9334);
+    expect(getState("headless-0").phase).toBe("idle");
+    expect(getState("headless-2").phase).toBe("idle");
+    const state1 = getState("headless-1");
+    expect(state1.phase).toBe("chrome_up");
+    if (state1.phase === "chrome_up") {
+      expect(state1.port).toBe(9334);
+    }
+  });
+
   test("markLaunching transitions to chrome_launching", () => {
-    markLaunching("headless");
-    const state = getState("headless");
+    markLaunching("headless-0");
+    const state = getState("headless-0");
     expect(state.phase).toBe("chrome_launching");
     assertValidState(state);
   });
 
   test("markUp transitions to chrome_up with pid and port", () => {
-    markUp("headless", 12345, 9333);
-    const state = getState("headless");
+    markUp("headless-0", 12345, 9333);
+    const state = getState("headless-0");
     expect(state.phase).toBe("chrome_up");
     assertValidState(state);
     if (state.phase === "chrome_up") {
@@ -80,8 +102,8 @@ describe("state machine contract", () => {
   });
 
   test("markCrashed transitions to chrome_crashed with exitCode and lastCrash", () => {
-    markCrashed("headless", 137);
-    const state = getState("headless");
+    markCrashed("headless-0", 137);
+    const state = getState("headless-0");
     expect(state.phase).toBe("chrome_crashed");
     assertValidState(state);
     if (state.phase === "chrome_crashed") {
@@ -100,41 +122,41 @@ describe("state machine contract", () => {
 
   test("transitionTo returns the new state", () => {
     const next: ChromeState = { phase: "chrome_up", pid: 111, port: 9333 };
-    const returned = transitionTo("headless", next);
+    const returned = transitionTo("headless-0", next);
     expect(returned).toEqual(next);
-    expect(getState("headless")).toEqual(next);
+    expect(getState("headless-0")).toEqual(next);
   });
 
   test("targets are independent — headless transition does not affect headed", () => {
-    markUp("headless", 12345, 9333);
+    markUp("headless-0", 12345, 9333);
     expect(getState("headed").phase).toBe("idle");
 
     markCrashed("headed", 1);
-    expect(getState("headless").phase).toBe("chrome_up");
+    expect(getState("headless-0").phase).toBe("chrome_up");
   });
 
   test("resetAll clears both targets to idle", () => {
-    markUp("headless", 12345, 9333);
+    markUp("headless-0", 12345, 9333);
     markUp("headed", 67890, 9444);
 
     resetAll();
 
-    expect(getState("headless").phase).toBe("idle");
+    expect(getState("headless-0").phase).toBe("idle");
     expect(getState("headed").phase).toBe("idle");
   });
 
   test("every valid transition produces a valid ChromeState", () => {
     // Full lifecycle: idle → launching → up → crashed → idle
     const transitions: Array<() => void> = [
-      () => markLaunching("headless"),
-      () => markUp("headless", 1234, 9333),
-      () => markCrashed("headless", 1),
-      () => markIdle("headless"),
+      () => markLaunching("headless-0"),
+      () => markUp("headless-0", 1234, 9333),
+      () => markCrashed("headless-0", 1),
+      () => markIdle("headless-0"),
     ];
 
     for (const transition of transitions) {
       transition();
-      assertValidState(getState("headless"));
+      assertValidState(getState("headless-0"));
     }
   });
 });

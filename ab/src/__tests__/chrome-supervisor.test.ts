@@ -42,8 +42,8 @@ afterEach(() => {
 describe("chrome-supervisor contract", () => {
   test("ensure() on already-running Chrome returns alreadyRunning: true from state", () => {
     // Simulate Chrome already up via state machine
-    markUp("headless", 12345, 9333);
-    const state = getState("headless");
+    markUp("headless-0", 12345, 9333);
+    const state = getState("headless-0");
 
     // This is what ensure() does internally when phase === "chrome_up"
     if (state.phase === "chrome_up") {
@@ -59,6 +59,17 @@ describe("chrome-supervisor contract", () => {
     } else {
       throw new Error("Expected chrome_up state");
     }
+  });
+
+  test("ensure() on already-running Chrome reports profileFresh: false", async () => {
+    // A shard that's already up was, by definition, launched from a profile
+    // that already existed at that point — never "fresh" on this fast path.
+    // Exercises the real ensure() fast path (no Bun.spawn/fs touched).
+    markUp("headless-0", 12345, 9333);
+    const { ensure } = await import("../chrome-supervisor");
+    const result = await ensure("headless-0");
+    expect(result.alreadyRunning).toBe(true);
+    expect(result.profileFresh).toBe(false);
   });
 
   test("ensure() return shape matches ChromeEnsureResponse contract", async () => {
@@ -94,12 +105,13 @@ describe("chrome-supervisor contract", () => {
     const { ensure } = await import("../chrome-supervisor");
 
     try {
-      const result = await ensure("headless");
+      const result = await ensure("headless-0");
 
-      // Contract shape: { pid: number, port: number, alreadyRunning: boolean }
+      // Contract shape: { pid: number, port: number, alreadyRunning: boolean, profileFresh: boolean }
       expect(typeof result.pid).toBe("number");
       expect(typeof result.port).toBe("number");
       expect(typeof result.alreadyRunning).toBe("boolean");
+      expect(typeof result.profileFresh).toBe("boolean");
 
       // Since we started fresh, alreadyRunning should be false
       // (unless state was already up from a prior test — reset handles this)
@@ -120,21 +132,21 @@ describe("chrome-supervisor contract", () => {
 
   test("kill() transitions state to idle", () => {
     // Simulate Chrome being up
-    markUp("headless", 12345, 9333);
-    expect(getState("headless").phase).toBe("chrome_up");
+    markUp("headless-0", 12345, 9333);
+    expect(getState("headless-0").phase).toBe("chrome_up");
 
     // kill() calls markIdle internally — test the state contract
     const { markIdle } = require("../state");
-    markIdle("headless");
+    markIdle("headless-0");
 
-    expect(getState("headless").phase).toBe("idle");
+    expect(getState("headless-0").phase).toBe("idle");
   });
 
   test("state after crash includes exitCode and lastCrash date", () => {
     const { markCrashed } = require("../state");
-    markCrashed("headless", 137);
+    markCrashed("headless-0", 137);
 
-    const state = getState("headless");
+    const state = getState("headless-0");
     expect(state.phase).toBe("chrome_crashed");
     if (state.phase === "chrome_crashed") {
       expect(state.exitCode).toBe(137);
@@ -152,7 +164,7 @@ describe("chrome-supervisor contract", () => {
     let inflight: Promise<{ pid: number; port: number }> | null = null;
 
     async function ensureMock(): Promise<EnsureResult> {
-      const state = getState("headless");
+      const state = getState("headless-0");
       if (state.phase === "chrome_up") {
         return { pid: state.pid, port: state.port, alreadyRunning: true };
       }
@@ -164,7 +176,7 @@ describe("chrome-supervisor contract", () => {
 
       const promise = new Promise<{ pid: number; port: number }>((resolve) => {
         setTimeout(() => {
-          markUp("headless", 99999, 9333);
+          markUp("headless-0", 99999, 9333);
           resolve({ pid: 99999, port: 9333 });
         }, 10);
       });
@@ -200,9 +212,9 @@ describe("chrome-supervisor contract", () => {
     // it adopts the existing process. We verify the state contract.
 
     // Simulate: something is already on port 9333, supervisor adopts it
-    markUp("headless", 88888, 9333);
+    markUp("headless-0", 88888, 9333);
 
-    const state = getState("headless");
+    const state = getState("headless-0");
     expect(state.phase).toBe("chrome_up");
     if (state.phase === "chrome_up") {
       expect(state.port).toBe(9333);
@@ -218,5 +230,110 @@ describe("chrome-supervisor contract", () => {
     };
     expect(result.alreadyRunning).toBe(true);
     expect(result.port).toBe(9333);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Headless pool — per-shard crash isolation (chrome-pool-plan Unit 1)
+  //
+  // This is deterministic and doesn't launch real Chrome: it verifies the
+  // state-machine-level contract that crashing one shard's target key cannot
+  // mutate another shard's entry. Real-Chrome crash/restart behavior for the
+  // always-on shard is covered by daemon-integration.test.ts's "PID death and
+  // restarts" test; that test only exercises shard 0.
+  // ---------------------------------------------------------------------------
+
+  test("crash isolation: marking headless-1 crashed does not affect headless-0 or headed", () => {
+    const { markCrashed, markIdle } = require("../state");
+
+    markUp("headless-0", 11111, 9333);
+    markUp("headless-1", 22222, 9334);
+    markUp("headed", 33333, 9444);
+
+    markCrashed("headless-1", 133);
+    markIdle("headless-1"); // on-demand policy: settle straight to idle, no restart
+
+    // headless-0 and headed are completely untouched by headless-1's crash
+    const shard0 = getState("headless-0");
+    expect(shard0.phase).toBe("chrome_up");
+    if (shard0.phase === "chrome_up") {
+      expect(shard0.pid).toBe(11111);
+      expect(shard0.port).toBe(9333);
+    }
+
+    const headed = getState("headed");
+    expect(headed.phase).toBe("chrome_up");
+    if (headed.phase === "chrome_up") {
+      expect(headed.pid).toBe(33333);
+    }
+
+    // headless-1 itself settled to idle, not left mid-crash
+    expect(getState("headless-1").phase).toBe("idle");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fresh-profile detection (chrome-pool-plan Unit 3, decision 5)
+  //
+  // launchChrome() signals profileFresh so callers know a shard's cookie jar
+  // is empty (likely needs `ab reauth`). Tested here against throwaway /tmp
+  // paths rather than the real ~/.agent-browser/profile-<i> dirs — those are
+  // real user data and real Chrome hasn't launched shard 1/2 profiles on this
+  // machine yet, so touching them from a unit test would be both risky and
+  // order-dependent. The real launch path is covered end-to-end (actual
+  // Chrome, actual fresh profile dir) in daemon-integration.test.ts.
+  // ---------------------------------------------------------------------------
+
+  describe("isProfileDirMissing", () => {
+    const dir = `/tmp/ab-test-profile-fresh-${process.pid}`;
+
+    afterEach(() => {
+      try { require("fs").rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    });
+
+    test("returns true for a directory that doesn't exist yet", async () => {
+      const { isProfileDirMissing } = await import("../chrome-supervisor");
+      expect(isProfileDirMissing(dir)).toBe(true);
+    });
+
+    test("returns false once the directory exists", async () => {
+      const { isProfileDirMissing } = await import("../chrome-supervisor");
+      require("fs").mkdirSync(dir, { recursive: true });
+      expect(isProfileDirMissing(dir)).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 4 — profileFresh lies after the crash-loop profile nuke.
+  //
+  // profileFresh is snapshotted (isProfileDirMissing) BEFORE the
+  // backoff-max corruption-recovery block runs. That block rmSync+mkdirSync's
+  // the profile dir, which makes the profile genuinely fresh afterward even
+  // when the early snapshot said false — suppressing the reauth hint exactly
+  // when it matters most (right after a forced logout via profile nuke).
+  //
+  // The decision itself (does a crash-loop recovery override the earlier
+  // snapshot) is extracted into a pure helper so it's unit-testable without
+  // driving Bun.spawn/real Chrome through an actual crash loop — this
+  // repo's own daemon-integration.test.ts documents that the real crash-loop
+  // path is flaky under sandboxed repeated Chrome cycling (see its "NOTE"
+  // comment on the shard-1-crash test), so integration coverage intentionally
+  // stops at this helper.
+  // ---------------------------------------------------------------------------
+
+  describe("profileFreshAfterRecovery", () => {
+    test("reports fresh when crash-loop recovery ran, even if the pre-launch snapshot said not-fresh", async () => {
+      const { profileFreshAfterRecovery } = await import("../chrome-supervisor");
+      expect(profileFreshAfterRecovery(false, true)).toBe(true);
+    });
+
+    test("preserves the pre-launch snapshot when recovery did not run", async () => {
+      const { profileFreshAfterRecovery } = await import("../chrome-supervisor");
+      expect(profileFreshAfterRecovery(false, false)).toBe(false);
+      expect(profileFreshAfterRecovery(true, false)).toBe(true);
+    });
+
+    test("recovery always wins even if the snapshot happened to already say fresh", async () => {
+      const { profileFreshAfterRecovery } = await import("../chrome-supervisor");
+      expect(profileFreshAfterRecovery(true, true)).toBe(true);
+    });
   });
 });

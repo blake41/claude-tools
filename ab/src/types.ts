@@ -9,7 +9,7 @@
 
 export type ChromePolicy = "always-on" | "on-demand";
 
-export type ChromeTarget = "headless" | "headed";
+export type ChromeTarget = "headed" | `headless-${number}`;
 
 export interface ChromeConfig {
   target: ChromeTarget;
@@ -18,6 +18,46 @@ export interface ChromeConfig {
   launchArgs: string[];
   policy: ChromePolicy;
 }
+
+// ---------------------------------------------------------------------------
+// Headless pool sizing
+// ---------------------------------------------------------------------------
+
+const MIN_HEADLESS_POOL_SIZE = 1;
+const MAX_HEADLESS_POOL_SIZE = 8;
+const DEFAULT_HEADLESS_POOL_SIZE = 3;
+
+function clampPoolSize(n: number): number {
+  return Math.min(MAX_HEADLESS_POOL_SIZE, Math.max(MIN_HEADLESS_POOL_SIZE, n));
+}
+
+function resolvePoolSize(): number {
+  const raw = process.env.AB_HEADLESS_POOL_SIZE;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_HEADLESS_POOL_SIZE;
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed)) return DEFAULT_HEADLESS_POOL_SIZE;
+  return clampPoolSize(parsed);
+}
+
+/**
+ * Number of headless Chrome shards this process supervises, resolved once
+ * at module load from AB_HEADLESS_POOL_SIZE (default 3, clamped 1-8).
+ */
+export const HEADLESS_POOL_SIZE: number = resolvePoolSize();
+
+/** Build the ChromeTarget key for headless shard `shard` (0-indexed). */
+export function headlessTarget(shard: number): ChromeTarget {
+  return `headless-${shard}`;
+}
+
+/** All headless shard targets in the pool: headless-0 .. headless-(N-1). */
+export const HEADLESS_TARGETS: ChromeTarget[] = Array.from(
+  { length: HEADLESS_POOL_SIZE },
+  (_, i) => headlessTarget(i),
+);
+
+/** Every Chrome target the daemon supervises: headed + the headless pool. */
+export const ALL_TARGETS: ChromeTarget[] = ["headed", ...HEADLESS_TARGETS];
 
 // ---------------------------------------------------------------------------
 // Chrome state (discriminated union used by state machine)
@@ -34,8 +74,11 @@ export type ChromeState =
 // ---------------------------------------------------------------------------
 
 export interface StatusResponse {
+  /** @deprecated back-compat alias for headlessPool[0] (shard 0) */
   headless: ChromeState;
   headed: ChromeState;
+  /** Per-shard state, index = shard number. */
+  headlessPool: ChromeState[];
   uptime: number;
 }
 
@@ -45,8 +88,11 @@ export interface StatusResponse {
 
 export interface HealthResponse {
   ok: boolean;
+  /** @deprecated back-compat alias for headlessPool[0] (shard 0) */
   headless: { phase: ChromeState["phase"]; port: number | null };
   headed: { phase: ChromeState["phase"]; port: number | null };
+  /** Per-shard health, index = shard number. */
+  headlessPool: Array<{ phase: ChromeState["phase"]; port: number | null }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,6 +102,8 @@ export interface HealthResponse {
 export interface ChromeEnsureRequest {
   /** Optional timeout in ms to wait for Chrome to become ready */
   timeoutMs?: number;
+  /** Optional headless pool shard index (0..poolSize-1). Defaults to 0. */
+  shard?: number;
 }
 
 export interface ChromeEnsureResponse {
@@ -63,6 +111,13 @@ export interface ChromeEnsureResponse {
   pid: number;
   port: number;
   alreadyRunning: boolean;
+  /**
+   * True when this shard's Chrome just launched from a profile dir that
+   * didn't exist yet (empty cookie jar — likely needs `ab reauth`). False
+   * when Chrome was already running or the profile already existed.
+   * (chrome-pool-plan Unit 3, decision 5.)
+   */
+  profileFresh: boolean;
 }
 
 // ---------------------------------------------------------------------------

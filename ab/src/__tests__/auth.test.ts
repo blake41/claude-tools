@@ -5,6 +5,7 @@
  * Verifies the shapes that cli.ts reads: { ok, user: { slackUserId, email }, error }.
  */
 import { test, expect, describe, beforeEach, afterEach, mock } from "bun:test";
+import * as fs from "fs";
 import { resetAuthState, getAuthStatus, authenticate, isAuthenticatedUrl } from "../auth";
 import type { AuthLoginResponse, AuthStatusResponse } from "../types";
 
@@ -492,5 +493,235 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
     );
     expect(r.apiBaseUrl).toBe("https://custom.example.com");
     expect(r.appBaseUrl).toBe("https://custom.example.com");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chrome-pool-plan Unit 3 — reauth is shard-aware "for free"
+//
+// `reauth` is a member of cli.ts's NEEDS_CHROME set, so main() already
+// resolves this session's sticky shard and ensures that shard's Chrome
+// *before* dispatching to cmdReauth — the cdpPort cmdReauth receives is
+// never the old hardcoded CDP_PORT_HEADLESS constant. These tests exercise
+// that exact production sequence (ensureChromePort -> cmdReauth) against a
+// mocked daemon (fetch) and mocked agent-browser (spawn, reused from the
+// top-level beforeEach) to prove authLogin receives the shard-correct port.
+// ---------------------------------------------------------------------------
+
+describe("reauth is shard-aware (chrome-pool-plan Unit 3)", () => {
+  const testPid = `abtest-reauth-shard-${process.pid}`;
+  const markerPath = `/tmp/.ab-session-${testPid}`;
+  const originalAbPid = process.env.AB_SESSION_PID;
+  const originalCco = process.env.CCO_SESSION_ID;
+
+  beforeEach(() => {
+    process.env.AB_SESSION_PID = testPid;
+    delete process.env.CCO_SESSION_ID;
+  });
+
+  afterEach(() => {
+    try { fs.unlinkSync(markerPath); } catch { /* ignore */ }
+    if (originalAbPid === undefined) delete process.env.AB_SESSION_PID;
+    else process.env.AB_SESSION_PID = originalAbPid;
+    if (originalCco === undefined) delete process.env.CCO_SESSION_ID;
+    else process.env.CCO_SESSION_ID = originalCco;
+  });
+
+  /** Route the shared fetchMock like a minimal daemon: /chrome/ensure echoes
+   *  9333+shard, /chrome/ensure-headed returns 9444, /auth/login always
+   *  succeeds. Records every call's { path, body } for assertions. */
+  function installDaemonRouter(): Array<{ path: string; body: unknown }> {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : (url as Request).url;
+      const pathname = new URL(urlStr, "http://localhost").pathname;
+      let body: unknown;
+      if (init?.body) {
+        try { body = JSON.parse(String(init.body)); } catch { body = undefined; }
+      }
+      calls.push({ path: pathname, body });
+
+      if (pathname === "/chrome/ensure") {
+        const shard = (body as { shard?: number } | undefined)?.shard ?? 0;
+        return new Response(
+          JSON.stringify({ ok: true, pid: 100 + shard, port: 9333 + shard, alreadyRunning: true, profileFresh: false }),
+          { status: 200 },
+        );
+      }
+      if (pathname === "/chrome/ensure-headed") {
+        return new Response(
+          JSON.stringify({ ok: true, pid: 200, port: 9444, alreadyRunning: true, profileFresh: false }),
+          { status: 200 },
+        );
+      }
+      if (pathname === "/auth/login") {
+        return new Response(
+          JSON.stringify({ ok: true, user: { email: "blake.johnson@clay.com", slackUserId: "U08M03CDY73" } }),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+    return calls;
+  }
+
+  test("reauth on a session pinned to shard 1 sends port 9334 to authLogin", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=1\n`);
+    const calls = installDaemonRouter();
+
+    const { ensureChromePort, cmdReauth } = await import("../cli");
+    const cdpPort = await ensureChromePort(false);
+    expect(cdpPort).toBe(9334); // 9333 + shard 1
+
+    const exitCode = await cmdReauth([], cdpPort, `ab-${testPid}`);
+    expect(exitCode).toBe(0);
+
+    const loginCall = calls.find((c) => c.path === "/auth/login");
+    expect(loginCall).toBeDefined();
+    expect((loginCall!.body as { port: number }).port).toBe(9334);
+  });
+
+  test("headed reauth keeps port 9444 regardless of the session's headless shard assignment", async () => {
+    // Pin the session to headless shard 1 — headed reauth must ignore this
+    // entirely and stay on the single headed Chrome (port 9444).
+    fs.writeFileSync(markerPath, `${testPid}\nshard=1\n`);
+    const calls = installDaemonRouter();
+
+    const { ensureChromePort, cmdReauth } = await import("../cli");
+    const cdpPort = await ensureChromePort(true);
+    expect(cdpPort).toBe(9444);
+
+    await cmdReauth([], cdpPort, `ab-${testPid}`);
+
+    const loginCall = calls.find((c) => c.path === "/auth/login");
+    expect(loginCall).toBeDefined();
+    expect((loginCall!.body as { port: number }).port).toBe(9444);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chrome-pool-plan Fix 2 — persist the shard the daemon actually served.
+//
+// resolveOrAssignShard writes `shard=<requested>` to the marker BEFORE
+// rpc.ensureChrome({shard}) resolves. A pre-pool daemon ignores the `shard`
+// field entirely and always serves its single Chrome on port 9333, so the
+// marker would keep lying about where the tab actually lives unless it gets
+// corrected from the ensure response's *port* (the daemon's actual source of
+// truth) once that response arrives.
+// ---------------------------------------------------------------------------
+
+describe("sticky shard correction from the ensure response's served port (Fix 2)", () => {
+  const testPid = `abtest-shard-correct-${process.pid}`;
+  const markerPath = `/tmp/.ab-session-${testPid}`;
+  const originalAbPid = process.env.AB_SESSION_PID;
+  const originalCco = process.env.CCO_SESSION_ID;
+
+  beforeEach(() => {
+    process.env.AB_SESSION_PID = testPid;
+    delete process.env.CCO_SESSION_ID;
+  });
+
+  afterEach(() => {
+    try { fs.unlinkSync(markerPath); } catch { /* ignore */ }
+    if (originalAbPid === undefined) delete process.env.AB_SESSION_PID;
+    else process.env.AB_SESSION_PID = originalAbPid;
+    if (originalCco === undefined) delete process.env.CCO_SESSION_ID;
+    else process.env.CCO_SESSION_ID = originalCco;
+  });
+
+  function mockEnsurePort(port: number): void {
+    fetchMock.mockImplementation(async () =>
+      new Response(
+        JSON.stringify({ ok: true, pid: 100, port, alreadyRunning: true, profileFresh: false }),
+        { status: 200 },
+      ),
+    );
+  }
+
+  test("a pre-pool daemon that always serves 9333 rewrites a shard=2 marker down to shard 0", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=2\n`);
+    mockEnsurePort(9333); // daemon ignored the requested shard, served its one Chrome
+
+    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    const cdpPort = await ensureChromePort(false);
+    expect(cdpPort).toBe(9333);
+    expect(readShardAssignment(testPid)).toBe(0);
+  });
+
+  test("when the served port matches the requested shard, the marker is left untouched", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=1\n`);
+    const before = fs.statSync(markerPath).mtimeMs;
+    mockEnsurePort(9334); // 9333 + shard 1 — matches what was requested
+
+    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    const cdpPort = await ensureChromePort(false);
+    expect(cdpPort).toBe(9334);
+    expect(readShardAssignment(testPid)).toBe(1);
+    const after = fs.statSync(markerPath).mtimeMs;
+    expect(after).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chrome-pool-plan Unit 3 — fresh-profile stderr hint
+//
+// ensureChromePort prints a one-line hint when the daemon reports
+// profileFresh: true (an agent landed on a shard whose Chrome just started
+// from an empty, logged-out profile), and stays silent otherwise.
+// ---------------------------------------------------------------------------
+
+describe("fresh-profile hint on ensureChromePort", () => {
+  const testPid = `abtest-freshhint-${process.pid}`;
+  const markerPath = `/tmp/.ab-session-${testPid}`;
+  const originalAbPid = process.env.AB_SESSION_PID;
+  const originalCco = process.env.CCO_SESSION_ID;
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  let stderrLines: string[];
+
+  beforeEach(() => {
+    process.env.AB_SESSION_PID = testPid;
+    delete process.env.CCO_SESSION_ID;
+    stderrLines = [];
+    process.stderr.write = ((chunk: unknown) => {
+      stderrLines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+  });
+
+  afterEach(() => {
+    process.stderr.write = originalStderrWrite;
+    try { fs.unlinkSync(markerPath); } catch { /* ignore */ }
+    if (originalAbPid === undefined) delete process.env.AB_SESSION_PID;
+    else process.env.AB_SESSION_PID = originalAbPid;
+    if (originalCco === undefined) delete process.env.CCO_SESSION_ID;
+    else process.env.CCO_SESSION_ID = originalCco;
+  });
+
+  function mockEnsureResponse(profileFresh: boolean): void {
+    fetchMock.mockImplementation(async (url: unknown) => {
+      const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : (url as Request).url;
+      const pathname = new URL(urlStr, "http://localhost").pathname;
+      if (pathname === "/chrome/ensure") {
+        return new Response(
+          JSON.stringify({ ok: true, pid: 1, port: 9333, alreadyRunning: !profileFresh, profileFresh }),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+  }
+
+  test("prints the hint when the daemon reports profileFresh: true", async () => {
+    mockEnsureResponse(true);
+    const { ensureChromePort } = await import("../cli");
+    await ensureChromePort(false);
+    expect(stderrLines.some((l) => l.includes("fresh profile"))).toBe(true);
+  });
+
+  test("stays silent when the daemon reports profileFresh: false", async () => {
+    mockEnsureResponse(false);
+    const { ensureChromePort } = await import("../cli");
+    await ensureChromePort(false);
+    expect(stderrLines.some((l) => l.includes("fresh profile"))).toBe(false);
   });
 });

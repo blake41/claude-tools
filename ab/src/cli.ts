@@ -16,6 +16,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
+import { HEADLESS_POOL_SIZE } from "./types";
+import type { ChromeState } from "./types";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -40,6 +42,9 @@ const AGENT_BROWSER = "agent-browser";
 //
 // pid := AB_SESSION_PID (set by subagent hook) ?? CCO_SESSION_ID (main thread)
 // file := /tmp/.ab-session-<pid>   (existence = initialized, content = pid)
+//         line 2 is optional: `shard=<i>`, the session's sticky headless
+//         pool shard (chrome-pool-plan.md Unit 2, decision 3). Written
+//         lazily the first time a session needs headless Chrome.
 // session := ab-<pid>               (agent-browser session identity)
 // ---------------------------------------------------------------------------
 
@@ -170,16 +175,255 @@ export function parseFlags(argv: string[]): ParsedFlags {
 }
 
 // ---------------------------------------------------------------------------
-// Ensure Chrome is running via daemon
+// Sticky shard mapping (chrome-pool-plan.md Unit 2, decisions 3 & 6)
+//
+// Persisted in the session marker's optional second line: `shard=<i>`.
+// Assignment is least-loaded — count `shard=` lines across current
+// non-stale markers, pick the fewest (ties -> lowest index) — computed
+// CLI-side from /tmp, no daemon RPC or daemon-side state, and it
+// self-corrects as `ab gc` removes stale markers.
+//
+// Race note: two processes can't collide on a *write* (each session owns
+// its own marker file), but two sessions resolving/assigning concurrently
+// can read the same load snapshot and land on the same "least-loaded"
+// shard. Last-writer-wins on that snapshot is accepted (plan decision, not
+// built as locking) — worst case is a transient load imbalance, not a
+// correctness bug: every invocation re-reads its own marker fresh before
+// using it, so the tab a session actually gets always matches what its
+// marker says.
 // ---------------------------------------------------------------------------
 
-async function ensureChromePort(headed: boolean): Promise<number> {
+/**
+ * Read the shard a session is pinned to from its marker file's optional
+ * second line. Returns null when the marker is missing, has no second line,
+ * or the second line doesn't parse as `shard=<int>` — all treated as
+ * "unassigned" so the caller can (re)assign or default.
+ */
+export function readShardAssignment(pid: string): number | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(sessionFilePath(pid), "utf-8");
+  } catch {
+    return null;
+  }
+  const line2 = raw.split("\n")[1];
+  if (!line2) return null;
+  const m = /^shard=(\d+)\s*$/.exec(line2);
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Overwrite (or create) a session's marker with the given shard, preserving
+ * line 1 (the pid) when the marker already exists.
+ */
+function writeShardAssignment(pid: string, shard: number): void {
+  const fp = sessionFilePath(pid);
+  let line1 = pid;
+  try {
+    const existing = fs.readFileSync(fp, "utf-8").split("\n")[0];
+    if (existing) line1 = existing;
+  } catch {
+    // Marker doesn't exist yet — create it fresh below.
+  }
+  fs.writeFileSync(fp, `${line1}\nshard=${shard}\n`);
+}
+
+/**
+ * Simple, stable string hash (djb2). Deterministic across runs — used only
+ * for the tiebreak below, never for anything security-sensitive.
+ */
+export function hashString(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 33) ^ s.charCodeAt(i);
+  }
+  return h >>> 0; // unsigned
+}
+
+/**
+ * Pick the shard with the fewest sessions from a per-shard load count.
+ *
+ * Among shards tied at the minimum, breaks the tie deterministically via
+ * `hash(identity) % tiedCount` into the sorted list of tied shard indices
+ * (chrome-pool-plan Fix 3) — this spreads N sessions that start
+ * simultaneously (all seeing the same all-zero count snapshot) across
+ * shards instead of every one of them collapsing onto shard 0, which would
+ * reproduce the exact single-Chrome contention incident the pool exists to
+ * fix. Without an `identity` (or with only one shard tied), ties break to
+ * the lowest index — back-compat for callers that don't have a session
+ * identity to hash.
+ */
+export function pickLeastLoadedShard(counts: number[], identity?: string): number {
+  const min = Math.min(...counts);
+  const tied: number[] = [];
+  for (let i = 0; i < counts.length; i++) {
+    if (counts[i] === min) tied.push(i);
+  }
+  if (tied.length === 1 || identity === undefined) return tied[0];
+  return tied[hashString(identity) % tied.length];
+}
+
+/**
+ * Assign `pid` to the least-loaded headless shard and persist the choice.
+ * `entries` defaults to a live `/tmp` scan (production path); tests can
+ * inject a fabricated peer list to get deterministic counts on a machine
+ * that's also running real, concurrent ab sessions.
+ */
+export function assignShard(
+  pid: string,
+  poolSize: number = HEADLESS_POOL_SIZE,
+  entries: SessionEntry[] = listSessionEntries(),
+): number {
+  const counts = new Array<number>(poolSize).fill(0);
+  for (const entry of entries) {
+    if (entry.pid === pid) continue; // don't count our own not-yet-written marker
+    if (entry.state === "stale") continue; // on its way out via `ab gc`
+    if (entry.shard === null) continue;
+    counts[entry.shard % poolSize] += 1;
+  }
+  const shard = pickLeastLoadedShard(counts, pid);
+  writeShardAssignment(pid, shard);
+  return shard;
+}
+
+/**
+ * Clamp a marker's recorded shard to the current pool size (decision 6: a
+ * pool shrink can leave markers pointing past the new size) and persist the
+ * corrected value so future reads see it directly. No-op (no rewrite) when
+ * the shard is already in range.
+ */
+function clampAndPersistShard(pid: string, shard: number, poolSize: number): number {
+  if (shard < poolSize) return shard;
+  const clamped = shard % poolSize;
+  writeShardAssignment(pid, clamped);
+  return clamped;
+}
+
+/**
+ * Resolve (or assign) the shard a session should boot/use Chrome on: read
+ * the marker; if unassigned, assign a fresh least-loaded shard; if the
+ * recorded shard is out of range for the current pool, clamp it. Used by
+ * the passthrough-command path, where booting a fresh shard for an
+ * unassigned session is the correct behavior.
+ */
+export function resolveOrAssignShard(pid: string, poolSize: number = HEADLESS_POOL_SIZE): number {
+  const raw = readShardAssignment(pid);
+  if (raw === null) return assignShard(pid, poolSize);
+  return clampAndPersistShard(pid, raw, poolSize);
+}
+
+/**
+ * Resolve the shard whose Chrome a session's tab actually lives on, for
+ * teardown purposes (`ab close`, `ab gc`). Never assigns and never boots
+ * Chrome — a missing/legacy (pid-only) or garbled marker is treated as
+ * shard 0, matching where an unassigned session's tab landed before
+ * sharding existed (shard 0 reuses the pre-pool profile/port).
+ */
+export function resolveTeardownShard(pid: string, poolSize: number = HEADLESS_POOL_SIZE): number {
+  const raw = readShardAssignment(pid);
+  if (raw === null) return 0;
+  return clampAndPersistShard(pid, raw, poolSize);
+}
+
+/**
+ * Look up the CDP port for `shard` from an already-fetched headlessPool
+ * snapshot (`status().headlessPool`), or null if that shard's Chrome isn't
+ * up.
+ *
+ * Tolerates a daemon that hasn't been restarted with pool support yet (no
+ * `headlessPool` field on /status at all) via `legacyHeadless` — the
+ * daemon's `status().headless` field, which exists in both the pre-pool and
+ * pool-aware response shapes. A pre-pool daemon runs exactly one headless
+ * Chrome, and every session's tab lives there regardless of what the
+ * marker's shard= line claims, so when `headlessPool` is missing this falls
+ * back to `legacyHeadless` for EVERY shard rather than reporting every
+ * shard down (chrome-pool-plan Fix 1).
+ */
+export function portForShard(
+  headlessPool: ChromeState[] | undefined,
+  shard: number,
+  legacyHeadless?: ChromeState,
+): number | null {
+  if (headlessPool) {
+    const state = headlessPool[shard];
+    return state && state.phase === "chrome_up" ? state.port : null;
+  }
+  return legacyHeadless && legacyHeadless.phase === "chrome_up" ? legacyHeadless.port : null;
+}
+
+/**
+ * Print a one-line stderr hint when a shard's Chrome just started from a
+ * brand-new profile (empty cookie jar — see ChromeEnsureResponse.profileFresh,
+ * chrome-pool-plan Unit 3 decision 5). No-op when the profile already
+ * existed. Shared by both the headless and headed branches of
+ * ensureChromePort so the hint fires regardless of which Chrome a command
+ * ends up needing.
+ */
+function maybePrintFreshProfileHint(profileFresh: boolean): void {
+  if (profileFresh) {
+    gray("fresh profile for this shard — run 'ab reauth' if you need auth");
+  }
+}
+
+/**
+ * Derive the headless shard that actually served a request from the port
+ * the daemon reported. The daemon's response port is the source of truth —
+ * a pre-pool daemon ignores the `shard` field on the request entirely and
+ * always serves its single Chrome on port 9333 regardless of what was
+ * requested (chrome-pool-plan Fix 2). Ports map back via `9333 + i`;
+ * anything outside the current pool's port range (legacy daemon, single
+ * Chrome) resolves to shard 0 — that Chrome IS where every tab lives
+ * pre-pool.
+ */
+export function shardForPort(port: number, poolSize: number = HEADLESS_POOL_SIZE): number {
+  const i = port - CDP_PORT_HEADLESS;
+  if (i < 0 || i >= poolSize) return 0;
+  return i;
+}
+
+/**
+ * Resolve the CDP port headless commands should use for this session:
+ * resolve (or assign) its shard, then ensure that shard's Chrome is up via
+ * the daemon. Returns the port the daemon reports rather than assuming the
+ * `9333 + shard` formula — the daemon is the source of truth for the port.
+ *
+ * If the daemon served a different shard than the one requested (a
+ * pre-pool daemon that ignores `shard` entirely, or a future mismatch),
+ * rewrite the marker to the shard actually served — otherwise the marker
+ * would keep lying about where this session's tab lives (chrome-pool-plan
+ * Fix 2).
+ */
+async function resolveSessionCdpPort(pid: string): Promise<number> {
+  const requestedShard = resolveOrAssignShard(pid);
+  const result = await rpc.ensureChrome({ shard: requestedShard });
+  maybePrintFreshProfileHint(result.profileFresh);
+  const servedShard = shardForPort(result.port);
+  if (servedShard !== requestedShard) {
+    writeShardAssignment(pid, servedShard);
+  }
+  return result.port;
+}
+
+// ---------------------------------------------------------------------------
+// Ensure Chrome is running via daemon
+//
+// This is also what makes `ab reauth` shard-correct "for free" (chrome-pool-
+// plan Unit 3, decision 5): `reauth` is a member of NEEDS_CHROME (below), so
+// main() already routes it through here before dispatching to cmdReauth —
+// the cdpPort cmdReauth receives is always this session's sticky-resolved
+// shard port, never a hardcoded constant. See auth.test.ts's
+// "reauth is shard-aware" tests for the wiring proof.
+// ---------------------------------------------------------------------------
+
+export async function ensureChromePort(headed: boolean): Promise<number> {
   if (headed) {
     const result = await rpc.ensureChromeHeaded();
+    maybePrintFreshProfileHint(result.profileFresh);
     return result.port;
   }
-  const result = await rpc.ensureChrome();
-  return result.port;
+  return resolveSessionCdpPort(resolvePid());
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +468,53 @@ async function cmdHeal(): Promise<number> {
 // to run next to any failure. Exit code 0 if everything passes, 1 otherwise.
 // ---------------------------------------------------------------------------
 
+export interface DoctorCheck {
+  label: string;
+  ok: boolean;
+  detail?: string;
+  fix?: string;
+}
+
+/**
+ * Build the headless-Chrome health checks for `ab doctor`. Iterates
+ * `status.headlessPool` (one line per shard, chrome-pool-plan Fix 5) when
+ * the daemon reports it, so a crash-looping shard 1/2 no longer hides
+ * behind a healthy shard 0; falls back to the single legacy
+ * `status.headless` line for a daemon that predates the pool (no
+ * `headlessPool` field on /status at all). Shard 0 is always-on (down =
+ * failure, same as before); shards >= 1 are on-demand (idle is healthy,
+ * mirroring the existing headed-Chrome treatment) — only a crash fails
+ * them. Pure and exported for direct unit testing: cmdDoctor itself talks
+ * to the live daemon over RPC and writes straight to stdout, so this is
+ * the only test seam without a larger refactor.
+ */
+export function buildHeadlessDoctorChecks(
+  status: { headless: ChromeState; headlessPool?: ChromeState[] },
+): DoctorCheck[] {
+  if (status.headlessPool && status.headlessPool.length > 0) {
+    return status.headlessPool.map((state, i) => {
+      const alwaysOn = i === 0;
+      const ok = alwaysOn ? state.phase === "chrome_up" : state.phase !== "chrome_crashed";
+      const detail = !alwaysOn && state.phase === "idle" ? "idle (on-demand)" : state.phase;
+      return {
+        label: `Chrome (headless-${i}, ${CDP_PORT_HEADLESS + i})`,
+        ok,
+        detail,
+        fix: ok ? undefined : "ab ensure   # or: ab heal",
+      };
+    });
+  }
+  const headlessOk = status.headless.phase === "chrome_up";
+  return [
+    {
+      label: "Chrome (headless, 9333)",
+      ok: headlessOk,
+      detail: status.headless.phase,
+      fix: headlessOk ? undefined : "ab ensure   # or: ab heal",
+    },
+  ];
+}
+
 async function cmdDoctor(): Promise<number> {
   const checks: Array<{ label: string; ok: boolean; detail?: string; fix?: string }> = [];
 
@@ -248,13 +539,7 @@ async function cmdDoctor(): Promise<number> {
   }
 
   if (status) {
-    const headlessOk = status.headless.phase === "chrome_up";
-    checks.push({
-      label: "Chrome (headless, 9333)",
-      ok: headlessOk,
-      detail: status.headless.phase,
-      fix: headlessOk ? undefined : "ab ensure   # or: ab heal",
-    });
+    checks.push(...buildHeadlessDoctorChecks(status));
 
     // Headed is on-demand — not running is normal, only flag if crashed.
     const headedCrashed = status.headed.phase === "chrome_crashed";
@@ -468,7 +753,7 @@ async function getBrowserCurrentUrl(cdpPort: number, sessionName: string | null)
   return url || undefined;
 }
 
-async function cmdReauth(
+export async function cmdReauth(
   rest: string[],
   cdpPort: number,
   sessionName: string | null,
@@ -645,6 +930,9 @@ export interface SessionEntry {
   ageSeconds: number;
   state: "active" | "idle" | "stale";
   daemonPid: number | null;
+  /** Headless shard this session is pinned to, or null if unassigned
+   *  (legacy marker, headed-only session, or never touched Chrome). */
+  shard: number | null;
 }
 
 export function listSessionEntries(now: Date = new Date()): SessionEntry[] {
@@ -683,6 +971,7 @@ export function listSessionEntries(now: Date = new Date()): SessionEntry[] {
       ageSeconds: Math.max(0, Math.floor(ageMs / 1000)),
       state,
       daemonPid,
+      shard: readShardAssignment(pid),
     });
   }
   entries.sort((a, b) => {
@@ -725,14 +1014,16 @@ function cmdPs(args: string[]): number {
   }
   const pidW = Math.max(3, ...entries.map((e) => e.pid.length));
   const ownerW = Math.max(5, ...entries.map((e) => e.owner.length));
-  const header = `  ${"PID".padEnd(pidW)}  ${"OWNER".padEnd(ownerW)}  ${"AGE".padEnd(6)}  STATUS`;
+  const shardW = 5;
+  const header = `  ${"PID".padEnd(pidW)}  ${"OWNER".padEnd(ownerW)}  ${"AGE".padEnd(6)}  ${"SHARD".padEnd(shardW)}  STATUS`;
   process.stdout.write(header + "\n");
   let needsGc = false;
   for (const e of entries) {
     const marker = e.owner === "self" ? "*" : " ";
     if (e.state === "idle" || e.state === "stale") needsGc = true;
+    const shardStr = e.shard === null ? "" : String(e.shard);
     process.stdout.write(
-      `${marker} ${e.pid.padEnd(pidW)}  ${e.owner.padEnd(ownerW)}  ${formatAge(e.ageSeconds).padEnd(6)}  ${e.state}\n`,
+      `${marker} ${e.pid.padEnd(pidW)}  ${e.owner.padEnd(ownerW)}  ${formatAge(e.ageSeconds).padEnd(6)}  ${shardStr.padEnd(shardW)}  ${e.state}\n`,
     );
   }
   if (needsGc) {
@@ -742,13 +1033,14 @@ function cmdPs(args: string[]): number {
 }
 
 /**
- * Tear down a session's headless Chrome tab via the same passthrough `close`
- * uses. Never boots Chrome — no-op when Chrome isn't up. For an idle entry
- * this transiently spawns a per-session agent-browser daemon to close the
- * orphan tab; it exits immediately after (idle timeout).
+ * Tear down a session's Chrome tab via the same passthrough `close` uses.
+ * Callers must already know the target shard's Chrome is up (via
+ * `portForShard`/status) — this function unconditionally attempts the
+ * close, it never boots Chrome itself. For an idle entry this transiently
+ * spawns a per-session agent-browser daemon to close the orphan tab; it
+ * exits immediately after (idle timeout).
  */
-async function teardownSession(sessionPid: string, chromeUp: boolean, cdpPort: number): Promise<void> {
-  if (!chromeUp) return;
+async function teardownSession(sessionPid: string, cdpPort: number): Promise<void> {
   await runAgentBrowser(cdpPort, buildSessionName(sessionPid), ["close"]);
 }
 
@@ -805,16 +1097,19 @@ async function cmdGc(args: string[]): Promise<number> {
     return 0;
   }
 
-  // Resolve headless Chrome liveness once for the whole run — same
-  // guarantee as `close`: never boots Chrome, no-op when nothing is up.
-  let chromeUp = false;
-  let cdpPort = CDP_PORT_HEADLESS;
+  // Resolve the headless pool's liveness once for the whole run — same
+  // guarantee as `close`: never boots Chrome, no-op for a shard that isn't
+  // up. Each entry below resolves its own marker's shard and only gets a
+  // close attempt if THAT shard is up (decision 2/6: per-shard, not global).
+  let headlessPool: ChromeState[] | undefined;
+  let legacyHeadless: ChromeState | undefined;
   try {
     const st = await rpc.status();
-    chromeUp = st.headless.phase === "chrome_up";
-    if (chromeUp && "port" in st.headless) cdpPort = st.headless.port;
+    headlessPool = st.headlessPool;
+    legacyHeadless = st.headless;
   } catch {
-    chromeUp = false; // daemon down → nothing to close
+    headlessPool = undefined; // daemon down → nothing to close on any shard
+    legacyHeadless = undefined;
   }
 
   for (const e of targets) {
@@ -843,7 +1138,11 @@ async function cmdGc(args: string[]): Promise<number> {
       continue;
     }
 
-    await teardownSession(e.pid, chromeUp, cdpPort);
+    const shard = resolveTeardownShard(e.pid);
+    const port = portForShard(headlessPool, shard, legacyHeadless);
+    if (port !== null) {
+      await teardownSession(e.pid, port);
+    }
     try { fs.unlinkSync(sessionFile); } catch { /* race: already gone */ }
     if (e.state === "stale") {
       try { fs.unlinkSync(wrapper); } catch { /* wrapper may not exist */ }
@@ -1128,17 +1427,23 @@ async function main(): Promise<number> {
     //    browser is running there is nothing to close (no-op success). This is
     //    the targeted alternative to `ab heal`, which nukes every session's tabs. --
     if (command === "close") {
-      let running = false;
+      let closePort: number | null = null;
       try {
         const st = await rpc.status();
-        const state = flags.headed ? st.headed : st.headless;
-        running = state.phase === "chrome_up";
-        if (running && "port" in state) cdpPort = state.port;
+        if (flags.headed) {
+          closePort = st.headed.phase === "chrome_up" ? st.headed.port : null;
+        } else {
+          // Resolve this session's shard the same way teardown/gc does:
+          // marker's recorded shard (missing/legacy → 0), never assigned or
+          // booted here — `close` must stay a pure teardown.
+          const shard = resolveTeardownShard(pid);
+          closePort = portForShard(st.headlessPool, shard, st.headless);
+        }
       } catch {
-        running = false; // daemon down → nothing to close
+        closePort = null; // daemon down → nothing to close
       }
-      if (running) {
-        await teardownSession(pid, running, cdpPort);
+      if (closePort !== null) {
+        await teardownSession(pid, closePort);
       } else {
         gray("No browser running — nothing to close.");
       }

@@ -9,6 +9,7 @@
 import * as path from "path";
 import { existsSync, unlinkSync, rmSync, mkdirSync, readdirSync } from "fs";
 import type { ChromeConfig, ChromeTarget } from "./types";
+import { ALL_TARGETS, HEADLESS_POOL_SIZE, headlessTarget } from "./types";
 import {
   getState,
   markLaunching,
@@ -45,22 +46,42 @@ const SHARED_LAUNCH_ARGS: readonly string[] = [
   "--use-mock-keychain",
 ];
 
-const CONFIGS: Record<ChromeTarget, ChromeConfig> = {
-  headless: {
-    target: "headless",
-    port: 9333,
-    profilePath: `${process.env.HOME}/.agent-browser/profile`,
-    launchArgs: ["--headless=new", ...SHARED_LAUNCH_ARGS],
-    policy: "always-on",
-  },
-  headed: {
-    target: "headed",
-    port: 9444,
-    profilePath: `${process.env.HOME}/.agent-browser/profile-headed`,
-    launchArgs: [...SHARED_LAUNCH_ARGS],
-    policy: "on-demand",
-  },
-};
+/**
+ * Base CDP port for the headless pool. Shard i listens on HEADLESS_BASE_PORT + i.
+ * Shard 0 reuses the pre-pool port (9333) and the pre-pool profile dir so
+ * existing auth + zero-migration back-compat is preserved.
+ */
+const HEADLESS_BASE_PORT = 9333;
+
+function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
+  const configs: Record<ChromeTarget, ChromeConfig> = {
+    headed: {
+      target: "headed",
+      port: 9444,
+      profilePath: `${process.env.HOME}/.agent-browser/profile-headed`,
+      launchArgs: [...SHARED_LAUNCH_ARGS],
+      policy: "on-demand",
+    },
+  } as Record<ChromeTarget, ChromeConfig>;
+
+  for (let i = 0; i < HEADLESS_POOL_SIZE; i++) {
+    const target = headlessTarget(i);
+    configs[target] = {
+      target,
+      port: HEADLESS_BASE_PORT + i,
+      profilePath:
+        i === 0
+          ? `${process.env.HOME}/.agent-browser/profile`
+          : `${process.env.HOME}/.agent-browser/profile-${i}`,
+      launchArgs: ["--headless=new", ...SHARED_LAUNCH_ARGS],
+      policy: i === 0 ? "always-on" : "on-demand",
+    };
+  }
+
+  return configs;
+}
+
+const CONFIGS: Record<ChromeTarget, ChromeConfig> = buildConfigs();
 
 const DASHBOARD_PORT = 4848;
 
@@ -123,10 +144,15 @@ interface TargetRuntime {
   heartbeatWs: WebSocket | null;
 }
 
-const runtime: Record<ChromeTarget, TargetRuntime> = {
-  headless: freshRuntime(),
-  headed: freshRuntime(),
-};
+function buildRuntime(): Record<ChromeTarget, TargetRuntime> {
+  const built: Record<ChromeTarget, TargetRuntime> = {} as Record<ChromeTarget, TargetRuntime>;
+  for (const target of ALL_TARGETS) {
+    built[target] = freshRuntime();
+  }
+  return built;
+}
+
+const runtime: Record<ChromeTarget, TargetRuntime> = buildRuntime();
 
 function freshRuntime(): TargetRuntime {
   return {
@@ -148,10 +174,10 @@ function freshRuntime(): TargetRuntime {
 // Runtime snapshot — for crash dumps
 // ---------------------------------------------------------------------------
 
-/** Capture the current runtime state of both Chrome targets for diagnostics. */
+/** Capture the current runtime state of every supervised Chrome target for diagnostics. */
 export function getRuntimeSnapshot(): Record<string, unknown> {
   const snapshot: Record<string, unknown> = {};
-  for (const target of ["headless", "headed"] as const) {
+  for (const target of ALL_TARGETS) {
     const rt = runtime[target];
     const state = getState(target);
     snapshot[target] = {
@@ -179,23 +205,56 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether `profilePath` doesn't exist yet on disk — checked before any
+ * launch/recovery logic touches it (mkdir during corruption recovery, or
+ * Chrome itself creating the dir on first launch, would make a check
+ * afterward meaningless). A true result means the shard's Chrome is about to
+ * start from an empty profile: no cookies, i.e. logged out (chrome-pool-plan
+ * Unit 3, decision 5). Exported for direct unit testing against a throwaway
+ * path — see chrome-supervisor.test.ts's `isProfileDirMissing` block.
+ */
+export function isProfileDirMissing(profilePath: string): boolean {
+  return !existsSync(profilePath);
+}
+
+/**
+ * Whether a launch attempt's `profileFresh` result should be overridden to
+ * `true` because crash-loop corruption recovery ran during this launch. The
+ * recovery block (`rmSync` + `mkdirSync` of the profile dir, further down in
+ * `launchChrome`) happens strictly after the early `isProfileDirMissing`
+ * snapshot is taken, so that snapshot is stale by the time launch finishes —
+ * without this override a shard that just got its profile nuked would
+ * report `profileFresh: false` and suppress the reauth hint exactly when
+ * it's most needed (chrome-pool-plan Fix 4). Pure and exported for direct
+ * unit testing — the real crash-loop path itself needs real repeated Chrome
+ * cycling to trigger and is documented elsewhere (daemon-integration.test.ts)
+ * as flaky under sandboxed conditions, so integration coverage intentionally
+ * stops at this helper.
+ */
+export function profileFreshAfterRecovery(preLaunchSnapshot: boolean, didRecover: boolean): boolean {
+  return didRecover ? true : preLaunchSnapshot;
+}
+
+/**
  * Ensure Chrome is running for `target`. If already up, returns immediately.
  * Serialized through the operation queue — concurrent calls wait their turn.
  */
 export async function ensure(
   target: ChromeTarget,
-): Promise<{ pid: number; port: number; alreadyRunning: boolean }> {
+): Promise<{ pid: number; port: number; alreadyRunning: boolean; profileFresh: boolean }> {
   return opQueue.enqueue(() =>
     withOpId(newOpId(), async () => {
-      // Check if already up FIRST (fast path, no launch needed)
+      // Check if already up FIRST (fast path, no launch needed). A
+      // shard that's already up was, by construction, launched from a
+      // profile that already existed at that point — never fresh here.
       const state = getState(target);
       if (state.phase === "chrome_up") {
-        return { pid: state.pid, port: state.port, alreadyRunning: true };
+        return { pid: state.pid, port: state.port, alreadyRunning: true, profileFresh: false };
       }
       const result = await launchChrome(target);
       return { ...result, alreadyRunning: false };
     }),
-  ) as Promise<{ pid: number; port: number; alreadyRunning: boolean }>;
+  ) as Promise<{ pid: number; port: number; alreadyRunning: boolean; profileFresh: boolean }>;
 }
 
 /**
@@ -247,7 +306,10 @@ async function doKill(target: ChromeTarget): Promise<void> {
 
 /**
  * Start the daemon's always-on supervision. Call once at daemon boot.
- * Launches headless Chrome, starts health checks, then launches the dashboard.
+ * Launches every always-on target (today: headed is on-demand, so this
+ * launches only headless shard 0), starts health checks, then launches
+ * the dashboard. On-demand targets (headed, headless shards >= 1) stay
+ * idle until their first ensure() so idle machines run one Chrome, not N.
  */
 export async function startSupervision(): Promise<void> {
   return opQueue.enqueue(() =>
@@ -257,9 +319,12 @@ export async function startSupervision(): Promise<void> {
         throw new Error("Unsupported platform: " + process.platform);
       }
       log.info("Starting Chrome supervision");
-      const state = getState("headless");
-      if (state.phase !== "chrome_up") {
-        await launchChrome("headless");
+      for (const target of ALL_TARGETS) {
+        if (CONFIGS[target].policy !== "always-on") continue;
+        const state = getState(target);
+        if (state.phase !== "chrome_up") {
+          await launchChrome(target);
+        }
       }
       startDashboard();
       log.info("Chrome supervision active");
@@ -279,7 +344,7 @@ export async function stopAll(): Promise<void> {
         dashboardProc.kill();
         dashboardProc = null;
       }
-      await Promise.all([doKill("headless"), doKill("headed")]);
+      await Promise.all(ALL_TARGETS.map((target) => doKill(target)));
     }),
   ) as Promise<void>;
 }
@@ -290,12 +355,19 @@ export async function stopAll(): Promise<void> {
 
 async function launchChrome(
   target: ChromeTarget,
-): Promise<{ pid: number; port: number }> {
+): Promise<{ pid: number; port: number; profileFresh: boolean }> {
   const config = CONFIGS[target];
   const rt = runtime[target];
 
   rt.restartScheduled = false;
   markLaunching(target);
+
+  // Snapshot freshness before anything below can create/touch the profile
+  // dir (SingletonLock cleanup, corruption-recovery mkdir, or Chrome itself
+  // creating it on first launch) — see isProfileDirMissing's doc comment.
+  // `let`, not `const`: the corruption-recovery block below can invalidate
+  // this snapshot (see profileFreshAfterRecovery's doc comment, Fix 4).
+  let profileFresh = isProfileDirMissing(config.profilePath);
 
   // --- Port conflict resolution ---
   // Check if something is already listening on our port before spawning.
@@ -313,7 +385,7 @@ async function launchChrome(
       startHeartbeat(target);
       resetStableTimer(target);
       if (target === "headed") resetIdleTimer(target);
-      return { pid, port: config.port };
+      return { pid, port: config.port, profileFresh };
     }
   } else if (inCrashLoop && existingCdp) {
     // In a crash loop — don't adopt, kill the occupant so we go through
@@ -372,13 +444,16 @@ async function launchChrome(
   // this by checking if backoff has escalated, which means repeated crashes.
   if (rt.backoffMs >= BACKOFF_MAX_MS) {
     log.warn(`[${target}] Backoff at max — resetting profile to recover from possible corruption`);
+    let recovered = false;
     try {
       rmSync(config.profilePath, { recursive: true, force: true });
       mkdirSync(config.profilePath, { recursive: true });
       rt.backoffMs = BACKOFF_INITIAL_MS;
+      recovered = true;
     } catch (err) {
       log.error(`[${target}] Failed to reset profile`, { err: String(err) });
     }
+    profileFresh = profileFreshAfterRecovery(profileFresh, recovered);
   }
 
   const args = [
@@ -466,7 +541,7 @@ async function launchChrome(
   }
 
   log.info(`[${target}] Chrome ready`, { pid: proc.pid, port: config.port });
-  return { pid: proc.pid, port: config.port };
+  return { pid: proc.pid, port: config.port, profileFresh };
 }
 
 // ---------------------------------------------------------------------------
