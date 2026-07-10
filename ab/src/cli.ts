@@ -13,6 +13,7 @@
 
 import { spawn } from "child_process";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
 
@@ -596,14 +597,45 @@ function cmdNewSession(): number {
 // ---------------------------------------------------------------------------
 // ab ps + ab gc — session inventory and cleanup.
 //
-// The filesystem (/tmp/.ab-session-*) is the source of truth. We don't query
-// the daemon for liveness — if a follow-up exposes a listSessions RPC we can
-// upgrade later. For now, file exists = live; mtime > STALE_AGE_MS = stale.
+// Three-state liveness, derived from real daemon state (not just marker
+// file existence):
+//   - active — the per-session agent-browser daemon is alive
+//     (~/.agent-browser/ab-<pid>.pid names a live OS pid)
+//   - idle   — daemon is dead, marker age <= STALE_AGE_MS
+//   - stale  — daemon is dead, marker age > STALE_AGE_MS
+// CDP /json/list cross-check is explicitly deferred — pid-file check is
+// sufficient for v1 and keeps this dependency-free.
 // ---------------------------------------------------------------------------
 
 const SESSION_FILE_PREFIX = "/tmp/.ab-session-";
 const WRAPPER_PREFIX = "/tmp/ab-";
 const STALE_AGE_MS = 24 * 60 * 60 * 1000;
+/** Grace window before an idle (daemon-dead, not-yet-stale) session is reaped by `ab gc`. */
+const IDLE_GRACE_MS = Number(process.env.AB_GC_IDLE_GRACE_MS ?? 30 * 60 * 1000);
+
+function daemonPidFilePath(sessionPid: string): string {
+  return path.join(os.homedir(), ".agent-browser", `ab-${sessionPid}.pid`);
+}
+
+/** Returns the per-session daemon's OS pid if alive, else null. */
+function daemonPidAlive(sessionPid: string): number | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(daemonPidFilePath(sessionPid), "utf-8").trim();
+  } catch {
+    return null; // no pid file — daemon never started or already cleaned up
+  }
+  const pid = Number.parseInt(raw, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0); // signal 0: existence check only, doesn't kill
+    return pid; // no throw — process exists and we can signal it
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "EPERM") return pid; // exists, owned by another user — still alive
+    return null; // ESRCH (or anything else) — dead
+  }
+}
 
 export interface SessionEntry {
   pid: string;
@@ -611,7 +643,8 @@ export interface SessionEntry {
   owner: "self" | "self (main-thread)" | "subagent" | "other-cc" | "other-cc (subagent)";
   mtimeIso: string;
   ageSeconds: number;
-  stale: boolean;
+  state: "active" | "idle" | "stale";
+  daemonPid: number | null;
 }
 
 export function listSessionEntries(now: Date = new Date()): SessionEntry[] {
@@ -639,13 +672,17 @@ export function listSessionEntries(now: Date = new Date()): SessionEntry[] {
     }
     if (!stat.isFile()) continue;
     const ageMs = now.getTime() - stat.mtimeMs;
+    const daemonPid = daemonPidAlive(pid);
+    const state: SessionEntry["state"] =
+      daemonPid !== null ? "active" : ageMs > STALE_AGE_MS ? "stale" : "idle";
     entries.push({
       pid,
       session: `ab-${pid}`,
       owner: classifyOwner(pid, selfPid, cco),
       mtimeIso: new Date(stat.mtimeMs).toISOString(),
       ageSeconds: Math.max(0, Math.floor(ageMs / 1000)),
-      stale: ageMs > STALE_AGE_MS,
+      state,
+      daemonPid,
     });
   }
   entries.sort((a, b) => {
@@ -690,43 +727,139 @@ function cmdPs(args: string[]): number {
   const ownerW = Math.max(5, ...entries.map((e) => e.owner.length));
   const header = `  ${"PID".padEnd(pidW)}  ${"OWNER".padEnd(ownerW)}  ${"AGE".padEnd(6)}  STATUS`;
   process.stdout.write(header + "\n");
-  let anyStale = false;
+  let needsGc = false;
   for (const e of entries) {
     const marker = e.owner === "self" ? "*" : " ";
-    const status = e.stale ? "stale" : "live";
-    if (e.stale) anyStale = true;
+    if (e.state === "idle" || e.state === "stale") needsGc = true;
     process.stdout.write(
-      `${marker} ${e.pid.padEnd(pidW)}  ${e.owner.padEnd(ownerW)}  ${formatAge(e.ageSeconds).padEnd(6)}  ${status}\n`,
+      `${marker} ${e.pid.padEnd(pidW)}  ${e.owner.padEnd(ownerW)}  ${formatAge(e.ageSeconds).padEnd(6)}  ${e.state}\n`,
     );
   }
-  if (anyStale) {
+  if (needsGc) {
     stderr("Run `ab gc` to prune stale sessions.");
   }
   return 0;
 }
 
-function cmdGc(args: string[]): number {
+/**
+ * Tear down a session's headless Chrome tab via the same passthrough `close`
+ * uses. Never boots Chrome — no-op when Chrome isn't up. For an idle entry
+ * this transiently spawns a per-session agent-browser daemon to close the
+ * orphan tab; it exits immediately after (idle timeout).
+ */
+async function teardownSession(sessionPid: string, chromeUp: boolean, cdpPort: number): Promise<void> {
+  if (!chromeUp) return;
+  await runAgentBrowser(cdpPort, buildSessionName(sessionPid), ["close"]);
+}
+
+/** Guard regex for orphan-wrapper sweep: hex-ish session pid shapes only.
+ *  Deliberately excludes name-adjacent sidecar files like
+ *  `ab-server-out.log` / `ab-server-error.log` (see plan history: a prior
+ *  glob-based cleanup deleted `ab-server.sock` this way). */
+const ORPHAN_WRAPPER_NAME_RE = /^ab-[0-9a-f][0-9a-f-]*$/i;
+
+/**
+ * Second gc pass: wrapper shims in /tmp with no matching session marker
+ * (already reaped, or never had one) that are old enough (> STALE_AGE_MS)
+ * to be confidently orphaned. Guarded hard against non-session sidecar
+ * files sharing the `/tmp/ab-*` prefix.
+ */
+function findOrphanWrappers(entries: SessionEntry[], now: Date = new Date()): string[] {
+  const dir = "/tmp";
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const knownPids = new Set(entries.map((e) => e.pid));
+  const orphans: string[] = [];
+  for (const name of names) {
+    if (!ORPHAN_WRAPPER_NAME_RE.test(name)) continue;
+    const pid = name.slice("ab-".length);
+    if (knownPids.has(pid)) continue; // has a marker — not orphaned
+    const fp = `${dir}/${name}`;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fp);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    const isExecutable = (stat.mode & 0o111) !== 0;
+    if (!isExecutable) continue; // real wrapper shims are chmod +x
+    if (now.getTime() - stat.mtimeMs <= STALE_AGE_MS) continue;
+    orphans.push(fp);
+  }
+  return orphans;
+}
+
+async function cmdGc(args: string[]): Promise<number> {
   const dryRun = args.includes("--dry-run");
   const entries = listSessionEntries();
-  const targets = entries.filter((e) => e.stale);
-  if (targets.length === 0) {
+  const targets = entries.filter((e) => e.state === "idle" || e.state === "stale");
+  const orphanWrappers = findOrphanWrappers(entries);
+
+  if (targets.length === 0 && orphanWrappers.length === 0) {
     stderr("Nothing to prune.");
     return 0;
   }
+
+  // Resolve headless Chrome liveness once for the whole run — same
+  // guarantee as `close`: never boots Chrome, no-op when nothing is up.
+  let chromeUp = false;
+  let cdpPort = CDP_PORT_HEADLESS;
+  try {
+    const st = await rpc.status();
+    chromeUp = st.headless.phase === "chrome_up";
+    if (chromeUp && "port" in st.headless) cdpPort = st.headless.port;
+  } catch {
+    chromeUp = false; // daemon down → nothing to close
+  }
+
   for (const e of targets) {
     const sessionFile = `${SESSION_FILE_PREFIX}${e.pid}`;
     const wrapper = `${WRAPPER_PREFIX}${e.pid}`;
+    const withinGrace = e.state === "idle" && e.ageSeconds * 1000 <= IDLE_GRACE_MS;
+
+    if (withinGrace) {
+      const line = `${e.pid}  state=${e.state}  age=${formatAge(e.ageSeconds)}  action=skip: within grace window`;
+      if (dryRun) process.stdout.write(line + "\n");
+      continue;
+    }
+
     if (dryRun) {
+      const action =
+        e.state === "stale"
+          ? "close + remove marker + wrapper"
+          : "close + remove marker (keep wrapper)";
+      process.stdout.write(
+        `${e.pid}  state=${e.state}  age=${formatAge(e.ageSeconds)}  action=${action}\n`,
+      );
       process.stdout.write(`would remove: ${sessionFile}\n`);
-      if (fs.existsSync(wrapper)) {
+      if (e.state === "stale") {
         process.stdout.write(`would remove: ${wrapper}\n`);
       }
-    } else {
-      try { fs.unlinkSync(sessionFile); } catch { /* race: already gone */ }
-      try { fs.unlinkSync(wrapper); } catch { /* wrapper may not exist */ }
-      stderr(`removed: ${e.pid}`);
+      continue;
     }
+
+    await teardownSession(e.pid, chromeUp, cdpPort);
+    try { fs.unlinkSync(sessionFile); } catch { /* race: already gone */ }
+    if (e.state === "stale") {
+      try { fs.unlinkSync(wrapper); } catch { /* wrapper may not exist */ }
+    }
+    stderr(`reaped: ${e.pid} (${e.state})`);
   }
+
+  for (const wrapperPath of orphanWrappers) {
+    if (dryRun) {
+      process.stdout.write(`orphan wrapper  action=remove: ${wrapperPath}\n`);
+      continue;
+    }
+    try { fs.unlinkSync(wrapperPath); } catch { /* already gone */ }
+    stderr(`reaped orphan wrapper: ${wrapperPath}`);
+  }
+
   return 0;
 }
 
@@ -852,6 +985,12 @@ const PASSTHROUGH_COMMANDS = new Set([
 
 const BLOCKED_COMMANDS = new Set(["eval", "js", "execute"]);
 
+/** Commands that must never bump a session marker's mtime — see the touch
+ *  in main() below. `ps`/`gc` are inspection, not activity (and `gc` runs as
+ *  pid "default" under launchd — it must never keep a marker perpetually
+ *  fresh); `new-session` creates the marker itself. */
+const NO_TOUCH_COMMANDS = new Set(["ps", "gc", "new-session"]);
+
 /** Commands that require a managed Chrome instance (ensureChromePort). */
 const NEEDS_CHROME = new Set([
   // `close` is intentionally excluded: it should tear down, never boot Chrome.
@@ -889,6 +1028,16 @@ async function main(): Promise<number> {
   // Resolve session identity from pid (see resolvePid above).
   const pid = resolvePid();
   const sessionName = buildSessionName(pid);
+
+  // Touch the marker's mtime on every real invocation so "age" tracks last
+  // activity, not creation time — this is what both the gc grace window and
+  // the 24h stale threshold actually want.
+  if (command && !NO_TOUCH_COMMANDS.has(command)) {
+    try {
+      const now = new Date();
+      fs.utimesSync(sessionFilePath(pid), now, now);
+    } catch { /* marker not initialized — fine */ }
+  }
 
   // Resolve CDP port based on flags
   let cdpPort: number;
@@ -939,7 +1088,7 @@ async function main(): Promise<number> {
     // -- Standalone --
     if (command === "new-session") return cmdNewSession();
     if (command === "ps") return cmdPs(rest);
-    if (command === "gc") return cmdGc(rest);
+    if (command === "gc") return await cmdGc(rest);
     if (command === "console-tail") return await cmdConsoleTail(rest, cdpPort);
     if (command === "watch") return await cmdWatch(rest, cdpPort);
     if (command === "click-js") return await cmdClickJs(rest, cdpPort);
@@ -988,10 +1137,8 @@ async function main(): Promise<number> {
       } catch {
         running = false; // daemon down → nothing to close
       }
-      let exitCode = 0;
       if (running) {
-        const result = await runAgentBrowser(cdpPort, sessionName, flags.args);
-        exitCode = result.exitCode;
+        await teardownSession(pid, running, cdpPort);
       } else {
         gray("No browser running — nothing to close.");
       }
@@ -999,7 +1146,7 @@ async function main(): Promise<number> {
       // immediately instead of waiting for the 24h gc.
       try { fs.unlinkSync(`${SESSION_FILE_PREFIX}${pid}`); } catch { /* already gone */ }
       try { fs.unlinkSync(`${WRAPPER_PREFIX}${pid}`); } catch { /* may not exist */ }
-      return exitCode;
+      return 0;
     }
 
     // -- Passthrough commands --
