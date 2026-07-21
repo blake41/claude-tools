@@ -165,6 +165,8 @@ cmd_trace_list() {
   local error_only=""
   local min_latency=""
   local name=""
+  local abs_start=""
+  local abs_end=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --project) project="$2"; shift 2 ;;
@@ -173,13 +175,21 @@ cmd_trace_list() {
       --error) error_only="true"; shift ;;
       --min-latency) min_latency="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
+      --start) abs_start="$2"; shift 2 ;;
+      --end) abs_end="$2"; shift 2 ;;
+      --before) abs_end="$2"; shift 2 ;;
       *) json_error "$TOOL_NAME trace list" "Unknown option: $1" "INVALID_ARG" \
-           "Usage: lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--error] [--min-latency SECONDS] [--name STRING]" ;;
+           "Usage: lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--before ISO8601] [--error] [--min-latency SECONDS] [--name STRING]" ;;
     esac
   done
 
   [[ -z "$project" ]] && json_error "$TOOL_NAME trace list" "--project is required" "MISSING_ARG" \
     "Run 'lsmith project list' to find a project name, then 'lsmith trace list --project NAME'"
+
+  if [[ -n "$last_n_minutes" && ( -n "$abs_start" || -n "$abs_end" ) ]]; then
+    json_error "$TOOL_NAME trace list" "--last-n-minutes cannot be combined with --start/--end/--before" "INVALID_ARG" \
+      "Use --last-n-minutes for a relative window, or --start/--end for an absolute historical window"
+  fi
 
   load_api_key || json_error "$TOOL_NAME trace list" "No LangSmith API key found" "AUTH_MISSING" "$AUTH_FIX"
 
@@ -187,9 +197,13 @@ cmd_trace_list() {
   session_id=$(resolve_project_id "$project" "$TOOL_NAME trace list") || { echo "$session_id"; exit 1; }
   rethrow "$session_id"
 
-  # Default: last 7 days.
+  # Default: last 7 days. --start overrides the lower bound; --end/--before
+  # sets an upper bound (both are absolute ISO 8601 timestamps), since the
+  # underlying API's start_time field only ever expresses a lower bound.
   local start_time
-  if [[ -n "$last_n_minutes" ]]; then
+  if [[ -n "$abs_start" ]]; then
+    start_time="$abs_start"
+  elif [[ -n "$last_n_minutes" ]]; then
     start_time=$(date -u -v-"${last_n_minutes}"M +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
       || date -u -d "${last_n_minutes} minutes ago" +"%Y-%m-%dT%H:%M:%SZ")
   else
@@ -212,6 +226,10 @@ cmd_trace_list() {
       start_time: $start_time
     }')
 
+  if [[ -n "$abs_end" ]]; then
+    body_json=$(echo "$body_json" | jq --arg end_time "$abs_end" \
+      '. + {filter: ("lt(start_time, \"" + $end_time + "\")")}')
+  fi
   if [[ -n "$error_only" ]]; then
     body_json=$(echo "$body_json" | jq '. + {error: true}')
   fi
@@ -341,7 +359,7 @@ dispatch_trace() {
     get)  cmd_trace_get "$@" ;;
     "")
       cmd_tree "$TOOL_NAME trace" "Trace (root run) commands" "$(jq -n '[
-        {name: "list", description: "List recent traces in a project (default 7-day window, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--error] [--min-latency SEC] [--name STRING]"},
+        {name: "list", description: "List recent traces in a project (default 7-day window, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--error] [--min-latency SEC] [--name STRING]"},
         {name: "get",  description: "Get a single trace by ID (full root-run record)", usage: "lsmith trace get <trace-id>"}
       ]')"
       ;;
@@ -370,7 +388,7 @@ dispatch_run() {
 if [[ $# -lt 1 ]]; then
   cmd_tree "$TOOL_NAME" "LangSmith CLI for AI agents (read-only debug surface)" "$(jq -n '[
     {name: "project list", description: "List tracing projects",                                  usage: "lsmith project list [--limit N] [--name-contains STRING]"},
-    {name: "trace list",   description: "List recent traces in a project (default 7d, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--error] [--min-latency SEC] [--name STRING]"},
+    {name: "trace list",   description: "List recent traces in a project (default 7d, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--error] [--min-latency SEC] [--name STRING]"},
     {name: "trace get",    description: "Get a single trace by ID",                                usage: "lsmith trace get <trace-id>"},
     {name: "run get",      description: "Get a single run by ID",                                  usage: "lsmith run get <run-id>"}
   ]')"
