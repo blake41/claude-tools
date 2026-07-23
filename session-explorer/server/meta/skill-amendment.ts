@@ -10,7 +10,9 @@ import { SKILL_INSPECTION_PROMPT, SKILL_AMENDMENT_PROMPT } from "./prompts.js";
 import type { SkillAmendment, FailureCategory } from "./types.js";
 
 const anthropic = new Anthropic();
-const HOME = process.env.HOME || "/Users/blake";
+const homeEnv = process.env.HOME;
+if (!homeEnv) throw new Error("HOME environment variable is not set");
+const HOME: string = homeEnv;
 
 // ── Prepared Statements ────────────────────────────────────────────
 
