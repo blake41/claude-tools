@@ -25,6 +25,14 @@ const AB_BIN = path.join(HOME, ".local", "bin", "ab");
 const AB_BACKUP = AB_BIN + ".bash.bak";
 const CLI_SRC = path.join(AB_DIR, "src", "cli.ts");
 
+// agent-browser (the native Rust CDP engine `ab` shells out to) is a separate
+// repo — this fork carries a click-actionability patch upstream doesn't have.
+// Pinned to a tag rather than a branch so installs are reproducible.
+const AGENT_BROWSER_REPO = "git@github.com:blake41/agent-browser.git";
+const AGENT_BROWSER_TAG = "v0.32.4-clay.1";
+const AGENT_BROWSER_SRC_DIR = path.join(HOME, ".agent-browser", "src");
+const AGENT_BROWSER_BIN = path.join(HOME, ".local", "bin", "agent-browser");
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -98,11 +106,79 @@ function uninstall(): void {
 }
 
 // ---------------------------------------------------------------------------
+// agent-browser (native binary)
+// ---------------------------------------------------------------------------
+
+/** Build agent-browser from source and symlink it into ~/.local/bin, unless
+ * it's already resolvable on PATH. Requires the Rust toolchain (cargo) — this
+ * is left to the user to install since it's an interactive installer that
+ * modifies shell profiles.
+ */
+function ensureAgentBrowser(): void {
+  log("Checking agent-browser binary...");
+  const existing = run("command -v agent-browser", true);
+  if (existing) {
+    log(`agent-browser already on PATH (${existing}) — skipping build`);
+    return;
+  }
+
+  const cargoVersion = run("cargo --version", true);
+  if (!cargoVersion) {
+    process.stderr.write(`
+  agent-browser (the browser-automation engine \`ab\` depends on) isn't installed,
+  and building it from source requires the Rust toolchain (cargo), which isn't
+  on your PATH.
+
+  Install Rust first:
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    source "$HOME/.cargo/env"
+
+  Then re-run this installer:
+    bun run install.ts
+
+  (This script won't run the rustup installer for you — it's interactive and
+  modifies your shell profile.)
+`);
+    process.exit(1);
+  }
+
+  log(`Building agent-browser (${AGENT_BROWSER_TAG})...`);
+  if (!fs.existsSync(AGENT_BROWSER_SRC_DIR)) {
+    fs.mkdirSync(path.dirname(AGENT_BROWSER_SRC_DIR), { recursive: true });
+    run(
+      `git clone --branch ${AGENT_BROWSER_TAG} --depth 1 ${AGENT_BROWSER_REPO} "${AGENT_BROWSER_SRC_DIR}"`,
+    );
+  } else {
+    run(
+      `cd "${AGENT_BROWSER_SRC_DIR}" && git fetch --depth 1 origin tag ${AGENT_BROWSER_TAG} && git checkout ${AGENT_BROWSER_TAG}`,
+    );
+  }
+
+  run(`cargo build --release --manifest-path "${AGENT_BROWSER_SRC_DIR}/cli/Cargo.toml"`);
+
+  const builtBin = path.join(AGENT_BROWSER_SRC_DIR, "cli", "target", "release", "agent-browser");
+  if (!fs.existsSync(builtBin)) {
+    process.stderr.write(`\n  ERROR: build finished but binary not found at ${builtBin}\n`);
+    process.exit(1);
+  }
+
+  fs.mkdirSync(path.dirname(AGENT_BROWSER_BIN), { recursive: true });
+  if (fs.existsSync(AGENT_BROWSER_BIN) || fs.lstatSync(AGENT_BROWSER_BIN, { throwIfNoEntry: false })) {
+    fs.unlinkSync(AGENT_BROWSER_BIN);
+  }
+  fs.symlinkSync(builtBin, AGENT_BROWSER_BIN);
+  log(`Installed agent-browser -> ${AGENT_BROWSER_BIN}`);
+}
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 
 function install(): void {
   process.stderr.write("\nInstalling ab-server...\n\n");
+
+  // 0. Ensure the native agent-browser binary exists (builds from source if needed)
+  ensureAgentBrowser();
 
   // 1. Verify daemon builds
   log("Verifying daemon builds...");
@@ -118,7 +194,7 @@ function install(): void {
   log("Installing launchd plist...");
   fs.mkdirSync(path.dirname(PLIST_DST), { recursive: true });
   const plistTemplate = fs.readFileSync(PLIST_SRC, "utf-8");
-  const plistContent = plistTemplate.replaceAll("{{HOME}}", HOME);
+  const plistContent = plistTemplate.replaceAll("{{HOME}}", HOME).replaceAll("{{AB_DIR}}", AB_DIR);
   fs.writeFileSync(PLIST_DST, plistContent);
   log(`Wrote ${PLIST_DST}`);
 

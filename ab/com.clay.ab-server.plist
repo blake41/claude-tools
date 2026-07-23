@@ -14,7 +14,7 @@
 	<array>
 		<string>{{HOME}}/.bun/bin/bun</string>
 		<string>run</string>
-		<string>{{HOME}}/Documents/Development/tools/ab/src/daemon.ts</string>
+		<string>{{AB_DIR}}/src/daemon.ts</string>
 	</array>
 	<key>StandardOutPath</key>
 	<string>/tmp/ab-server-out.log</string>
