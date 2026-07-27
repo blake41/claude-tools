@@ -2,7 +2,7 @@ import { readdirSync, statSync, existsSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
 import db from "./db.js";
-import { stripSession } from "./strip.js";
+import { stripSession, type StrippedMessage } from "./strip.js";
 
 // ── Config ─────────────────────────────────────────────────────────
 
@@ -79,6 +79,25 @@ function displayName(workspacePath: string): string {
 
   // Otherwise last 2 segments
   return parts.slice(-2).join("/");
+}
+
+/**
+ * A bare slash command with no argument text (e.g. "/model", "/clear") makes a
+ * useless title even though it's real "text" content — skip it in favor of the
+ * next user turn. A command WITH argument text (e.g. "/ship-lite fix the bug")
+ * is still title-worthy.
+ */
+function isTitleWorthy(content: string): boolean {
+  const trimmed = content.trim();
+  return trimmed.length > 0 && !/^\/\S+\s*$/.test(trimmed);
+}
+
+function pickTitle(userMessages: StrippedMessage[]): string {
+  // System-context/caveat boilerplate is already classified messageType "system"
+  // by strip.ts, not "text" — restrict to real text turns first.
+  const textMessages = userMessages.filter((m) => m.messageType === "text");
+  const best = textMessages.find((m) => isTitleWorthy(m.content)) ?? textMessages[0];
+  return best?.content.slice(0, 200) || "";
 }
 
 // ── Prepared Statements ────────────────────────────────────────────
@@ -198,7 +217,7 @@ function ingestSession(
   if (messages.length === 0) return false;
 
   const userMessages = messages.filter((m) => m.role === "user");
-  const title = userMessages[0]?.content.slice(0, 200) || "";
+  const title = pickTitle(userMessages);
   const startedAt = messages[0]?.timestamp || null;
   const endedAt = messages[messages.length - 1]?.timestamp || null;
 
