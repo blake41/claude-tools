@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# keystone-ask - Ask Keystone (Clay's AI Account Intelligence service) a real
+# question directly, bypassing Terra's UI. For spike/debug scenarios where you
+# need a real traced LLM call against a real or fixture account.
+#
+# Hits Keystone's own backend API directly (the same one Terra's
+# src/api/keystone-conversations.ts proxies to):
+#   POST /backend/conversations            (create)
+#   POST /backend/conversations/:id/ask     (ask — 202 enqueue ack, async)
+#   GET  /backend/conversations/:id         (poll — messageCount only, no text)
+#   GET  /backend/conversations             (list)
+#
+# NOTE: Keystone's answer text itself is only available via its SSE
+# /stream endpoint, which this tool does not parse yet (v1 scope: trigger +
+# confirm-answered, not display the full answer). Use `run --wait` to block
+# until messageCount increases, then check LangSmith for the trace, or open
+# the conversation in Terra's UI to read the answer.
+
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="keystone-ask"
+CONFIG_DIR="${HOME}/.config/keystone"
+ENV_NAME="staging"
+
+# Service-to-service identity: Keystone's requireAuth() accepts a single
+# shared API_SECRET_KEY and hardcodes the caller identity to
+# `service:slack-project` regardless of the x-terra-user-* headers below —
+# those headers are cosmetic (used for logging/persona resolution on
+# Keystone's side), not a real per-user auth boundary.
+DEFAULT_USER_EMAIL="blake.johnson@clay.com"
+DEFAULT_USER_SLACK_ID="U08M03CDY73"
+
+RESOLVED_HOST=""
+RESOLVED_TOKEN=""
+
+load_config() {
+  if [[ -n "${KEYSTONE_API_HOST:-}" && -n "${KEYSTONE_API_TOKEN:-}" ]]; then
+    RESOLVED_HOST="$KEYSTONE_API_HOST"
+    RESOLVED_TOKEN="$KEYSTONE_API_TOKEN"
+    return 0
+  fi
+  local envfile="$CONFIG_DIR/${ENV_NAME}.env"
+  if [[ -f "$envfile" ]]; then
+    # shellcheck disable=SC1090
+    set -a; source "$envfile"; set +a
+    RESOLVED_HOST="${KEYSTONE_API_HOST:-}"
+    RESOLVED_TOKEN="${KEYSTONE_API_TOKEN:-}"
+  fi
+  if [[ -z "$RESOLVED_HOST" || -z "$RESOLVED_TOKEN" ]]; then
+    return 1
+  fi
+  RESOLVED_HOST="${RESOLVED_HOST%/}"
+  return 0
+}
+
+AUTH_FIX="Set KEYSTONE_API_HOST + KEYSTONE_API_TOKEN env vars, or write them to ~/.config/keystone/{staging,prod}.env (KEY=VALUE lines). Pull prod values via: infisical-api secrets export -p <slack-server-project-id> -e production"
+
+require_config() {
+  if ! load_config; then
+    json_error "$TOOL_NAME" "KEYSTONE_API_HOST/KEYSTONE_API_TOKEN not resolved for env '$ENV_NAME'" "MISSING_CONFIG" "$AUTH_FIX"
+  fi
+}
+
+auth_headers=()
+build_auth_headers() {
+  auth_headers=(-H "Authorization: Bearer $RESOLVED_TOKEN" -H "Content-Type: application/json"
+    -H "x-terra-user-email: ${USER_EMAIL:-$DEFAULT_USER_EMAIL}"
+    -H "x-terra-user-id: ${USER_SLACK_ID:-$DEFAULT_USER_SLACK_ID}")
+}
+
+# ---------------------------------------------------------------------------
+# Arg parsing helpers
+# ---------------------------------------------------------------------------
+
+USER_EMAIL=""
+USER_SLACK_ID=""
+
+REST_ARGS=()
+strip_global_flags() {
+  # Pulls --env/--user-email/--user-slack-id out of "$@" into globals
+  # (ENV_NAME/USER_EMAIL/USER_SLACK_ID) and leaves the rest in REST_ARGS.
+  # Must be called directly (NOT via `$(...)`/`<(...)`) — a subshell would
+  # discard the ENV_NAME/USER_EMAIL/USER_SLACK_ID assignments, silently
+  # making --env a no-op.
+  REST_ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --env) ENV_NAME="$2"; shift 2 ;;
+      --user-email) USER_EMAIL="$2"; shift 2 ;;
+      --user-slack-id) USER_SLACK_ID="$2"; shift 2 ;;
+      *) REST_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+  local account="" persona_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account) account="$2"; shift 2 ;;
+      --persona-id) persona_id="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME create" "Unknown arg: $1" "BAD_ARG" "Usage: keystone-ask create --account <accountId> [--persona-id <uuid>]" ;;
+    esac
+  done
+  [[ -z "$account" ]] && json_error "$TOOL_NAME create" "--account is required" "BAD_ARG" "Usage: keystone-ask create --account <accountId>"
+
+  require_config
+  build_auth_headers
+  local body
+  body=$(jq -n --arg accountId "$account" --arg personaId "$persona_id" \
+    '{selectedAccountId: $accountId} + (if $personaId != "" then {personaId: $personaId} else {} end)')
+
+  local resp
+  resp=$(safe_api_call "$TOOL_NAME create" -sS -X POST "${auth_headers[@]}" -d "$body" "$RESOLVED_HOST/backend/conversations") || { echo "$resp"; exit 1; }
+  json_ok "$TOOL_NAME create" "$resp" "$(next_actions "$(next_action "keystone-ask ask <conversationId> --question '...'" "Ask a question in this conversation")")"
+}
+
+cmd_ask() {
+  local conv_id="${1:-}"; shift || true
+  [[ -z "$conv_id" ]] && json_error "$TOOL_NAME ask" "conversationId is required" "BAD_ARG" "Usage: keystone-ask ask <conversationId> --question '...'"
+  local question=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --question) question="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME ask" "Unknown arg: $1" "BAD_ARG" "Usage: keystone-ask ask <conversationId> --question '...'" ;;
+    esac
+  done
+  [[ -z "$question" ]] && json_error "$TOOL_NAME ask" "--question is required" "BAD_ARG" "Usage: keystone-ask ask <conversationId> --question '...'"
+
+  require_config
+  build_auth_headers
+  local client_msg_id
+  client_msg_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  local body
+  body=$(jq -n --arg q "$question" --arg cmid "$client_msg_id" '{question: $q, clientMessageId: $cmid}')
+
+  local resp
+  resp=$(safe_api_call "$TOOL_NAME ask" -sS -X POST "${auth_headers[@]}" -d "$body" "$RESOLVED_HOST/backend/conversations/$conv_id/ask") || { echo "$resp"; exit 1; }
+  json_ok "$TOOL_NAME ask" "$resp" "$(next_actions "$(next_action "keystone-ask get $conv_id" "Poll for messageCount / answer status")")"
+}
+
+cmd_get() {
+  local conv_id="${1:-}"
+  [[ -z "$conv_id" ]] && json_error "$TOOL_NAME get" "conversationId is required" "BAD_ARG" "Usage: keystone-ask get <conversationId>"
+  require_config
+  build_auth_headers
+  local resp
+  resp=$(safe_api_call "$TOOL_NAME get" -sS "${auth_headers[@]}" "$RESOLVED_HOST/backend/conversations/$conv_id") || { echo "$resp"; exit 1; }
+  json_ok "$TOOL_NAME get" "$resp"
+}
+
+cmd_list() {
+  require_config
+  build_auth_headers
+  local resp
+  resp=$(safe_api_call "$TOOL_NAME list" -sS "${auth_headers[@]}" "$RESOLVED_HOST/backend/conversations") || { echo "$resp"; exit 1; }
+  json_ok "$TOOL_NAME list" "$resp"
+}
+
+cmd_run() {
+  local account="" question="" wait_secs=60 persona_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account) account="$2"; shift 2 ;;
+      --question) question="$2"; shift 2 ;;
+      --persona-id) persona_id="$2"; shift 2 ;;
+      --wait-secs) wait_secs="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME run" "Unknown arg: $1" "BAD_ARG" "Usage: keystone-ask run --account <id> --question '...' [--wait-secs N]" ;;
+    esac
+  done
+  [[ -z "$account" || -z "$question" ]] && json_error "$TOOL_NAME run" "--account and --question are required" "BAD_ARG" "Usage: keystone-ask run --account <id> --question '...'"
+
+  require_config
+  build_auth_headers
+
+  local create_body create_resp conv_id
+  create_body=$(jq -n --arg accountId "$account" --arg personaId "$persona_id" \
+    '{selectedAccountId: $accountId} + (if $personaId != "" then {personaId: $personaId} else {} end)')
+  create_resp=$(safe_api_call "$TOOL_NAME run:create" -sS -X POST "${auth_headers[@]}" -d "$create_body" "$RESOLVED_HOST/backend/conversations") || { echo "$create_resp"; exit 1; }
+  conv_id=$(echo "$create_resp" | jq -r '.conversationId // .id')
+
+  local client_msg_id ask_body ask_resp
+  client_msg_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  ask_body=$(jq -n --arg q "$question" --arg cmid "$client_msg_id" '{question: $q, clientMessageId: $cmid}')
+  ask_resp=$(safe_api_call "$TOOL_NAME run:ask" -sS -X POST "${auth_headers[@]}" -d "$ask_body" "$RESOLVED_HOST/backend/conversations/$conv_id/ask") || { echo "$ask_resp"; exit 1; }
+
+  local start_count get_resp count elapsed=0
+  get_resp=$(safe_api_call "$TOOL_NAME run:get0" -sS "${auth_headers[@]}" "$RESOLVED_HOST/backend/conversations/$conv_id") || { echo "$get_resp"; exit 1; }
+  start_count=$(echo "$get_resp" | jq -r '.messageCount // 0')
+
+  while [[ "$elapsed" -lt "$wait_secs" ]]; do
+    sleep 3
+    elapsed=$((elapsed + 3))
+    get_resp=$(safe_api_call "$TOOL_NAME run:poll" -sS "${auth_headers[@]}" "$RESOLVED_HOST/backend/conversations/$conv_id") || { echo "$get_resp"; exit 1; }
+    count=$(echo "$get_resp" | jq -r '.messageCount // 0')
+    if [[ "$count" -gt "$start_count" ]]; then
+      json_ok "$TOOL_NAME run" "$(jq -n --arg cid "$conv_id" --argjson conv "$get_resp" --argjson elapsed "$elapsed" \
+        '{conversationId: $cid, answered: true, elapsedSeconds: $elapsed, conversation: $conv}')" \
+        "$(next_actions "$(next_action "lsmith trace list --project keystone --last-n-minutes 5" "Find the LangSmith trace for this call")")"
+      return 0
+    fi
+  done
+
+  json_ok "$TOOL_NAME run" "$(jq -n --arg cid "$conv_id" --argjson conv "$get_resp" --argjson elapsed "$elapsed" \
+    '{conversationId: $cid, answered: false, elapsedSeconds: $elapsed, conversation: $conv, note: "timed out waiting for messageCount to increase — question may still be processing"}')"
+}
+
+# ---------------------------------------------------------------------------
+# Root / dispatch
+# ---------------------------------------------------------------------------
+
+show_root() {
+  local commands
+  commands=$(jq -n '[
+    {name: "create", description: "Create a conversation for an account", usage: "keystone-ask create --account <accountId> [--persona-id <uuid>]"},
+    {name: "ask", description: "Ask a question in an existing conversation (async — 202 ack, no answer text)", usage: "keystone-ask ask <conversationId> --question \"...\""},
+    {name: "get", description: "Get conversation metadata (messageCount, not message text)", usage: "keystone-ask get <conversationId>"},
+    {name: "list", description: "List conversations", usage: "keystone-ask list"},
+    {name: "run", description: "create + ask + poll until answered (or timeout) in one call — the main entry point for spike/debug scenarios", usage: "keystone-ask run --account <accountId> --question \"...\" [--wait-secs 60]"}
+  ]')
+  cmd_tree "$TOOL_NAME" "Ask Keystone directly (bypasses Terra) for spike/debug scenarios. --env staging|prod (default staging), --user-email/--user-slack-id override the x-terra-user-* headers." "$commands"
+}
+
+if [[ $# -eq 0 ]]; then
+  show_root
+  exit 0
+fi
+
+CMD="$1"; shift || true
+
+case "$CMD" in
+  create|ask|get|list|run)
+    strip_global_flags "$@"
+    case "$CMD" in
+      create) cmd_create "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
+      ask) cmd_ask "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
+      get) cmd_get "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
+      list) cmd_list ;;
+      run) cmd_run "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
+    esac
+    ;;
+  --help|-h|help) show_root ;;
+  *) json_error "$TOOL_NAME" "Unknown command: $CMD" "BAD_ARG" "Run 'keystone-ask' with no args to see available commands" ;;
+esac
