@@ -274,6 +274,38 @@ agent-browser-heal --force >&2 || true
 
 ---
 
+## F11: Every `ab` Command Silently No-Ops (exit 0, no output)
+
+**Symptom:** Fresh install completes ("Install complete. Daemon is running."), daemon is healthy, but every `ab` command — `ab status`, `ab --help`, even bare `ab` — prints nothing and exits 0. Looks like `ab` resolving to the wrong binary (Apache Bench), but `which ab` shows the correct `~/.local/bin/ab` shim.
+
+**Root cause:** `install.ts` wrote the CLI shim as a bun script that dynamically imports cli.ts:
+
+```
+#!/usr/bin/env bun
+await import("<...>/ab/src/cli.ts");
+```
+
+cli.ts guards its entrypoint with `if (import.meta.main)`. When cli.ts is *imported*, the shim — not cli.ts — is the entry module, so `import.meta.main` is `false` inside cli.ts and `main()` never runs. Module loads, nothing executes, exit 0.
+
+**Reproduction:**
+```bash
+ab status; echo "exit=$?"          # no output, exit=0
+bun <...>/ab/src/cli.ts status     # works — cli.ts IS the entry module here
+```
+
+**Fix:** shim must exec bun with cli.ts as the entry module:
+```sh
+#!/bin/sh
+exec bun "<...>/ab/src/cli.ts" "$@"
+```
+(install.ts now writes this form; re-run `bun run install.ts` to regenerate a broken shim.)
+
+**Prevention:** never invoke a module that has an `import.meta.main` guard via `await import(...)` from a wrapper script — exec it as the entry module instead.
+
+**Confirmed:** 2026-07-29. Fresh install on a machine with no prior `ab`; the ship-lite browser-QA lane surfaced it as "ab resolves to Apache Bench" because the real shim produced no output at all.
+
+---
+
 ## Quick Reference: Recovery Playbook
 
 | Symptom | Likely cause | Fix |
@@ -285,6 +317,7 @@ agent-browser-heal --force >&2 || true
 | "claude not found in PATH" | F7: Missing PATH entry | Check `~/.local/bin` is in PATH |
 | Can't start browser from cco session | F6: Sandbox restriction | Exit session, run `ab ensure`, re-enter |
 | Other agent killed my browser | F8: Shared session name | Auto-fixed: `ab` now uses per-session names |
+| Every `ab` command silent, exit 0 | F11: import-based shim skips `import.meta.main` | Re-run `bun run install.ts` (writes exec-style shim) |
 | Chrome opens junk tabs | F9: Comma-separated args | Remove `--disable-features` from config |
 | `ab` hangs after "Browser is working!" | F10: Pipe blocks on daemon FDs | Don't pipe heal output through sed |
 
