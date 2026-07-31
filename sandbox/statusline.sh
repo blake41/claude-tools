@@ -199,14 +199,12 @@ fi
 
 # Line 2: Session metadata (session id, claude code version, output style, sandbox)
 # Sandbox indicator
-# CCO_SESSION_ID is set in BOTH sandbox and --no-sandbox modes (it just means
-# "managed by cco-permissions"), so it can't be the only signal. Look for the
-# explicit CCO_SANDBOX_OFF flag that cco-permissions sets when --no-sandbox
-# is used. No CCO_SESSION_ID at all = bare claude, neither indicator applies.
+# Probe the Seatbelt directly instead of trusting env vars: `ps` is blocked
+# under the cco Seatbelt profile but works everywhere else. Env-based signals
+# (CCO_SESSION_ID) proved unreliable — cmux auto-resume can relaunch claude
+# outside cco while stale env survives, showing 🔒 for an unsandboxed session.
 sandbox_indicator=""
-if [ -n "${CCO_SANDBOX_OFF:-}" ]; then
-  sandbox_indicator="🔓 no sandbox"
-elif [ -n "${CCO_SESSION_ID:-}" ]; then
+if ! ps -p 1 >/dev/null 2>&1; then
   sandbox_indicator="🔒 sandbox"
 else
   sandbox_indicator="🔓 no sandbox"

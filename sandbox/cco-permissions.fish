@@ -37,31 +37,11 @@ function cco-permissions
         set prev $i
     end
 
-    # Auto-resume the session cmux recorded for this surface. cmux's own
-    # auto-resume (terminal.autoResumeAgentSessions) is disabled on purpose:
-    # it types bare `claude --resume`, which runs OUTSIDE this seatbelt
-    # sandbox. Instead we read cmux's native hook file — it maps each stable
-    # surface UUID to the live Claude session id — and resume through cco so
-    # the restored session stays sandboxed.
+    # Auto-resume is handled by cmux's autoResumeAgentSessions: it types
+    # `claude --resume <id>`, which the `claude` fish function (defined below)
+    # intercepts and routes through cco-permissions. Manual invocation of
+    # cco-permissions always starts a fresh session unless --resume is explicit.
     set -l extra_args
-    if test -n "$CMUX_SURFACE_ID" -a "$has_resume_flag" != true
-        set -l hook_file ~/.cmuxterm/claude-hook-sessions.json
-        if test -f $hook_file
-            set -l saved_sid (jq -r --arg s "$CMUX_SURFACE_ID" \
-                '.activeSessionsBySurface[$s].sessionId // empty' $hook_file 2>/dev/null)
-            if test -n "$saved_sid"
-                # Resume only if the transcript still exists on disk.
-                set -l session_jsonl (find ~/.claude/projects -maxdepth 2 -name "$saved_sid.jsonl" -type f 2>/dev/null | head -1)
-                if test -n "$session_jsonl"
-                    echo "cmux: resuming surface session → $saved_sid"
-                    set -a extra_args --resume $saved_sid
-                    set session_id $saved_sid
-                else
-                    echo "cmux: recorded session $saved_sid no longer on disk — starting fresh"
-                end
-            end
-        end
-    end
 
     if test -z "$session_id"
         set session_id (head -c 4 /dev/urandom | xxd -p)
@@ -77,6 +57,17 @@ function cco-permissions
 
     set -gx CCO_SESSION_ID $session_id
 
+    # Persist the chosen mode so a later auto-resume (cmux's
+    # autoResumeAgentSessions, via the claude() interceptor below) can boot
+    # back into the same mode instead of always forcing sandboxed.
+    set -l mode_dir ~/.cmux/claude-sessions/mode
+    mkdir -p $mode_dir
+    if $skip_sandbox
+        echo "no-sandbox" >$mode_dir/$session_id
+    else
+        echo "sandboxed" >$mode_dir/$session_id
+    end
+
     if not contains $HOME/.local/bin $PATH
         set -x PATH $HOME/.local/bin $PATH
     end
@@ -89,7 +80,11 @@ function cco-permissions
         # back to "is CCO_SESSION_ID set?" which is true in both modes and
         # would show the lock icon misleadingly.
         set -gx CCO_SANDBOX_OFF 1
-        claude --dangerously-skip-permissions $extra_args $argv
+        # `command` bypasses the claude() interceptor function below — bare
+        # `claude` would re-enter it (CMUX_SURFACE_ID + --resume) and recurse
+        # through cco-permissions forever. The sandboxed path is immune only
+        # because claude-sandbox execvp's the binary directly.
+        command claude --dangerously-skip-permissions $extra_args $argv
         set -e CCO_SESSION_ID
         set -e CCO_SANDBOX_OFF
         return
@@ -181,4 +176,44 @@ function cco-permissions
     end
 
     set -e CCO_SESSION_ID
+end
+
+# Intercept `claude --resume <id>` typed by cmux's autoResumeAgentSessions so
+# restored sessions boot back into whichever mode (sandboxed or --no-sandbox)
+# they were last launched with. Falls through to the real binary for all
+# other invocations (non-cmux, no resume flag, etc.).
+# claude-sandbox uses execvp internally so this function is never re-entered.
+function claude
+    if test -n "$CMUX_SURFACE_ID"
+        for i in (seq 1 (count $argv))
+            set -l flag $argv[$i]
+            if test "$flag" = --resume -o "$flag" = -r -o "$flag" = --continue -o "$flag" = -c
+                # Pass the resume flag + session ID to cco-permissions, restoring
+                # whatever mode (sandboxed / --no-sandbox) that session id was
+                # last explicitly launched with — see Task 2 in
+                # HANDOFF-sandbox-mode-persistence.md for why this can't
+                # distinguish cmux auto-resume from a bare manual resume (both
+                # are byte-identical at the shell level), and why that's fine.
+                set -l next (math $i + 1)
+                set -l resume_id ""
+                if test $next -le (count $argv)
+                    set resume_id $argv[$next]
+                end
+                set -l resume_extra
+                set -l mode_file ~/.cmux/claude-sessions/mode/$resume_id
+                if test -f $mode_file
+                    if test (cat $mode_file) = "no-sandbox"
+                        set resume_extra --no-sandbox
+                    end
+                end
+                if test -n "$resume_id"
+                    cco-permissions $resume_extra $flag $resume_id
+                else
+                    cco-permissions $resume_extra $flag
+                end
+                return
+            end
+        end
+    end
+    command claude $argv
 end

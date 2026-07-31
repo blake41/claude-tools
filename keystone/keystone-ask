@@ -214,6 +214,70 @@ cmd_run() {
 }
 
 # ---------------------------------------------------------------------------
+# Data-sources manifest QA (spike/debug + staging QA passes, not just chat)
+# ---------------------------------------------------------------------------
+
+cmd_generate() {
+  local account="" account_name="" callback_url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account) account="$2"; shift 2 ;;
+      --account-name) account_name="$2"; shift 2 ;;
+      --callback-url) callback_url="$2"; shift 2 ;;
+      *) json_error "$TOOL_NAME generate" "Unknown arg: $1" "BAD_ARG" "Usage: keystone-ask generate --account <accountId> [--account-name <name>]" ;;
+    esac
+  done
+  [[ -z "$account" ]] && json_error "$TOOL_NAME generate" "--account is required" "BAD_ARG" "Usage: keystone-ask generate --account <accountId>"
+
+  require_config
+  build_auth_headers
+  local body
+  body=$(jq -n --arg accountName "$account_name" --arg callbackUrl "$callback_url" \
+    '{} + (if $accountName != "" then {accountName: $accountName} else {} end) + (if $callbackUrl != "" then {callbackUrl: $callbackUrl} else {} end)')
+
+  local resp
+  resp=$(safe_api_call "$TOOL_NAME generate" -sS -X POST "${auth_headers[@]}" -d "$body" "$RESOLVED_HOST/backend/accounts/$account/generate") || { echo "$resp"; exit 1; }
+  json_ok "$TOOL_NAME generate" "$resp" "$(next_actions "$(next_action "keystone-ask manifest $account" "Poll for the data-sources manifest once generation completes")")"
+}
+
+cmd_manifest() {
+  local account="${1:-}"
+  [[ -z "$account" ]] && json_error "$TOOL_NAME manifest" "accountId is required" "BAD_ARG" "Usage: keystone-ask manifest <accountId>"
+  require_config
+  build_auth_headers
+
+  # Custom (not safe_api_call): a 404 here is a DEFINED CONTRACT STATE per
+  # server.js — accounts extracted before the manifest shipped, or never
+  # extracted, 404. That's a successful "not found" answer, not a tool error.
+  local tmpfile http_code body
+  tmpfile=$(mktemp)
+  http_code=$(curl -sS -w '%{http_code}' -o "$tmpfile" "${auth_headers[@]}" "$RESOLVED_HOST/backend/accounts/$account/data-sources-manifest") || {
+    rm -f "$tmpfile"
+    json_error "$TOOL_NAME manifest" "curl failed" "NETWORK_ERROR" "Check network connectivity and URL"
+  }
+  body=$(cat "$tmpfile"); rm -f "$tmpfile"
+
+  case "$http_code" in
+    200)
+      json_ok "$TOOL_NAME manifest" "$(echo "$body" | jq '. + {found: true}')"
+      ;;
+    404)
+      json_ok "$TOOL_NAME manifest" "$(jq -n --arg aid "$account" '{found: false, accountId: $aid}')" \
+        "$(next_actions "$(next_action "keystone-ask generate --account $account" "Trigger a generation to create a manifest")")"
+      ;;
+    401)
+      json_error "$TOOL_NAME manifest" "Unauthorized — check KEYSTONE_API_TOKEN" "HTTP_401" "$AUTH_FIX"
+      ;;
+    *)
+      local msg
+      msg=$(echo "$body" | jq -r '.error // .message // empty' 2>/dev/null)
+      [[ -z "$msg" ]] && msg="HTTP $http_code"
+      json_error "$TOOL_NAME manifest" "$msg" "HTTP_$http_code" "Check API credentials and endpoint"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Root / dispatch
 # ---------------------------------------------------------------------------
 
@@ -224,7 +288,9 @@ show_root() {
     {name: "ask", description: "Ask a question in an existing conversation (async — 202 ack, no answer text)", usage: "keystone-ask ask <conversationId> --question \"...\""},
     {name: "get", description: "Get conversation metadata (messageCount, not message text)", usage: "keystone-ask get <conversationId>"},
     {name: "list", description: "List conversations", usage: "keystone-ask list"},
-    {name: "run", description: "create + ask + poll until answered (or timeout) in one call — the main entry point for spike/debug scenarios", usage: "keystone-ask run --account <accountId> --question \"...\" [--wait-secs 60]"}
+    {name: "run", description: "create + ask + poll until answered (or timeout) in one call — the main entry point for spike/debug scenarios", usage: "keystone-ask run --account <accountId> --question \"...\" [--wait-secs 60]"},
+    {name: "generate", description: "Trigger a full account generation (POST /backend/accounts/:id/generate)", usage: "keystone-ask generate --account <accountId> [--account-name <name>]"},
+    {name: "manifest", description: "Fetch the data-sources manifest for an account. 404 is a normal \"not found\" result (found: false), not an error.", usage: "keystone-ask manifest <accountId>"}
   ]')
   cmd_tree "$TOOL_NAME" "Ask Keystone directly (bypasses Terra) for spike/debug scenarios. --env staging|prod (default staging), --user-email/--user-slack-id override the x-terra-user-* headers." "$commands"
 }
@@ -237,7 +303,7 @@ fi
 CMD="$1"; shift || true
 
 case "$CMD" in
-  create|ask|get|list|run)
+  create|ask|get|list|run|generate|manifest)
     strip_global_flags "$@"
     case "$CMD" in
       create) cmd_create "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
@@ -245,6 +311,8 @@ case "$CMD" in
       get) cmd_get "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
       list) cmd_list ;;
       run) cmd_run "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
+      generate) cmd_generate "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
+      manifest) cmd_manifest "${REST_ARGS[@]+"${REST_ARGS[@]}"}" ;;
     esac
     ;;
   --help|-h|help) show_root ;;

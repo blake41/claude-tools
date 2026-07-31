@@ -1,0 +1,15 @@
+#!/bin/bash
+# cco-claude-shim — reroute cmux auto-resume through the fish `claude` interceptor.
+#
+# cmux's restored-session bindings exec "$CMUX_CLAUDE_WRAPPER_SHIM" by absolute
+# path via /bin/sh, so the fish claude() function (which routes --resume through
+# cco-permissions for Seatbelt + --dangerously-skip-permissions) never fires.
+# Fish config repoints CMUX_CLAUDE_WRAPPER_SHIM at this script, which bounces
+# the invocation back into fish where the interceptor lives.
+#
+# Non-resume invocations fall through inside the interceptor to `command claude`,
+# which still resolves to cmux's own shim dir in PATH — cmux session tracking is
+# preserved on every path. cmux's original shim path is kept in
+# CMUX_CLAUDE_WRAPPER_SHIM_ORIG by the fish config block (unused here; the PATH
+# fallthrough covers it) so it can be restored by hand if needed.
+exec /opt/homebrew/bin/fish -c 'claude $argv' -- "$@"

@@ -90,3 +90,17 @@
 [2026-06-03 11:11:09] Using jq for JSON parsing
 ---
 [2026-06-03 11:11:09] Extracted: dir=~/Documents/Development/clay/terra/.claude/worktrees/surface-model-phase-0, model=, version=, git=worktree-workflow-model-phase-0, context=95%, cost=, cost_ph=, tokens=, tpm=, session_pct=
+[2026-07-16 16:12:03] Status line triggered (cc-statusline v1.4.0)
+[2026-07-16 16:12:03] Input:
+{
+  "model": {
+    "display_name": "Test"
+  },
+  "workspace": {
+    "current_dir": "/tmp"
+  },
+  "session_id": "abc"
+}
+[2026-07-16 16:12:03] Using jq for JSON parsing
+---
+[2026-07-16 16:12:03] Extracted: dir=/tmp, model=Test, version=, git=worktree-dbos-alert-parent-fix, context=, cost=, cost_ph=, tokens=, tpm=, session_pct=
