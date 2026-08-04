@@ -129,6 +129,91 @@ async function runAgentBrowser(
 }
 
 // ---------------------------------------------------------------------------
+// CDP HTTP helpers (tab-teardown-fix U1)
+//
+// Modeled on `checkCdp` (chrome-supervisor.ts:621-632) — plain HTTP against
+// the shard's DevTools endpoint, short AbortSignal.timeout, fail soft
+// (null/false) so a wedged or absent Chrome can never hang `ab gc`.
+//
+// These are the ONLY teardown mechanism that has no last-tab guard: raw CDP
+// closes an exact targetId with no agent-browser binary and no per-session
+// daemon in the path.
+// ---------------------------------------------------------------------------
+
+/** Short by design: teardown runs ~2,300x/month under launchd; a wedged
+ *  shard must degrade to "unverified" fast, never block the reap loop. */
+const CDP_HTTP_TIMEOUT_MS = 2_000;
+
+export interface CdpPage {
+  id: string;
+  url: string;
+  title: string;
+}
+
+/**
+ * List a shard's open page targets via `GET /json/list`, filtered to
+ * `type === "page"` (service workers / iframes / extension targets are not
+ * tabs and must never be counted or closed). Returns null — never throws —
+ * when the shard is unreachable, slow, non-OK, or returns a body that
+ * isn't the expected array.
+ */
+export async function listCdpPages(
+  port: number,
+  timeoutMs: number = CDP_HTTP_TIMEOUT_MS,
+): Promise<CdpPage[] | null> {
+  let body: unknown;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    body = await res.json();
+  } catch {
+    return null; // unreachable / timed out / unparseable — caller treats as unknown
+  }
+  if (!Array.isArray(body)) return null;
+  const pages: CdpPage[] = [];
+  for (const raw of body) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const entry = raw as Record<string, unknown>;
+    if (entry.type !== "page") continue;
+    if (typeof entry.id !== "string" || entry.id.length === 0) continue;
+    pages.push({
+      id: entry.id,
+      url: typeof entry.url === "string" ? entry.url : "",
+      title: typeof entry.title === "string" ? entry.title : "",
+    });
+  }
+  return pages;
+}
+
+/** CDP target ids are uppercase hex. Anything else is either corruption in a
+ *  session marker or an injection attempt into the request path — refuse it
+ *  rather than letting it reach `/json/close/`. */
+const CDP_TARGET_ID_RE = /^[0-9A-Fa-f]{4,}$/;
+
+/**
+ * Close one exact target via `GET /json/close/<targetId>`. Returns false
+ * (never throws) on a malformed id, a non-OK response, or an unreachable
+ * shard.
+ */
+export async function closeCdpTarget(
+  port: number,
+  targetId: string,
+  timeoutMs: number = CDP_HTTP_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!CDP_TARGET_ID_RE.test(targetId)) return false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/close/${targetId}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Flag parsing
 // ---------------------------------------------------------------------------
 
@@ -216,18 +301,125 @@ export function readShardAssignment(pid: string): number | null {
 
 /**
  * Overwrite (or create) a session's marker with the given shard, preserving
- * line 1 (the pid) when the marker already exists.
+ * line 1 (the pid) and any `target=` lines when the marker already exists
+ * (tab-teardown-fix U1 — a shard rewrite must never destroy tab identity).
  */
 function writeShardAssignment(pid: string, shard: number): void {
   const fp = sessionFilePath(pid);
   let line1 = pid;
+  let targetLines: string[] = [];
   try {
-    const existing = fs.readFileSync(fp, "utf-8").split("\n")[0];
-    if (existing) line1 = existing;
+    const lines = fs.readFileSync(fp, "utf-8").split("\n");
+    if (lines[0]) line1 = lines[0];
+    targetLines = lines.filter((l) => l.startsWith(TARGET_LINE_PREFIX));
   } catch {
     // Marker doesn't exist yet — create it fresh below.
   }
-  fs.writeFileSync(fp, `${line1}\nshard=${shard}\n`);
+  fs.writeFileSync(fp, [line1, `shard=${shard}`, ...targetLines, ""].join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Tab identity: `target=<cdpPort>:<targetId>` marker lines (tab-teardown-fix U1)
+//
+// WHY THIS EXISTS. Teardown used to ask agent-browser to close "the session's
+// tab". Verified empirically 2026-08-04 against a live shard: on an attached
+// shared CDP browser, `--session` does NOT scope tabs. A session-scoped `tab`
+// listing enumerates every page on the shard (26 foreign tabs included), and a
+// session-scoped `goto` navigates the browser's currently-focused target —
+// which, after the per-invocation daemon respawn that every gc reap triggers,
+// is routinely ANOTHER agent's tab. There is no other session→tab mapping
+// anywhere in the system (the marker held pid+shard; `get cdp-url` returns the
+// browser endpoint, not a page target; the `.config` sidecar is an opaque
+// token).
+//
+// So identity is recorded at creation instead: `cmdOpen` diffs `/json/list`
+// around its `tab new` and persists the target that appeared. Teardown closes
+// exactly those ids over raw CDP. A session with no recorded target owns no
+// tab and touches none — which is the common case (67 of 69 live markers had
+// never used headless Chrome, yet all of them were aimed at shard 0, whose one
+// page belonged to nobody; the binary's last-tab guard, not our code, is what
+// had been preventing ~2,000 wrongful closures).
+//
+// The port is part of the key because a session can hold tabs on both a
+// headless shard and headed Chrome; only the ones on the port being torn down
+// are in scope.
+// ---------------------------------------------------------------------------
+
+const TARGET_LINE_PREFIX = "target=";
+
+/** Upper bound on `target=` lines kept per marker. A session that opened more
+ *  tabs than this is pathological; the oldest are dropped (a newer tab is more
+ *  likely to still exist) and the U2 CDP sweep is the backstop for the rest. */
+export const MAX_RECORDED_TARGETS = 200;
+
+/** `target=<port>:<hex targetId>` — anything else in the marker is ignored. */
+const TARGET_LINE_RE = /^target=(\d+):([0-9A-Fa-f]{4,})\s*$/;
+
+function readMarkerLines(pid: string): string[] {
+  try {
+    return fs.readFileSync(sessionFilePath(pid), "utf-8").split("\n");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The CDP target ids this session created on `cdpPort`, oldest first.
+ * Returns [] for a missing marker, a marker with no target lines, or lines
+ * that don't parse — all meaning "this session owns no known tab here", which
+ * teardown must treat as "touch nothing".
+ */
+export function readSessionTargets(pid: string, cdpPort: number): string[] {
+  const out: string[] = [];
+  for (const line of readMarkerLines(pid)) {
+    const m = TARGET_LINE_RE.exec(line);
+    if (m && Number.parseInt(m[1], 10) === cdpPort) out.push(m[2]);
+  }
+  return out;
+}
+
+/**
+ * Append `targetId` to the session's marker as a `target=<port>:<id>` line.
+ * Best-effort and idempotent: a duplicate is a no-op, a malformed id is
+ * refused, and any fs failure is swallowed (losing identity degrades teardown
+ * to a no-op, which is safe — it must never break `ab open`).
+ */
+export function recordSessionTarget(pid: string, cdpPort: number, targetId: string): void {
+  if (!CDP_TARGET_ID_RE.test(targetId)) return;
+  const line = `${TARGET_LINE_PREFIX}${cdpPort}:${targetId}`;
+  try {
+    const lines = readMarkerLines(pid);
+    if (lines.length === 0) {
+      // No marker yet (session never ran `new-session`) — create a minimal one
+      // rather than dropping identity on the floor.
+      fs.writeFileSync(sessionFilePath(pid), [pid, line, ""].join("\n"));
+      return;
+    }
+    if (lines.includes(line)) return;
+    const kept = lines.filter((l) => l !== "" && !l.startsWith(TARGET_LINE_PREFIX));
+    const targets = [...lines.filter((l) => l.startsWith(TARGET_LINE_PREFIX)), line];
+    const capped = targets.slice(Math.max(0, targets.length - MAX_RECORDED_TARGETS));
+    fs.writeFileSync(sessionFilePath(pid), [...kept, ...capped, ""].join("\n"));
+  } catch {
+    /* marker unwritable — teardown will simply have nothing to close */
+  }
+}
+
+/** Drop every `target=` line for `cdpPort` (called after teardown closed
+ *  them, so a marker that outlives the reap can't re-target dead ids). */
+export function clearSessionTargets(pid: string, cdpPort: number): void {
+  try {
+    const lines = readMarkerLines(pid);
+    if (lines.length === 0) return;
+    const kept = lines.filter((l) => {
+      if (l === "") return false;
+      const m = TARGET_LINE_RE.exec(l);
+      return !(m && Number.parseInt(m[1], 10) === cdpPort);
+    });
+    fs.writeFileSync(sessionFilePath(pid), [...kept, ""].join("\n"));
+  } catch {
+    /* best effort */
+  }
 }
 
 /**
@@ -432,7 +624,11 @@ export async function ensureChromePort(headed: boolean): Promise<number> {
 
 async function cmdStatus(): Promise<number> {
   const result = await rpc.status();
-  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+  // tab-teardown-fix U3 (R5, decision 8): status stays raw data — a
+  // shard-aligned tabCounts array, no threshold interpretation (that's
+  // doctor's job via buildTabCountChecks).
+  const tabCounts = await fetchTabCounts(result.headlessPool, result.headless);
+  process.stdout.write(JSON.stringify({ ...result, tabCounts }, null, 2) + "\n");
   return 0;
 }
 
@@ -515,6 +711,81 @@ export function buildHeadlessDoctorChecks(
   ];
 }
 
+/**
+ * Warn threshold for a single shard's open-page count (tab-teardown-fix U3,
+ * decision 6). Healthy steady-state is roughly one tab per active session
+ * spread across the 3-shard pool, and the observed healthy total was ~13
+ * sessions; 15 on ONE shard is already ~3x that shard's expected share and
+ * far below the 35-39 pages seen during the confirmed 2026-08-03 outage — it
+ * fires early without false-positives during normal parallel QA. A named
+ * constant makes it a one-line tune instead of a buried magic number.
+ */
+export const TAB_WARN_THRESHOLD = 15;
+
+/**
+ * Fetch per-shard open-page counts for `ab status`/`ab doctor`
+ * (tab-teardown-fix U3, R5). Mirrors `buildHeadlessDoctorChecks`'s
+ * pool-vs-legacy fallback shape so tab visibility degrades the same way
+ * Chrome-liveness visibility already does: every `headlessPool` shard gets
+ * an entry (its real count if `chrome_up`, `null` otherwise — down/idle and
+ * "couldn't ask" must never be conflated with a passing zero), and a
+ * pre-pool daemon (no `headlessPool` field at all) falls back to a single
+ * legacy entry. `listPages` is injectable (defaults to `listCdpPages`) so
+ * tests never contact the real shared CDP pool. Fails soft per shard: a
+ * `null` from `listPages` (timeout/unreachable, per `listCdpPages`'s own
+ * contract) becomes a `null` count for that shard only — sibling shards are
+ * unaffected.
+ */
+export async function fetchTabCounts(
+  headlessPool: ChromeState[] | undefined,
+  legacyHeadless: ChromeState | undefined,
+  listPages: (port: number) => Promise<CdpPage[] | null> = listCdpPages,
+): Promise<Array<number | null>> {
+  if (headlessPool) {
+    return Promise.all(
+      headlessPool.map(async (state) => {
+        if (state.phase !== "chrome_up") return null;
+        const p = await listPages(state.port);
+        return p ? p.length : null;
+      }),
+    );
+  }
+  if (legacyHeadless) {
+    if (legacyHeadless.phase !== "chrome_up") return [null];
+    const p = await listPages(legacyHeadless.port);
+    return [p ? p.length : null];
+  }
+  return [];
+}
+
+/**
+ * Build the tab-count health checks for `ab doctor` (tab-teardown-fix U3,
+ * R5). Pure and exported, following `buildHeadlessDoctorChecks`'s
+ * documented test-seam pattern. One check per entry in `tabCounts` (already
+ * shard-aligned by `fetchTabCounts`): `ok` is a straight `count <=
+ * TAB_WARN_THRESHOLD` binary — no three-state warn level (decision 7,
+ * explicitly deferred). A `null` count (shard down/idle/unreachable) always
+ * renders as an ok "unreachable/idle" line, mirroring
+ * `buildHeadlessDoctorChecks`'s existing idle-is-healthy treatment for
+ * on-demand shards — an idle shard has no pages by definition, and "we
+ * couldn't ask" is not evidence of a problem either.
+ */
+export function buildTabCountChecks(tabCounts: Array<number | null>): DoctorCheck[] {
+  return tabCounts.map((count, i) => {
+    const label = `Chrome tabs (headless-${i}, ${CDP_PORT_HEADLESS + i})`;
+    if (count === null) {
+      return { label, ok: true, detail: "unreachable/idle" };
+    }
+    const ok = count <= TAB_WARN_THRESHOLD;
+    return {
+      label,
+      ok,
+      detail: `${count} open pages`,
+      fix: ok ? undefined : "ab gc   # or: ab heal",
+    };
+  });
+}
+
 async function cmdDoctor(): Promise<number> {
   const checks: Array<{ label: string; ok: boolean; detail?: string; fix?: string }> = [];
 
@@ -540,6 +811,12 @@ async function cmdDoctor(): Promise<number> {
 
   if (status) {
     checks.push(...buildHeadlessDoctorChecks(status));
+
+    // tab-teardown-fix U3 (R5): per-shard open-page counts, appended right
+    // after the headless-liveness checks so a tab-level leak can never
+    // again hide behind a healthy session/Chrome-liveness picture.
+    const tabCounts = await fetchTabCounts(status.headlessPool, status.headless);
+    checks.push(...buildTabCountChecks(tabCounts));
 
     // Headed is on-demand — not running is normal, only flag if crashed.
     const headedCrashed = status.headed.phase === "chrome_crashed";
@@ -797,14 +1074,66 @@ const DEFAULT_VIEWPORT_W = process.env.AB_VIEWPORT_W ?? "1440";
 const DEFAULT_VIEWPORT_H = process.env.AB_VIEWPORT_H ?? "900";
 const DEFAULT_VIEWPORT_SCALE = process.env.AB_VIEWPORT_SCALE ?? "2";
 
+/** Seams for tests — production callers use the defaults. */
+export interface OpenTabDeps {
+  listPages: (port: number) => Promise<CdpPage[] | null>;
+  runAb: (port: number, sessionName: string | null, args: string[]) => Promise<ExecResult>;
+  recordTarget: (pid: string, port: number, targetId: string) => void;
+}
+
+const DEFAULT_OPEN_TAB_DEPS: OpenTabDeps = {
+  listPages: (port) => listCdpPages(port),
+  runAb: (port, sessionName, args) => runAgentBrowser(port, sessionName, args),
+  recordTarget: recordSessionTarget,
+};
+
+/**
+ * Run `tab new <url>` and record the CDP target it created into the session
+ * marker (tab-teardown-fix U1). This is the ONLY point where a session's tab
+ * identity is knowable: `tab new` is the moment a page appears that belongs
+ * to us, so the id is captured by diffing `/json/list` across the call.
+ *
+ * Skip-when-ambiguous: if zero — or more than one — page appeared (a
+ * concurrent agent opening a tab in the same instant), nothing is recorded.
+ * An unrecorded tab leaks until the gc CDP sweep collects it; a MIS-recorded
+ * one would make teardown close another agent's live page. Only the second
+ * failure mode is unacceptable.
+ *
+ * Identity is strictly best-effort — an unreachable shard or an unwritable
+ * marker must never make `ab open` fail. Returns the recorded id, or null.
+ */
+export async function openTabAndRecordTarget(
+  sessionPid: string,
+  cdpPort: number,
+  sessionName: string | null,
+  url: string,
+  deps: OpenTabDeps = DEFAULT_OPEN_TAB_DEPS,
+): Promise<string | null> {
+  const before = await deps.listPages(cdpPort);
+  await deps.runAb(cdpPort, sessionName, ["tab", "new", url]);
+  if (before === null) return null;
+  const after = await deps.listPages(cdpPort);
+  if (after === null) return null;
+
+  const beforeIds = new Set(before.map((p) => p.id));
+  const created = after.filter((p) => !beforeIds.has(p.id));
+  if (created.length !== 1) return null;
+
+  deps.recordTarget(sessionPid, cdpPort, created[0].id);
+  return created[0].id;
+}
+
 async function cmdOpen(
   url: string,
   cdpPort: number,
   sessionName: string | null,
+  sessionPid: string,
 ): Promise<number> {
   // Create a dedicated tab for this session so parallel sessions don't collide.
   // tab new sets the new tab as active, so subsequent commands target it.
-  await runAgentBrowser(cdpPort, sessionName, ["tab", "new", url]);
+  // The tab's CDP target id is captured here and persisted to the session
+  // marker so teardown can close exactly this tab later (tab-teardown-fix U1).
+  await openTabAndRecordTarget(sessionPid, cdpPort, sessionName, url);
   // Apply viewport unless explicitly skipped. Override defaults via
   // AB_VIEWPORT_W / AB_VIEWPORT_H / AB_VIEWPORT_SCALE; set AB_VIEWPORT=skip
   // to leave Chrome's native window size in place.
@@ -1032,24 +1361,188 @@ function cmdPs(args: string[]): number {
   return 0;
 }
 
+export interface TeardownResult {
+  /** True when every recorded target for this port is confirmed absent from
+   *  CDP afterwards (including the "owned nothing" case). Never inferred
+   *  from an exit code — see tab-teardown-fix decision 4. */
+  ok: boolean;
+  reason:
+    | "no-recorded-target" // session owns no tab here — nothing was touched
+    | "already-gone"       // its tabs were already closed by someone else
+    | "closed"             // closed and verified gone
+    | "target-survived"    // close didn't take — tab is still open
+    | "cdp-unreachable";   // couldn't observe the shard — outcome unverified
+  port: number;
+  /** Recorded targets this teardown was responsible for. */
+  targets: string[];
+  /** Recorded targets still present after the attempt. */
+  survivors: string[];
+  pagesBefore: number | null;
+  pagesAfter: number | null;
+}
+
+/** Seams for tests — production callers use the defaults. Injecting these is
+ *  what lets the teardown contract be tested without an agent-browser binary
+ *  or any contact with the shared shard pool. */
+export interface TeardownDeps {
+  listPages: (port: number) => Promise<CdpPage[] | null>;
+  closeTarget: (port: number, targetId: string) => Promise<boolean>;
+  runAb: (port: number, sessionName: string | null, args: string[]) => Promise<ExecResult>;
+  readTargets: (pid: string, port: number) => string[];
+  clearTargets: (pid: string, port: number) => void;
+}
+
+const DEFAULT_TEARDOWN_DEPS: TeardownDeps = {
+  listPages: (port) => listCdpPages(port),
+  closeTarget: (port, id) => closeCdpTarget(port, id),
+  runAb: (port, sessionName, args) => runAgentBrowser(port, sessionName, args),
+  readTargets: readSessionTargets,
+  clearTargets: clearSessionTargets,
+};
+
 /**
- * Tear down a session's Chrome tab via the same passthrough `close` uses.
- * Callers must already know the target shard's Chrome is up (via
- * `portForShard`/status) — this function unconditionally attempts the
- * close, it never boots Chrome itself. For an idle entry this transiently
- * spawns a per-session agent-browser daemon to close the orphan tab; it
- * exits immediately after (idle timeout).
+ * Tear down a session's Chrome tabs (tab-teardown-fix U1).
+ *
+ * Closes ONLY the CDP targets this session recorded at `ab open` time (see
+ * the tab-identity block above), by exact targetId over raw CDP, then shuts
+ * the per-session daemon down as before, then re-queries `/json/list` and
+ * confirms those ids are actually gone.
+ *
+ * Two properties matter more than the close itself:
+ *  - A session with no recorded target closes NOTHING. The previous
+ *    implementation asked agent-browser to close "the session's tab" on a
+ *    shard where that session had never opened one, which aimed a close at
+ *    whatever tab happened to be focused — another agent's, in the measured
+ *    case. Only the binary's last-tab guard prevented ~2,000 such closures.
+ *  - The result is verified, never assumed. The original bug survived ~2,342
+ *    reaps because nothing ever looked at the tab state afterwards.
+ *
+ * Never boots Chrome; callers must already know the shard is up (via
+ * `portForShard`/status). Fail-soft throughout: an unreachable shard yields
+ * an unverified failure result, never a throw and never a hang.
  */
-async function teardownSession(sessionPid: string, cdpPort: number): Promise<void> {
+export async function teardownSession(
+  sessionPid: string,
+  cdpPort: number,
+  deps: TeardownDeps = DEFAULT_TEARDOWN_DEPS,
+): Promise<TeardownResult> {
+  try {
+    return await teardownSessionInner(sessionPid, cdpPort, deps);
+  } catch {
+    // Belt-and-braces: gc reaps entries in a loop and one wedged session must
+    // never abort the rest of the run (tab-teardown-fix U1).
+    return {
+      ok: false,
+      reason: "cdp-unreachable",
+      port: cdpPort,
+      targets: [],
+      survivors: [],
+      pagesBefore: null,
+      pagesAfter: null,
+    };
+  }
+}
+
+async function teardownSessionInner(
+  sessionPid: string,
+  cdpPort: number,
+  deps: TeardownDeps,
+): Promise<TeardownResult> {
+  const sessionName = buildSessionName(sessionPid);
+  const targets = deps.readTargets(sessionPid, cdpPort);
+
   // Bare `close` only shuts down the per-session daemon — in attached-CDP
   // mode it never closes the Chrome tab (verified 2026-07-10 via
-  // `/json/list`: the tab survives). `tab close` is what closes the
-  // daemon's tab, so run it first, then `close` to end the daemon. If the
-  // daemon had already idle-exited, the respawned daemon may not re-adopt
-  // the orphan tab, so the tab-close is best-effort for dead-daemon reaps.
-  const sessionName = buildSessionName(sessionPid);
-  await runAgentBrowser(cdpPort, sessionName, ["tab", "close"]);
-  await runAgentBrowser(cdpPort, sessionName, ["close"]);
+  // `/json/list`: the tab survives). It's still correct and still cheap, so
+  // it runs on every path; the tab itself is handled over CDP above it.
+  const closeDaemon = () => deps.runAb(cdpPort, sessionName, ["close"]);
+
+  if (targets.length === 0) {
+    await closeDaemon();
+    return {
+      ok: true,
+      reason: "no-recorded-target",
+      port: cdpPort,
+      targets: [],
+      survivors: [],
+      pagesBefore: null,
+      pagesAfter: null,
+    };
+  }
+
+  const before = await deps.listPages(cdpPort);
+  if (before === null) {
+    // Can't see the shard — do NOT close blindly, and don't claim success.
+    await closeDaemon();
+    return {
+      ok: false,
+      reason: "cdp-unreachable",
+      port: cdpPort,
+      targets,
+      survivors: targets,
+      pagesBefore: null,
+      pagesAfter: null,
+    };
+  }
+
+  const presentIds = new Set(before.map((p) => p.id));
+  const present = targets.filter((id) => presentIds.has(id));
+  for (const id of present) {
+    await deps.closeTarget(cdpPort, id);
+  }
+
+  await closeDaemon();
+
+  const after = await deps.listPages(cdpPort);
+  if (after === null) {
+    return {
+      ok: false,
+      reason: "cdp-unreachable",
+      port: cdpPort,
+      targets,
+      survivors: present,
+      pagesBefore: before.length,
+      pagesAfter: null,
+    };
+  }
+
+  const afterIds = new Set(after.map((p) => p.id));
+  const survivors = targets.filter((id) => afterIds.has(id));
+  const ok = survivors.length === 0;
+  if (ok) deps.clearTargets(sessionPid, cdpPort);
+
+  return {
+    ok,
+    reason: ok ? (present.length > 0 ? "closed" : "already-gone") : "target-survived",
+    port: cdpPort,
+    targets,
+    survivors,
+    pagesBefore: before.length,
+    pagesAfter: after.length,
+  };
+}
+
+/**
+ * One-line teardown-failure warning shared by both call sites (`ab gc` and
+ * `ab close`). Carries shard, port, and expected-vs-observed page counts so
+ * `/tmp/ab-gc.log` shows what actually happened, per the plan's requirement
+ * that failures be visible rather than fatal.
+ */
+export function formatTeardownWarning(
+  sessionPid: string,
+  /** Headless shard index, or null for headed Chrome (which has no shard —
+   *  reporting "shard=0" there would send a reader to the wrong browser). */
+  shard: number | null,
+  r: TeardownResult,
+): string {
+  const closedCount = r.targets.length - r.survivors.length;
+  const expected = r.pagesBefore === null ? "?" : String(r.pagesBefore - closedCount);
+  const observed = r.pagesAfter === null ? "?" : String(r.pagesAfter);
+  return (
+    `warn: teardown unverified for ${sessionPid} — ${r.reason}; ` +
+    `shard=${shard === null ? "headed" : shard} port=${r.port} pages ${observed} (expected ${expected}); ` +
+    `targets=[${r.targets.join(",")}] survived=[${r.survivors.join(",")}]`
+  );
 }
 
 /** Guard regex for orphan-wrapper sweep: hex-ish session pid shapes only.
@@ -1094,6 +1587,265 @@ function findOrphanWrappers(entries: SessionEntry[], now: Date = new Date()): st
   return orphans;
 }
 
+// ---------------------------------------------------------------------------
+// Third gc pass: backstop orphan-tab sweep (tab-teardown-fix U2 — genuine
+// backstop: raw CDP has no last-tab guard; only path that reaches zero leaked
+// pages, per decision 3).
+//
+// It exists because per-session teardown structurally cannot reach every
+// leaked page: a session whose marker is already gone has no teardown path at
+// all, and a page created before tab-identity recording existed was never
+// attributable to its session in the first place.
+//
+// Ownership rule (decision 9 — the highest-consequence constraint in the
+// plan). The shared shard pool serves concurrently-running agents, so closing
+// a live agent's tab mid-QA-run is far worse than missing a leaked tab for one
+// 30-minute gc cycle. A page is therefore only ever closed when NOTHING can
+// claim it, and every uncertain case is skipped and logged instead.
+// ---------------------------------------------------------------------------
+
+/** What a still-live session contributes to attribution on ONE shard. */
+export interface ShardSessionEvidence {
+  pid: string;
+  state: SessionEntry["state"];
+  /** Shard the marker pins this session to, or null when unassigned. */
+  shard: number | null;
+  /** Target ids this session recorded on the swept shard's CDP port
+   *  (`readSessionTargets`) — the only precise session→tab mapping that
+   *  exists (tab-teardown-fix U1). */
+  targets: string[];
+}
+
+export interface OrphanPartition {
+  /** Attributable to nobody — safe to close. */
+  orphans: CdpPage[];
+  /** Might belong to a live agent — skipped and logged, NEVER closed. */
+  ambiguous: Array<{ page: CdpPage; reason: string }>;
+  /** Claimed by a live session's recorded tab identity. */
+  owned: Array<{ page: CdpPage; pid: string }>;
+}
+
+/** Only real navigations can collide meaningfully; `about:blank` and
+ *  devtools/chrome-internal URLs are shared by every leaked residue tab and
+ *  would make the collision rule swallow the entire sweep. */
+function isAttributableUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url);
+}
+
+/**
+ * Partition one shard's CDP pages into owned / ambiguous / orphan.
+ *
+ * Pure and exported as the unit-test seam, modeled on `findOrphanWrappers`.
+ *
+ * Attribution uses the `target=<port>:<id>` marker lines U1 records at `ab
+ * open` time. (The plan's preferred mechanism — a per-active-session
+ * agent-browser `tab` listing — was ruled out by U1's empirical finding that
+ * `--session` does NOT scope tab listings on an attached shared browser: it
+ * enumerates every page on the shard, so it attributes nothing.)
+ *
+ * Two distinct sources of doubt both resolve to `ambiguous`:
+ *  1. ANY active session pinned to this shard freezes every unclaimed page on
+ *     it. Recorded identity proves what a session DOES own, never what it
+ *     doesn't: a pre-U1 marker recorded nothing at all, and a page the site
+ *     itself spawned (window.open, target=_blank, an OAuth popup) is created
+ *     without going through `ab open`, so it is never recorded. We cannot tell
+ *     WHICH unclaimed page might be that agent's, so none of them are touched.
+ *     Cost: the sweep is a no-op on a shard with a live agent on it, and drains
+ *     that shard on a later cycle instead. That is the trade decision 9 makes
+ *     explicitly — missing a leaked tab for a cycle is cheap; closing a tab out
+ *     from under a running QA agent is not.
+ *  2. An unclaimed page whose URL matches a page a live session does own —
+ *     plausibly that same agent's untracked second tab on the same app.
+ */
+export function partitionOrphanTargets(
+  pages: CdpPage[],
+  evidence: ShardSessionEvidence[],
+  shard: number,
+): OrphanPartition {
+  const ownerById = new Map<string, string>();
+  for (const e of evidence) {
+    for (const id of e.targets) {
+      if (!ownerById.has(id)) ownerById.set(id, e.pid);
+    }
+  }
+
+  const activeHere = evidence
+    .filter((e) => e.state === "active" && (e.shard ?? 0) === shard)
+    .map((e) => e.pid);
+
+  const claimedUrls = new Set<string>();
+  for (const p of pages) {
+    if (ownerById.has(p.id) && isAttributableUrl(p.url)) claimedUrls.add(p.url);
+  }
+
+  const result: OrphanPartition = { orphans: [], ambiguous: [], owned: [] };
+  for (const p of pages) {
+    const pid = ownerById.get(p.id);
+    if (pid !== undefined) {
+      result.owned.push({ page: p, pid });
+      continue;
+    }
+    if (activeHere.length > 0) {
+      result.ambiguous.push({
+        page: p,
+        reason: `active session(s) [${activeHere.join(",")}] pinned to shard ${shard} — unrecorded ownership cannot be ruled out`,
+      });
+      continue;
+    }
+    if (isAttributableUrl(p.url) && claimedUrls.has(p.url)) {
+      result.ambiguous.push({
+        page: p,
+        reason: `url collides with a live session's tab (${p.url}) — could be that agent's untracked tab`,
+      });
+      continue;
+    }
+    result.orphans.push(p);
+  }
+  return result;
+}
+
+export interface SweepShard {
+  shard: number;
+  port: number;
+}
+
+/**
+ * The shards the sweep may touch: `phase === "chrome_up"` only, matching
+ * `portForShard`'s gating — a shard that isn't up has no pages and must not
+ * be fetched (and must certainly never be booted by gc).
+ *
+ * Differs from `portForShard` in one deliberate way: a pre-pool daemon (no
+ * `headlessPool` on /status) runs ONE headless Chrome that `portForShard`
+ * reports for every shard index. Sweeping it once per shard would list and
+ * close the same pages N times, so it collapses to a single entry here.
+ */
+export function sweepShards(
+  headlessPool: ChromeState[] | undefined,
+  legacyHeadless: ChromeState | undefined,
+): SweepShard[] {
+  const out: SweepShard[] = [];
+  if (headlessPool) {
+    for (let i = 0; i < headlessPool.length; i++) {
+      const state = headlessPool[i];
+      if (state && state.phase === "chrome_up") out.push({ shard: i, port: state.port });
+    }
+    return out;
+  }
+  if (legacyHeadless && legacyHeadless.phase === "chrome_up") {
+    out.push({ shard: 0, port: legacyHeadless.port });
+  }
+  return out;
+}
+
+/** Seams for tests — production passes the raw-CDP defaults. Injecting these
+ *  is what lets the sweep's close path be tested without any contact with the
+ *  shared shard pool serving other live agents. */
+export interface SweepDeps {
+  listPages: (port: number) => Promise<CdpPage[] | null>;
+  closeTarget: (port: number, targetId: string) => Promise<boolean>;
+}
+
+const DEFAULT_SWEEP_DEPS: SweepDeps = {
+  listPages: (port) => listCdpPages(port),
+  closeTarget: (port, id) => closeCdpTarget(port, id),
+};
+
+export interface SweepSummary {
+  scanned: number;
+  owned: number;
+  ambiguous: number;
+  /** Orphans reported under --dry-run (nothing was closed). */
+  wouldClose: number;
+  closed: number;
+  failed: number;
+  /** Shards whose `/json/list` couldn't be read — skipped, never guessed at. */
+  unreachable: number;
+}
+
+export interface SweepOptions {
+  shards: SweepShard[];
+  /** Attribution evidence for one shard, resolved lazily so a shard that
+   *  can't be listed costs no marker reads. */
+  evidenceFor: (shard: SweepShard) => ShardSessionEvidence[];
+  dryRun: boolean;
+  deps?: SweepDeps;
+  /** --dry-run report lines (stdout). */
+  out: (line: string) => void;
+  /** Normal-verbosity operational lines (stderr → /tmp/ab-gc.log). */
+  warn: (line: string) => void;
+}
+
+/**
+ * Run the backstop sweep across the given shards (tab-teardown-fix U2).
+ *
+ * Fail-soft at every step: an unreachable shard is skipped rather than
+ * guessed at, a close failure is logged and the loop continues, and nothing
+ * throws out of here — gc must always finish its run.
+ */
+export async function sweepOrphanTabs(opts: SweepOptions): Promise<SweepSummary> {
+  const deps = opts.deps ?? DEFAULT_SWEEP_DEPS;
+  const summary: SweepSummary = {
+    scanned: 0,
+    owned: 0,
+    ambiguous: 0,
+    wouldClose: 0,
+    closed: 0,
+    failed: 0,
+    unreachable: 0,
+  };
+  // Informational lines go to stdout in dry-run (where they ARE the report)
+  // and stderr otherwise (where the gc log lives).
+  const emit = (line: string) => (opts.dryRun ? opts.out(line) : opts.warn(line));
+
+  for (const s of opts.shards) {
+    let pages: CdpPage[] | null;
+    try {
+      pages = await deps.listPages(s.port);
+    } catch {
+      pages = null;
+    }
+    if (pages === null) {
+      summary.unreachable += 1;
+      emit(`orphan tab  action=skip (unreadable): shard=${s.shard} port=${s.port} — CDP list failed`);
+      continue;
+    }
+    summary.scanned += pages.length;
+
+    const { orphans, ambiguous, owned } = partitionOrphanTargets(pages, opts.evidenceFor(s), s.shard);
+    summary.owned += owned.length;
+    summary.ambiguous += ambiguous.length;
+
+    for (const a of ambiguous) {
+      emit(
+        `orphan tab  action=skip (ambiguous): shard=${s.shard} targetId=${a.page.id} url=${a.page.url} reason=${a.reason}`,
+      );
+    }
+
+    for (const p of orphans) {
+      const where = `shard=${s.shard} targetId=${p.id} url=${p.url}`;
+      if (opts.dryRun) {
+        summary.wouldClose += 1;
+        opts.out(`orphan tab  action=close: ${where}`);
+        continue;
+      }
+      let ok = false;
+      try {
+        ok = await deps.closeTarget(s.port, p.id);
+      } catch {
+        ok = false;
+      }
+      if (ok) {
+        summary.closed += 1;
+        opts.warn(`reaped orphan tab: ${where}`);
+      } else {
+        summary.failed += 1;
+        opts.warn(`warn: orphan tab close failed: ${where}`);
+      }
+    }
+  }
+  return summary;
+}
+
 async function cmdGc(args: string[]): Promise<number> {
   const dryRun = args.includes("--dry-run");
   const entries = listSessionEntries();
@@ -1101,8 +1853,10 @@ async function cmdGc(args: string[]): Promise<number> {
   const orphanWrappers = findOrphanWrappers(entries);
 
   if (targets.length === 0 && orphanWrappers.length === 0) {
+    // No markers/wrappers to prune, but the orphan-tab sweep below still runs:
+    // a leaked page whose session marker is long gone is exactly the case
+    // nothing else can reach (tab-teardown-fix U2).
     stderr("Nothing to prune.");
-    return 0;
   }
 
   // Resolve the headless pool's liveness once for the whole run — same
@@ -1119,6 +1873,10 @@ async function cmdGc(args: string[]): Promise<number> {
     headlessPool = undefined; // daemon down → nothing to close on any shard
     legacyHeadless = undefined;
   }
+
+  /** Pids whose markers this run actually removed — they stop counting as
+   *  live attribution evidence for the sweep below. */
+  const reapedPids = new Set<string>();
 
   for (const e of targets) {
     const sessionFile = `${SESSION_FILE_PREFIX}${e.pid}`;
@@ -1149,12 +1907,23 @@ async function cmdGc(args: string[]): Promise<number> {
     const shard = resolveTeardownShard(e.pid);
     const port = portForShard(headlessPool, shard, legacyHeadless);
     if (port !== null) {
-      await teardownSession(e.pid, port);
+      // tab-teardown-fix U1: teardown is now verified, and a failure is loud
+      // but non-fatal — this loop must keep reaping the remaining entries.
+      const result = await teardownSession(e.pid, port);
+      if (!result.ok) stderr(formatTeardownWarning(e.pid, shard, result));
     }
     try { fs.unlinkSync(sessionFile); } catch { /* race: already gone */ }
     if (e.state === "stale") {
       try { fs.unlinkSync(wrapper); } catch { /* wrapper may not exist */ }
     }
+    // tab-teardown-fix U2/R6: the per-session agent-browser daemon leaves an
+    // opaque `ab-<pid>.config` sidecar behind; gc never cleaned it, which had
+    // accumulated ~1,936 files. Best-effort — a missing one is normal (the
+    // session may never have started a daemon).
+    try {
+      fs.unlinkSync(path.join(os.homedir(), ".agent-browser", `ab-${e.pid}.config`));
+    } catch { /* may not exist */ }
+    reapedPids.add(e.pid);
     stderr(`reaped: ${e.pid} (${e.state})`);
   }
 
@@ -1165,6 +1934,33 @@ async function cmdGc(args: string[]): Promise<number> {
     }
     try { fs.unlinkSync(wrapperPath); } catch { /* already gone */ }
     stderr(`reaped orphan wrapper: ${wrapperPath}`);
+  }
+
+  // Third pass — backstop orphan-tab sweep (tab-teardown-fix U2). Runs last so
+  // it sees the world after this run's reaps: a target whose owner was just
+  // reaped is no longer claimed by anything, so a teardown that silently
+  // failed above still gets cleaned up here, in the same run.
+  //
+  // Escape hatch for the test suite: the shared ab-server serves other live
+  // agents, so any test that invokes a REAL `ab gc` sets AB_GC_TAB_SWEEP=0 and
+  // the pool is never even listed (ps.test.ts:17-24).
+  if (process.env.AB_GC_TAB_SWEEP !== "0") {
+    const survivors = entries.filter((e) => !reapedPids.has(e.pid));
+    await sweepOrphanTabs({
+      shards: sweepShards(headlessPool, legacyHeadless),
+      evidenceFor: ({ port }) =>
+        survivors.map((e) => ({
+          pid: e.pid,
+          state: e.state,
+          // Clamp exactly like resolveTeardownShard, but WITHOUT its marker
+          // rewrite — the sweep must not mutate other agents' markers.
+          shard: e.shard === null ? null : e.shard % HEADLESS_POOL_SIZE,
+          targets: readSessionTargets(e.pid, port),
+        })),
+      dryRun,
+      out: (line) => process.stdout.write(line + "\n"),
+      warn: stderr,
+    });
   }
 
   return 0;
@@ -1407,7 +2203,7 @@ async function main(): Promise<number> {
     // -- Navigation (open/navigate/goto) --
     if (command === "open" || command === "navigate" || command === "goto") {
       const url = rest[0] ?? "about:blank";
-      return await cmdOpen(url, cdpPort, sessionName);
+      return await cmdOpen(url, cdpPort, sessionName, pid);
     }
 
     // -- Recording --
@@ -1436,6 +2232,7 @@ async function main(): Promise<number> {
     //    the targeted alternative to `ab heal`, which nukes every session's tabs. --
     if (command === "close") {
       let closePort: number | null = null;
+      let closeShard: number | null = null; // null = headed (no shard)
       try {
         const st = await rpc.status();
         if (flags.headed) {
@@ -1444,19 +2241,26 @@ async function main(): Promise<number> {
           // Resolve this session's shard the same way teardown/gc does:
           // marker's recorded shard (missing/legacy → 0), never assigned or
           // booted here — `close` must stay a pure teardown.
-          const shard = resolveTeardownShard(pid);
-          closePort = portForShard(st.headlessPool, shard, st.headless);
+          closeShard = resolveTeardownShard(pid);
+          closePort = portForShard(st.headlessPool, closeShard, st.headless);
         }
       } catch {
         closePort = null; // daemon down → nothing to close
       }
       if (closePort !== null) {
-        await teardownSession(pid, closePort);
+        // tab-teardown-fix U1 / decision 11: a residual tab is reported on
+        // stderr but never flips the exit code — callers (hooks, scripts)
+        // treat `ab close` as best-effort teardown, and the gc CDP sweep
+        // collects anything left behind within one cycle.
+        const result = await teardownSession(pid, closePort);
+        if (!result.ok) stderr(formatTeardownWarning(pid, closeShard, result));
       } else {
         gray("No browser running — nothing to close.");
       }
       // Reap this session's own /tmp markers so `ab ps` reflects the teardown
-      // immediately instead of waiting for the 24h gc.
+      // immediately instead of waiting for the next 30-minute gc cycle
+      // (IDLE_GRACE_MS above; the old "24h" here was the stale-LABEL
+      // threshold, not the reap trigger).
       try { fs.unlinkSync(`${SESSION_FILE_PREFIX}${pid}`); } catch { /* already gone */ }
       try { fs.unlinkSync(`${WRAPPER_PREFIX}${pid}`); } catch { /* may not exist */ }
       return 0;

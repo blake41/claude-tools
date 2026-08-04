@@ -22,6 +22,13 @@
  * marker) fixtures are ever touched — those are safe by construction
  * regardless of grace. Anything that needs to exercise the grace boundary
  * itself uses --dry-run, which never deletes or spawns teardown.
+ *
+ * Every `ab gc` invocation here also passes AB_GC_TAB_SWEEP=0, which disables
+ * the U2 backstop orphan-tab sweep. Grace pinning protects session markers;
+ * it does NOT protect Chrome pages, and the sweep would otherwise run against
+ * the real shared pool (listing, and potentially closing, tabs belonging to
+ * other agents) as a side effect of running this suite. The sweep's own
+ * behavior is covered with injected fakes in gc-sweep.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
@@ -498,6 +505,7 @@ describe("ab gc (subprocess) — real reap, safe-by-construction fixtures only",
     const r = runAb(["gc", "--dry-run"], {
       CCO_SESSION_ID: freshPid,
       AB_GC_IDLE_GRACE_MS: SAFE_LARGE_GRACE_MS,
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(`${stalePid}`);
@@ -515,6 +523,7 @@ describe("ab gc (subprocess) — real reap, safe-by-construction fixtures only",
     const r = runAb(["gc"], {
       CCO_SESSION_ID: freshPid,
       AB_GC_IDLE_GRACE_MS: SAFE_LARGE_GRACE_MS,
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(fs.existsSync(`/tmp/.ab-session-${stalePid}`)).toBe(false);
@@ -546,6 +555,7 @@ describe("ab gc (subprocess) — grace-boundary behavior (dry-run only, no real 
     const r = runAb(["gc", "--dry-run"], {
       CCO_SESSION_ID: withinGracePid,
       AB_GC_IDLE_GRACE_MS: String(GRACE_MS),
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(`${withinGracePid}`);
@@ -558,6 +568,7 @@ describe("ab gc (subprocess) — grace-boundary behavior (dry-run only, no real 
     const r = runAb(["gc", "--dry-run"], {
       CCO_SESSION_ID: withinGracePid,
       AB_GC_IDLE_GRACE_MS: String(GRACE_MS),
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(`${pastGracePid}`);
@@ -575,6 +586,7 @@ describe("ab gc (subprocess) — grace-boundary behavior (dry-run only, no real 
     const r = runAb(["gc", "--dry-run"], {
       CCO_SESSION_ID: withinGracePid,
       AB_GC_IDLE_GRACE_MS: String(GRACE_MS),
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("action=close + remove marker + wrapper");
@@ -622,6 +634,7 @@ describe("ab gc (subprocess) — orphan-wrapper sweep", () => {
     const r = runAb(["gc", "--dry-run"], {
       CCO_SESSION_ID: uniqueCco,
       AB_GC_IDLE_GRACE_MS: SAFE_LARGE_GRACE_MS,
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(`orphan wrapper  action=remove: ${orphanWrapper}`);
@@ -642,6 +655,7 @@ describe("ab gc (subprocess) — orphan-wrapper sweep", () => {
     const r = runAb(["gc"], {
       CCO_SESSION_ID: uniqueCco,
       AB_GC_IDLE_GRACE_MS: SAFE_LARGE_GRACE_MS,
+      AB_GC_TAB_SWEEP: "0",
     });
     expect(r.code).toBe(0);
     expect(fs.existsSync(orphanWrapper)).toBe(false);
