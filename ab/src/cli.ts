@@ -1110,7 +1110,13 @@ export async function openTabAndRecordTarget(
   deps: OpenTabDeps = DEFAULT_OPEN_TAB_DEPS,
 ): Promise<string | null> {
   const before = await deps.listPages(cdpPort);
-  await deps.runAb(cdpPort, sessionName, ["tab", "new", url]);
+  const tabNewResult = await deps.runAb(cdpPort, sessionName, ["tab", "new", url]);
+  // F2: if `tab new` itself failed (daemon spawn failure, CDP hiccup), any
+  // page that appears on the shard during this window is NOT provably ours —
+  // recording it would risk mis-attributing (and later closing) another
+  // agent's live tab. Fail-soft: the open is best-effort regardless, but
+  // identity is never guessed at.
+  if (tabNewResult.exitCode !== 0) return null;
   if (before === null) return null;
   const after = await deps.listPages(cdpPort);
   if (after === null) return null;
@@ -1123,28 +1129,52 @@ export async function openTabAndRecordTarget(
   return created[0].id;
 }
 
-async function cmdOpen(
-  url: string,
-  cdpPort: number,
-  sessionName: string | null,
-  sessionPid: string,
-): Promise<number> {
-  // Create a dedicated tab for this session so parallel sessions don't collide.
-  // tab new sets the new tab as active, so subsequent commands target it.
-  // The tab's CDP target id is captured here and persisted to the session
-  // marker so teardown can close exactly this tab later (tab-teardown-fix U1).
-  await openTabAndRecordTarget(sessionPid, cdpPort, sessionName, url);
-  // Apply viewport unless explicitly skipped. Override defaults via
-  // AB_VIEWPORT_W / AB_VIEWPORT_H / AB_VIEWPORT_SCALE; set AB_VIEWPORT=skip
-  // to leave Chrome's native window size in place.
-  if (process.env.AB_VIEWPORT !== "skip") {
-    await runAgentBrowser(cdpPort, sessionName, [
+/** Seams for tests — production callers use the defaults. */
+export interface CmdOpenDeps {
+  openTab: (
+    sessionPid: string,
+    cdpPort: number,
+    sessionName: string | null,
+    url: string,
+  ) => Promise<string | null>;
+  setViewport: (cdpPort: number, sessionName: string | null) => Promise<unknown>;
+}
+
+const DEFAULT_CMD_OPEN_DEPS: CmdOpenDeps = {
+  openTab: (sessionPid, cdpPort, sessionName, url) =>
+    openTabAndRecordTarget(sessionPid, cdpPort, sessionName, url),
+  setViewport: (cdpPort, sessionName) =>
+    runAgentBrowser(cdpPort, sessionName, [
       "set",
       "viewport",
       DEFAULT_VIEWPORT_W,
       DEFAULT_VIEWPORT_H,
       DEFAULT_VIEWPORT_SCALE,
-    ]);
+    ]),
+};
+
+export async function cmdOpen(
+  url: string,
+  cdpPort: number,
+  sessionName: string | null,
+  sessionPid: string,
+  deps: CmdOpenDeps = DEFAULT_CMD_OPEN_DEPS,
+): Promise<number> {
+  // Create a dedicated tab for this session so parallel sessions don't collide.
+  // tab new sets the new tab as active, so subsequent commands target it.
+  // The tab's CDP target id is captured here and persisted to the session
+  // marker so teardown can close exactly this tab later (tab-teardown-fix U1).
+  const recordedId = await deps.openTab(sessionPid, cdpPort, sessionName, url);
+  // Apply viewport unless explicitly skipped, and ONLY when this session's
+  // own tab was actually recorded (F2, secondary finding): a session-scoped
+  // command on a respawned daemon acts on the browser's currently-FOCUSED
+  // target, not necessarily this session's own — if `openTab` failed or was
+  // ambiguous, `set viewport` could resize/mutate a foreign agent's tab.
+  // Override viewport defaults via AB_VIEWPORT_W / AB_VIEWPORT_H /
+  // AB_VIEWPORT_SCALE; set AB_VIEWPORT=skip to leave Chrome's native window
+  // size in place.
+  if (recordedId !== null && process.env.AB_VIEWPORT !== "skip") {
+    await deps.setViewport(cdpPort, sessionName);
   }
   return 0;
 }
@@ -1846,6 +1876,40 @@ export async function sweepOrphanTabs(opts: SweepOptions): Promise<SweepSummary>
   return summary;
 }
 
+/**
+ * Builds the gc sweep's `evidenceFor` callback (F1 fix, tab-teardown-fix
+ * follow-up).
+ *
+ * Must NOT close over a start-of-run `listSessionEntries()` snapshot: the
+ * reap loop between that snapshot and the sweep evaluating a given shard can
+ * run 30-60+ seconds under a backlog (up to two 2s-timeout CDP lists and a
+ * spawned `agent-browser close` per idle/stale entry). A session created
+ * during that window would be invisible to a stale snapshot, so its
+ * freshly-opened, correctly-recorded tab would read as unclaimed —
+ * `sweepOrphanTabs` would close it live, mid-QA-run, for another agent.
+ *
+ * `evidenceFor` is already invoked lazily, once per shard, by design — this
+ * just makes each call re-scan `listSessionEntries()` fresh instead of
+ * reusing an old array, so evidence reflects the world as it is at the
+ * moment each shard is actually evaluated.
+ */
+export function makeGcSweepEvidenceProvider(
+  reapedPids: Set<string>,
+  listEntries: () => SessionEntry[] = listSessionEntries,
+): (shard: SweepShard) => ShardSessionEvidence[] {
+  return ({ port }) =>
+    listEntries()
+      .filter((e) => !reapedPids.has(e.pid))
+      .map((e) => ({
+        pid: e.pid,
+        state: e.state,
+        // Clamp exactly like resolveTeardownShard, but WITHOUT its marker
+        // rewrite — the sweep must not mutate other agents' markers.
+        shard: e.shard === null ? null : e.shard % HEADLESS_POOL_SIZE,
+        targets: readSessionTargets(e.pid, port),
+      }));
+}
+
 async function cmdGc(args: string[]): Promise<number> {
   const dryRun = args.includes("--dry-run");
   const entries = listSessionEntries();
@@ -1945,18 +2009,12 @@ async function cmdGc(args: string[]): Promise<number> {
   // agents, so any test that invokes a REAL `ab gc` sets AB_GC_TAB_SWEEP=0 and
   // the pool is never even listed (ps.test.ts:17-24).
   if (process.env.AB_GC_TAB_SWEEP !== "0") {
-    const survivors = entries.filter((e) => !reapedPids.has(e.pid));
     await sweepOrphanTabs({
       shards: sweepShards(headlessPool, legacyHeadless),
-      evidenceFor: ({ port }) =>
-        survivors.map((e) => ({
-          pid: e.pid,
-          state: e.state,
-          // Clamp exactly like resolveTeardownShard, but WITHOUT its marker
-          // rewrite — the sweep must not mutate other agents' markers.
-          shard: e.shard === null ? null : e.shard % HEADLESS_POOL_SIZE,
-          targets: readSessionTargets(e.pid, port),
-        })),
+      // F1: evidenceFor re-scans listSessionEntries() fresh on every call
+      // (see makeGcSweepEvidenceProvider) rather than reusing the stale
+      // top-of-run `entries` snapshot taken above.
+      evidenceFor: makeGcSweepEvidenceProvider(reapedPids),
       dryRun,
       out: (line) => process.stdout.write(line + "\n"),
       warn: stderr,

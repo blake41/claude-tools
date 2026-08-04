@@ -22,9 +22,16 @@ import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import type { CdpPage, ShardSessionEvidence, SweepDeps } from "../cli";
+import type { CdpPage, SessionEntry, ShardSessionEvidence, SweepDeps } from "../cli";
 import type { ChromeState } from "../types";
-import { partitionOrphanTargets, sweepOrphanTabs, sweepShards } from "../cli";
+import {
+  makeGcSweepEvidenceProvider,
+  partitionOrphanTargets,
+  recordSessionTarget,
+  sessionFilePath,
+  sweepOrphanTabs,
+  sweepShards,
+} from "../cli";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
 const AGENT_BROWSER_HOME = path.join(os.homedir(), ".agent-browser");
@@ -143,6 +150,89 @@ describe("partitionOrphanTargets", () => {
     );
     expect(result.orphans).toEqual([leakedBlank]);
     expect(result.ambiguous).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeGcSweepEvidenceProvider — F1: the sweep's ownership evidence must never
+// be built from a stale start-of-run `listSessionEntries()` snapshot. The reap
+// loop between that snapshot and the sweep evaluating a shard can run 30-60+
+// seconds under a backlog; a session created in that window would be
+// invisible to a stale snapshot, and its freshly-recorded, legitimately-owned
+// tab would read as unclaimed — closed live by the sweep for another agent.
+// ---------------------------------------------------------------------------
+
+describe("makeGcSweepEvidenceProvider", () => {
+  const latePid = `${TEST_PREFIX}-late-session`;
+  const lateMarker = sessionFilePath(latePid);
+
+  afterEach(() => {
+    try { fs.unlinkSync(lateMarker); } catch { /* already gone */ }
+  });
+
+  test("a session created AFTER the provider is built is still seen when evidenceFor is actually called — no captured snapshot", () => {
+    // Simulates cmdGc's real sequence: some earlier snapshot (not modeled
+    // here) saw nothing. `liveEntries` is what listSessionEntries() would
+    // return if called again right now, at sweep time.
+    let liveEntries: SessionEntry[] = [];
+    const listEntries = () => liveEntries;
+
+    // Provider built (mirrors cmdGc constructing the evidenceFor closure)
+    // BEFORE the late session exists.
+    const provider = makeGcSweepEvidenceProvider(new Set(), listEntries);
+
+    // The session opens its tab and records its identity strictly AFTER the
+    // provider was constructed — the exact live-repro window from F1.
+    fs.writeFileSync(lateMarker, `${latePid}\nshard=0\n`);
+    recordSessionTarget(latePid, 9333, "1A7E0001");
+    liveEntries = [
+      {
+        pid: latePid,
+        session: `ab-${latePid}`,
+        owner: "other-cc",
+        mtimeIso: new Date().toISOString(),
+        ageSeconds: 0,
+        state: "active",
+        daemonPid: 4242,
+        shard: 0,
+      },
+    ];
+
+    // evidenceFor is invoked lazily, at actual sweep time — it must reflect
+    // liveEntries as it is NOW, not as it was when the provider was built.
+    const evidence = provider({ shard: 0, port: 9333 });
+    expect(evidence).toEqual([{ pid: latePid, state: "active", shard: 0, targets: ["1A7E0001"] }]);
+
+    // End-to-end through the real ownership rule: the freshly-opened tab must
+    // be classified as owned, never an orphan the sweep would close.
+    const p: CdpPage = { id: "1A7E0001", url: "http://localhost:5173/app", title: "t" };
+    const partition = partitionOrphanTargets([p], evidence, 0);
+    expect(partition.owned).toEqual([{ page: p, pid: latePid }]);
+    expect(partition.orphans).toEqual([]);
+  });
+
+  test("a reaped pid is excluded from evidence even if listEntries still returns it", () => {
+    let liveEntries: SessionEntry[] = [
+      {
+        pid: "reaped-1",
+        session: "ab-reaped-1",
+        owner: "other-cc",
+        mtimeIso: new Date().toISOString(),
+        ageSeconds: 999,
+        state: "stale",
+        daemonPid: null,
+        shard: 0,
+      },
+    ];
+    const provider = makeGcSweepEvidenceProvider(new Set(["reaped-1"]), () => liveEntries);
+    expect(provider({ shard: 0, port: 9333 })).toEqual([]);
+  });
+
+  test("defaults to the real listSessionEntries when no override is given", () => {
+    // Just proves the default parameter wires to the real function without
+    // throwing — the fixture-driven tests above cover actual behavior.
+    const provider = makeGcSweepEvidenceProvider(new Set());
+    expect(() => provider({ shard: 0, port: 9333 })).not.toThrow();
   });
 });
 

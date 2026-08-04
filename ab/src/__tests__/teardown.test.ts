@@ -21,11 +21,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import type { CdpPage, OpenTabDeps, TeardownDeps } from "../cli";
+import type { CdpPage, CmdOpenDeps, OpenTabDeps, TeardownDeps } from "../cli";
 import {
   MAX_RECORDED_TARGETS,
   assignShard,
   closeCdpTarget,
+  cmdOpen,
   formatTeardownWarning,
   listCdpPages,
   openTabAndRecordTarget,
@@ -442,7 +443,11 @@ describe("formatTeardownWarning", () => {
 // openTabAndRecordTarget — the identity-capture half of `ab open`.
 // ---------------------------------------------------------------------------
 
-function openRecorder(opts: { before?: CdpPage[] | null; after?: CdpPage[] | null }): {
+function openRecorder(opts: {
+  before?: CdpPage[] | null;
+  after?: CdpPage[] | null;
+  tabNewExitCode?: number;
+}): {
   deps: OpenTabDeps;
   abCalls: string[][];
   recorded: Array<{ pid: string; port: number; id: string }>;
@@ -463,7 +468,7 @@ function openRecorder(opts: { before?: CdpPage[] | null; after?: CdpPage[] | nul
       },
       runAb: async (_port, _session, args) => {
         abCalls.push(args);
-        return { exitCode: 0 };
+        return { exitCode: opts.tabNewExitCode ?? 0 };
       },
       recordTarget: (pid, port, id) => { recorded.push({ pid, port, id }); },
     },
@@ -505,6 +510,74 @@ describe("openTabAndRecordTarget", () => {
     expect(id).toBeNull();
     expect(r.recorded).toEqual([]);
     expect(r.abCalls).toEqual([["tab", "new", "http://x/"]]);
+  });
+
+  // F2: `tab new` reporting failure must not be silently ignored. If it fails
+  // (daemon spawn failure, CDP hiccup) while exactly one FOREIGN tab happens
+  // to appear on the shard during that window, recording that foreign target
+  // as this session's own would make later teardown close another agent's
+  // live tab.
+  test("records nothing when `tab new` exits non-zero, even if exactly one (foreign) tab appeared", async () => {
+    const r = openRecorder({
+      before: [page("FOREIGN1")],
+      after: [page("FOREIGN1"), page("SOMEONEELSESTAB")],
+      tabNewExitCode: 1,
+    });
+    const id = await openTabAndRecordTarget("pid-o5", 9333, "ab-pid-o5", "http://x/", r.deps);
+    expect(id).toBeNull();
+    expect(r.recorded).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cmdOpen — F2 (secondary): a session-scoped command on a respawned daemon
+// acts on the browser's currently-FOCUSED target, not necessarily this
+// session's own. If openTabAndRecordTarget failed to record this session's
+// tab, `set viewport` must not run — it could resize/mutate a foreign agent's
+// tab.
+// ---------------------------------------------------------------------------
+
+describe("cmdOpen viewport gating", () => {
+  const prevAbViewport = process.env.AB_VIEWPORT;
+  afterEach(() => {
+    if (prevAbViewport === undefined) delete process.env.AB_VIEWPORT;
+    else process.env.AB_VIEWPORT = prevAbViewport;
+  });
+
+  test("does not set viewport when the tab was not recorded (open failed/ambiguous)", async () => {
+    delete process.env.AB_VIEWPORT;
+    const viewportCalls: number[] = [];
+    const deps: CmdOpenDeps = {
+      openTab: async () => null, // simulates F2: tab-new failed / ambiguous
+      setViewport: async (port) => { viewportCalls.push(port); },
+    };
+    const code = await cmdOpen("http://x/", 9333, "ab-pid-cmdopen-1", "pid-cmdopen-1", deps);
+    expect(code).toBe(0);
+    expect(viewportCalls).toEqual([]);
+  });
+
+  test("sets viewport when the tab was recorded successfully", async () => {
+    delete process.env.AB_VIEWPORT;
+    const viewportCalls: number[] = [];
+    const deps: CmdOpenDeps = {
+      openTab: async () => "NEW001",
+      setViewport: async (port) => { viewportCalls.push(port); },
+    };
+    const code = await cmdOpen("http://x/", 9333, "ab-pid-cmdopen-2", "pid-cmdopen-2", deps);
+    expect(code).toBe(0);
+    expect(viewportCalls).toEqual([9333]);
+  });
+
+  test("AB_VIEWPORT=skip still suppresses viewport even when the tab WAS recorded", async () => {
+    process.env.AB_VIEWPORT = "skip";
+    const viewportCalls: number[] = [];
+    const deps: CmdOpenDeps = {
+      openTab: async () => "NEW001",
+      setViewport: async (port) => { viewportCalls.push(port); },
+    };
+    const code = await cmdOpen("http://x/", 9333, "ab-pid-cmdopen-3", "pid-cmdopen-3", deps);
+    expect(code).toBe(0);
+    expect(viewportCalls).toEqual([]);
   });
 });
 
