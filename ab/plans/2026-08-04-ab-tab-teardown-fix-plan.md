@@ -2,7 +2,7 @@
 title: ab Tab Teardown Fix — Close the Leaked Chrome Tabs
 date: 2026-08-04
 origin: plans/2026-07-09-session-reaper-plan.md (closes that plan's Unit-0 open risk; requirements supplied by a confirmed live diagnosis, no brainstorm doc)
-status: draft
+status: shipped (2026-08-04, commit 9d90f2c) — approach for U1 pivoted during implementation; see "Implementation Note" below
 ---
 
 # ab Tab Teardown Fix — Close the Leaked Chrome Tabs
@@ -10,6 +10,54 @@ status: draft
 ## Overview
 
 Fix a confirmed tab-leak bug in the `ab` CLI: `teardownSession` never actually closes a session's Chrome tab because the compiled `agent-browser` binary refuses to close a session's last remaining tab, so every reap leaks a live tab into the shared 3-shard headless Chrome pool. This plan (1) fixes the teardown sequence so the tab really closes and is CDP-verified, (2) adds a CDP-level orphan-tab backstop sweep to `ab gc`, and (3) adds per-shard tab-count visibility to `ab status`/`ab doctor` — plus a small fold-in fix for leaked `~/.agent-browser/ab-<pid>.config` files.
+
+## Implementation Note: U1's Approach Pivoted (added post-ship)
+
+R1/R2 and Decision 5 below describe the approach as originally planned:
+blank-navigate the tab, defeat the last-tab guard by opening a throwaway
+`about:blank` tab and closing the original by a runtime-discovered index,
+then close the daemon. **That is not what shipped.** Two empirical findings
+during U1 forced a different design, described here so the rest of this
+document can be read as the historical record of what was planned rather
+than a false account of what runs today:
+
+1. **`agent-browser --session <name> tab` does not scope its listing to the
+   session.** It enumerates every page on the shard regardless of
+   `--session`, so a listing-based parser can never determine which index is
+   "this session's tab" on a shard with more than one live session — the
+   entire premise of Decision 5's runtime index discovery. Confirmed via
+   cli.ts:1640-1644.
+2. **Closing via raw CDP (`GET /json/close/<targetId>`) never touches the
+   agent-browser binary's `tab close` command at all**, so the last-tab
+   guard (`✗ Cannot close the last tab`) that R2 was designed to defeat
+   simply never fires on this path — there is nothing to defeat. No
+   blank-navigate step, no throwaway tab, no guard-defeat sequence exists in
+   the shipped code.
+
+**What shipped instead:** tab identity is captured once, at `ab open` time,
+not rediscovered at teardown. `openTabAndRecordTarget` (cli.ts:1105-1124)
+diffs the shard's `/json/list` before and after `tab new`; if exactly one
+page appeared, that CDP `targetId` is recorded on the session's marker as a
+`target=<port>:<id>` line (`recordSessionTarget`, cli.ts:387-406). If zero or
+more than one page appeared — a concurrent agent opened a tab on the same
+shard in that instant — nothing is recorded (skip-when-ambiguous: an
+unrecorded tab leaks until U2's gc sweep collects it, which is safe;
+mis-recording another agent's tab and later closing it is not).
+`teardownSession` (cli.ts:1424-1523) closes exactly the recorded target ids
+via raw CDP `closeCdpTarget`, then re-queries `/json/list` and confirms those
+specific ids are gone (R3, unchanged from the original plan) — no index
+guessing, no navigation, no binary-level guard interaction at all.
+
+R1 (blank-before-close) and R3 (CDP-verified teardown) are satisfied by the
+shipped design for the reasons above, R3 literally as originally specified.
+R2 (guard-defeat via blank tab + index close) is satisfied in spirit — no
+tab is left holding a live dev-server socket, and the guard never blocks a
+close — but by a structurally different, simpler mechanism than R2
+describes. Decision 5 (runtime index discovery) was superseded outright by
+capture-at-open-time identity. U2's attribution mechanism (Deferred
+question 2) resolved to marker-based recorded-target matching, not the
+per-active-session `tab`-listing mechanism the plan preferred — precisely
+because finding 1 above ruled that mechanism out.
 
 ## Problem Frame
 
@@ -111,8 +159,8 @@ The 2026-07-09 session-reaper plan shipped 3-state liveness (active/idle/stale) 
 
 ### Deferred to Implementation
 
-- **agent-browser `tab` listing output format and index base (0- vs 1-based).** Resolve empirically: run `agent-browser --cdp <port> --session <name> tab` against a throwaway live session and inspect the listing before writing the parser. Do not guess the format.
-- **Exact attribution mechanism for the U2 sweep** (which live-session evidence to use: per-active-session `tab` listings via the capture helper vs. URL-set matching vs. targetId snapshots). Guidance: whatever is chosen must satisfy Decision 9's skip-when-ambiguous rule; per-active-session tab listing is the most precise and is already enabled by U1's capture helper. If two sessions' tabs share a URL and only URL matching is available, both are "ambiguous" → skipped.
+- **agent-browser `tab` listing output format and index base (0- vs 1-based).** RESOLVED — moot: see "Implementation Note" above. `--session` doesn't scope the listing, so no listing-based parser was built; identity is captured via CDP diff at open time instead.
+- **Exact attribution mechanism for the U2 sweep** (which live-session evidence to use: per-active-session `tab` listings via the capture helper vs. URL-set matching vs. targetId snapshots). RESOLVED — see "Implementation Note" above: recorded `target=` marker lines from U1's open-time capture, not `tab` listings (ruled out) — with URL-collision as a secondary ambiguity check (`isAttributableUrl`, cli.ts:1628-1633).
 - **Whether a respawned per-session daemon re-adopts the orphan tab on dead-daemon (idle) reaps** — the existing docblock caveat (src/cli.ts:1047-1049). The 2,037 "Cannot close the last tab" errors strongly suggest the respawned daemon DOES see the session's tab (the guard fires, meaning it found exactly one tab to refuse to close), but verify empirically. If it does not re-adopt in some case, U1 logs the verification failure and the U2 sweep is the designed catch-all.
 - **Verification-failure message wording and gc log format** — implementer's call; must include shard, port, expected vs. observed page count.
 
