@@ -80,6 +80,25 @@ export interface StatusResponse {
   /** Per-shard state, index = shard number. */
   headlessPool: ChromeState[];
   uptime: number;
+  /**
+   * Per-target health diagnostics — additive, does not replace/rename
+   * anything above. Added for the 2026-08-04 incident diagnosability gap
+   * (a heartbeat closed at 16:28Z and nothing loggable existed until the
+   * next crash at 21:52Z).
+   */
+  diagnostics: {
+    headed: ShardDiagnostics;
+    /** Index-aligned with headlessPool. */
+    headlessPool: ShardDiagnostics[];
+  };
+}
+
+/** Per-target health diagnostics — see StatusResponse.diagnostics. */
+export interface ShardDiagnostics {
+  /** ISO timestamp of the last successful health-check poll, or null if none yet. */
+  lastHealthOkAt: string | null;
+  /** ISO timestamp since the current heartbeat WS was armed, or null if no heartbeat is open. */
+  heartbeatArmedSince: string | null;
 }
 
 // ---------------------------------------------------------------------------

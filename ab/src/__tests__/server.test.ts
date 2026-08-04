@@ -76,6 +76,12 @@ beforeAll(() => {
       if (method === "GET" && pathname === "/status") {
         const st = getAllStates();
         const headlessPool = HEADLESS_TARGETS.map((target) => st[target]);
+        // Additive diagnostics block — this test harness has no real
+        // chrome-supervisor runtime, so it always reports "never" (null),
+        // matching an idle/never-armed target. The real shape (and the
+        // lastHealthOkAt/heartbeatArmedSince population logic) is exercised
+        // in chrome-supervisor.test.ts / heartbeat-rearm.test.ts instead.
+        const emptyDiagnostics = { lastHealthOkAt: null, heartbeatArmedSince: null };
         return json({
           ok: true,
           version: VERSION,
@@ -83,6 +89,10 @@ beforeAll(() => {
           headless: headlessPool[0],
           headed: st.headed,
           headlessPool,
+          diagnostics: {
+            headed: emptyDiagnostics,
+            headlessPool: headlessPool.map(() => emptyDiagnostics),
+          },
         });
       }
 
@@ -238,6 +248,17 @@ describe("server RPC contract", () => {
     expect(data.headlessPool[0]).toEqual(data.headless);
     for (const state of data.headlessPool) {
       expect(typeof state.phase).toBe("string");
+    }
+
+    // diagnostics is additive too — per-target lastHealthOkAt/heartbeatArmedSince
+    // (2026-08-04 incident diagnosability gap), index-aligned with headlessPool.
+    expect(data.diagnostics).toBeDefined();
+    expect(data.diagnostics.headed).toBeDefined();
+    expect(Array.isArray(data.diagnostics.headlessPool)).toBe(true);
+    expect(data.diagnostics.headlessPool.length).toBe(HEADLESS_POOL_SIZE);
+    for (const shard of data.diagnostics.headlessPool) {
+      expect(shard.lastHealthOkAt === null || typeof shard.lastHealthOkAt === "string").toBe(true);
+      expect(shard.heartbeatArmedSince === null || typeof shard.heartbeatArmedSince === "string").toBe(true);
     }
   });
 

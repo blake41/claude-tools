@@ -8,7 +8,7 @@
 
 import * as path from "path";
 import { existsSync, unlinkSync, rmSync, mkdirSync, readdirSync } from "fs";
-import type { ChromeConfig, ChromeTarget } from "./types";
+import type { ChromeConfig, ChromeTarget, ShardDiagnostics } from "./types";
 import { ALL_TARGETS, HEADLESS_POOL_SIZE, headlessTarget } from "./types";
 import {
   getState,
@@ -87,15 +87,36 @@ const DASHBOARD_PORT = 4848;
 
 let dashboardProc: ReturnType<typeof Bun.spawn> | null = null;
 
-// Health check tuning
-const HEALTH_INTERVAL_MS = 5_000;
+// Health check tuning. AB_HEALTH_INTERVAL_MS is test-only — overridden to a
+// tiny value so health-summary.test.ts can observe a real tick (lastHealthOkAt
+// getting set) without waiting multiple real seconds.
+const HEALTH_INTERVAL_MS = Number(process.env.AB_HEALTH_INTERVAL_MS) || 5_000;
 const HEALTH_TIMEOUT_MS = 2_000;
 const HEALTH_FAILURE_THRESHOLD = 3;
+
+// Periodic per-target health summary log — diagnosability gap from the
+// 2026-08-04 incident (heartbeat closed 16:28Z, nothing loggable until
+// 21:52Z). ~36 lines/hour for 3 shards; AB_HEALTH_SUMMARY_MS is test-only.
+const HEALTH_SUMMARY_INTERVAL_MS = Number(process.env.AB_HEALTH_SUMMARY_MS) || 5 * 60_000;
 
 // Backoff tuning
 const BACKOFF_INITIAL_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 const BACKOFF_STABLE_RESET_MS = 60_000;
+
+// Heartbeat re-arm tuning — a benign WS close (Chrome pid still alive) must
+// re-arm the heartbeat, not leave the shard heartbeat-less (2026-08-04
+// incident: shard ran 5.5h with no heartbeat, only the HTTP polling health
+// check, which a half-wedged Chrome kept passing). The delay + bounded
+// counter below stop a wedged Chrome from spinning the WS open/close loop —
+// after HEARTBEAT_BENIGN_CLOSE_THRESHOLD rapid closes we give up re-arming
+// and fall back to polling alone (same degraded mode as a setup failure).
+// AB_HEARTBEAT_REARM_MS is test-only — overridden to a tiny value so
+// heartbeat-rearm.test.ts doesn't need to wait multiple seconds per case.
+const HEARTBEAT_REARM_DELAY_MS = Number(process.env.AB_HEARTBEAT_REARM_MS) || 3_000;
+/** Exported so tests can drive exactly this many closes instead of duplicating the magic number. */
+export const HEARTBEAT_BENIGN_CLOSE_THRESHOLD = 5;
+const HEARTBEAT_STABLE_RESET_MS = 60_000;
 
 // Headed idle timeout
 const HEADED_IDLE_TIMEOUT_MS = 90 * 60_000; // 90 minutes (covers oracle Pro runs up to 60m)
@@ -142,6 +163,47 @@ interface TargetRuntime {
   inflight: Promise<{ pid: number; port: number }> | null;
   /** WebSocket heartbeat connection to Chrome's devtools endpoint */
   heartbeatWs: WebSocket | null;
+  /**
+   * Consecutive benign heartbeat closes (Chrome pid still alive at close
+   * time) since the last stable period. Bounded by
+   * HEARTBEAT_BENIGN_CLOSE_THRESHOLD so a wedged Chrome that keeps closing
+   * the WS immediately after re-arm can't spin forever — see
+   * decideHeartbeatClose.
+   */
+  consecutiveBenignCloses: number;
+  /** Delayed re-arm timer scheduled after a benign heartbeat close. */
+  heartbeatRearmTimer: ReturnType<typeof setTimeout> | null;
+  /** Resets consecutiveBenignCloses once the heartbeat has stayed open for HEARTBEAT_STABLE_RESET_MS. */
+  heartbeatStableTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Bumped at the top of every startHeartbeat() call and inside
+   * clearTimers(). startHeartbeat snapshots this counter before its
+   * fetch/json awaits (~2s) and re-checks it afterward: if anything else
+   * bumped it in the meantime — a competing fresh/rearm startHeartbeat call,
+   * or a teardown (kill/handleCrashDetected/handleExit, all of which route
+   * through clearTimers) — the in-flight call knows it's been superseded and
+   * must not resurrect/orphan a heartbeat WS. See startHeartbeat's staleness
+   * guard (2026-08-04 incident follow-up: the un-guarded version of this
+   * race either resurrected a heartbeat on a torn-down target or orphaned
+   * an open devtools WS for the life of the Chrome process).
+   */
+  heartbeatGeneration: number;
+  /**
+   * Epoch ms of the last successful checkCdp() poll inside the health-check
+   * timer; null until the first successful poll. Surfaced on /status and in
+   * the periodic health summary log (2026-08-04 incident: no signal existed
+   * between a heartbeat close and the next crash — this closes that gap).
+   */
+  lastHealthOkAt: number | null;
+  /**
+   * Epoch ms since the current heartbeat WS was armed; null whenever no
+   * heartbeat is open (closed, degraded to polling-only, or never
+   * established). Paired with every `heartbeatWs = ws` / `heartbeatWs = null`
+   * assignment.
+   */
+  heartbeatArmedSince: number | null;
+  /** Periodic (every HEALTH_SUMMARY_INTERVAL_MS) per-target health summary log timer. */
+  healthSummaryTimer: ReturnType<typeof setInterval> | null;
 }
 
 function buildRuntime(): Record<ChromeTarget, TargetRuntime> {
@@ -167,6 +229,13 @@ function freshRuntime(): TargetRuntime {
     restartScheduled: false,
     inflight: null,
     heartbeatWs: null,
+    consecutiveBenignCloses: 0,
+    heartbeatRearmTimer: null,
+    heartbeatStableTimer: null,
+    heartbeatGeneration: 0,
+    lastHealthOkAt: null,
+    heartbeatArmedSince: null,
+    healthSummaryTimer: null,
   };
 }
 
@@ -195,9 +264,91 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
       hasRestartTimer: rt.restartTimer !== null,
       hasHeartbeatWs: rt.heartbeatWs !== null,
       hasInflight: rt.inflight !== null,
+      consecutiveBenignCloses: rt.consecutiveBenignCloses,
+      hasHeartbeatRearmTimer: rt.heartbeatRearmTimer !== null,
+      lastHealthOkAt: rt.lastHealthOkAt !== null ? new Date(rt.lastHealthOkAt).toISOString() : null,
+      heartbeatArmedSince: rt.heartbeatArmedSince !== null ? new Date(rt.heartbeatArmedSince).toISOString() : null,
     };
   }
   return snapshot;
+}
+
+/**
+ * Per-target health diagnostics for the /status RPC — the 2026-08-04
+ * incident diagnosability gap (a heartbeat closed at 16:28Z and nothing
+ * loggable existed until the next crash at 21:52Z). Kept separate from
+ * getRuntimeSnapshot (crash-dump-shaped, `Record<string, unknown>`) so
+ * server.ts gets a typed, additive shape it can attach to StatusResponse
+ * without touching ChromeState itself.
+ */
+export function getHealthDiagnostics(): Record<ChromeTarget, ShardDiagnostics> {
+  const result: Record<ChromeTarget, ShardDiagnostics> = {} as Record<ChromeTarget, ShardDiagnostics>;
+  for (const target of ALL_TARGETS) {
+    const rt = runtime[target];
+    result[target] = {
+      lastHealthOkAt: rt.lastHealthOkAt !== null ? new Date(rt.lastHealthOkAt).toISOString() : null,
+      heartbeatArmedSince: rt.heartbeatArmedSince !== null ? new Date(rt.heartbeatArmedSince).toISOString() : null,
+    };
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Health summary — pure payload builder (testable without timers)
+// ---------------------------------------------------------------------------
+
+export interface HealthSummaryPayload {
+  target: ChromeTarget;
+  phase: string;
+  pid: number | null;
+  heartbeatArmed: boolean;
+  heartbeatArmedSinceIso: string | null;
+  consecutiveFailures: number;
+  lastHealthOkAtIso: string | null;
+}
+
+/**
+ * Pure builder for the periodic per-target health summary log line. Exported
+ * for direct unit testing — same rationale as isProfileDirMissing /
+ * decideHeartbeatClose: keep the file's timer/process-heavy code as thin
+ * wiring around small pure functions.
+ */
+export function buildHealthSummaryPayload(
+  target: ChromeTarget,
+  phase: string,
+  pid: number | null,
+  heartbeatArmed: boolean,
+  heartbeatArmedSince: number | null,
+  consecutiveFailures: number,
+  lastHealthOkAt: number | null,
+): HealthSummaryPayload {
+  return {
+    target,
+    phase,
+    pid,
+    heartbeatArmed,
+    heartbeatArmedSinceIso: heartbeatArmedSince !== null ? new Date(heartbeatArmedSince).toISOString() : null,
+    consecutiveFailures,
+    lastHealthOkAtIso: lastHealthOkAt !== null ? new Date(lastHealthOkAt).toISOString() : null,
+  };
+}
+
+/** Logs the periodic per-target health summary. No-op for idle targets — keeps volume down. */
+function logHealthSummary(target: ChromeTarget): void {
+  const rt = runtime[target];
+  const state = getState(target);
+  if (state.phase === "idle") return;
+  const pid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+  const payload = buildHealthSummaryPayload(
+    target,
+    state.phase,
+    pid,
+    rt.heartbeatWs !== null,
+    rt.heartbeatArmedSince,
+    rt.consecutiveFailures,
+    rt.lastHealthOkAt,
+  );
+  log.info(`[${target}] Health summary`, payload as unknown as Record<string, unknown>);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,20 +424,26 @@ async function doKill(target: ChromeTarget): Promise<void> {
 
   if (rt.proc) {
     const proc = rt.proc; // Capture before await — handleExit may null rt.proc
-    log.info(`[${target}] Killing Chrome (PID ${proc.pid})`);
+    log.info(`[${target}] Killing Chrome (PID ${proc.pid})`, { killedBy: "supervisor", reason: "kill() requested" });
     proc.kill();
     // Wait for process exit (up to 5s)
     await Promise.race([proc.exited, sleep(5_000)]);
     // If Chrome didn't exit gracefully, escalate to SIGKILL
     if (proc.exitCode === null) {
-      log.warn(`[${target}] Chrome did not exit gracefully — sending SIGKILL`);
+      log.warn(`[${target}] Chrome did not exit gracefully — sending SIGKILL`, {
+        killedBy: "supervisor",
+        reason: "graceful-exit-timeout",
+      });
       proc.kill(9); // SIGKILL
       await Promise.race([proc.exited, sleep(2_000)]);
     }
     rt.proc = null;
   } else if (rt.adoptedPid) {
     // Kill adopted Chrome we don't have a proc handle for
-    log.info(`[${target}] Killing adopted Chrome (PID ${rt.adoptedPid})`);
+    log.info(`[${target}] Killing adopted Chrome (PID ${rt.adoptedPid})`, {
+      killedBy: "supervisor",
+      reason: "kill() requested",
+    });
     try {
       process.kill(rt.adoptedPid, "SIGKILL");
     } catch { /* already dead */ }
@@ -392,7 +549,10 @@ async function launchChrome(
     // the full recovery path (profile nuke below).
     const stalePid = await getListeningPid(config.port);
     if (stalePid) {
-      log.warn(`[${target}] Crash loop — killing existing Chrome (PID ${stalePid}) instead of adopting`);
+      log.warn(`[${target}] Crash loop — killing existing Chrome (PID ${stalePid}) instead of adopting`, {
+        killedBy: "supervisor",
+        reason: "crash-loop-recovery",
+      });
       try {
         process.kill(stalePid, "SIGKILL");
       } catch {
@@ -408,7 +568,10 @@ async function launchChrome(
     // Port might be bound by a non-responsive process — kill the occupant.
     const stalePid = await getListeningPid(config.port);
     if (stalePid) {
-      log.warn(`[${target}] Port ${config.port} occupied by unresponsive PID ${stalePid} — killing`);
+      log.warn(`[${target}] Port ${config.port} occupied by unresponsive PID ${stalePid} — killing`, {
+        killedBy: "supervisor",
+        reason: "port-occupied",
+      });
       try {
         process.kill(stalePid, "SIGKILL");
       } catch {
@@ -498,6 +661,11 @@ async function launchChrome(
   // Watch for unexpected exit
   proc.exited.then((exitCode) => {
     const exitedPid = proc.pid;
+    // Captured now, before Bun reaps the handle — lets handleExit log
+    // whether the OS delivered a signal (e.g. exit 137 from SIGKILL), so an
+    // exit with NO preceding "killedBy: supervisor" log line is provably
+    // external (OOM etc.) rather than an ambiguous crash.
+    const exitSignal = proc.signalCode ?? null;
     opQueue.enqueue(() =>
       withOpId(newOpId(), async () => {
         // If a different Chrome is now running, this exit is stale
@@ -506,7 +674,7 @@ async function launchChrome(
           log.info(`[${target}] Ignoring stale exit for PID ${exitedPid}`);
           return;
         }
-        handleExit(target, exitCode ?? 1);
+        handleExit(target, exitCode ?? 1, exitSignal);
       }),
     );
   });
@@ -554,6 +722,7 @@ function startHealthCheck(target: ChromeTarget): void {
 
   // Clear any existing timer
   if (rt.healthTimer) clearInterval(rt.healthTimer);
+  if (rt.healthSummaryTimer) clearInterval(rt.healthSummaryTimer);
 
   rt.consecutiveFailures = 0;
 
@@ -591,6 +760,7 @@ function startHealthCheck(target: ChromeTarget): void {
     const ok = await checkCdp(config.port);
     if (ok) {
       rt.consecutiveFailures = 0;
+      rt.lastHealthOkAt = Date.now();
     } else {
       rt.consecutiveFailures++;
       log.warn(`[${target}] Health check failed`, {
@@ -616,6 +786,10 @@ function startHealthCheck(target: ChromeTarget): void {
       }
     }
   }, HEALTH_INTERVAL_MS);
+
+  rt.healthSummaryTimer = setInterval(() => {
+    logHealthSummary(target);
+  }, HEALTH_SUMMARY_INTERVAL_MS);
 }
 
 async function checkCdp(port: number): Promise<boolean> {
@@ -650,15 +824,96 @@ async function waitForCdp(
 // WebSocket heartbeat — instant Chrome death detection
 // ---------------------------------------------------------------------------
 
-async function startHeartbeat(target: ChromeTarget): Promise<void> {
+/**
+ * Decide what to do when a target's heartbeat WebSocket closes.
+ *
+ * Pure and exported for direct unit testing — see the doc comment on
+ * isProfileDirMissing for why this file's timer/process-heavy functions
+ * push their branching logic into small pure helpers instead of testing
+ * through a real WebSocket + Bun.spawn + timers.
+ *
+ * - Dead PID → always crash handling, regardless of close history.
+ * - Alive PID → re-arm, UNLESS this is the `threshold`-th rapid benign
+ *   close in a row, in which case give up and fall back to polling-only
+ *   (the same degraded mode as a heartbeat setup failure).
+ */
+export type HeartbeatCloseDecision =
+  | { action: "crash" }
+  | { action: "rearm"; nextConsecutiveBenignCloses: number }
+  | { action: "fallback-to-polling"; consecutiveBenignCloses: number };
+
+export function decideHeartbeatClose(
+  pidAlive: boolean,
+  consecutiveBenignCloses: number,
+  threshold: number = HEARTBEAT_BENIGN_CLOSE_THRESHOLD,
+): HeartbeatCloseDecision {
+  if (!pidAlive) return { action: "crash" };
+  const next = consecutiveBenignCloses + 1;
+  if (next >= threshold) {
+    return { action: "fallback-to-polling", consecutiveBenignCloses: next };
+  }
+  return { action: "rearm", nextConsecutiveBenignCloses: next };
+}
+
+/**
+ * Staleness guard for a delayed heartbeat re-arm: the world may have moved
+ * on during the HEARTBEAT_REARM_DELAY_MS wait (pid changed, a new heartbeat
+ * WS already got established some other way, or the target isn't chrome_up
+ * anymore). Pure and exported for the same reason as decideHeartbeatClose.
+ */
+export function shouldRearmHeartbeat(
+  currentPid: number | null,
+  deadPid: number,
+  currentHeartbeatWs: unknown,
+  statePhase: string,
+): boolean {
+  if (currentPid !== deadPid) return false;
+  if (currentHeartbeatWs !== null) return false;
+  if (statePhase !== "chrome_up") return false;
+  return true;
+}
+
+/**
+ * Start (or re-arm) the heartbeat WebSocket for `target`.
+ *
+ * `isRearm` distinguishes a delayed re-arm after a benign close from a
+ * fresh call at full launch/adopt time (lines ~385, ~533): only a fresh
+ * call resets consecutiveBenignCloses — a re-arm must not reset its own
+ * budget, or the bounded-spin guard in decideHeartbeatClose never bites.
+ */
+async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<void> {
   const rt = runtime[target];
   const config = CONFIGS[target];
+
+  if (!isRearm) {
+    rt.consecutiveBenignCloses = 0;
+  }
+
+  if (rt.heartbeatRearmTimer) {
+    clearTimeout(rt.heartbeatRearmTimer);
+    rt.heartbeatRearmTimer = null;
+  }
+  if (rt.heartbeatStableTimer) {
+    clearTimeout(rt.heartbeatStableTimer);
+    rt.heartbeatStableTimer = null;
+  }
 
   // Close existing heartbeat if any
   if (rt.heartbeatWs) {
     try { rt.heartbeatWs.close(); } catch { /* ignore */ }
     rt.heartbeatWs = null;
+    rt.heartbeatArmedSince = null;
   }
+
+  // Staleness guard setup — snapshot identity BEFORE the fetch/json awaits
+  // below (~2s of async work). See heartbeatGeneration's doc comment on
+  // TargetRuntime for why: without this, a re-arm (or even a fresh call)
+  // whose fetch resolves after the world moved on would unconditionally
+  // execute `rt.heartbeatWs = ws` further down, either resurrecting a
+  // heartbeat on a torn-down target or orphaning whichever WS loses the
+  // race (2026-08-04 incident follow-up).
+  const capturedPid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+  const myGeneration = ++rt.heartbeatGeneration;
 
   try {
     const resp = await fetch(`http://127.0.0.1:${config.port}/json/version`, {
@@ -668,25 +923,94 @@ async function startHeartbeat(target: ChromeTarget): Promise<void> {
     if (!info.webSocketDebuggerUrl) return;
 
     const ws = new WebSocket(info.webSocketDebuggerUrl);
+
+    // Re-validate staleness now that the async boundary above has passed:
+    // pid unchanged, nothing else already armed a heartbeat, no newer
+    // startHeartbeat/teardown superseded us (generation), and the target is
+    // still chrome_up. Any mismatch means we lost the race — close what we
+    // just opened and abandon without touching rt.heartbeatWs.
+    const currentPid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+    if (
+      rt.heartbeatGeneration !== myGeneration ||
+      currentPid !== capturedPid ||
+      rt.heartbeatWs !== null ||
+      getState(target).phase !== "chrome_up"
+    ) {
+      log.debug(`[${target}] Heartbeat setup stale after fetch — abandoning`, {
+        capturedPid,
+        currentPid,
+        isRearm,
+      });
+      try { ws.close(); } catch { /* ignore */ }
+      return;
+    }
+
     rt.heartbeatWs = ws;
+    rt.heartbeatArmedSince = Date.now();
+    log.info(`[${target}] Heartbeat armed`, {
+      rearm: isRearm,
+      consecutiveBenignCloses: rt.consecutiveBenignCloses,
+    });
+
+    // Once the heartbeat has stayed open for a while, the shard is healthy
+    // again — reset the benign-close budget so a close far in the future
+    // doesn't inherit an old, unrelated close streak.
+    rt.heartbeatStableTimer = setTimeout(() => {
+      if (rt.heartbeatWs === ws) {
+        rt.consecutiveBenignCloses = 0;
+      }
+    }, HEARTBEAT_STABLE_RESET_MS);
 
     ws.onclose = () => {
       if (rt.heartbeatWs !== ws) return; // Stale — we've moved on
       const deadPid = rt.proc?.pid ?? rt.adoptedPid;
       log.warn(`[${target}] Heartbeat WebSocket closed — Chrome may be dead`, { pid: deadPid });
       rt.heartbeatWs = null;
+      rt.heartbeatArmedSince = null;
+      if (rt.heartbeatStableTimer) {
+        clearTimeout(rt.heartbeatStableTimer);
+        rt.heartbeatStableTimer = null;
+      }
       // Enqueue crash detection — the queue + PID check handles staleness
       if (deadPid) {
         opQueue.enqueue(() =>
           withOpId(newOpId(), async () => {
             const currentPid = rt.proc?.pid ?? rt.adoptedPid;
             if (currentPid !== deadPid) return;
-            // Verify Chrome is actually dead before marking crashed
+            let pidAlive = true;
             try {
               process.kill(deadPid, 0);
-              return; // Still alive — WebSocket close was benign
-            } catch { /* PID dead — proceed to crash handling */ }
-            handleCrashDetected(target);
+            } catch {
+              pidAlive = false; // PID dead — proceed to crash handling
+            }
+
+            const decision = decideHeartbeatClose(pidAlive, rt.consecutiveBenignCloses);
+            if (decision.action === "crash") {
+              handleCrashDetected(target);
+              return;
+            }
+            if (decision.action === "fallback-to-polling") {
+              rt.consecutiveBenignCloses = decision.consecutiveBenignCloses;
+              log.warn(
+                `[${target}] ${decision.consecutiveBenignCloses} rapid benign heartbeat closes — falling back to polling-only`,
+                { pid: deadPid },
+              );
+              return;
+            }
+
+            // action === "rearm" — still alive, WebSocket close was benign.
+            // Re-arm after a short delay so a wedged Chrome that closes the
+            // WS immediately again doesn't spin in a tight loop.
+            rt.consecutiveBenignCloses = decision.nextConsecutiveBenignCloses;
+            if (rt.heartbeatRearmTimer) clearTimeout(rt.heartbeatRearmTimer);
+            rt.heartbeatRearmTimer = setTimeout(() => {
+              rt.heartbeatRearmTimer = null;
+              const currentPidAtRearm = rt.proc?.pid ?? rt.adoptedPid;
+              if (!shouldRearmHeartbeat(currentPidAtRearm, deadPid, rt.heartbeatWs, getState(target).phase)) {
+                return;
+              }
+              startHeartbeat(target, true);
+            }, HEARTBEAT_REARM_DELAY_MS);
           }),
         );
       }
@@ -705,7 +1029,7 @@ async function startHeartbeat(target: ChromeTarget): Promise<void> {
 // Crash / exit handling
 // ---------------------------------------------------------------------------
 
-function handleExit(target: ChromeTarget, exitCode: number): void {
+function handleExit(target: ChromeTarget, exitCode: number, exitSignal: string | null = null): void {
   const rt = runtime[target];
   const state = getState(target);
 
@@ -715,9 +1039,13 @@ function handleExit(target: ChromeTarget, exitCode: number): void {
   // If a restart is already scheduled (e.g. from handleCrashDetected), don't double-schedule
   if (rt.restartScheduled) return;
 
-  // Log profile diagnostics on non-zero exit to help root-cause crashes
+  // Log profile diagnostics on non-zero exit to help root-cause crashes.
+  // `signal` is included whenever the OS reports one (e.g. SIGKILL -> 137):
+  // this handler only ever runs for exits nobody attributed to
+  // killedBy: "supervisor" above, so an exit with a signal logged here and
+  // no preceding supervisor-kill log line is provably external (OOM etc.).
   const config = CONFIGS[target];
-  const diag: Record<string, unknown> = { exitCode };
+  const diag: Record<string, unknown> = { exitCode, signal: exitSignal };
   if (exitCode !== 0) {
     try {
       const lockPath = path.join(config.profilePath, "SingletonLock");
@@ -755,13 +1083,21 @@ function handleCrashDetected(target: ChromeTarget): void {
 
   // Force-kill the unresponsive process
   if (rt.proc) {
+    const pid = rt.proc.pid;
     rt.proc.kill();
     rt.proc = null;
+    log.info(`[${target}] Killed unresponsive Chrome (PID ${pid})`, {
+      killedBy: "supervisor",
+      reason: "crash-detected",
+    });
   } else if (rt.adoptedPid) {
     // Kill adopted Chrome we don't have a proc handle for
     try {
       process.kill(rt.adoptedPid, "SIGKILL");
-      log.info(`[${target}] Killed adopted Chrome (PID ${rt.adoptedPid})`);
+      log.info(`[${target}] Killed adopted Chrome (PID ${rt.adoptedPid})`, {
+        killedBy: "supervisor",
+        reason: "crash-detected",
+      });
     } catch { /* already dead */ }
     rt.adoptedPid = null;
   }
@@ -869,9 +1205,18 @@ function startDashboard(): void {
 
 function clearTimers(target: ChromeTarget): void {
   const rt = runtime[target];
+  // Bump the heartbeat generation on every teardown so any startHeartbeat()
+  // call currently blocked on its fetch/json awaits discovers, once it
+  // resumes, that it's been superseded — see heartbeatGeneration's doc
+  // comment on TargetRuntime and the staleness guard in startHeartbeat.
+  rt.heartbeatGeneration++;
   if (rt.healthTimer) {
     clearInterval(rt.healthTimer);
     rt.healthTimer = null;
+  }
+  if (rt.healthSummaryTimer) {
+    clearInterval(rt.healthSummaryTimer);
+    rt.healthSummaryTimer = null;
   }
   if (rt.stableTimer) {
     clearTimeout(rt.stableTimer);
@@ -885,13 +1230,37 @@ function clearTimers(target: ChromeTarget): void {
     clearTimeout(rt.restartTimer);
     rt.restartTimer = null;
   }
+  if (rt.heartbeatRearmTimer) {
+    clearTimeout(rt.heartbeatRearmTimer);
+    rt.heartbeatRearmTimer = null;
+  }
+  if (rt.heartbeatStableTimer) {
+    clearTimeout(rt.heartbeatStableTimer);
+    rt.heartbeatStableTimer = null;
+  }
   // Close heartbeat WebSocket
   if (rt.heartbeatWs) {
     try { rt.heartbeatWs.close(); } catch { /* ignore */ }
     rt.heartbeatWs = null;
   }
+  rt.heartbeatArmedSince = null;
   // Invalidate any in-flight launch promise so ensure() doesn't await a stale one
   rt.inflight = null;
+}
+
+/**
+ * Reset all in-memory runtime state (timers, heartbeat WS, counters, proc
+ * handles) for every target. Test-only — production code never has a
+ * reason to blow away timers without also killing the underlying Chrome
+ * process (use kill()/stopAll() for that). Exists so heartbeat-rearm.test.ts
+ * can fully isolate its mocked WebSocket/timer state between cases without
+ * waiting on real process teardown for a fake proc that was never real.
+ */
+export function __resetRuntimeForTest(): void {
+  for (const target of ALL_TARGETS) {
+    clearTimers(target);
+    runtime[target] = freshRuntime();
+  }
 }
 
 /**

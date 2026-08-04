@@ -89,6 +89,10 @@ function portFromState(state: ChromeState): number | null {
 function handleStatus(): Response {
   const states = getAllStates();
   const headlessPool = HEADLESS_TARGETS.map((target) => states[target]);
+  // Additive per-target diagnostics — 2026-08-04 incident diagnosability gap
+  // (a heartbeat closed at 16:28Z and nothing loggable existed until the
+  // next crash at 21:52Z). Doesn't touch/rename headless/headed/headlessPool.
+  const diag = supervisor.getHealthDiagnostics();
   const body: StatusResponse & { ok: true; version: string } = {
     ok: true,
     version: VERSION,
@@ -96,6 +100,10 @@ function handleStatus(): Response {
     headless: headlessPool[0],
     headed: states.headed,
     headlessPool,
+    diagnostics: {
+      headed: diag.headed,
+      headlessPool: HEADLESS_TARGETS.map((target) => diag[target]),
+    },
   };
   return json(body);
 }
