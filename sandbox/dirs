@@ -39,6 +39,7 @@
 ~/.local/share/tennis-warehouse-pp-cli/
 ~/.roughdraft/
 ~/Library/Developer/CoreSimulator/
+~/.cursor
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
