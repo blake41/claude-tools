@@ -497,6 +497,38 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
 });
 
 // ---------------------------------------------------------------------------
+// FINAL CONSENSUS SPEC item 13 — the four Chrome-consuming debug commands
+// (`console-tail`, `watch`, `click-js`, `click-xy`) join NEEDS_CHROME.
+//
+// Before this, a down shard turned "wrong Chrome" into "correct error
+// against a dead shard" for these commands, instead of healing it via the
+// same demand-driven ensure() every other Chrome-consuming command already
+// goes through (cli.ts:2238's gate: `if (NEEDS_CHROME.has(command) &&
+// !flags.userChrome) { cdpPort = await ensureChromePort(flags.headed); }`).
+// No handler changes were needed — cmdConsoleTail/cmdWatch/cmdClickJs/
+// cmdClickXy already take `cdpPort` as a parameter (cli.ts:2253-2256); set
+// membership alone is what routes them through the gate. This is a plain
+// membership check, not a full main() dispatch drive — main() itself isn't
+// exported, same constraint the "reauth is shard-aware" tests below work
+// around by testing ensureChromePort()/cmdReauth directly instead.
+// ---------------------------------------------------------------------------
+
+describe("NEEDS_CHROME membership (FINAL CONSENSUS SPEC item 13)", () => {
+  test("console-tail, watch, click-js, click-xy are all members", async () => {
+    const { NEEDS_CHROME } = await import("../cli");
+    expect(NEEDS_CHROME.has("console-tail")).toBe(true);
+    expect(NEEDS_CHROME.has("watch")).toBe(true);
+    expect(NEEDS_CHROME.has("click-js")).toBe(true);
+    expect(NEEDS_CHROME.has("click-xy")).toBe(true);
+  });
+
+  test("close stays excluded — it must tear down, never boot Chrome", async () => {
+    const { NEEDS_CHROME } = await import("../cli");
+    expect(NEEDS_CHROME.has("close")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // chrome-pool-plan Unit 3 — reauth is shard-aware "for free"
 //
 // `reauth` is a member of cli.ts's NEEDS_CHROME set, so main() already

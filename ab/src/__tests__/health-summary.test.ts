@@ -37,7 +37,10 @@ describe("buildHealthSummaryPayload", () => {
     const armedSince = Date.parse("2026-08-04T16:00:00.000Z");
     const lastOk = Date.parse("2026-08-04T16:05:00.000Z");
 
-    const payload = buildHealthSummaryPayload("headless-0", "chrome_up", 12345, true, armedSince, 0, lastOk);
+    const payload = buildHealthSummaryPayload(
+      "headless-0", "chrome_up", 12345, true, armedSince, 0, lastOk,
+      "armed", null, null,
+    );
 
     expect(payload).toEqual({
       target: "headless-0",
@@ -47,13 +50,19 @@ describe("buildHealthSummaryPayload", () => {
       heartbeatArmedSinceIso: "2026-08-04T16:00:00.000Z",
       consecutiveFailures: 0,
       lastHealthOkAtIso: "2026-08-04T16:05:00.000Z",
+      heartbeatMode: "armed",
+      lastExit: null,
+      lastDetection: null,
     });
   });
 
   test("reports a disarmed heartbeat with null timestamps distinctly from an armed one", async () => {
     const { buildHealthSummaryPayload } = await loadSupervisor();
 
-    const disarmed = buildHealthSummaryPayload("headed", "chrome_up", 999, false, null, 2, null);
+    const disarmed = buildHealthSummaryPayload(
+      "headed", "chrome_up", 999, false, null, 2, null,
+      "cooldown", null, null,
+    );
 
     expect(disarmed.heartbeatArmed).toBe(false);
     expect(disarmed.heartbeatArmedSinceIso).toBeNull();
@@ -63,8 +72,31 @@ describe("buildHealthSummaryPayload", () => {
 
   test("carries pid through as null when there is none (never launched)", async () => {
     const { buildHealthSummaryPayload } = await loadSupervisor();
-    const payload = buildHealthSummaryPayload("headless-1", "idle", null, false, null, 0, null);
+    const payload = buildHealthSummaryPayload(
+      "headless-1", "idle", null, false, null, 0, null,
+      "off", null, null,
+    );
     expect(payload.pid).toBeNull();
+  });
+
+  // FINAL CONSENSUS SPEC — mode + lastExit + lastDetection rendered, and
+  // lastExit never contains a synthesized code+signal pair (a signal death
+  // reports code:null, never a fabricated exit code).
+  test("renders heartbeatMode, lastExit, and lastDetection as ISO-stamped, verbatim (never synthesized)", async () => {
+    const { buildHealthSummaryPayload } = await loadSupervisor();
+    const exitAt = Date.parse("2026-08-04T16:05:00.000Z");
+    const detectAt = Date.parse("2026-08-04T16:06:00.000Z");
+
+    const payload = buildHealthSummaryPayload(
+      "headless-1", "chrome_crashed", null, false, null, 0, null,
+      "off",
+      { code: null, signal: "SIGKILL", at: exitAt },
+      { reason: "pid-gone", at: detectAt },
+    );
+
+    expect(payload.heartbeatMode).toBe("off");
+    expect(payload.lastExit).toEqual({ code: null, signal: "SIGKILL", at: "2026-08-04T16:05:00.000Z" });
+    expect(payload.lastDetection).toEqual({ reason: "pid-gone", at: "2026-08-04T16:06:00.000Z" });
   });
 });
 
@@ -73,14 +105,26 @@ describe("buildHealthSummaryPayload", () => {
 // ---------------------------------------------------------------------------
 
 describe("getHealthDiagnostics", () => {
-  test("reports null for every target before anything has ever run", async () => {
+  test("reports null/off for every target before anything has ever run", async () => {
     const { getHealthDiagnostics, __resetRuntimeForTest } = await loadSupervisor();
     __resetRuntimeForTest();
     resetAll();
 
     const diag = getHealthDiagnostics();
-    expect(diag.headed).toEqual({ lastHealthOkAt: null, heartbeatArmedSince: null });
-    expect(diag["headless-0"]).toEqual({ lastHealthOkAt: null, heartbeatArmedSince: null });
+    expect(diag.headed).toEqual({
+      lastHealthOkAt: null,
+      heartbeatArmedSince: null,
+      heartbeatMode: "off",
+      lastExit: null,
+      lastDetection: null,
+    });
+    expect(diag["headless-0"]).toEqual({
+      lastHealthOkAt: null,
+      heartbeatArmedSince: null,
+      heartbeatMode: "off",
+      lastExit: null,
+      lastDetection: null,
+    });
   });
 });
 

@@ -86,11 +86,11 @@ describe("decideHeartbeatClose", () => {
     });
   });
 
-  test("alive pid, the Nth rapid close hits the threshold → falls back to polling-only", async () => {
+  test("alive pid, the Nth rapid close hits the threshold → threshold-reached (caller decides probe vs. cooldown)", async () => {
     const { decideHeartbeatClose } = await loadSupervisor();
-    // threshold=3: the close that brings the count to 3 gives up re-arming.
+    // threshold=3: the close that brings the count to 3 exhausts the budget.
     expect(decideHeartbeatClose(true, 2, 3)).toEqual({
-      action: "fallback-to-polling",
+      action: "threshold-reached",
       consecutiveBenignCloses: 3,
     });
   });
@@ -100,7 +100,49 @@ describe("decideHeartbeatClose", () => {
     const justBelow = decideHeartbeatClose(true, HEARTBEAT_BENIGN_CLOSE_THRESHOLD - 2);
     expect(justBelow.action).toBe("rearm");
     const atThreshold = decideHeartbeatClose(true, HEARTBEAT_BENIGN_CLOSE_THRESHOLD - 1);
-    expect(atThreshold.action).toBe("fallback-to-polling");
+    expect(atThreshold.action).toBe("threshold-reached");
+  });
+
+  test("never returns 'crash' for an alive pid regardless of close count", async () => {
+    const { decideHeartbeatClose } = await loadSupervisor();
+    for (const closes of [0, 1, 5, 100]) {
+      expect(decideHeartbeatClose(true, closes).action).not.toBe("crash");
+    }
+  });
+});
+
+describe("decideThresholdPlan", () => {
+  test("headless (always-on or on-demand) → probe", async () => {
+    const { decideThresholdPlan } = await loadSupervisor();
+    expect(decideThresholdPlan("always-on")).toBe("probe");
+    expect(decideThresholdPlan("on-demand")).toBe("probe");
+  });
+
+  test("headed → cooldown, never probe (headed is never killed by the supervisor)", async () => {
+    const { decideThresholdPlan } = await loadSupervisor();
+    expect(decideThresholdPlan("headed")).toBe("cooldown");
+  });
+});
+
+describe("decideProbeOutcome", () => {
+  test("both probes fail → recycle", async () => {
+    const { decideProbeOutcome } = await loadSupervisor();
+    expect(decideProbeOutcome(false, false)).toEqual({ action: "recycle" });
+  });
+
+  test("probe 1 succeeds alone → cooldown (short-circuit case)", async () => {
+    const { decideProbeOutcome } = await loadSupervisor();
+    expect(decideProbeOutcome(true, false)).toEqual({ action: "cooldown" });
+  });
+
+  test("probe 2 succeeds alone (probe 1 failed) → cooldown", async () => {
+    const { decideProbeOutcome } = await loadSupervisor();
+    expect(decideProbeOutcome(false, true)).toEqual({ action: "cooldown" });
+  });
+
+  test("both probes succeed → cooldown", async () => {
+    const { decideProbeOutcome } = await loadSupervisor();
+    expect(decideProbeOutcome(true, true)).toEqual({ action: "cooldown" });
   });
 });
 
@@ -418,9 +460,9 @@ describe("heartbeat re-arm wiring (real ensure() -> launchChrome() -> startHeart
     expect(snapshot.headed.phase).toBe("chrome_up"); // benign close never touched Chrome's up state
   }, 10_000);
 
-  test("N rapid benign closes fall back to polling-only and stop re-arming, with a warn log", async () => {
+  test("N rapid benign closes on headed hit threshold → cooldown directly, no probe, no kill, and stop re-arming", async () => {
     installSpawnMock(65002);
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await loadSupervisor();
+    const { ensure, getRuntimeSnapshot, HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await loadSupervisor();
 
     await ensure("headed");
 
@@ -431,15 +473,30 @@ describe("heartbeat re-arm wiring (real ensure() -> launchChrome() -> startHeart
     }
 
     // Closes 1..(threshold-1) each re-arm (one new WS per close); the
-    // threshold-th close gives up instead of opening a (threshold+1)th WS.
+    // threshold-th close hits the budget and — because headed always skips
+    // probing (decideThresholdPlan) — goes straight to cooldown instead of
+    // opening a (threshold+1)th WS.
     expect(FakeWebSocket.instances.length).toBe(HEARTBEAT_BENIGN_CLOSE_THRESHOLD);
+
+    const snapshot = getRuntimeSnapshot() as Record<
+      string,
+      { phase: string; heartbeatMode: string; hasHeartbeatCooldownTimer: boolean }
+    >;
+    // Headed is never killed by the supervisor — Chrome stays up, cooldown
+    // just means the heartbeat transport is degraded to HTTP-poll-only.
+    expect(snapshot.headed.phase).toBe("chrome_up");
+    expect(snapshot.headed.heartbeatMode).toBe("cooldown");
+    expect(snapshot.headed.hasHeartbeatCooldownTimer).toBe(true);
 
     const logs = getRecentLogs();
     expect(
       logs.some(
-        (e) => e.level === "warn" && typeof e.msg === "string" && e.msg.includes("falling back to polling-only"),
+        (e) => e.level === "warn" && typeof e.msg === "string" && e.msg.includes("cooldown"),
       ),
     ).toBe(true);
+    // Never falls back to a permanent, unrecoverable degraded state — the
+    // old terminal "fallback-to-polling" wording must not appear anywhere.
+    expect(logs.some((e) => typeof e.msg === "string" && e.msg.includes("falling back to polling-only"))).toBe(false);
   }, 10_000);
 
   test("close with a dead pid triggers crash handling — never re-arms", async () => {

@@ -93,12 +93,50 @@ export interface StatusResponse {
   };
 }
 
+/**
+ * Heartbeat transport state machine for a single target's WS heartbeat.
+ * "off": no heartbeat (torn down or never armed). "armed": a heartbeat WS is
+ * open. "rearming": a benign close happened below threshold and a short
+ * (HEARTBEAT_REARM_DELAY_MS) delayed re-arm is scheduled. "probing": the
+ * benign-close threshold was hit on a headless target and the two
+ * independent CDP probes (probeBrowserWs) are running to decide crash vs.
+ * cooldown. "cooldown": threshold outcome was keep-Chrome (probe succeeded,
+ * or headed which skips probing entirely) — heartbeat transport is degraded,
+ * detection falls back to HTTP polling alone, and a
+ * HEARTBEAT_COOLDOWN_MS retry timer is armed. There is no terminal
+ * "degraded" state: cooldown always retries.
+ */
+export type HeartbeatMode = "off" | "armed" | "rearming" | "probing" | "cooldown";
+
+/**
+ * Why the supervisor decided a target's Chrome needed to be killed and
+ * recreated (handleCrashDetected's `reason` parameter). Recorded in
+ * `lastDetection` and included verbatim in the existing `killedBy:
+ * "supervisor"` log line's `reason` field.
+ */
+export type DetectionReason =
+  | "pid-gone"
+  | "health-poll-failures"
+  | "heartbeat-close-pid-dead"
+  | "ws-probe-failed";
+
 /** Per-target health diagnostics — see StatusResponse.diagnostics. */
 export interface ShardDiagnostics {
   /** ISO timestamp of the last successful health-check poll, or null if none yet. */
   lastHealthOkAt: string | null;
   /** ISO timestamp since the current heartbeat WS was armed, or null if no heartbeat is open. */
   heartbeatArmedSince: string | null;
+  /** Current heartbeat transport mode — see HeartbeatMode. */
+  heartbeatMode: HeartbeatMode;
+  /**
+   * The last exit observed by handleExit (intentional kills are excluded —
+   * they never reach handleExit's exit-recording point). `code`/`signal`
+   * are verbatim from the runtime (never synthesized): exactly one of them
+   * is non-null for a real exit, per POSIX code-XOR-signal semantics.
+   */
+  lastExit: { code: number | null; signal: string | null; at: string } | null;
+  /** The last crash-detection event handleCrashDetected recorded, with why. */
+  lastDetection: { reason: DetectionReason; at: string } | null;
 }
 
 // ---------------------------------------------------------------------------

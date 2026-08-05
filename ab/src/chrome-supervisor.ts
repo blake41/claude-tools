@@ -8,7 +8,7 @@
 
 import * as path from "path";
 import { existsSync, unlinkSync, rmSync, mkdirSync, readdirSync } from "fs";
-import type { ChromeConfig, ChromeTarget, ShardDiagnostics } from "./types";
+import type { ChromeConfig, ChromePolicy, ChromeTarget, DetectionReason, HeartbeatMode, ShardDiagnostics } from "./types";
 import { ALL_TARGETS, HEADLESS_POOL_SIZE, headlessTarget } from "./types";
 import {
   getState,
@@ -53,12 +53,24 @@ const SHARED_LAUNCH_ARGS: readonly string[] = [
  */
 const HEADLESS_BASE_PORT = 9333;
 
+/**
+ * Root directory for every Chrome profile dir. AB_PROFILE_ROOT is test-only —
+ * read once at module load, matching the AB_* override pattern used elsewhere
+ * in this file (AB_BACKOFF_INITIAL_MS etc.) — so a test can point every
+ * target's profilePath at a disposable tmp dir instead of the real
+ * ~/.agent-browser. This is the reason the original corruption-recovery test
+ * (the one that drove backoffMs to BACKOFF_MAX_MS and asserted on the real
+ * rmSync+mkdirSync path) was deleted: it had no way to avoid operating on a
+ * real user profile. Default is unchanged production behavior.
+ */
+const PROFILE_ROOT = process.env.AB_PROFILE_ROOT || `${process.env.HOME}/.agent-browser`;
+
 function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
   const configs: Record<ChromeTarget, ChromeConfig> = {
     headed: {
       target: "headed",
       port: 9444,
-      profilePath: `${process.env.HOME}/.agent-browser/profile-headed`,
+      profilePath: `${PROFILE_ROOT}/profile-headed`,
       launchArgs: [...SHARED_LAUNCH_ARGS],
       policy: "on-demand",
     },
@@ -71,8 +83,8 @@ function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
       port: HEADLESS_BASE_PORT + i,
       profilePath:
         i === 0
-          ? `${process.env.HOME}/.agent-browser/profile`
-          : `${process.env.HOME}/.agent-browser/profile-${i}`,
+          ? `${PROFILE_ROOT}/profile`
+          : `${PROFILE_ROOT}/profile-${i}`,
       launchArgs: ["--headless=new", ...SHARED_LAUNCH_ARGS],
       policy: i === 0 ? "always-on" : "on-demand",
     };
@@ -99,10 +111,18 @@ const HEALTH_FAILURE_THRESHOLD = 3;
 // 21:52Z). ~36 lines/hour for 3 shards; AB_HEALTH_SUMMARY_MS is test-only.
 const HEALTH_SUMMARY_INTERVAL_MS = Number(process.env.AB_HEALTH_SUMMARY_MS) || 5 * 60_000;
 
-// Backoff tuning
-const BACKOFF_INITIAL_MS = 1_000;
-const BACKOFF_MAX_MS = 30_000;
-const BACKOFF_STABLE_RESET_MS = 60_000;
+// Backoff tuning. AB_BACKOFF_INITIAL_MS / AB_BACKOFF_MAX_MS are test-only —
+// let a test drive an on-demand shard all the way to the corruption-recovery
+// gate (`rt.backoffMs >= BACKOFF_MAX_MS`) via a couple of fast crash cycles
+// instead of the real ~31s (1s+2s+4s+8s+16s) of exponential real-time waits
+// the production defaults would otherwise require.
+const BACKOFF_INITIAL_MS = Number(process.env.AB_BACKOFF_INITIAL_MS) || 1_000;
+const BACKOFF_MAX_MS = Number(process.env.AB_BACKOFF_MAX_MS) || 30_000;
+// AB_BACKOFF_STABLE_RESET_MS is test-only, matching the established pattern
+// (e.g. AB_HEARTBEAT_REARM_MS) — lets a test prove "spawn success alone
+// doesn't reset backoff; only surviving this stable window does" without a
+// real 60s wait.
+const BACKOFF_STABLE_RESET_MS = Number(process.env.AB_BACKOFF_STABLE_RESET_MS) || 60_000;
 
 // Heartbeat re-arm tuning — a benign WS close (Chrome pid still alive) must
 // re-arm the heartbeat, not leave the shard heartbeat-less (2026-08-04
@@ -117,6 +137,16 @@ const HEARTBEAT_REARM_DELAY_MS = Number(process.env.AB_HEARTBEAT_REARM_MS) || 3_
 /** Exported so tests can drive exactly this many closes instead of duplicating the magic number. */
 export const HEARTBEAT_BENIGN_CLOSE_THRESHOLD = 5;
 const HEARTBEAT_STABLE_RESET_MS = 60_000;
+
+// Threshold -> probe -> cooldown tuning (FINAL CONSENSUS SPEC). Hitting
+// HEARTBEAT_BENIGN_CLOSE_THRESHOLD rapid closes no longer gives up on the
+// heartbeat forever ("fallback-to-polling"): two independent fresh CDP
+// probes (probeBrowserWs) distinguish "our heartbeat bookkeeping is the
+// thing failing" from "Chrome's WS layer is actually dead" before deciding
+// crash vs. cooldown. AB_PROBE_TIMEOUT_MS / AB_HEARTBEAT_COOLDOWN_MS are
+// test-only overrides, matching the established pattern.
+export const PROBE_TIMEOUT_MS = Number(process.env.AB_PROBE_TIMEOUT_MS) || 2_000;
+export const HEARTBEAT_COOLDOWN_MS = Number(process.env.AB_HEARTBEAT_COOLDOWN_MS) || 5 * 60_000;
 
 // Headed idle timeout
 const HEADED_IDLE_TIMEOUT_MS = 90 * 60_000; // 90 minutes (covers oracle Pro runs up to 60m)
@@ -204,6 +234,32 @@ interface TargetRuntime {
   heartbeatArmedSince: number | null;
   /** Periodic (every HEALTH_SUMMARY_INTERVAL_MS) per-target health summary log timer. */
   healthSummaryTimer: ReturnType<typeof setInterval> | null;
+  /**
+   * Current heartbeat transport mode — see HeartbeatMode's doc comment in
+   * types.ts. Set alongside every heartbeatWs assignment / teardown so it
+   * never drifts from the actual WS lifecycle.
+   */
+  heartbeatMode: HeartbeatMode;
+  /**
+   * The last exit handleExit observed for this target, verbatim (code XOR
+   * signal, never synthesized). Written ONLY by handleExit — intentional
+   * teardowns (doKill, idle timeout, heal) never reach it because they mark
+   * idle before the exit fires, and handleExit's own idle/restartScheduled
+   * guards make it a no-op for those paths.
+   */
+  lastExit: { code: number | null; signal: string | null; at: number } | null;
+  /** The last crash-detection event handleCrashDetected recorded, with why. */
+  lastDetection: { reason: DetectionReason; at: number } | null;
+  /**
+   * Epoch ms before which a fresh ensure() must fail fast with
+   * RetryAfterError rather than attempt another launch. Set by the failure
+   * accounting in handleExit/handleCrashDetected (now + backoffMs) so a
+   * shard mid-crash-loop backoff can't be hammered by a caller's ensure()
+   * blocking the shared serial opQueue.
+   */
+  retryNotBefore: number;
+  /** Timer for the cooldown-mode retry (HEARTBEAT_COOLDOWN_MS after entering cooldown). */
+  heartbeatCooldownTimer: ReturnType<typeof setTimeout> | null;
 }
 
 function buildRuntime(): Record<ChromeTarget, TargetRuntime> {
@@ -236,6 +292,11 @@ function freshRuntime(): TargetRuntime {
     lastHealthOkAt: null,
     heartbeatArmedSince: null,
     healthSummaryTimer: null,
+    heartbeatMode: "off",
+    lastExit: null,
+    lastDetection: null,
+    retryNotBefore: 0,
+    heartbeatCooldownTimer: null,
   };
 }
 
@@ -268,6 +329,11 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
       hasHeartbeatRearmTimer: rt.heartbeatRearmTimer !== null,
       lastHealthOkAt: rt.lastHealthOkAt !== null ? new Date(rt.lastHealthOkAt).toISOString() : null,
       heartbeatArmedSince: rt.heartbeatArmedSince !== null ? new Date(rt.heartbeatArmedSince).toISOString() : null,
+      heartbeatMode: rt.heartbeatMode,
+      lastExit: rt.lastExit !== null ? { ...rt.lastExit, at: new Date(rt.lastExit.at).toISOString() } : null,
+      lastDetection: rt.lastDetection !== null ? { ...rt.lastDetection, at: new Date(rt.lastDetection.at).toISOString() } : null,
+      retryNotBefore: rt.retryNotBefore,
+      hasHeartbeatCooldownTimer: rt.heartbeatCooldownTimer !== null,
     };
   }
   return snapshot;
@@ -288,6 +354,9 @@ export function getHealthDiagnostics(): Record<ChromeTarget, ShardDiagnostics> {
     result[target] = {
       lastHealthOkAt: rt.lastHealthOkAt !== null ? new Date(rt.lastHealthOkAt).toISOString() : null,
       heartbeatArmedSince: rt.heartbeatArmedSince !== null ? new Date(rt.heartbeatArmedSince).toISOString() : null,
+      heartbeatMode: rt.heartbeatMode,
+      lastExit: rt.lastExit !== null ? { ...rt.lastExit, at: new Date(rt.lastExit.at).toISOString() } : null,
+      lastDetection: rt.lastDetection !== null ? { ...rt.lastDetection, at: new Date(rt.lastDetection.at).toISOString() } : null,
     };
   }
   return result;
@@ -305,13 +374,19 @@ export interface HealthSummaryPayload {
   heartbeatArmedSinceIso: string | null;
   consecutiveFailures: number;
   lastHealthOkAtIso: string | null;
+  heartbeatMode: HeartbeatMode;
+  lastExit: { code: number | null; signal: string | null; at: string } | null;
+  lastDetection: { reason: DetectionReason; at: string } | null;
 }
 
 /**
  * Pure builder for the periodic per-target health summary log line. Exported
  * for direct unit testing — same rationale as isProfileDirMissing /
  * decideHeartbeatClose: keep the file's timer/process-heavy code as thin
- * wiring around small pure functions.
+ * wiring around small pure functions. heartbeatMode/lastExit/lastDetection
+ * are the same additive diagnostics surfaced on /status (getHealthDiagnostics)
+ * — carried through here too so the periodic log line and doctor never
+ * disagree about a shard's crash evidence.
  */
 export function buildHealthSummaryPayload(
   target: ChromeTarget,
@@ -321,6 +396,9 @@ export function buildHealthSummaryPayload(
   heartbeatArmedSince: number | null,
   consecutiveFailures: number,
   lastHealthOkAt: number | null,
+  heartbeatMode: HeartbeatMode,
+  lastExit: { code: number | null; signal: string | null; at: number } | null,
+  lastDetection: { reason: DetectionReason; at: number } | null,
 ): HealthSummaryPayload {
   return {
     target,
@@ -330,6 +408,9 @@ export function buildHealthSummaryPayload(
     heartbeatArmedSinceIso: heartbeatArmedSince !== null ? new Date(heartbeatArmedSince).toISOString() : null,
     consecutiveFailures,
     lastHealthOkAtIso: lastHealthOkAt !== null ? new Date(lastHealthOkAt).toISOString() : null,
+    heartbeatMode,
+    lastExit: lastExit !== null ? { code: lastExit.code, signal: lastExit.signal, at: new Date(lastExit.at).toISOString() } : null,
+    lastDetection: lastDetection !== null ? { reason: lastDetection.reason, at: new Date(lastDetection.at).toISOString() } : null,
   };
 }
 
@@ -347,6 +428,9 @@ function logHealthSummary(target: ChromeTarget): void {
     rt.heartbeatArmedSince,
     rt.consecutiveFailures,
     rt.lastHealthOkAt,
+    rt.heartbeatMode,
+    rt.lastExit,
+    rt.lastDetection,
   );
   log.info(`[${target}] Health summary`, payload as unknown as Record<string, unknown>);
 }
@@ -468,7 +552,17 @@ async function doKill(target: ChromeTarget): Promise<void> {
  * the dashboard. On-demand targets (headed, headless shards >= 1) stay
  * idle until their first ensure() so idle machines run one Chrome, not N.
  */
-export async function startSupervision(): Promise<void> {
+export interface StartSupervisionResult {
+  /**
+   * Always-on targets that were still inside their crash-loop backoff
+   * window (RetryAfterError) when startSupervision ran, so their launch was
+   * skipped this pass rather than left to throw and abort the whole
+   * function. handleHeal surfaces these in its HealResponse.actions.
+   */
+  skippedBackoff: Array<{ target: ChromeTarget; retryAfterMs: number }>;
+}
+
+export async function startSupervision(): Promise<StartSupervisionResult> {
   return opQueue.enqueue(() =>
     withOpId(newOpId(), async () => {
       if (process.platform !== "darwin") {
@@ -476,17 +570,37 @@ export async function startSupervision(): Promise<void> {
         throw new Error("Unsupported platform: " + process.platform);
       }
       log.info("Starting Chrome supervision");
+      const skippedBackoff: Array<{ target: ChromeTarget; retryAfterMs: number }> = [];
       for (const target of ALL_TARGETS) {
         if (CONFIGS[target].policy !== "always-on") continue;
         const state = getState(target);
         if (state.phase !== "chrome_up") {
-          await launchChrome(target);
+          // An always-on target's launch must never throw uncaught here — a
+          // crash-looping shard (RetryAfterError from launchChrome's
+          // ensure-gate) would otherwise abort this loop before later
+          // always-on targets get a chance AND before startDashboard() runs
+          // below. Scenario: `ab heal` on a crash-looping always-on shard —
+          // without this catch, the shard stays down with no relaunch timer
+          // and the dashboard never restarts either.
+          try {
+            await launchChrome(target);
+          } catch (err) {
+            if (err instanceof RetryAfterError) {
+              log.warn(`[${target}] startSupervision skipping launch — crash backoff`, {
+                retryAfterMs: err.retryAfterMs,
+              });
+              skippedBackoff.push({ target, retryAfterMs: err.retryAfterMs });
+            } else {
+              log.error(`[${target}] startSupervision launch failed`, { err: String(err) });
+            }
+          }
         }
       }
       startDashboard();
       log.info("Chrome supervision active");
+      return { skippedBackoff };
     }),
-  ) as Promise<void>;
+  ) as Promise<StartSupervisionResult>;
 }
 
 /**
@@ -510,11 +624,35 @@ export async function stopAll(): Promise<void> {
 // Chrome launch
 // ---------------------------------------------------------------------------
 
+/**
+ * Thrown by launchChrome's ensure-gate when a target is inside its
+ * crash-loop backoff window (rt.retryNotBefore in the future). Deliberately
+ * a fail-fast rejection, never a sleep: opQueue is a single global serial
+ * queue (see SerialQueue above), so sleeping inside launchChrome for one
+ * target's backoff would block every other target's ensure()/kill() until
+ * the sleep finished. server.ts maps this to a 503 with retryAfterMs.
+ */
+export class RetryAfterError extends Error {
+  constructor(public readonly retryAfterMs: number) {
+    super(`Chrome ensure rejected — crash backoff, retry in ${Math.ceil(retryAfterMs / 1000)}s`);
+    this.name = "RetryAfterError";
+  }
+}
+
 async function launchChrome(
   target: ChromeTarget,
 ): Promise<{ pid: number; port: number; profileFresh: boolean }> {
   const config = CONFIGS[target];
   const rt = runtime[target];
+
+  // Ensure gate (item 7): fail fast rather than let a backoff-window ensure
+  // block the shared opQueue for every other target.
+  const now = Date.now();
+  if (now < rt.retryNotBefore) {
+    const retryAfterMs = rt.retryNotBefore - now;
+    log.warn(`[${target}] Ensure rejected — crash backoff`, { retryAfterMs });
+    throw new RetryAfterError(retryAfterMs);
+  }
 
   rt.restartScheduled = false;
   markLaunching(target);
@@ -659,12 +797,16 @@ async function launchChrome(
   rt.adoptedPid = null; // No longer adopted — we own the process
 
   // Watch for unexpected exit
-  proc.exited.then((exitCode) => {
+  proc.exited.then(() => {
     const exitedPid = proc.pid;
-    // Captured now, before Bun reaps the handle — lets handleExit log
-    // whether the OS delivered a signal (e.g. exit 137 from SIGKILL), so an
-    // exit with NO preceding "killedBy: supervisor" log line is provably
-    // external (OOM etc.) rather than an ambiguous crash.
+    // Captured now, before Bun reaps the handle — read the raw nullable
+    // fields (not the `.exited` promise's own numeric resolution) so
+    // handleExit's lastExit records code XOR signal verbatim, never
+    // synthesized: a signal death (e.g. SIGKILL) reports exitCode null and
+    // signalCode "SIGKILL", not a fabricated 137. An exit with a signal
+    // logged here and NO preceding "killedBy: supervisor" log line is
+    // provably external (OOM etc.) rather than an ambiguous crash.
+    const rawExitCode = proc.exitCode;
     const exitSignal = proc.signalCode ?? null;
     opQueue.enqueue(() =>
       withOpId(newOpId(), async () => {
@@ -674,7 +816,7 @@ async function launchChrome(
           log.info(`[${target}] Ignoring stale exit for PID ${exitedPid}`);
           return;
         }
-        handleExit(target, exitCode ?? 1, exitSignal);
+        handleExit(target, rawExitCode, exitSignal);
       }),
     );
   });
@@ -749,7 +891,7 @@ function startHealthCheck(target: ChromeTarget): void {
                 log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
                 return;
               }
-              handleCrashDetected(target);
+              handleCrashDetected(target, "pid-gone");
             }),
           );
           return;
@@ -780,7 +922,7 @@ function startHealthCheck(target: ChromeTarget): void {
               log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
               return;
             }
-            handleCrashDetected(target);
+            handleCrashDetected(target, "health-poll-failures");
           }),
         );
       }
@@ -834,13 +976,15 @@ async function waitForCdp(
  *
  * - Dead PID → always crash handling, regardless of close history.
  * - Alive PID → re-arm, UNLESS this is the `threshold`-th rapid benign
- *   close in a row, in which case give up and fall back to polling-only
- *   (the same degraded mode as a heartbeat setup failure).
+ *   close in a row, in which case the benign-close budget is exhausted and
+ *   the caller must independently verify Chrome's WS layer (decideThresholdPlan
+ *   / probeBrowserWs / decideProbeOutcome) before deciding crash vs. cooldown
+ *   — never "crashed" for an alive pid, and never a silent give-up either.
  */
 export type HeartbeatCloseDecision =
   | { action: "crash" }
   | { action: "rearm"; nextConsecutiveBenignCloses: number }
-  | { action: "fallback-to-polling"; consecutiveBenignCloses: number };
+  | { action: "threshold-reached"; consecutiveBenignCloses: number };
 
 export function decideHeartbeatClose(
   pidAlive: boolean,
@@ -850,9 +994,121 @@ export function decideHeartbeatClose(
   if (!pidAlive) return { action: "crash" };
   const next = consecutiveBenignCloses + 1;
   if (next >= threshold) {
-    return { action: "fallback-to-polling", consecutiveBenignCloses: next };
+    return { action: "threshold-reached", consecutiveBenignCloses: next };
   }
   return { action: "rearm", nextConsecutiveBenignCloses: next };
+}
+
+/**
+ * Decide what the benign-close threshold means for `target`'s policy. Headed
+ * Chrome is never killed by the supervisor (it's an interactive session the
+ * user/agent is actively driving), so probing to justify a kill is pointless
+ * — go straight to cooldown. Every headless target (always-on shard 0 or
+ * on-demand shards 1+) gets probed: five correlated heartbeat closes alone
+ * only prove "our heartbeat bookkeeping saw five closes," not that Chrome's
+ * WS layer is actually dead (the repo's own 4d187a2 fixed a supervisor-side
+ * race that produced exactly this kind of close storm).
+ *
+ * Takes a distinct "headed" policy value (not ChromePolicy) because
+ * CONFIGS["headed"].policy is "on-demand" — identical to headless shards
+ * 1+ — so ChromePolicy alone can't distinguish them. Callers pass "headed"
+ * literally when target === "headed", and config.policy otherwise.
+ */
+export function decideThresholdPlan(
+  policy: ChromePolicy | "headed",
+): "probe" | "cooldown" {
+  return policy === "headed" ? "cooldown" : "probe";
+}
+
+/** Outcome of the two-probe sequence — any single probe success means Chrome's WS layer is alive. */
+export type ProbeOutcome = { action: "recycle" } | { action: "cooldown" };
+
+export function decideProbeOutcome(probe1Ok: boolean, probe2Ok: boolean): ProbeOutcome {
+  return probe1Ok || probe2Ok ? { action: "cooldown" } : { action: "recycle" };
+}
+
+/** Result of a single probeBrowserWs attempt — `error` is a short diagnostic string for logging, never thrown. */
+export interface ProbeResult {
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * One independent, fresh functional CDP probe against `port`: fetch
+ * `/json/version` for the current `webSocketDebuggerUrl`, open a brand-new
+ * WebSocket (not the heartbeat's — that one already closed), send exactly
+ * one CDP request (`method`), and require a response carrying the matching
+ * `id` within `timeoutMs`. Closes the WS unconditionally (success, failure,
+ * or timeout) so a probe never leaks a connection. Sequential two-probe
+ * calling convention (decideThresholdPlan's caller) short-circuits on the
+ * first success — this function only ever runs one probe per call.
+ */
+export async function probeBrowserWs(
+  port: number,
+  method: "Browser.getVersion" | "Target.getTargets",
+  timeoutMs: number = PROBE_TIMEOUT_MS,
+): Promise<ProbeResult> {
+  let resp: Response;
+  try {
+    resp = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    return { ok: false, error: `fetch /json/version failed: ${String(err)}` };
+  }
+  let info: { webSocketDebuggerUrl?: string };
+  try {
+    info = (await resp.json()) as { webSocketDebuggerUrl?: string };
+  } catch (err) {
+    return { ok: false, error: `invalid /json/version body: ${String(err)}` };
+  }
+  if (!info.webSocketDebuggerUrl) {
+    return { ok: false, error: "no webSocketDebuggerUrl in /json/version" };
+  }
+
+  return new Promise<ProbeResult>((resolve) => {
+    let settled = false;
+    const id = Date.now();
+    let ws: WebSocket;
+    const finish = (result: ProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch { /* close unconditionally, best effort */ }
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish({ ok: false, error: `probe timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+    try {
+      ws = new WebSocket(info.webSocketDebuggerUrl!);
+    } catch (err) {
+      clearTimeout(timer);
+      resolve({ ok: false, error: `WebSocket construction failed: ${String(err)}` });
+      return;
+    }
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({ id, method }));
+      } catch (err) {
+        finish({ ok: false, error: `send failed: ${String(err)}` });
+      }
+    };
+    ws.onmessage = (ev: MessageEvent) => {
+      try {
+        const data = JSON.parse(String(ev.data)) as { id?: number };
+        if (data.id === id) finish({ ok: true });
+      } catch {
+        // Not our response — keep waiting for the timeout.
+      }
+    };
+    ws.onerror = () => {
+      finish({ ok: false, error: "WebSocket error during probe" });
+    };
+    ws.onclose = () => {
+      finish({ ok: false, error: "WebSocket closed before a matching response" });
+    };
+  });
 }
 
 /**
@@ -920,7 +1176,10 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
       signal: AbortSignal.timeout(2_000),
     });
     const info = await resp.json() as { webSocketDebuggerUrl?: string };
-    if (!info.webSocketDebuggerUrl) return;
+    if (!info.webSocketDebuggerUrl) {
+      reenterCooldownIfStillUp(target, isRearm, myGeneration, capturedPid);
+      return;
+    }
 
     const ws = new WebSocket(info.webSocketDebuggerUrl);
 
@@ -947,6 +1206,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
 
     rt.heartbeatWs = ws;
     rt.heartbeatArmedSince = Date.now();
+    rt.heartbeatMode = "armed";
     log.info(`[${target}] Heartbeat armed`, {
       rearm: isRearm,
       consecutiveBenignCloses: rt.consecutiveBenignCloses,
@@ -986,15 +1246,42 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
 
             const decision = decideHeartbeatClose(pidAlive, rt.consecutiveBenignCloses);
             if (decision.action === "crash") {
-              handleCrashDetected(target);
+              handleCrashDetected(target, "heartbeat-close-pid-dead");
               return;
             }
-            if (decision.action === "fallback-to-polling") {
+            if (decision.action === "threshold-reached") {
+              // Threshold exhausted — independently verify Chrome's WS layer
+              // (or skip straight to cooldown for headed) instead of just
+              // giving up. Note: consecutiveBenignCloses is deliberately
+              // left at the threshold value, not reset — if the eventual
+              // cooldown-retry heartbeat closes again before it survives
+              // HEARTBEAT_STABLE_RESET_MS, it's already at threshold and
+              // probes/cooldowns again immediately (bounded, no spin).
               rt.consecutiveBenignCloses = decision.consecutiveBenignCloses;
+              const effectivePolicy = target === "headed" ? "headed" : config.policy;
+              const plan = decideThresholdPlan(effectivePolicy);
+              if (plan === "cooldown") {
+                log.warn(
+                  `[${target}] Heartbeat threshold reached — headed skips probing, cooldown, retry in ${HEARTBEAT_COOLDOWN_MS / 1000}s`,
+                  { pid: deadPid, closes: decision.consecutiveBenignCloses },
+                );
+                enterCooldown(target, deadPid);
+                return;
+              }
+              rt.heartbeatMode = "probing";
               log.warn(
-                `[${target}] ${decision.consecutiveBenignCloses} rapid benign heartbeat closes — falling back to polling-only`,
-                { pid: deadPid },
+                `[${target}] Heartbeat close #${decision.consecutiveBenignCloses} with pid alive — probing browser WS`,
+                { pid: deadPid, closes: decision.consecutiveBenignCloses },
               );
+              // Detached from opQueue: the probe sequence (up to ~2x
+              // PROBE_TIMEOUT_MS) must not block every other target's
+              // ensure()/kill() on this shared serial queue. It re-enqueues
+              // itself below once it has an outcome.
+              const probeGeneration = rt.heartbeatGeneration;
+              const closesAtProbeTime = decision.consecutiveBenignCloses;
+              runThresholdProbe(target, deadPid, probeGeneration, closesAtProbeTime).catch((err) => {
+                log.error(`[${target}] Threshold-probe cycle threw`, { err: String(err) });
+              });
               return;
             }
 
@@ -1002,6 +1289,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
             // Re-arm after a short delay so a wedged Chrome that closes the
             // WS immediately again doesn't spin in a tight loop.
             rt.consecutiveBenignCloses = decision.nextConsecutiveBenignCloses;
+            rt.heartbeatMode = "rearming";
             if (rt.heartbeatRearmTimer) clearTimeout(rt.heartbeatRearmTimer);
             rt.heartbeatRearmTimer = setTimeout(() => {
               rt.heartbeatRearmTimer = null;
@@ -1022,14 +1310,149 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
   } catch {
     // CDP not ready or WebSocket failed — fall back to polling health check
     log.debug(`[${target}] Heartbeat WebSocket setup failed — relying on polling`);
+    reenterCooldownIfStillUp(target, isRearm, myGeneration, capturedPid);
   }
+}
+
+/**
+ * Re-arm the cooldown timer when a cooldown-triggered `startHeartbeat(target,
+ * true)` retry itself fails during setup (no `webSocketDebuggerUrl` in
+ * `/json/version`, or the outer catch — fetch/json/WebSocket-construction
+ * throwing). Without this, `heartbeatMode` stays "cooldown" but no new
+ * `heartbeatCooldownTimer` exists to ever retry again — a permanently stuck,
+ * silent degraded state. FINAL CONSENSUS SPEC: cooldown is never terminal,
+ * "the timer always retries" (see enterCooldown's doc comment). The cooldown
+ * interval itself (HEARTBEAT_COOLDOWN_MS) bounds the retry cadence, so no
+ * additional spin guard is needed here.
+ *
+ * No-op unless this really is a cooldown retry (`isRearm`) for a target that
+ * hasn't been superseded (relaunch/teardown bumps heartbeatGeneration, or
+ * changes the owning pid) while this attempt's fetch/json was in flight, and
+ * is still chrome_up.
+ */
+function reenterCooldownIfStillUp(
+  target: ChromeTarget,
+  isRearm: boolean,
+  myGeneration: number,
+  capturedPid: number | null,
+): void {
+  if (!isRearm || capturedPid === null) return;
+  const rt = runtime[target];
+  if (rt.heartbeatGeneration !== myGeneration) return;
+  const currentPid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+  if (currentPid !== capturedPid) return;
+  if (getState(target).phase !== "chrome_up") return;
+  log.warn(`[${target}] Cooldown retry setup failed — retrying in ${HEARTBEAT_COOLDOWN_MS / 1000}s`);
+  enterCooldown(target, capturedPid);
+}
+
+/**
+ * Run the two-probe sequence (sequential, short-circuit on first success —
+ * see probeBrowserWs) for a target that just hit the benign-close threshold,
+ * then re-enqueue onto opQueue to apply the outcome. Deliberately NOT
+ * awaited by its caller (the ws.onclose opQueue task) — this function's own
+ * awaits (fetch + WS round-trip, up to ~2x PROBE_TIMEOUT_MS) must happen
+ * off the shared serial queue so they can't block every other target's
+ * ensure()/kill() for that long.
+ *
+ * `generation`/`deadPid` are snapshotted by the caller before this function
+ * starts running, so the re-enqueued continuation can detect whether the
+ * world moved on (relaunch, teardown, a newer heartbeat cycle) while the
+ * probes were in flight and discard a stale result silently — same
+ * generation+pid+phase guard set as startHeartbeat's own staleness check.
+ */
+async function runThresholdProbe(
+  target: ChromeTarget,
+  deadPid: number,
+  generation: number,
+  closes: number,
+): Promise<void> {
+  const config = CONFIGS[target];
+  const probe1 = await probeBrowserWs(config.port, "Browser.getVersion");
+  let probe2: ProbeResult = { ok: false };
+  if (!probe1.ok) {
+    probe2 = await probeBrowserWs(config.port, "Target.getTargets");
+  }
+  const outcome = decideProbeOutcome(probe1.ok, probe2.ok);
+
+  await opQueue.enqueue(() =>
+    withOpId(newOpId(), async () => {
+      const rt = runtime[target];
+      const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+      if (
+        rt.heartbeatGeneration !== generation ||
+        currentPid !== deadPid ||
+        getState(target).phase !== "chrome_up"
+      ) {
+        log.debug(`[${target}] Stale probe result — discarding`, { deadPid, generation });
+        return;
+      }
+
+      if (outcome.action === "recycle") {
+        log.error(`[${target}] Browser WS probes failed — recycling Chrome`, {
+          pid: deadPid,
+          probe1Err: probe1.error ?? null,
+          probe2Err: probe2.error ?? null,
+        });
+        handleCrashDetected(target, "ws-probe-failed");
+        return;
+      }
+
+      log.warn(
+        `[${target}] Browser WS probe succeeded despite ${closes} heartbeat closes — cooldown, retry in ${HEARTBEAT_COOLDOWN_MS / 1000}s`,
+        { pid: deadPid },
+      );
+      enterCooldown(target, deadPid);
+    }),
+  );
+}
+
+/**
+ * Enter cooldown mode for `target`: heartbeat transport is degraded (no WS
+ * armed), detection falls back to HTTP polling alone, and a
+ * HEARTBEAT_COOLDOWN_MS timer is armed to attempt exactly one re-arm.
+ * Reached either directly (headed skips probing per decideThresholdPlan) or
+ * after a probe outcome of "cooldown". There is no terminal degraded state
+ * — the timer always retries, gated by shouldRearmHeartbeat so a stale
+ * cooldown (Chrome relaunched, target torn down) can't resurrect anything.
+ */
+function enterCooldown(target: ChromeTarget, pid: number): void {
+  const rt = runtime[target];
+  rt.heartbeatMode = "cooldown";
+  if (rt.heartbeatCooldownTimer) clearTimeout(rt.heartbeatCooldownTimer);
+  rt.heartbeatCooldownTimer = setTimeout(() => {
+    rt.heartbeatCooldownTimer = null;
+    const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+    if (!shouldRearmHeartbeat(currentPid, pid, rt.heartbeatWs, getState(target).phase)) {
+      return;
+    }
+    startHeartbeat(target, true);
+  }, HEARTBEAT_COOLDOWN_MS);
 }
 
 // ---------------------------------------------------------------------------
 // Crash / exit handling
 // ---------------------------------------------------------------------------
 
-function handleExit(target: ChromeTarget, exitCode: number, exitSignal: string | null = null): void {
+/**
+ * Bump backoff (double, capped at BACKOFF_MAX_MS) and arm retryNotBefore —
+ * the single failure-accounting step shared by handleExit and
+ * handleCrashDetected, for every policy (item 6). Previously this only
+ * happened inside scheduleRestart, which on-demand targets never call, so
+ * an on-demand shard's backoffMs never escalated and the corruption-recovery
+ * gate in launchChrome (`rt.backoffMs >= BACKOFF_MAX_MS`) was unreachable
+ * for it. handleExit and handleCrashDetected are mutually exclusive per
+ * process generation (a crash-detected kill nulls rt.proc/marks non-idle
+ * before its own proc.exited fires, so handleExit's idle/restartScheduled
+ * guards above already no-op that call) — so this always runs exactly once
+ * per death.
+ */
+function bumpBackoffAndRetry(rt: TargetRuntime): void {
+  rt.retryNotBefore = Date.now() + rt.backoffMs;
+  rt.backoffMs = Math.min(rt.backoffMs * 2, BACKOFF_MAX_MS);
+}
+
+function handleExit(target: ChromeTarget, exitCode: number | null, exitSignal: string | null = null): void {
   const rt = runtime[target];
   const state = getState(target);
 
@@ -1039,9 +1462,17 @@ function handleExit(target: ChromeTarget, exitCode: number, exitSignal: string |
   // If a restart is already scheduled (e.g. from handleCrashDetected), don't double-schedule
   if (rt.restartScheduled) return;
 
+  bumpBackoffAndRetry(rt);
+  // Verbatim exit evidence (item 2) — code XOR signal, exactly as the
+  // runtime reported them, never synthesized. handleExit is the ONLY writer
+  // of lastExit; intentional teardowns (doKill, idle timeout, heal) never
+  // reach this point because they mark idle before their exit fires, and
+  // the idle guard above turns this call into a no-op for them.
+  rt.lastExit = { code: exitCode, signal: exitSignal, at: Date.now() };
+
   // Log profile diagnostics on non-zero exit to help root-cause crashes.
-  // `signal` is included whenever the OS reports one (e.g. SIGKILL -> 137):
-  // this handler only ever runs for exits nobody attributed to
+  // `signal` is included whenever the OS reports one (e.g. SIGKILL): this
+  // handler only ever runs for exits nobody attributed to
   // killedBy: "supervisor" above, so an exit with a signal logged here and
   // no preceding supervisor-kill log line is provably external (OOM etc.).
   const config = CONFIGS[target];
@@ -1066,7 +1497,7 @@ function handleExit(target: ChromeTarget, exitCode: number, exitSignal: string |
   log.warn(`[${target}] Chrome exited`, diag);
   rt.proc = null;
   clearTimers(target);
-  markCrashed(target, exitCode);
+  markCrashed(target, exitCode ?? -1);
   resetAuthState();
 
   if (CONFIGS[target].policy === "always-on") {
@@ -1078,8 +1509,10 @@ function handleExit(target: ChromeTarget, exitCode: number, exitSignal: string |
   }
 }
 
-function handleCrashDetected(target: ChromeTarget): void {
+function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): void {
   const rt = runtime[target];
+  rt.lastDetection = { reason, at: Date.now() };
+  bumpBackoffAndRetry(rt);
 
   // Force-kill the unresponsive process
   if (rt.proc) {
@@ -1088,7 +1521,7 @@ function handleCrashDetected(target: ChromeTarget): void {
     rt.proc = null;
     log.info(`[${target}] Killed unresponsive Chrome (PID ${pid})`, {
       killedBy: "supervisor",
-      reason: "crash-detected",
+      reason,
     });
   } else if (rt.adoptedPid) {
     // Kill adopted Chrome we don't have a proc handle for
@@ -1096,7 +1529,7 @@ function handleCrashDetected(target: ChromeTarget): void {
       process.kill(rt.adoptedPid, "SIGKILL");
       log.info(`[${target}] Killed adopted Chrome (PID ${rt.adoptedPid})`, {
         killedBy: "supervisor",
-        reason: "crash-detected",
+        reason,
       });
     } catch { /* already dead */ }
     rt.adoptedPid = null;
@@ -1116,10 +1549,15 @@ function handleCrashDetected(target: ChromeTarget): void {
 function scheduleRestart(target: ChromeTarget): void {
   const rt = runtime[target];
   rt.restartScheduled = true;
-  const delay = rt.backoffMs;
+  // retryNotBefore was already armed by bumpBackoffAndRetry (handleExit /
+  // handleCrashDetected, called just before this) — reuse it as the single
+  // source of truth for "when is it safe to retry" instead of a second,
+  // independently-bumped delay. backoffMs itself was already doubled by
+  // that same call, for the NEXT failure's baseline.
+  const delay = Math.max(0, rt.retryNotBefore - Date.now());
 
   log.info(`[${target}] Scheduling restart in ${delay}ms`, {
-    backoffMs: delay,
+    backoffMs: rt.backoffMs,
   });
 
   rt.restartTimer = setTimeout(async () => {
@@ -1132,9 +1570,6 @@ function scheduleRestart(target: ChromeTarget): void {
       });
     }
   }, delay);
-
-  // Exponential backoff: 1s → 2s → 4s → ... → 30s max
-  rt.backoffMs = Math.min(rt.backoffMs * 2, BACKOFF_MAX_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,12 +1673,21 @@ function clearTimers(target: ChromeTarget): void {
     clearTimeout(rt.heartbeatStableTimer);
     rt.heartbeatStableTimer = null;
   }
+  if (rt.heartbeatCooldownTimer) {
+    clearTimeout(rt.heartbeatCooldownTimer);
+    rt.heartbeatCooldownTimer = null;
+  }
   // Close heartbeat WebSocket
   if (rt.heartbeatWs) {
     try { rt.heartbeatWs.close(); } catch { /* ignore */ }
     rt.heartbeatWs = null;
   }
   rt.heartbeatArmedSince = null;
+  // Every teardown path (kill/handleCrashDetected/handleExit) routes through
+  // here — no residual mode should survive a torn-down heartbeat. This is
+  // what lets a stale cooldown/probing/rearming mode never block a fresh
+  // startHeartbeat() call after the target comes back up.
+  rt.heartbeatMode = "off";
   // Invalidate any in-flight launch promise so ensure() doesn't await a stale one
   rt.inflight = null;
 }
@@ -1261,6 +1705,17 @@ export function __resetRuntimeForTest(): void {
     clearTimers(target);
     runtime[target] = freshRuntime();
   }
+}
+
+/**
+ * Resolved profilePath for `target`, exactly as launchChrome's
+ * corruption-recovery block would rmSync+mkdirSync it. Test-only — lets a
+ * test assert the resolved path is under a disposable AB_PROFILE_ROOT tmp
+ * dir BEFORE triggering any destructive recovery flow, instead of trusting
+ * that the env override was picked up.
+ */
+export function __getProfilePathForTest(target: ChromeTarget): string {
+  return CONFIGS[target].profilePath;
 }
 
 /**

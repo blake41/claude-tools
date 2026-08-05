@@ -17,7 +17,7 @@ import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
 import { HEADLESS_POOL_SIZE } from "./types";
-import type { ChromeState } from "./types";
+import type { ChromeState, ShardDiagnostics } from "./types";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -684,14 +684,53 @@ export interface DoctorCheck {
  * to the live daemon over RPC and writes straight to stdout, so this is
  * the only test seam without a larger refactor.
  */
+/**
+ * Render "16:05Z" from an ISO timestamp — doctor's crash-evidence detail
+ * string wants a short, glanceable time, not a full ISO stamp.
+ */
+function formatHHMMZ(iso: string): string {
+  const match = /T(\d{2}:\d{2})/.exec(iso);
+  return match ? `${match[1]}Z` : iso;
+}
+
+/**
+ * Build the human-readable detail string for one headless shard's doctor
+ * line. On-demand shards (i>=1) that are idle with crash evidence
+ * (`diag.lastExit`) render that evidence inline instead of the bare "idle
+ * (on-demand)" — before this, a shard that had just crash-looped and
+ * silently relaunched itself on the next command left no trace in `ab
+ * doctor` at all (FINAL CONSENSUS SPEC item 14). Pure and exported for
+ * direct unit testing, following buildHeadlessDoctorChecks's own
+ * established pattern (chrome-pool-plan Fix 5).
+ */
+export function buildHeadlessDoctorDetail(
+  alwaysOn: boolean,
+  phase: string,
+  diag: ShardDiagnostics | undefined,
+): string {
+  if (!alwaysOn && phase === "idle") {
+    if (diag?.lastExit) {
+      const { code, signal, at } = diag.lastExit;
+      return `idle (on-demand; last exit code=${code} signal=${signal} ${formatHHMMZ(at)} — relaunches on next use)`;
+    }
+    return "idle (on-demand)";
+  }
+  return phase;
+}
+
 export function buildHeadlessDoctorChecks(
-  status: { headless: ChromeState; headlessPool?: ChromeState[] },
+  status: {
+    headless: ChromeState;
+    headlessPool?: ChromeState[];
+    diagnostics?: { headlessPool?: ShardDiagnostics[] };
+  },
 ): DoctorCheck[] {
   if (status.headlessPool && status.headlessPool.length > 0) {
     return status.headlessPool.map((state, i) => {
       const alwaysOn = i === 0;
       const ok = alwaysOn ? state.phase === "chrome_up" : state.phase !== "chrome_crashed";
-      const detail = !alwaysOn && state.phase === "idle" ? "idle (on-demand)" : state.phase;
+      const diag = status.diagnostics?.headlessPool?.[i];
+      const detail = buildHeadlessDoctorDetail(alwaysOn, state.phase, diag);
       return {
         label: `Chrome (headless-${i}, ${CDP_PORT_HEADLESS + i})`,
         ok,
@@ -823,7 +862,7 @@ async function cmdDoctor(): Promise<number> {
     checks.push({
       label: "Chrome (headed, 9444)",
       ok: !headedCrashed,
-      detail: status.headed.phase === "idle" ? "idle (on-demand)" : status.headed.phase,
+      detail: buildHeadlessDoctorDetail(false, status.headed.phase, status.diagnostics?.headed),
       fix: headedCrashed ? "ab heal" : undefined,
     });
   }
@@ -2152,8 +2191,24 @@ const BLOCKED_COMMANDS = new Set(["eval", "js", "execute"]);
  *  fresh); `new-session` creates the marker itself. */
 const NO_TOUCH_COMMANDS = new Set(["ps", "gc", "new-session"]);
 
-/** Commands that require a managed Chrome instance (ensureChromePort). */
-const NEEDS_CHROME = new Set([
+/**
+ * Commands that require a managed Chrome instance (ensureChromePort).
+ *
+ * `console-tail`/`watch`/`click-js`/`click-xy` joined this set per the
+ * FINAL CONSENSUS SPEC (2026-08-04): they all consume Chrome (they already
+ * take `cdpPort` as a handler parameter — see cmdConsoleTail/cmdWatch/
+ * cmdClickJs/cmdClickXy below), so leaving them out of NEEDS_CHROME meant a
+ * down shard turned "wrong Chrome" into "correct error against a dead
+ * shard" instead of healing it via the same demand-driven ensure() every
+ * other Chrome-consuming command goes through. No handler changes were
+ * needed — membership alone routes them through the existing
+ * `ensureChromePort` -> pinned-shard ensure gate at the dispatch site below.
+ * `close` stays excluded, as designed: it must tear down, never boot Chrome.
+ * Exported so tests can assert membership directly instead of driving the
+ * full main() dispatch (main() itself isn't exported — see auth.test.ts's
+ * "reauth is shard-aware" tests for the established pattern this follows).
+ */
+export const NEEDS_CHROME = new Set([
   // `close` is intentionally excluded: it should tear down, never boot Chrome.
   ...[...PASSTHROUGH_COMMANDS].filter((c) => c !== "close"),
   "open",
@@ -2163,6 +2218,10 @@ const NEEDS_CHROME = new Set([
   "localStorage",
   "dashboard",
   "reauth",
+  "console-tail",
+  "watch",
+  "click-js",
+  "click-xy",
 ]);
 
 // ---------------------------------------------------------------------------

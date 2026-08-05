@@ -37,12 +37,13 @@ import * as os from "os";
 import * as path from "path";
 import {
   buildHeadlessDoctorChecks,
+  buildHeadlessDoctorDetail,
   listSessionEntries,
   portForShard,
   readShardAssignment,
   resolveTeardownShard,
 } from "../cli";
-import type { ChromeState } from "../types";
+import type { ChromeState, ShardDiagnostics } from "../types";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
 const AGENT_BROWSER_HOME = path.join(os.homedir(), ".agent-browser");
@@ -472,6 +473,83 @@ describe("buildHeadlessDoctorChecks (ab doctor pool-awareness, Fix 5)", () => {
     const checks = buildHeadlessDoctorChecks(status);
     expect(checks[0].ok).toBe(false);
     expect(checks[0].fix).toBe("ab ensure   # or: ab heal");
+  });
+
+  // FINAL CONSENSUS SPEC item 14 — an idle on-demand shard with crash
+  // evidence (diagnostics.lastExit) renders that evidence inline instead of
+  // the bare "idle (on-demand)", so `ab doctor` shows a shard that just
+  // crash-looped and silently relaunched itself on the next command.
+  test("idle on-demand shard with lastExit renders crash evidence inline", () => {
+    const status = {
+      headless: { phase: "chrome_up", pid: 1, port: 9333 } as ChromeState,
+      headlessPool: [
+        { phase: "chrome_up", pid: 1, port: 9333 } as ChromeState,
+        { phase: "idle" } as ChromeState,
+      ],
+      diagnostics: {
+        headlessPool: [
+          { lastHealthOkAt: null, heartbeatArmedSince: null, heartbeatMode: "armed", lastExit: null, lastDetection: null } as ShardDiagnostics,
+          {
+            lastHealthOkAt: null,
+            heartbeatArmedSince: null,
+            heartbeatMode: "off",
+            lastExit: { code: null, signal: "SIGKILL", at: "2026-08-04T16:05:00.000Z" },
+            lastDetection: { reason: "pid-gone", at: "2026-08-04T16:05:00.000Z" },
+          } as ShardDiagnostics,
+        ],
+      },
+    };
+    const checks = buildHeadlessDoctorChecks(status);
+    expect(checks[1]).toMatchObject({
+      label: "Chrome (headless-1, 9334)",
+      ok: true, // idle on-demand is still healthy — evidence is informational, not a failure
+      detail: "idle (on-demand; last exit code=null signal=SIGKILL 16:05Z — relaunches on next use)",
+    });
+  });
+});
+
+describe("buildHeadlessDoctorDetail (FINAL CONSENSUS SPEC item 14)", () => {
+  test("always-on shard renders its bare phase regardless of diagnostics", () => {
+    expect(buildHeadlessDoctorDetail(true, "chrome_up", undefined)).toBe("chrome_up");
+  });
+
+  test("on-demand shard, idle, no diagnostics -> bare 'idle (on-demand)'", () => {
+    expect(buildHeadlessDoctorDetail(false, "idle", undefined)).toBe("idle (on-demand)");
+  });
+
+  test("on-demand shard, idle, diagnostics present but no lastExit -> still bare", () => {
+    const diag: ShardDiagnostics = {
+      lastHealthOkAt: null,
+      heartbeatArmedSince: null,
+      heartbeatMode: "off",
+      lastExit: null,
+      lastDetection: null,
+    };
+    expect(buildHeadlessDoctorDetail(false, "idle", diag)).toBe("idle (on-demand)");
+  });
+
+  test("on-demand shard, idle, lastExit present -> renders code/signal/time verbatim", () => {
+    const diag: ShardDiagnostics = {
+      lastHealthOkAt: null,
+      heartbeatArmedSince: null,
+      heartbeatMode: "off",
+      lastExit: { code: 1, signal: null, at: "2026-08-04T09:12:00.000Z" },
+      lastDetection: null,
+    };
+    expect(buildHeadlessDoctorDetail(false, "idle", diag)).toBe(
+      "idle (on-demand; last exit code=1 signal=null 09:12Z — relaunches on next use)",
+    );
+  });
+
+  test("non-idle on-demand phase (e.g. chrome_crashed) ignores lastExit — only idle gets the crash-evidence line", () => {
+    const diag: ShardDiagnostics = {
+      lastHealthOkAt: null,
+      heartbeatArmedSince: null,
+      heartbeatMode: "off",
+      lastExit: { code: null, signal: "SIGKILL", at: "2026-08-04T16:05:00.000Z" },
+      lastDetection: null,
+    };
+    expect(buildHeadlessDoctorDetail(false, "chrome_crashed", diag)).toBe("chrome_crashed");
   });
 });
 

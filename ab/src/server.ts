@@ -126,16 +126,40 @@ function handleHealth(): Response {
   return json(body);
 }
 
-async function handleEnsure(target: ChromeTarget): Promise<Response> {
-  const result = await supervisor.ensure(target);
-  const body: ChromeEnsureResponse = {
-    ok: true,
-    pid: result.pid,
-    port: result.port,
-    alreadyRunning: result.alreadyRunning,
-    profileFresh: result.profileFresh,
-  };
-  return json(body);
+export async function handleEnsure(target: ChromeTarget): Promise<Response> {
+  try {
+    const result = await supervisor.ensure(target);
+    const body: ChromeEnsureResponse = {
+      ok: true,
+      pid: result.pid,
+      port: result.port,
+      alreadyRunning: result.alreadyRunning,
+      profileFresh: result.profileFresh,
+    };
+    return json(body);
+  } catch (err) {
+    if (err instanceof supervisor.RetryAfterError) {
+      // A target inside its crash-loop backoff window rejects fast (see
+      // launchChrome's ensure gate, which already logs "Ensure rejected —
+      // crash backoff") rather than making the caller hang. The `error`
+      // string embeds the human-readable retry-seconds message —
+      // rpc.ts's generic HTTP-error surfacing (`parsed.error || parsed.message`)
+      // only propagates a flat string to the CLI's stderr, with no separate
+      // channel for `retryAfterMs`, so this is the one place that message
+      // has to be readable on its own. `retryAfterMs` is still included
+      // verbatim for any caller that parses the body directly.
+      const retryAfterMs = err.retryAfterMs;
+      return json(
+        {
+          ok: false,
+          error: `crash-loop backoff, retry in ${Math.ceil(retryAfterMs / 1000)}s`,
+          retryAfterMs,
+        },
+        503,
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -164,16 +188,21 @@ async function parseChromeEnsureBody(
   return parsed.data;
 }
 
-async function handleEnsureHeadless(req: Request): Promise<Response> {
+export async function handleEnsureHeadless(req: Request): Promise<Response> {
   const parsed = await parseChromeEnsureBody(req);
   if ("error" in parsed) {
     return json({ ok: false, error: parsed.error }, 400);
   }
   const shard = parsed.shard ?? 0;
+  // The missing incident forensic (FINAL CONSENSUS SPEC item 15): every
+  // ensure request logs which shard it resolved to, so an incident
+  // postmortem can see which shard a given caller actually landed on
+  // without cross-referencing the CLI's own shard-assignment file.
+  log.info(`POST /chrome/ensure shard=${shard}`);
   return handleEnsure(headlessTarget(shard));
 }
 
-async function handleHeal(): Promise<Response> {
+export async function handleHeal(): Promise<Response> {
   const actions: string[] = [];
 
   // Step 1: clean agent-browser sessions (pure filesystem ops — no external process)
@@ -190,8 +219,17 @@ async function handleHeal(): Promise<Response> {
   actions.push("state reset");
 
   // Step 4: restart supervision (launches headless)
-  await supervisor.startSupervision();
+  const { skippedBackoff } = await supervisor.startSupervision();
   actions.push("supervisor.startSupervision()");
+  // Surface any always-on target that was still inside crash-loop backoff
+  // and got skipped this pass — heal must not silently leave it down with
+  // no visible signal (same additive-actions pattern as the rest of this
+  // list; HealResponse.actions is a plain string[]).
+  for (const skip of skippedBackoff) {
+    actions.push(
+      `${skip.target}: launch skipped — crash backoff, retry in ${Math.ceil(skip.retryAfterMs / 1000)}s`,
+    );
+  }
 
   const body: HealResponse = { ok: true, actions };
   return json(body);
