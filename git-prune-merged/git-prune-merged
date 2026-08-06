@@ -1,27 +1,42 @@
 #!/usr/bin/env bash
 # git-prune-merged - Clean up branches and worktrees already in master (rebase-aware)
-# Uses git cherry (patch-id comparison) instead of --merged (SHA comparison)
+# Uses git cherry (patch-id comparison) instead of --merged (SHA comparison).
+# Also treats a branch as prunable if it has a closed-but-unmerged PR (via gh),
+# since an abandoned/superseded PR's branch is just as dead as a merged one.
 
 set -euo pipefail
 
 PROTECTED="master main develop staging production release"
+
+# Lazily populated by fetch_closed_prs(): "headRefName<TAB>number" lines for
+# closed (not merged) PRs. GH_OK stays false if gh is missing, unauthenticated,
+# or rate-limited — closed-PR pruning silently degrades to merged-only in that
+# case rather than failing the whole run.
+GH_CHECKED=false
+GH_OK=false
+CLOSED_PR_CACHE=""
 
 usage() {
   cat <<'EOF'
 Usage: git prune-merged <command> [options]
 
 Commands:
-  branches    List (or delete) local branches fully merged into base
-  worktrees   List (or delete) worktrees whose branches are fully merged
+  branches    List (or delete) local branches fully merged (or closed-unmerged) into base
+  worktrees   List (or delete) worktrees whose branches are fully merged (or closed-unmerged)
 
 Options:
   --delete    Actually delete (default is dry-run)
   --base REF  Compare against this branch (default: master)
 
+A branch/worktree is prunable if either:
+  - all its commits are already in base (rebase-aware, via git cherry), or
+  - it has a closed (not merged) PR on GitHub (via gh; degrades silently if
+    gh is unavailable/unauthenticated/rate-limited)
+
 Examples:
-  git prune-merged branches              # dry-run: show merged branches
+  git prune-merged branches              # dry-run: show merged/closed branches
   git prune-merged branches --delete     # delete them
-  git prune-merged worktrees             # dry-run: show merged worktrees
+  git prune-merged worktrees             # dry-run: show merged/closed worktrees
   git prune-merged worktrees --delete    # remove them and their branches
 EOF
   exit 1
@@ -50,6 +65,64 @@ is_fully_merged() {
   ! echo "$output" | grep -q '^\+'
 }
 
+# One-shot, best-effort fetch of closed-but-unmerged PRs. Never fails the
+# script — any error just leaves GH_OK=false and callers fall back to
+# merged-only detection.
+fetch_closed_prs() {
+  $GH_CHECKED && return
+  GH_CHECKED=true
+
+  command -v gh >/dev/null 2>&1 || return
+  command -v jq >/dev/null 2>&1 || return
+
+  local json
+  json=$(gh pr list --state closed --json headRefName,number,mergedAt --limit 500 2>/dev/null) || return
+  echo "$json" | jq -e . >/dev/null 2>&1 || return
+
+  GH_OK=true
+  CLOSED_PR_CACHE=$(echo "$json" | jq -r '.[] | select(.mergedAt == null) | "\(.headRefName)\t\(.number)"')
+}
+
+# Prints the PR number on stdout and returns 0 if branch has a closed
+# (not merged) PR; returns 1 otherwise.
+closed_pr_number() {
+  local branch="$1"
+  $GH_OK || return 1
+  [[ -z "$CLOSED_PR_CACHE" ]] && return 1
+  local num
+  num=$(awk -F'\t' -v b="$branch" '$1 == b { print $2; exit }' <<<"$CLOSED_PR_CACHE")
+  [[ -n "$num" ]] || return 1
+  echo "$num"
+}
+
+# Prints "merged" or "closed:<PR#>" and returns 0 if branch should be
+# considered prunable; returns 1 if it's still live.
+prune_status() {
+  local base="$1" branch="$2"
+  if is_fully_merged "$base" "$branch"; then
+    echo "merged"
+    return 0
+  fi
+
+  fetch_closed_prs
+  local prnum
+  if prnum=$(closed_pr_number "$branch"); then
+    echo "closed:$prnum"
+    return 0
+  fi
+  return 1
+}
+
+# Formats a prune_status value ("merged" / "closed:N") into a parenthetical
+# suffix for display — empty for merged (the row prefix already says so),
+# "PR #N" for closed (disambiguates from a merged PR).
+status_suffix() {
+  local status="$1"
+  if [[ "$status" == closed:* ]]; then
+    echo ", PR #${status#closed:}"
+  fi
+}
+
 cmd_branches() {
   local base="master" delete=false
   while [[ $# -gt 0 ]]; do
@@ -68,13 +141,25 @@ cmd_branches() {
     is_protected "$branch" && continue
     [[ "$branch" == "$current" ]] && continue
 
-    if is_fully_merged "$base" "$branch"; then
-      found=1
-      local sha
-      sha=$(git rev-parse --short "$branch")
-      if $delete; then
-        git branch -D "$branch" >/dev/null 2>&1
-        echo "  deleted  $branch (was $sha)"
+    local status
+    if ! status=$(prune_status "$base" "$branch"); then
+      continue
+    fi
+    found=1
+
+    local sha suffix
+    sha=$(git rev-parse --short "$branch")
+    suffix=$(status_suffix "$status")
+
+    if $delete; then
+      if git branch -D "$branch" >/dev/null 2>&1; then
+        echo "  deleted  $branch (was $sha$suffix)"
+      else
+        echo "  FAILED   $branch — could not delete (checked out in a worktree?)"
+      fi
+    else
+      if [[ "$status" == closed:* ]]; then
+        echo "  closed   $branch ($sha$suffix)"
       else
         echo "  merged   $branch ($sha)"
       fi
@@ -82,7 +167,7 @@ cmd_branches() {
   done
 
   if [[ $found -eq 0 ]]; then
-    echo "No merged branches found."
+    echo "No merged or closed-unmerged branches found."
   elif ! $delete; then
     echo ""
     echo "Run with --delete to remove these branches."
@@ -133,7 +218,7 @@ cmd_worktrees() {
   fi
 
   if [[ $found -eq 0 ]]; then
-    echo "No merged worktrees found."
+    echo "No merged or closed-unmerged worktrees found."
   elif ! $delete; then
     echo ""
     echo "Run with --delete to remove these worktrees and their branches."
@@ -145,7 +230,8 @@ _check_worktree() {
 
   is_protected "$wt_branch" && return 1
 
-  if ! is_fully_merged "$base" "$wt_branch"; then
+  local status
+  if ! status=$(prune_status "$base" "$wt_branch"); then
     return 1
   fi
 
@@ -161,18 +247,23 @@ _check_worktree() {
     return 0
   fi
 
-  local sha
+  local sha suffix
   sha=$(git rev-parse --short "$wt_branch")
+  suffix=$(status_suffix "$status")
 
   if $delete; then
     if git worktree remove "$wt_path" 2>&1; then
       git branch -D "$wt_branch" >/dev/null 2>&1
-      echo "  removed  $wt_path ($wt_branch, was $sha)"
+      echo "  removed  $wt_path ($wt_branch, was $sha$suffix)"
     else
       echo "  FAILED   $wt_path ($wt_branch) — could not remove worktree, skipping"
     fi
   else
-    echo "  merged   $wt_path ($wt_branch, $sha)"
+    if [[ "$status" == closed:* ]]; then
+      echo "  closed   $wt_path ($wt_branch, $sha$suffix)"
+    else
+      echo "  merged   $wt_path ($wt_branch, $sha)"
+    fi
   fi
 
   return 0
