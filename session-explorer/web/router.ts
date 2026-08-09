@@ -52,6 +52,11 @@ export const insightsRoute = createRoute({
   path: "/insights",
 });
 
+export const bookmarksRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/bookmarks",
+});
+
 export const metaRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/meta",
@@ -118,6 +123,7 @@ const routeTree = rootRoute.addChildren([
   askRoute,
   searchRoute,
   insightsRoute,
+  bookmarksRoute,
   metaRoute,
   metaProposalsRoute,
   metaProposalDetailRoute,

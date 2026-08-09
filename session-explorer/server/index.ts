@@ -49,7 +49,9 @@ const deleteTag = db.prepare(`DELETE FROM tags WHERE id = ?`);
 const deleteTagSessions = db.prepare(`DELETE FROM session_tags WHERE tag_id = ?`);
 
 const addSessionTag = db.prepare(`
-  INSERT OR IGNORE INTO session_tags (session_id, tag_id, added_at) VALUES (?, ?, ?)
+  INSERT INTO session_tags (session_id, tag_id, note, added_at)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(session_id, tag_id) DO UPDATE SET note = COALESCE(excluded.note, session_tags.note)
 `);
 
 const removeSessionTag = db.prepare(`
@@ -73,7 +75,8 @@ const getTagsForSession = db.prepare(`
 
 const getSessionsForTag = db.prepare(`
   SELECT s.id, s.workspace_id, s.started_at, s.ended_at, s.git_branch, s.title,
-         s.message_count, s.user_message_count, s.summary,
+         s.message_count, s.user_message_count, s.summary, s.summary_short,
+         st.note,
          w.display_name as workspace_name, w.path as workspace_path
   FROM sessions s
   JOIN session_tags st ON s.id = st.session_id
@@ -869,7 +872,7 @@ app.delete("/api/tags/:id", (req, res) => {
 
 app.post("/api/sessions/:id/tags", (req, res) => {
   const sessionId = req.params.id;
-  let { tag_id, name, color } = req.body;
+  let { tag_id, name, color, note } = req.body;
 
   // Create-and-add flow: if name provided instead of tag_id
   if (!tag_id && name) {
@@ -888,7 +891,7 @@ app.post("/api/sessions/:id/tags", (req, res) => {
   }
 
   const now = new Date().toISOString();
-  addSessionTag.run(sessionId, tag_id, now);
+  addSessionTag.run(sessionId, tag_id, note ?? null, now);
   const tag = getTagById.get(tag_id) as { id: number; name: string } | undefined;
   insertAuditLog.run("add_tag", "session", sessionId, JSON.stringify({ tag_id, tag_name: tag?.name }));
   res.json(tag);
@@ -1095,7 +1098,7 @@ app.post("/api/saved-searches/:id/run", async (req, res) => {
       clearSessionTagsForTag.run(search.tag_id);
       const now = new Date().toISOString();
       for (const sessionId of sessionIds) {
-        addSessionTag.run(sessionId, search.tag_id, now);
+        addSessionTag.run(sessionId, search.tag_id, null, now);
       }
       updateSavedSearchRun.run(now, sessionIds.length, search.id);
     });

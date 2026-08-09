@@ -32,6 +32,7 @@ export interface SessionSummary {
   user_message_count: number;
   summary: string | null;
   summary_short: string | null;
+  note?: string | null;
   tool_call_count?: number;
   file_count?: number;
   tags?: Tag[];

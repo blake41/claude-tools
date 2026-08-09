@@ -433,6 +433,15 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           <span className="text-[13px] font-medium">Insights</span>
         </Link>
         <Link
+          to="/bookmarks"
+          className="group flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text-secondary transition-all hover:bg-white/5 hover:text-text [&[data-status=active]]:bg-accent-purple/12 [&[data-status=active]]:text-accent-purple"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M4 2.5A1.5 1.5 0 015.5 1h5A1.5 1.5 0 0112 2.5V15l-4-2.5L4 15V2.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+          </svg>
+          <span className="text-[13px] font-medium">Bookmarks</span>
+        </Link>
+        <Link
           to="/meta"
           className="group flex items-center gap-2 px-2.5 py-2 rounded-lg no-underline text-text-secondary transition-all hover:bg-white/5 hover:text-text [&[data-status=active]]:bg-accent-purple/12 [&[data-status=active]]:text-accent-purple"
         >

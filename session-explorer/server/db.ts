@@ -304,5 +304,12 @@ try {
   // Column already exists
 }
 
+// Migration: add note column to session_tags — personal note for why a session was tagged
+try {
+  db.exec(`ALTER TABLE session_tags ADD COLUMN note TEXT`);
+} catch {
+  // Column already exists
+}
+
 export default db;
 export { DB_PATH };

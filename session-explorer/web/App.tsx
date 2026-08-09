@@ -7,6 +7,7 @@ import Search from "./components/Search";
 import SessionCard from "./components/SessionCard";
 // AskView is now rendered inside the Search overlay's "Ask AI" tab
 import InsightsPage from "./components/InsightsPage";
+import Bookmarks from "./components/Bookmarks";
 import MetaDashboard from "./components/MetaDashboard";
 import ProposalQueue from "./components/ProposalQueue";
 import ProposalDetail from "./components/ProposalDetail";
@@ -24,6 +25,7 @@ import {
   askRoute,
   searchRoute,
   insightsRoute,
+  bookmarksRoute,
   metaRoute,
   metaProposalsRoute,
   metaProposalDetailRoute,
@@ -563,6 +565,7 @@ fileRoute.update({ component: FileView });
 askRoute.update({ component: () => null });
 searchRoute.update({ component: () => null });
 insightsRoute.update({ component: InsightsPage });
+bookmarksRoute.update({ component: Bookmarks });
 metaRoute.update({ component: MetaDashboard });
 metaProposalsRoute.update({ component: ProposalQueue });
 metaProposalDetailRoute.update({ component: ProposalDetail });
