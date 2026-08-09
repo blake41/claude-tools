@@ -50,5 +50,5 @@
 # === Read-only (Claude can see but not modify) ===
 ~/Library/Preferences:ro
 ~/.config/cco:ro
-~/.local/bin
+~/.local/bin:ro
 ~/Documents/Development/tools/sandbox:ro

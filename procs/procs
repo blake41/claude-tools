@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+procs - sandbox-safe replacement for `ps`/`top`
+
+/bin/ps and /usr/bin/top are setuid-root. sandbox-exec refuses to exec
+setuid binaries, so they fail with "operation not permitted" inside the
+Claude Code sandbox even though process enumeration itself is allowed.
+procs wraps pgrep (not setuid) to list processes instead.
+
+Usage:
+  procs             List all processes (PID + full command line)
+  procs <pattern>   Filter by pattern (matches against full command line)
+
+pm2-managed processes don't need this at all - pm2 list/describe/logs/restart
+already work natively inside the sandbox (its daemon runs outside the sandbox
+and the CLI talks to it over ~/.pm2/rpc.sock, which is sandbox-writable).
+EOF
+  exit 0
+fi
+
+exec pgrep -lf "${1:-.}"
