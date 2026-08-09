@@ -40,6 +40,7 @@
 ~/.roughdraft/
 ~/Library/Developer/CoreSimulator/
 ~/.cursor
+~/.lavish-axi
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
