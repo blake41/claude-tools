@@ -3,6 +3,12 @@
 # Uses git cherry (patch-id comparison) instead of --merged (SHA comparison).
 # Also treats a branch as prunable if it has a closed-but-unmerged PR (via gh),
 # since an abandoned/superseded PR's branch is just as dead as a merged one.
+#
+# Two extra worktree-only detectors handle cases branch-merge detection can't see:
+#   --stale-prs  a review worktree (often detached HEAD, named pr-N / pr-N-review)
+#                whose target PR has since merged or closed
+#   --stale-age  buckets everything else by idle time and asks once per bucket
+#                before deleting anything — never auto-deletes on age alone
 
 set -euo pipefail
 
@@ -25,8 +31,13 @@ Commands:
   worktrees   List (or delete) worktrees whose branches are fully merged (or closed-unmerged)
 
 Options:
-  --delete    Actually delete (default is dry-run)
-  --base REF  Compare against this branch (default: master)
+  --delete      Actually delete (default is dry-run)
+  --base REF    Compare against this branch (default: master)
+  --stale-prs   (worktrees only) Also flag review worktrees (often detached HEAD,
+                named pr-N / pr-N-review) whose target PR has merged or closed
+  --stale-age   (worktrees only) Bucket remaining worktrees by idle time
+                (30-59d / 60-89d / 90-179d / 180d+) and, with --delete, ask
+                once per bucket before removing anything in it
 
 A branch/worktree is prunable if either:
   - all its commits are already in base (rebase-aware, via git cherry), or
@@ -38,6 +49,9 @@ Examples:
   git prune-merged branches --delete     # delete them
   git prune-merged worktrees             # dry-run: show merged/closed worktrees
   git prune-merged worktrees --delete    # remove them and their branches
+  git prune-merged worktrees --stale-prs               # also flag dead PR-review worktrees
+  git prune-merged worktrees --stale-age               # report idle-age buckets
+  git prune-merged worktrees --stale-age --delete      # ...and prompt per bucket
 EOF
   exit 1
 }
@@ -113,14 +127,48 @@ prune_status() {
   return 1
 }
 
-# Formats a prune_status value ("merged" / "closed:N") into a parenthetical
-# suffix for display — empty for merged (the row prefix already says so),
-# "PR #N" for closed (disambiguates from a merged PR).
+# Extracts a PR number from a worktree directory name using the pr-N / prN
+# naming convention (pr-1149-review, pr-1046-test-retrofit, pr646-links, ...).
+extract_pr_number() {
+  local name="$1"
+  [[ "$name" =~ [Pp][Rr]-?([0-9]+) ]] && echo "${BASH_REMATCH[1]}"
+}
+
+# Prints "pr-merged:N" or "pr-closed:N" and returns 0 if the worktree's
+# directory name encodes a PR number whose PR is MERGED or CLOSED on
+# GitHub. Returns 1 if no PR number is found, gh/jq are unavailable, or
+# the PR is still OPEN. This exists because review worktrees are often
+# checked out detached at a PR's SHA — is_fully_merged has no branch to
+# compare, so a dead review worktree would otherwise sit around forever.
+pr_review_status() {
+  local wt_path="$1"
+  command -v gh >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local prnum
+  prnum=$(extract_pr_number "$(basename "$wt_path")") || return 1
+  [[ -n "$prnum" ]] || return 1
+
+  local json state
+  json=$(gh pr view "$prnum" --json state 2>/dev/null) || return 1
+  state=$(echo "$json" | jq -r '.state' 2>/dev/null) || return 1
+
+  case "$state" in
+    MERGED) echo "pr-merged:$prnum"; return 0 ;;
+    CLOSED) echo "pr-closed:$prnum"; return 0 ;;
+    *)      return 1 ;;
+  esac
+}
+
+# Formats a prune_status/pr_review_status value into a parenthetical
+# suffix for display.
 status_suffix() {
   local status="$1"
-  if [[ "$status" == closed:* ]]; then
-    echo ", PR #${status#closed:}"
-  fi
+  case "$status" in
+    closed:*)    echo ", PR #${status#closed:}" ;;
+    pr-merged:*) echo ", target PR #${status#pr-merged:} merged" ;;
+    pr-closed:*) echo ", target PR #${status#pr-closed:} closed" ;;
+  esac
 }
 
 cmd_branches() {
@@ -174,98 +222,233 @@ cmd_branches() {
   fi
 }
 
+# Populated by _check_worktree with worktrees that matched neither
+# branch-merge nor (if enabled) stale-PR detection — the candidates for
+# --stale-age bucketing. Globals (not `local`) so they persist across
+# _check_worktree calls within one cmd_worktrees run.
+WT_LIVE_PATHS=()
+WT_LIVE_BRANCHES=()
+
 cmd_worktrees() {
-  local base="master" delete=false
+  local base="master" delete=false stale_prs=false stale_age=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --delete) delete=true; shift ;;
       --base) base="$2"; shift 2 ;;
+      --stale-prs) stale_prs=true; shift ;;
+      --stale-age) stale_age=true; shift ;;
       *) echo "Unknown option: $1"; exit 1 ;;
     esac
   done
 
   local found=0
+  WT_LIVE_PATHS=()
+  WT_LIVE_BRANCHES=()
 
   # Parse worktree list (skip the main worktree — first entry)
   local first=true
-  local wt_path="" wt_branch=""
+  local wt_path="" wt_branch="" wt_pending=false
 
   while IFS= read -r line; do
     if [[ "$line" =~ ^worktree\ (.+) ]]; then
       # Process previous worktree (if any)
-      if [[ -n "$wt_path" && -n "$wt_branch" ]]; then
-        _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" && found=1
+      if $wt_pending; then
+        _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" "$stale_prs" && found=1
       fi
       wt_path="${BASH_REMATCH[1]}"
       wt_branch=""
+      wt_pending=true
       if $first; then
         # Skip main worktree
         first=false
-        wt_path=""
+        wt_pending=false
       fi
     elif [[ "$line" =~ ^branch\ refs/heads/(.+) ]]; then
       wt_branch="${BASH_REMATCH[1]}"
     elif [[ "$line" == "locked" ]]; then
       # Skip locked worktrees
-      wt_path=""
-      wt_branch=""
+      wt_pending=false
     fi
+    # A "detached" line just means wt_branch stays "" — still processed,
+    # since that's exactly the case --stale-prs needs to see.
   done < <(git worktree list --porcelain)
 
   # Process last entry
-  if [[ -n "$wt_path" && -n "$wt_branch" ]]; then
-    _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" && found=1
+  if $wt_pending; then
+    _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" "$stale_prs" && found=1
   fi
 
-  if [[ $found -eq 0 ]]; then
+  if $stale_age; then
+    _report_stale_age "$delete"
+  fi
+
+  if [[ $found -eq 0 ]] && ! $stale_age; then
     echo "No merged or closed-unmerged worktrees found."
-  elif ! $delete; then
+  elif ! $delete && [[ $found -gt 0 ]]; then
     echo ""
     echo "Run with --delete to remove these worktrees and their branches."
   fi
 }
 
 _check_worktree() {
-  local base="$1" wt_path="$2" wt_branch="$3" delete="$4"
+  local base="$1" wt_path="$2" wt_branch="$3" delete="$4" stale_prs="$5"
 
-  is_protected "$wt_branch" && return 1
+  if [[ -n "$wt_branch" ]] && is_protected "$wt_branch"; then
+    return 1
+  fi
 
-  local status
-  if ! status=$(prune_status "$base" "$wt_branch"); then
+  local status=""
+  if [[ -n "$wt_branch" ]] && status=$(prune_status "$base" "$wt_branch"); then
+    :
+  elif $stale_prs && status=$(pr_review_status "$wt_path"); then
+    :
+  else
+    WT_LIVE_PATHS+=("$wt_path")
+    WT_LIVE_BRANCHES+=("$wt_branch")
     return 1
   fi
 
   # Check for uncommitted changes
   if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
-    echo "  DIRTY    $wt_path ($wt_branch) — has uncommitted changes, skipping"
+    echo "  DIRTY    $wt_path (${wt_branch:-detached}) — has uncommitted changes, skipping"
     return 0
   fi
 
   # Check for active processes
   if lsof +D "$wt_path" >/dev/null 2>&1; then
-    echo "  IN USE   $wt_path ($wt_branch) — processes running, skipping"
+    echo "  IN USE   $wt_path (${wt_branch:-detached}) — processes running, skipping"
     return 0
   fi
 
   local sha suffix
-  sha=$(git rev-parse --short "$wt_branch")
+  sha=$(git -C "$wt_path" rev-parse --short HEAD)
   suffix=$(status_suffix "$status")
 
   if $delete; then
     if git worktree remove "$wt_path" 2>&1; then
-      git branch -D "$wt_branch" >/dev/null 2>&1
-      echo "  removed  $wt_path ($wt_branch, was $sha$suffix)"
+      [[ -n "$wt_branch" ]] && git branch -D "$wt_branch" >/dev/null 2>&1
+      echo "  removed  $wt_path (${wt_branch:-detached}, was $sha$suffix)"
     else
-      echo "  FAILED   $wt_path ($wt_branch) — could not remove worktree, skipping"
+      echo "  FAILED   $wt_path (${wt_branch:-detached}) — could not remove worktree, skipping"
     fi
   else
-    if [[ "$status" == closed:* ]]; then
-      echo "  closed   $wt_path ($wt_branch, $sha$suffix)"
-    else
-      echo "  merged   $wt_path ($wt_branch, $sha)"
-    fi
+    case "$status" in
+      closed:*)
+        echo "  closed    $wt_path ($wt_branch, $sha$suffix)" ;;
+      pr-merged:*|pr-closed:*)
+        echo "  stale-pr  $wt_path (${wt_branch:-detached}$suffix), $sha" ;;
+      *)
+        echo "  merged    $wt_path ($wt_branch, $sha)" ;;
+    esac
   fi
 
+  return 0
+}
+
+# Buckets WT_LIVE_PATHS/WT_LIVE_BRANCHES (worktrees not caught by
+# branch-merge or stale-PR detection) by idle time. Idle time is
+# max(last commit on HEAD, mtime of the worktree's .git admin file,
+# which updates on any git operation including staging) — a cheap
+# proxy that avoids scanning the whole tree for mtimes.
+_report_stale_age() {
+  local delete="$1"
+  local now
+  now=$(date +%s)
+
+  local BUCKET_30=() BUCKET_60=() BUCKET_90=() BUCKET_180=()
+
+  local i
+  for i in "${!WT_LIVE_PATHS[@]}"; do
+    local wt_path="${WT_LIVE_PATHS[$i]}"
+    local commit_epoch index_epoch idle_epoch idle_days
+    commit_epoch=$(git -C "$wt_path" log -1 --format=%ct HEAD 2>/dev/null) || commit_epoch=$now
+    index_epoch=$(stat -f %m "$wt_path/.git" 2>/dev/null) || index_epoch=$now
+    idle_epoch=$commit_epoch
+    (( index_epoch > idle_epoch )) && idle_epoch=$index_epoch
+    idle_days=$(( (now - idle_epoch) / 86400 ))
+
+    if   (( idle_days >= 180 )); then BUCKET_180+=("$i")
+    elif (( idle_days >= 90  )); then BUCKET_90+=("$i")
+    elif (( idle_days >= 60  )); then BUCKET_60+=("$i")
+    elif (( idle_days >= 30  )); then BUCKET_30+=("$i")
+    fi
+  done
+
+  local any=false
+  _handle_bucket "180d+ idle" "$delete" "${BUCKET_180[@]}" && any=true
+  _handle_bucket "90-179d idle" "$delete" "${BUCKET_90[@]}" && any=true
+  _handle_bucket "60-89d idle" "$delete" "${BUCKET_60[@]}" && any=true
+  _handle_bucket "30-59d idle" "$delete" "${BUCKET_30[@]}" && any=true
+
+  $any || echo "No worktrees idle 30+ days (outside merged/closed-PR detection)."
+}
+
+# Prints one age bucket and, in --delete mode, asks once before removing
+# everything in it. Still individually re-checks DIRTY/IN USE per worktree
+# at delete time and skips those regardless of the bucket-level answer —
+# a stale age never overrides "has uncommitted work."
+_handle_bucket() {
+  local label="$1" delete="$2"; shift 2
+  local indices=("$@")
+  [[ ${#indices[@]} -eq 0 ]] && return 1
+
+  echo ""
+  echo "== $label (${#indices[@]}) =="
+
+  local clean_idx=() dirty_idx=()
+  local i
+  for i in "${indices[@]}"; do
+    local wt_path="${WT_LIVE_PATHS[$i]}"
+    if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
+      dirty_idx+=("$i")
+    else
+      clean_idx+=("$i")
+    fi
+  done
+
+  if [[ ${#clean_idx[@]} -gt 0 ]]; then
+    echo "  Clean (${#clean_idx[@]}):"
+    for i in "${clean_idx[@]}"; do
+      local wt_path="${WT_LIVE_PATHS[$i]}" wt_branch="${WT_LIVE_BRANCHES[$i]}"
+      echo "    $wt_path"
+      echo "      branch: ${wt_branch:-detached}"
+    done
+  fi
+
+  if [[ ${#dirty_idx[@]} -gt 0 ]]; then
+    echo "  Dirty — will be skipped even if this bucket is approved (${#dirty_idx[@]}):"
+    for i in "${dirty_idx[@]}"; do
+      local wt_path="${WT_LIVE_PATHS[$i]}" wt_branch="${WT_LIVE_BRANCHES[$i]}"
+      echo "    $wt_path"
+      echo "      branch: ${wt_branch:-detached}"
+    done
+  fi
+
+  if $delete; then
+    local reply
+    read -r -p "Delete these ${#indices[@]} worktrees? [y/N] " reply < /dev/tty || reply="n"
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+      for i in "${indices[@]}"; do
+        local wt_path="${WT_LIVE_PATHS[$i]}" wt_branch="${WT_LIVE_BRANCHES[$i]}"
+        if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
+          echo "  DIRTY    $wt_path — skipping"
+          continue
+        fi
+        if lsof +D "$wt_path" >/dev/null 2>&1; then
+          echo "  IN USE   $wt_path — skipping"
+          continue
+        fi
+        if git worktree remove "$wt_path" 2>&1; then
+          [[ -n "$wt_branch" ]] && git branch -D "$wt_branch" >/dev/null 2>&1
+          echo "  removed  $wt_path"
+        else
+          echo "  FAILED   $wt_path — could not remove"
+        fi
+      done
+    else
+      echo "  skipped"
+    fi
+  fi
   return 0
 }
 
