@@ -184,7 +184,7 @@ end
 # other invocations (non-cmux, no resume flag, etc.).
 # claude-sandbox uses execvp internally so this function is never re-entered.
 function claude
-    if test -n "$CMUX_SURFACE_ID"
+    if test -n "$CMUX_SURFACE_ID"; and test (count $argv) -gt 0
         for i in (seq 1 (count $argv))
             set -l flag $argv[$i]
             if test "$flag" = --resume -o "$flag" = -r -o "$flag" = --continue -o "$flag" = -c
