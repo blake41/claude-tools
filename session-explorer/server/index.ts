@@ -14,16 +14,16 @@ import { loadLibrary } from "./library/cache.js";
 import { UNSUMMARIZED_BACKOFF_SQL } from "./summarize-backoff.js";
 import { sampleHeadTail } from "./text-sampling.js";
 import { parseSummaryOutput } from "./summary-parse.js";
-import { buildTrace, shapeTraceForResponse, TraceError } from "./trace/index.js";
-
-function cleanXmlNoise(text: string): string {
-  return text
-    .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, "")
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
-    .replace(/<(?:output-file|tool-use-id|task-id|status|summary|result|available-deferred-tools)>[\s\S]*?<\/(?:output-file|tool-use-id|task-id|status|summary|result|available-deferred-tools)>/g, "")
-    .replace(/<\/?(?:task-notification|system-reminder|output-file|tool-use-id|task-id|status|summary|result|available-deferred-tools)[^>]*>/g, "")
-    .trim();
-}
+import {
+  cleanXmlNoise,
+  getRawRecord,
+  hasUnderscoreTerms,
+  reassembleTrace,
+  scopeFtsToContent,
+  sessionExists as sessionRowExists,
+  toFtsQuery,
+  windowedMessages,
+} from "./serving.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -231,7 +231,6 @@ const searchMessagesLikeInWorkspace = db.prepare(`
   LIMIT 200
 `);
 
-/** Convert user query to FTS5 query — wraps words in double quotes for phrase-like matching */
 /** Convert a glob pattern (*, ?) to a SQL LIKE pattern */
 function globToLike(glob: string): string {
   let result = '';
@@ -242,31 +241,6 @@ function globToLike(glob: string): string {
     else result += ch;
   }
   return result;
-}
-
-function toFtsQuery(query: string): string {
-  const trimmed = query.trim();
-
-  // Exact phrase match: user wrapped query in quotes e.g. "artifacts = the data layer"
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length > 2) {
-    const phrase = trimmed.slice(1, -1).replace(/[^a-zA-Z0-9_.\-\s]/g, '').trim();
-    return phrase ? `"${phrase}"` : '""';
-  }
-
-  // Default: NEAR for multi-word, plain match for single word
-  const words = trimmed.split(/\s+/).filter(Boolean)
-    .map(w => w.replace(/[^a-zA-Z0-9_.\-]/g, ''))
-    .filter(w => w.length > 0);
-  if (words.length === 0) return '""';
-  if (words.length === 1) return `"${words[0].replace(/"/g, '""')}"`;
-  // NEAR keeps terms within 16 tokens so snippets show both matches
-  const quoted = words.map(w => `"${w.replace(/"/g, '""')}"`).join(' ');
-  return `NEAR(${quoted}, 16)`;
-}
-
-/** Check if query contains underscore-joined terms that FTS5 can't match as phrases */
-function hasUnderscoreTerms(query: string): boolean {
-  return query.trim().split(/\s+/).some(w => w.includes('_'));
 }
 
 // ── Summarization Prepared Statements ─────────────────────────────
@@ -579,6 +553,20 @@ app.post("/api/sessions/bulk", (req, res) => {
   res.json({ sessions: enriched });
 });
 
+// Returns session meta + tags + a FIRST WINDOW of messages (config.defaultPageSize
+// rows, timestamp ASC / sequence ASC) inline, plus the session's total
+// `message_count` column — chosen (plan U5 deferred question) so
+// `SessionDetail.tsx`'s initial paint never needs a second round trip for
+// the common case (most sessions are well under one page). For a session
+// LONGER than the window, this is a known, accepted transitional gap:
+// `SessionDetail.tsx` reads the full `messages` array directly (e.g. its
+// isLive/last-activity check and prev/next user-message navigation), so
+// until U7 (same pipeline) lands the windowed fetch against
+// `GET /api/sessions/:id/messages` below, a long session renders only its
+// first window here — never a crash, just a transient completeness gap.
+// `message_count` stays present at the top level (already a `sessions`
+// column, preserved by the `...session` spread) so `TraceView.tsx`'s
+// size-aware loading hint keeps working unmodified.
 app.get("/api/sessions/:id", (req, res) => {
   const session = getSession.get(req.params.id);
   if (!session) {
@@ -591,21 +579,51 @@ app.get("/api/sessions/:id", (req, res) => {
   // already extracted, too short, or already in flight.
   maybeExtractInsightsOnOpen(req.params.id);
 
-  const rawMessages = getMessages.all(req.params.id) as Array<{
-    role: string;
-    content: string;
-    timestamp: string;
-    sequence: number;
-    message_type?: string;
-    tool_use_id?: string | null;
-    tool_name?: string | null;
-    tool_input?: string | null;
-  }>;
-  const messages = rawMessages
-    .map((m) => ({ ...m, content: cleanXmlNoise(m.content) }))
-    .filter((m) => m.content.length > 0);
+  const { messages } = windowedMessages(db, req.params.id, {
+    limit: config.defaultPageSize,
+    offset: 0,
+  });
   const tags = getTagsForSession.all(req.params.id);
   res.json({ ...(session as Record<string, unknown>), messages, tags });
+});
+
+// Windowed message fetch (plan U5) — offset/limit over `(timestamp ASC,
+// sequence ASC)`. Offset/limit was chosen over a keyset cursor: sessions are
+// immutable between reingests (D10), so a client's offset never goes stale
+// mid-scroll the way it would against a live-writing table. See
+// server/serving.ts's `windowedMessages` doc comment for the full rationale.
+// Response rows carry `record_uuid` (the expand-on-click join key into
+// `raw_records`) and a `truncated` flag set when the projection cap (D7)
+// cut this row's content short.
+app.get("/api/sessions/:id/messages", (req, res) => {
+  const sessionId = req.params.id;
+  if (!sessionRowExists(db, sessionId)) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || config.defaultPageSize));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  res.json(windowedMessages(db, sessionId, { limit, offset }));
+});
+
+// Verbatim raw-record expand (plan U5, D2) — the expand-on-click source for
+// a projected message row. Untouched by cleanXmlNoise/redaction/capping;
+// `raw_records` exists specifically so this can always recover exactly what
+// Claude Code originally wrote.
+app.get("/api/sessions/:id/records/:uuid", (req, res) => {
+  const sessionId = req.params.id;
+  if (!sessionRowExists(db, sessionId)) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+
+  const record = getRawRecord(db, sessionId, req.params.uuid);
+  if (!record) {
+    res.status(404).json({ error: "Record not found" });
+    return;
+  }
+  res.json(record);
 });
 
 app.get("/api/search", (req, res) => {
@@ -616,7 +634,12 @@ app.get("/api/search", (req, res) => {
   }
 
   const isExact = req.query.exact === "1";
-  const ftsQuery = isExact ? toFtsQuery(`"${query}"`) : toFtsQuery(query);
+  // Scoped to the `content` FTS column (see serving.ts's scopeFtsToContent
+  // doc comment) — the D4/D5 porter/facet migration denormalized title and
+  // workspace onto every message row, and an unscoped MATCH here floods
+  // quick-search results with title/workspace-only hits from unrelated rows
+  // of the same session, starving out genuine content matches past LIMIT 200.
+  const ftsQuery = scopeFtsToContent(isExact ? toFtsQuery(`"${query}"`) : toFtsQuery(query));
   const sort = (req.query.sort as string) || "date";
   const workspaceId = req.query.workspace
     ? Number(req.query.workspace)
@@ -1463,7 +1486,7 @@ import {
   deleteInsight,
   maybeExtractInsightsOnOpen,
 } from "./insights.js";
-import { runIngestion, getStaleSessionsNeedingReingest, reingestSession } from "./ingest.js";
+import { runIngestion, getStaleSessionsNeedingReingest, reingestSession, getIngestHealth } from "./ingest.js";
 import type { IngestProgress } from "./ingest.js";
 
 let ingestProgress: IngestProgress | null = null;
@@ -1491,7 +1514,19 @@ app.post("/api/ingest", async (req, res) => {
 });
 
 app.get("/api/ingest/status", (_req, res) => {
-  res.json(ingestProgress || { running: false });
+  // Plan U6: report reality, not just "process running = healthy" — the
+  // existing progress fields (total/ingested/skipped/running) stay for
+  // compatibility; lastTickAt/pendingCount/recentFailures are new.
+  // `getIngestHealth()` is documented never to throw, but the whole point of
+  // this endpoint is truthfulness, so guard anyway rather than 500 the one
+  // endpoint whose job is to say "something's wrong".
+  let health: ReturnType<typeof getIngestHealth>;
+  try {
+    health = getIngestHealth();
+  } catch {
+    health = { lastTickAt: null, pendingCount: 0, recentFailures: [] };
+  }
+  res.json({ ...(ingestProgress || { running: false }), ...health });
 });
 
 // ── Open file in default app ──────────────────────────────────────
@@ -1883,28 +1918,34 @@ app.put("/api/meta/settings", (req, res) => {
   res.json(updated);
 });
 
-// Lossless parse-on-demand trace: parses the raw JSONL (not the stripped DB) via
-// the vendored claude-devtools pipeline. See server/trace/index.ts for resolution
-// order (DB source_path -> ~/.claude/projects glob -> gzipped archive fallback).
+// Trace, served from rows (plan U5, D3/D8) — reassembled from
+// `sessions.trace_meta` + `trace_chunks` (chunk_seq ASC), a pure SQL read
+// instead of the old per-request re-parse of the original JSONL. This is
+// why the endpoint no longer breaks once Claude Code prunes a session's
+// transcript: the row data survives independent of the source file.
 //
-// Default response is the lean shape (shapeTraceForResponse) — the full model
-// duplicates message content across messages[]/chunks[]/processes[] and can
-// serialize to ~7x the raw transcript size. Pass ?full=1 for the untrimmed
-// model (e.g. for scripts/tooling that want the lossless payload).
-app.get("/api/sessions/:id/trace", async (req, res) => {
-  try {
-    const trace = await buildTrace(req.params.id);
-    res.json(req.query.full === "1" ? trace : shapeTraceForResponse(trace));
-  } catch (err) {
-    if (err instanceof TraceError && err.code === "NOT_FOUND") {
-      res.status(404).json({ error: err.message });
+// The response is byte-shape-compatible with the old default (lean) shape,
+// so `TraceView.tsx` needed no changes. The `?full=1` untrimmed-model bypass
+// (D8) is gone — that raw model had no consumer once trace serving moved to
+// rows, and full fidelity is still reachable via `raw_records` and the
+// gzip archive. `buildTrace`/`buildTraceFromFile` stay exported from
+// server/trace/index.ts for ingest and the trace unit tests; nothing here
+// calls them anymore.
+app.get("/api/sessions/:id/trace", (req, res) => {
+  const result = reassembleTrace(db, req.params.id);
+  if (!result.ok) {
+    if (result.reason === "not_found") {
+      res.status(404).json({ error: "Session not found" });
       return;
     }
-    console.error(`[trace] failed for session ${req.params.id}:`, err);
-    res.status(500).json({
-      error: err instanceof TraceError ? err.message : "Failed to build session trace",
+    // trace_meta IS NULL — either pre-unified-parser ingest, or a session
+    // that was never successfully ingested at all.
+    res.status(404).json({
+      error: "No trace data for this session yet — reingest to enable trace.",
     });
+    return;
   }
+  res.json(result.trace);
 });
 
 // Initialize cron trigger on server start

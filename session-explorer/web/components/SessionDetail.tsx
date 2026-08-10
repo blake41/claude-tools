@@ -1,12 +1,27 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, useContext, createContext } from "react";
 import { useParams, useNavigate, useSearch } from "@tanstack/react-router";
+import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
 import { MarkdownBody, cleanUserContent } from "../sessionFormat";
+import { isLong } from "../traceFormat";
 import { INSIGHT_TYPE_COLORS } from "../insight-shared";
 import { useExtraction } from "../hooks/useExtraction";
 import SessionHeader from "./SessionHeader";
 import { sessionRoute } from "../router";
+
+// ── Windowed fetch paging (plan U5/U7) ───────────────────────────────
+// Page size for explicit `/messages` fetches once a session exceeds the
+// server's inline first window (`config.defaultPageSize`, currently 50).
+// Kept well under the endpoint's own 500-row cap so one page load never
+// spikes JSON-parse time on a huge session.
+const MESSAGES_PAGE_SIZE = 200;
+// Fetch the next page once the virtualizer's rendered range gets this close
+// to the end of what's currently loaded (scroll-driven page loads, D11).
+const LOAD_MORE_ROW_THRESHOLD = 8;
+// Safety cap on "load pages until the target sequence appears" (deep links
+// via ?msg=, U7) so a stale/bogus sequence can't loop forever fetching pages.
+const MAX_SEEK_PAGES = 60; // 60 * MESSAGES_PAGE_SIZE = 12,000 messages
 
 function formatTime(dateStr: string | null): string {
   if (!dateStr) return "";
@@ -120,12 +135,42 @@ function MermaidHost({ containerRef }: { containerRef: React.RefObject<HTMLDivEl
   return null;
 }
 
+// ── Persisted expand/collapse state across virtualization remounts (U7) ──
+// Rows scrolling out of the virtualizer's rendered range and back in are
+// fresh React mounts — a plain `useState` for "show reasoning" / "show
+// more" resets every time. This context holds a plain (mutated-in-place,
+// not React-state) `Map<string, boolean>` created once per SessionDetail
+// instance, so a row can read its prior toggle value on remount without
+// forcing the whole list to re-render on every toggle. Cleared whenever
+// the session id changes (see the `[id]` effect) so keys — which reuse
+// per-session `sequence` numbers — never bleed across sessions.
+const ExpandStoreContext = createContext<Map<string, boolean> | null>(null);
+
+function usePersistedExpand(
+  key: string,
+  initial = false
+): [boolean, (updater: boolean | ((prev: boolean) => boolean)) => void] {
+  const store = useContext(ExpandStoreContext);
+  const [value, setValue] = useState(() => store?.get(key) ?? initial);
+  const setPersisted = useCallback(
+    (updater: boolean | ((prev: boolean) => boolean)) => {
+      setValue((prev) => {
+        const next = typeof updater === "function" ? (updater as (prev: boolean) => boolean)(prev) : updater;
+        store?.set(key, next);
+        return next;
+      });
+    },
+    [store, key]
+  );
+  return [value, setPersisted];
+}
+
 const COLLAPSE_PX = 320; // ~20 lines at 14px/1.5lh
 
-function CollapsibleContent({ children, className, contentKey }: { children: React.ReactNode; className?: string; contentKey: string }) {
+function CollapsibleContent({ children, className, contentKey, expandKey }: { children: React.ReactNode; className?: string; contentKey: string; expandKey: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [overflows, setOverflows] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = usePersistedExpand(`collapsible-${expandKey}`);
 
   // Keyed on the content STRING, not the children element: an element is a
   // new object every render, which made this scrollHeight read (a forced
@@ -203,7 +248,7 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
           <span className="font-mono text-[10px] opacity-50 font-normal ml-1.5">{formatTime(message.timestamp)}</span>
         )}
       </div>
-      <CollapsibleContent contentKey={displayContent}>
+      <CollapsibleContent contentKey={displayContent} expandKey={`msg-${message.sequence}`}>
         <MarkdownBody text={displayContent} />
       </CollapsibleContent>
     </div>
@@ -278,20 +323,44 @@ function buildTurns(grouped: GroupedItem[]): TurnItem[] {
   return turns;
 }
 
+/** Find the row index (into a `turns`/`visibleTurns` array) whose content
+ *  contains the given raw message `sequence` — the virtualization-era
+ *  replacement for `document.getElementById('msg-'+seq)`: rows outside the
+ *  virtualizer's rendered range simply aren't in the DOM, so lookups must
+ *  go through the data model instead (U7). Returns -1 if not present in
+ *  the given (possibly userOnly-filtered, possibly not-yet-fully-loaded)
+ *  array. */
+function findTurnIndexForSequence(turns: TurnItem[], seq: number): number {
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t.kind === "user") {
+      if ((t.item as { kind: "text"; msg: Message }).msg.sequence === seq) return i;
+    } else {
+      for (const g of t.items) {
+        if (g.kind === "text" && g.msg.sequence === seq) return i;
+        if (g.kind === "tools" && g.allSequences.includes(seq)) return i;
+      }
+    }
+  }
+  return -1;
+}
+
 function AssistantTurnBlock({
   turn,
   highlight,
   userOnly,
   highlightSeq,
   isLive,
+  sessionId,
 }: {
   turn: TurnItem & { kind: "assistant" };
   highlight: boolean;
   userOnly: boolean;
   highlightSeq: number;
   isLive: boolean;
+  sessionId: string;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = usePersistedExpand(`turn-${turn.firstSeq}`);
 
   // Find the last assistant text message — shown by default
   const lastTextItem = [...turn.items].reverse().find(
@@ -328,7 +397,7 @@ function AssistantTurnBlock({
             if (g.kind === "tools") {
               if (userOnly) return null;
               const groupHighlight = !isNaN(highlightSeq) && g.allSequences.includes(highlightSeq);
-              return <ToolGroupBlock key={`tg-${idx}`} group={g} highlight={groupHighlight} isLive={isLive} />;
+              return <ToolGroupBlock key={`tg-${idx}`} group={g} highlight={groupHighlight} isLive={isLive} sessionId={sessionId} />;
             }
             const msg = g.msg;
             return (
@@ -485,17 +554,120 @@ function lcsDiff(oldStr: string, newStr: string): string {
   return html;
 }
 
-function ToolResultInline({ result }: { result: Message }) {
+/** Best-effort extraction of a tool_result block's text from a verbatim
+ *  Claude Code JSONL line (`server/serving.ts`'s `getRawRecord` — untouched
+ *  by redaction/capping). Shape varies: `message.content` may be a bare
+ *  string (older sessions) or an array of blocks, one of which is
+ *  `{ type: "tool_result", content }` where that nested `content` is
+ *  itself a string OR an array of `{ type: "text", text }` blocks. Falls
+ *  back to pretty-printed raw JSON so "expand" never renders nothing. */
+function extractRawToolResultText(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  const message = (parsed as Record<string, unknown> | null)?.["message"] as
+    | Record<string, unknown>
+    | undefined;
+  const content = message?.["content"];
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && (block as Record<string, unknown>)["type"] === "tool_result") {
+        const inner = (block as Record<string, unknown>)["content"];
+        if (typeof inner === "string") return inner;
+        if (Array.isArray(inner)) {
+          return inner
+            .map((b) =>
+              b && typeof b === "object" && typeof (b as Record<string, unknown>)["text"] === "string"
+                ? ((b as Record<string, unknown>)["text"] as string)
+                : ""
+            )
+            .join("");
+        }
+      }
+    }
+  }
+  try {
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+// String-length gate for "is this tool result worth collapsing" — deliberately
+// not a scrollHeight/DOM read (D11/U7: `CollapsibleContent`'s own comment on
+// why that's a perf trap; tool payloads can sit right at the 4000-char
+// projection cap, so a forced sync layout per big block adds up fast).
+const TOOL_RESULT_COLLAPSE_THRESHOLD = 1200;
+
+type FullFetchState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "loaded"; text: string };
+
+function ToolResultInline({ result, sessionId }: { result: Message; sessionId: string }) {
   const isError = /error|failed|Error:/i.test(result.content.slice(0, 80));
+  const [expanded, setExpanded] = usePersistedExpand(`toolresult-${result.sequence}`);
+  const [full, setFull] = useState<FullFetchState>({ status: "idle" });
+
+  // Expand-on-click source (D2/U7): only offered when the row was actually
+  // capped by the projection (`truncated`) AND carries a join key into
+  // `raw_records`. Pre-migration rows have neither — hidden, not broken.
+  const canLoadFull = !!result.record_uuid && !!result.truncated;
+  const displayContent = full.status === "loaded" ? full.text : result.content;
+  const isBig = isLong(displayContent, TOOL_RESULT_COLLAPSE_THRESHOLD);
+  const shown = isBig && !expanded ? truncate(displayContent, TOOL_RESULT_COLLAPSE_THRESHOLD) : displayContent;
+
+  async function loadFull() {
+    if (!result.record_uuid || full.status === "loading") return;
+    setFull({ status: "loading" });
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/records/${result.record_uuid}`);
+      if (res.status === 404) {
+        setFull({ status: "error", message: "Original record not found (session may predate the migration)." });
+        return;
+      }
+      if (!res.ok) {
+        setFull({ status: "error", message: `Failed to load full result (${res.status}).` });
+        return;
+      }
+      const data = await res.json();
+      setFull({ status: "loaded", text: extractRawToolResultText(data.raw) });
+      setExpanded(true);
+    } catch {
+      setFull({ status: "error", message: "Failed to load full result." });
+    }
+  }
+
   return (
     <details className={`tool-result-inline ${isError ? "tool-result-err" : "tool-result-ok"}`}>
       <summary>{isError ? "⚠ Error" : "Result"}</summary>
-      <pre>{truncate(result.content, 1500)}</pre>
+      <pre>{shown}</pre>
+      {isBig && (
+        <button type="button" className="tool-result-expand-btn" onClick={() => setExpanded((e) => !e)}>
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+      {canLoadFull && full.status !== "loaded" && (
+        <button
+          type="button"
+          className="tool-result-expand-btn"
+          onClick={loadFull}
+          disabled={full.status === "loading"}
+        >
+          {full.status === "loading" ? "Loading full result…" : full.status === "error" ? "Retry — load full result" : "Load full result"}
+        </button>
+      )}
+      {full.status === "error" && <div className="tool-result-error">{full.message}</div>}
     </details>
   );
 }
 
-function ToolCallBlock({ use, result }: { use: Message; result: Message | null }) {
+function ToolCallBlock({ use, result, sessionId }: { use: Message; result: Message | null; sessionId: string }) {
   const { name, input } = readToolCall(use);
   const time = use.timestamp ? formatTime(use.timestamp) : "";
 
@@ -514,7 +686,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
       <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-bash">
         {header("Bash", "bg-[#1f2328] text-[#e6edf3]", desc && <span className="tool-mini-desc" title={desc}>{desc}</span>)}
         <pre className="tool-mini-body tool-mini-code">{truncate(cmd, 800)}</pre>
-        {result && <ToolResultInline result={result} />}
+        {result && <ToolResultInline result={result} sessionId={sessionId} />}
       </div>
     );
   }
@@ -530,7 +702,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
         {diffHtml && (
           <div className="diff-view" dangerouslySetInnerHTML={{ __html: diffHtml }} />
         )}
-        {result && <ToolResultInline result={result} />}
+        {result && <ToolResultInline result={result} sessionId={sessionId} />}
       </div>
     );
   }
@@ -542,7 +714,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
       <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-write">
         {header("Write", "bg-[#2a9d8f]/20 text-[#2a9d8f]", fp && <span className="tool-mini-path" title={fp}>{fp}</span>)}
         {content && <pre className="tool-mini-body tool-mini-code">{truncate(content, 600)}</pre>}
-        {result && <ToolResultInline result={result} />}
+        {result && <ToolResultInline result={result} sessionId={sessionId} />}
       </div>
     );
   }
@@ -558,7 +730,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
         <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-todo">
           {header(name, "bg-[#457b9d]/20 text-[#8bb8d8]")}
           {subject && <div className="tool-mini-body text-[12px]">{subject}</div>}
-          {result && <ToolResultInline result={result} />}
+          {result && <ToolResultInline result={result} sessionId={sessionId} />}
         </div>
       );
     }
@@ -577,7 +749,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
             );
           })}
         </ul>
-        {result && <ToolResultInline result={result} />}
+        {result && <ToolResultInline result={result} sessionId={sessionId} />}
       </div>
     );
   }
@@ -589,7 +761,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
     return (
       <div id={`msg-${use.sequence}`} className="tool-mini tool-mini-generic">
         {header(name, "bg-[#2a2a2a] text-[#c9d1d9]", preview && <span className="tool-mini-path" title={preview}>{preview}</span>)}
-        {result && isError && <ToolResultInline result={result} />}
+        {result && isError && <ToolResultInline result={result} sessionId={sessionId} />}
       </div>
     );
   }
@@ -608,7 +780,7 @@ function ToolCallBlock({ use, result }: { use: Message; result: Message | null }
           <pre className="tool-mini-body tool-mini-code">{truncate(pretty, 400)}</pre>
         </details>
       )}
-      {result && <ToolResultInline result={result} />}
+      {result && <ToolResultInline result={result} sessionId={sessionId} />}
     </div>
   );
 }
@@ -643,10 +815,12 @@ function ToolGroupBlock({
   group,
   highlight,
   isLive,
+  sessionId,
 }: {
   group: Extract<GroupedItem, { kind: "tools" }>;
   highlight: boolean;
   isLive: boolean;
+  sessionId: string;
 }) {
   const names = group.items.map((it) => readToolCall(it.use).name);
   const unique = Array.from(new Set(names));
@@ -674,7 +848,7 @@ function ToolGroupBlock({
       </summary>
       <div className="tool-group-body">
         {group.items.map((it, idx) => (
-          <ToolCallBlock key={it.use.id ?? idx} use={it.use} result={it.result} />
+          <ToolCallBlock key={it.use.id ?? idx} use={it.use} result={it.result} sessionId={sessionId} />
         ))}
       </div>
     </details>
@@ -931,35 +1105,53 @@ export default function SessionDetail() {
 
   // -- User-only filter mode --
   const [userOnly, setUserOnly] = useState(false);
-  const [anchorSequence, setAnchorSequence] = useState<number | null>(null);
 
-  // When userOnly turns off with an anchor, scroll to that message after render
-  useEffect(() => {
-    if (!userOnly && anchorSequence !== null) {
-      // Wait for React to render all messages back into DOM
-      requestAnimationFrame(() => {
-        const el = document.getElementById(`msg-${anchorSequence}`);
-        if (el) {
-          el.scrollIntoView({ block: "center" });
-          el.classList.add("message-highlight");
-          setTimeout(() => el.classList.remove("message-highlight"), 2000);
-        }
-        setAnchorSequence(null);
-      });
-    }
-  }, [userOnly, anchorSequence]);
+  // -- Windowed fetch state (plan U5/U7) --
+  // `messages` starts as the server's inline first window (config.default
+  // PageSize) and grows via `/api/sessions/:id/messages` as the virtualizer
+  // scrolls near the end of what's loaded. Refs mirror the state so async
+  // loops (page-load-until-found for deep links) always read the LATEST
+  // value instead of a closure captured at effect-setup time.
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [totalMessages, setTotalMessages] = useState(0);
+  const [nextRawOffset, setNextRawOffset] = useState<number | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [lastActivityAt, setLastActivityAt] = useState<string | null>(null);
 
-  // -- In-page search state --
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [matches, setMatches] = useState<Element[]>([]);
-  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messagesRef = useRef<Message[]>([]);
+  const nextRawOffsetRef = useRef<number | null>(null);
+  const totalMessagesRef = useRef(0);
+  const loadingMoreRef = useRef(false);
+  const loadedSequencesRef = useRef<Set<number>>(new Set());
+  // Per-row expand/collapse toggles, keyed by a stable per-row id (message
+  // sequence / turn firstSeq — see `usePersistedExpand`). Survives a row's
+  // virtualizer-driven unmount/remount; cleared below on session change.
+  const expandStoreRef = useRef<Map<string, boolean>>(new Map());
+
+  function setMessagesBoth(next: Message[]) {
+    messagesRef.current = next;
+    setMessages(next);
+  }
+  function setNextRawOffsetBoth(next: number | null) {
+    nextRawOffsetRef.current = next;
+    setNextRawOffset(next);
+  }
+  function setTotalMessagesBoth(next: number) {
+    totalMessagesRef.current = next;
+    setTotalMessages(next);
+  }
 
   useEffect(() => {
     setLoading(true);
     setError(null);
+    loadedSequencesRef.current = new Set();
+    expandStoreRef.current.clear();
+    setMessagesBoth([]);
+    setNextRawOffsetBoth(null);
+    setTotalMessagesBoth(0);
+    setLastActivityAt(null);
+    setLoadMoreError(null);
     fetch(`/api/sessions/${id}`)
       .then((r) => {
         if (!r.ok) throw new Error("Session not found");
@@ -974,30 +1166,120 @@ export default function SessionDetail() {
             };
           }
           setSession(data);
+
+          const initial: Message[] = data.messages ?? [];
+          for (const m of initial) loadedSequencesRef.current.add(m.sequence);
+          setMessagesBoth(initial);
+          const total = data.message_count ?? initial.length;
+          setTotalMessagesBoth(total);
+
+          // Live-session liveness (below) needs the TRUE last message's
+          // timestamp, not just whatever's in the first window. Short
+          // sessions already have it; long ones get one cheap 1-row fetch
+          // instead of loading the whole session just to answer that.
+          if (initial.length >= total) {
+            setLastActivityAt(initial[initial.length - 1]?.timestamp ?? data.started_at ?? null);
+          } else if (!data.ended_at) {
+            fetch(`/api/sessions/${id}/messages?offset=${Math.max(0, total - 1)}&limit=1`)
+              .then((r) => r.json())
+              .then((d) => {
+                const last = (d.messages as Message[])[d.messages.length - 1];
+                setLastActivityAt(last?.timestamp ?? data.started_at ?? null);
+              })
+              .catch(() => setLastActivityAt(data.started_at ?? null));
+          }
         })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Scroll to highlighted message after load
+  // Bootstrap: once we know the session is longer than the inline first
+  // window, replace it with an explicitly-anchored page (offset=0) so
+  // every later page's offset math is exact instead of guessed from a
+  // post-filter array length (D9's cleanXmlNoise can drop rows to empty
+  // content, shortening the returned array without shortening the raw
+  // row range it consumed). Runs at most once per session load.
   useEffect(() => {
-    if (!loading && session && highlightMsg) {
-      const el = document.getElementById(`msg-${highlightMsg}`);
-      if (el) {
-        setTimeout(() => {
-          el.scrollIntoView({ behavior: "smooth", block: "center" });
-        }, 100);
-      }
-    }
-  }, [loading, session, highlightMsg]);
+    if (!session || loading) return;
+    if (nextRawOffsetRef.current !== null) return;
+    if (messagesRef.current.length >= totalMessagesRef.current) return;
+    let cancelled = false;
+    fetch(`/api/sessions/${id}/messages?offset=0&limit=${MESSAGES_PAGE_SIZE}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`Failed to load messages (${r.status}).`);
+        return r.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        loadedSequencesRef.current = new Set((data.messages as Message[]).map((m) => m.sequence));
+        setMessagesBoth(data.messages);
+        setNextRawOffsetBoth(data.offset + data.limit);
+      })
+      .catch((e) => {
+        if (!cancelled) setLoadMoreError(e instanceof Error ? e.message : "Failed to load messages.");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, loading, id]);
 
-  // -- Feature 1: Prev/Next user message navigation --
+  // Scroll-driven page loads (D11): fetches the next raw-row window and
+  // appends any not-already-loaded rows. Sequence-deduped so an overlap
+  // between the bootstrap page and a stale trigger never double-renders a
+  // row. Stable across the session's lifetime (reads/writes via refs) so
+  // it's safe to call repeatedly from both the virtualizer's onChange and
+  // the deep-link "load until found" loop below.
+  const loadMorePage = useCallback(async (): Promise<"loaded" | "done" | "already-loading" | "error"> => {
+    if (loadingMoreRef.current) return "already-loading";
+    const offset = nextRawOffsetRef.current;
+    if (offset === null || offset >= totalMessagesRef.current) return "done";
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    setLoadMoreError(null);
+    try {
+      const res = await fetch(`/api/sessions/${id}/messages?offset=${offset}&limit=${MESSAGES_PAGE_SIZE}`);
+      if (!res.ok) throw new Error(`Failed to load more messages (${res.status}).`);
+      const data = await res.json();
+      const fresh: Message[] = (data.messages as Message[]).filter((m) => !loadedSequencesRef.current.has(m.sequence));
+      for (const m of fresh) loadedSequencesRef.current.add(m.sequence);
+      if (fresh.length > 0) {
+        const next = [...messagesRef.current, ...fresh];
+        messagesRef.current = next;
+        setMessages(next);
+      }
+      const newOffset = data.offset + data.limit;
+      nextRawOffsetRef.current = newOffset;
+      setNextRawOffset(newOffset);
+      return "loaded";
+    } catch (e) {
+      setLoadMoreError(e instanceof Error ? e.message : "Failed to load more messages.");
+      return "error";
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [id]);
+
+  const hasMore = nextRawOffset !== null ? nextRawOffset < totalMessages : messages.length < totalMessages;
+
+  // -- In-page search state (re-pointed at the loaded window's DATA, not
+  // the DOM — most loaded messages aren't mounted under virtualization, so
+  // the old TreeWalker-over-.snippet-bubbles approach can't see them) --
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [matchSequences, setMatchSequences] = useState<number[]>([]);
+  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // -- Feature 1: Prev/Next user message navigation — scoped to the loaded
+  // window (U7: re-pointed from "all messages" to "what's loaded so far"). --
   const userMessageSequences = useMemo(() => {
-    if (!session) return [];
-    return session.messages
+    return messages
       .filter((m) => m.role === "user" && m.message_type !== "tool_result")
       .map((m) => String(m.sequence));
-  }, [session]);
+  }, [messages]);
 
   const currentUserIdx = useMemo(() => {
     if (!highlightMsg) return -1;
@@ -1012,11 +1294,9 @@ export default function SessionDetail() {
   const isLive = useMemo(() => {
     void liveTick;
     if (!session || session.ended_at) return false;
-    const lastMessage = session.messages[session.messages.length - 1];
-    const lastActivity = lastMessage?.timestamp ?? session.started_at;
-    if (!lastActivity) return false;
-    return Date.now() - new Date(lastActivity).getTime() < LIVE_WINDOW_MS;
-  }, [session, liveTick]);
+    if (!lastActivityAt) return false;
+    return Date.now() - new Date(lastActivityAt).getTime() < LIVE_WINDOW_MS;
+  }, [session, liveTick, lastActivityAt]);
   useEffect(() => {
     if (!isLive) return;
     const id = setInterval(() => setLiveTick((t) => t + 1), 60_000);
@@ -1044,119 +1324,37 @@ export default function SessionDetail() {
     [userMessageSequences, currentUserIdx, navigate, id],
   );
 
-  // -- Feature 2: In-page text search helpers --
-  const clearHighlights = useCallback(() => {
-    const container = document.querySelector(".snippet-bubbles");
-    if (!container) return;
-    const marks = container.querySelectorAll("mark.page-search-match, mark.page-search-current");
-    marks.forEach((mark) => {
-      const parent = mark.parentNode;
-      if (parent) {
-        parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
-        parent.normalize();
-      }
-    });
-  }, []);
-
   const performSearch = useCallback(
     (query: string) => {
-      clearHighlights();
       if (!query) {
-        setMatches([]);
+        setMatchSequences([]);
         setCurrentMatchIndex(0);
         return;
       }
-
-      const container = document.querySelector(".snippet-bubbles");
-      if (!container) return;
-
       const lowerQuery = query.toLowerCase();
-      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
-      const newMatches: Element[] = [];
-      let matchCount = 0;
-
-      // Collect text nodes with matches
-      const textNodes: Text[] = [];
-      let node: Node | null;
-      while ((node = walker.nextNode())) {
-        const text = node.textContent || "";
-        if (text.toLowerCase().includes(lowerQuery)) {
-          textNodes.push(node as Text);
-        }
-      }
-
-      // Process each text node (splitting and wrapping matches)
-      for (const textNode of textNodes) {
-        const text = textNode.textContent || "";
-        const parent = textNode.parentNode;
-        if (!parent) continue;
-
-        const fragment = document.createDocumentFragment();
-        let lastIdx = 0;
-        const lowerText = text.toLowerCase();
-        let searchIdx = lowerText.indexOf(lowerQuery, 0);
-
-        while (searchIdx !== -1) {
-          // Text before match
-          if (searchIdx > lastIdx) {
-            fragment.appendChild(document.createTextNode(text.slice(lastIdx, searchIdx)));
-          }
-          // Wrap match
-          const mark = document.createElement("mark");
-          mark.className = "page-search-match";
-          mark.dataset.matchIndex = String(matchCount);
-          mark.textContent = text.slice(searchIdx, searchIdx + query.length);
-          fragment.appendChild(mark);
-          newMatches.push(mark);
-          matchCount++;
-          lastIdx = searchIdx + query.length;
-          searchIdx = lowerText.indexOf(lowerQuery, lastIdx);
-        }
-
-        // Remaining text
-        if (lastIdx < text.length) {
-          fragment.appendChild(document.createTextNode(text.slice(lastIdx)));
-        }
-
-        parent.replaceChild(fragment, textNode);
-      }
-
-      setMatches(newMatches);
+      const found = messagesRef.current
+        .filter((m) => m.content.toLowerCase().includes(lowerQuery))
+        .map((m) => m.sequence);
+      setMatchSequences(found);
       setCurrentMatchIndex(0);
-
-      // Highlight first match
-      if (newMatches.length > 0) {
-        newMatches[0].className = "page-search-current";
-        newMatches[0].scrollIntoView({ behavior: "smooth", block: "center" });
-      }
     },
-    [clearHighlights],
+    [],
   );
 
   const navigateMatch = useCallback(
     (direction: 1 | -1) => {
-      if (matches.length === 0) return;
-      // Reset current
-      if (matches[currentMatchIndex]) {
-        matches[currentMatchIndex].className = "page-search-match";
-      }
-      const next = (currentMatchIndex + direction + matches.length) % matches.length;
-      setCurrentMatchIndex(next);
-      if (matches[next]) {
-        matches[next].className = "page-search-current";
-        matches[next].scrollIntoView({ behavior: "smooth", block: "center" });
-      }
+      if (matchSequences.length === 0) return;
+      setCurrentMatchIndex((idx) => (idx + direction + matchSequences.length) % matchSequences.length);
     },
-    [matches, currentMatchIndex],
+    [matchSequences],
   );
 
   const closeSearch = useCallback(() => {
     setSearchOpen(false);
     setSearchQuery("");
-    clearHighlights();
-    setMatches([]);
+    setMatchSequences([]);
     setCurrentMatchIndex(0);
-  }, [clearHighlights]);
+  }, []);
 
   // Debounced search effect
   useEffect(() => {
@@ -1213,7 +1411,6 @@ export default function SessionDetail() {
       if (!isInput && !searchOpen && e.key === "u") {
         e.preventDefault();
         setUserOnly((prev) => !prev);
-        setAnchorSequence(null);
         return;
       }
 
@@ -1241,6 +1438,147 @@ export default function SessionDetail() {
     setSession({ ...session, tags: newTags });
   }
 
+  // -- Grouping/turns over the loaded window (recomputed as it grows) --
+  const grouped = useMemo(() => groupMessagesForRender(messages), [messages]);
+  const turns = useMemo(() => buildTurns(grouped), [grouped]);
+  const visibleTurns = useMemo(
+    () => (userOnly ? turns.filter((t) => t.kind === "user") : turns),
+    [turns, userOnly],
+  );
+  const visibleTurnsRef = useRef<TurnItem[]>([]);
+  visibleTurnsRef.current = visibleTurns;
+
+  // Precompute which "user" rows need the separating divider drawn INSIDE
+  // their own virtual row (there's no separate flow sibling to put it in
+  // once rows are absolutely positioned) — every user turn except the
+  // first. Dividers are never shown in userOnly mode (matches prior
+  // behavior), so this is only consulted when `visibleTurns === turns`.
+  const dividerBeforeIndex = useMemo(() => {
+    const set = new Set<number>();
+    let seenFirstUser = false;
+    turns.forEach((t, i) => {
+      if (t.kind === "user") {
+        if (seenFirstUser) set.add(i);
+        seenFirstUser = true;
+      }
+    });
+    return set;
+  }, [turns]);
+
+  const urlHighlightSeq = highlightMsg ? Number(highlightMsg) : null;
+  const searchHighlightSeq = searchOpen && matchSequences.length > 0 ? matchSequences[currentMatchIndex] : null;
+  const highlightSeq = searchHighlightSeq ?? urlHighlightSeq ?? NaN;
+
+  // -- Virtualization (D11): window-scoped since the page itself scrolls
+  // (sticky header, no fixed-height inner container). `scrollMargin` is the
+  // list's offset from the top of the document — re-measured whenever
+  // anything above it (header/search bar/panels) changes size. --
+  const listContainerRef = useRef<HTMLDivElement>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+
+  useLayoutEffect(() => {
+    function measure() {
+      const el = listContainerRef.current;
+      if (!el) return;
+      setScrollMargin(el.getBoundingClientRect().top + window.scrollY);
+    }
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(document.body);
+    window.addEventListener("resize", measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [session?.id]);
+
+  const rowVirtualizer = useWindowVirtualizer({
+    count: visibleTurns.length,
+    estimateSize: () => 140,
+    overscan: 10,
+    gap: 10,
+    scrollMargin,
+    onChange: (instance) => {
+      const items = instance.getVirtualItems();
+      const last = items[items.length - 1];
+      if (last && hasMore && !loadingMoreRef.current && last.index >= visibleTurns.length - LOAD_MORE_ROW_THRESHOLD) {
+        void loadMorePage();
+      }
+    },
+  });
+
+  // Deep-link scroll (?msg=, prev/next nav, and the userOnly-bubble-click
+  // re-navigation below all funnel through this): find the target
+  // sequence's row and scroll to it. If it isn't loaded yet, load pages
+  // (bounded by MAX_SEEK_PAGES) until it appears or the session's
+  // exhausted — the U7 replacement for "everything's already in the DOM".
+  useEffect(() => {
+    if (loading || !session || !highlightMsg) return;
+    const seq = Number(highlightMsg);
+    if (Number.isNaN(seq)) return;
+    let cancelled = false;
+
+    (async () => {
+      for (let attempts = 0; attempts <= MAX_SEEK_PAGES; attempts++) {
+        if (cancelled) return;
+        const idx = findTurnIndexForSequence(visibleTurnsRef.current, seq);
+        if (idx !== -1) {
+          rowVirtualizer.scrollToIndex(idx, { align: "center", behavior: "smooth" });
+          return;
+        }
+        const result = await loadMorePage();
+        if (result === "done" || result === "error") return;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, session, highlightMsg, loadMorePage]);
+
+  // Jump-to-bottom (U7 fix): unlike Top, Bottom can't just scroll to the
+  // document's current scrollHeight — that only reflects whatever page(s)
+  // are loaded so far, so a naive scrollTo lands at the end of page 1 and
+  // stops even as onChange above keeps appending pages behind it. Load
+  // every remaining page first (same bounded loop as the deep-link seek
+  // above), then scroll — and re-invoke scrollToIndex once more after a
+  // frame, since react-virtual measures rows as they mount and the first
+  // call can land on estimateSize (140px) positions before that settles.
+  const jumpingToBottomRef = useRef(false);
+  const jumpToBottom = useCallback(async () => {
+    if (jumpingToBottomRef.current) return;
+    jumpingToBottomRef.current = true;
+    try {
+      for (let attempts = 0; attempts <= MAX_SEEK_PAGES; ) {
+        const result = await loadMorePage();
+        if (result === "done" || result === "error") break;
+        if (result === "already-loading") {
+          await new Promise((r) => setTimeout(r, 50));
+          continue;
+        }
+        attempts++;
+      }
+      const lastIndex = visibleTurnsRef.current.length - 1;
+      if (lastIndex < 0) return;
+      rowVirtualizer.scrollToIndex(lastIndex, { align: "end" });
+      requestAnimationFrame(() => {
+        rowVirtualizer.scrollToIndex(lastIndex, { align: "end" });
+      });
+    } finally {
+      jumpingToBottomRef.current = false;
+    }
+  }, [loadMorePage, rowVirtualizer]);
+
+  // Scroll to the current search match whenever it changes.
+  useEffect(() => {
+    if (!searchOpen || matchSequences.length === 0) return;
+    const seq = matchSequences[currentMatchIndex];
+    const idx = findTurnIndexForSequence(visibleTurns, seq);
+    if (idx !== -1) rowVirtualizer.scrollToIndex(idx, { align: "center", behavior: "smooth" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchOpen, matchSequences, currentMatchIndex, visibleTurns]);
+
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 p-15 text-text-secondary">
@@ -1263,6 +1601,7 @@ export default function SessionDetail() {
   const canGoNext = userMessageSequences.length > 0 && (currentUserIdx === -1 || currentUserIdx < userMessageSequences.length - 1);
 
   return (
+    <ExpandStoreContext.Provider value={expandStoreRef.current}>
     <div className="max-w-[1400px] mx-auto px-10 pt-0 pb-20">
       <div className="sticky top-0 z-10 bg-bg pt-6 pb-3">
         <div className="flex items-center justify-between">
@@ -1316,7 +1655,7 @@ export default function SessionDetail() {
             {/* User-only filter toggle */}
             <button
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[13px] rounded-md transition-all hover:text-text hover:bg-white/6 ${userOnly ? "text-accent-blue bg-accent-blue/10" : "text-text-secondary"}`}
-              onClick={() => { setUserOnly(!userOnly); setAnchorSequence(null); }}
+              onClick={() => setUserOnly(!userOnly)}
               title="Show only your messages  U"
             >
               <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
@@ -1346,11 +1685,10 @@ export default function SessionDetail() {
               Top
             </button>
             <button
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
-              onClick={() =>
-                window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" })
-              }
-              title="Scroll to bottom"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6 disabled:opacity-50"
+              onClick={() => void jumpToBottom()}
+              disabled={loadingMore}
+              title="Scroll to bottom (loads remaining pages first)"
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                 <path d="M8 4V12M4 8L8 12L12 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
@@ -1378,14 +1716,14 @@ export default function SessionDetail() {
               />
               {searchQuery && (
                 <span className="text-[11px] text-text-dim font-mono whitespace-nowrap">
-                  {matches.length > 0 ? `${currentMatchIndex + 1} of ${matches.length}` : "0 of 0"}
+                  {matchSequences.length > 0 ? `${currentMatchIndex + 1} of ${matchSequences.length}` : "0 of 0"}
                 </span>
               )}
             </div>
             <button
               className="p-1.5 text-text-dim rounded transition-all hover:text-text hover:bg-white/6 disabled:opacity-30"
               onClick={() => navigateMatch(-1)}
-              disabled={matches.length === 0}
+              disabled={matchSequences.length === 0}
               title="Previous match  Shift+Enter"
             >
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
@@ -1395,7 +1733,7 @@ export default function SessionDetail() {
             <button
               className="p-1.5 text-text-dim rounded transition-all hover:text-text hover:bg-white/6 disabled:opacity-30"
               onClick={() => navigateMatch(1)}
-              disabled={matches.length === 0}
+              disabled={matchSequences.length === 0}
               title="Next match  Enter"
             >
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
@@ -1433,75 +1771,113 @@ export default function SessionDetail() {
 
       <FilesPanel sessionId={session.id} />
 
-      <ToolsUsedChips messages={session.messages} />
+      {/* Reflects messages loaded so far, not the full session total, once
+          a session is longer than one page (U7: re-pointed at the loaded
+          window — see notes). Fills in as you scroll. */}
+      <ToolsUsedChips messages={messages} />
 
       <InsightsPanel sessionId={session.id} />
 
-      <div className="snippet-bubbles" style={{ gap: 10 }}>
-        {(() => {
-          const grouped = groupMessagesForRender(session.messages);
-          const turns = buildTurns(grouped);
-          const highlightSeq = highlightMsg ? Number(highlightMsg) : NaN;
-          let hasEmittedFirstUser = false;
+      <div ref={listContainerRef} className="snippet-bubbles-virtual" style={{ position: "relative", marginTop: 8 }}>
+        <div style={{ position: "relative", width: "100%", height: rowVirtualizer.getTotalSize() }}>
+          {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+            const turn = visibleTurns[virtualItem.index];
+            if (!turn) return null;
+            const showDivider = !userOnly && dividerBeforeIndex.has(virtualItem.index);
 
-          return turns.map((turn, idx) => {
+            let rowContent: React.ReactNode;
             if (turn.kind === "assistant") {
-              if (userOnly) return null;
               const turnHighlight =
                 !isNaN(highlightSeq) &&
                 turn.items.some((g) =>
-                  g.kind === "tools"
-                    ? g.allSequences.includes(highlightSeq)
-                    : g.msg.sequence === highlightSeq
+                  g.kind === "tools" ? g.allSequences.includes(highlightSeq) : g.msg.sequence === highlightSeq
                 );
-              return (
+              rowContent = (
                 <AssistantTurnBlock
-                  key={`at-${idx}`}
                   turn={turn}
                   highlight={turnHighlight}
                   userOnly={userOnly}
                   highlightSeq={highlightSeq}
                   isLive={isLive}
+                  sessionId={session.id}
                 />
+              );
+            } else {
+              const msg = (turn.item as { kind: "text"; msg: Message }).msg;
+              const bubble = (
+                <MessageBubble message={msg} highlight={!isNaN(highlightSeq) && highlightSeq === msg.sequence} />
+              );
+              rowContent = (
+                <>
+                  {showDivider && (
+                    <div className="w-full my-4 flex items-center">
+                      <div className="flex-1 h-px bg-border/40" />
+                    </div>
+                  )}
+                  {userOnly ? (
+                    <div
+                      className="cursor-pointer transition-all hover:brightness-125"
+                      onClick={() => {
+                        // Return to the full (non-filtered) view AND deep-link
+                        // to this message so the existing highlightMsg scroll
+                        // effect (above) carries it into view — reuses that
+                        // machinery instead of a separate transient-highlight
+                        // path (U7: simpler than re-deriving it under
+                        // virtualization, at the cost of a persistent rather
+                        // than a 2s-flash highlight; see implementation notes).
+                        setUserOnly(false);
+                        navigate({
+                          to: "/session/$id",
+                          params: { id },
+                          search: { msg: String(msg.sequence) },
+                          replace: true,
+                        });
+                      }}
+                    >
+                      {bubble}
+                    </div>
+                  ) : (
+                    bubble
+                  )}
+                </>
               );
             }
 
-            // user turn
-            const msg = (turn.item as { kind: "text"; msg: Message }).msg;
-            const isNewUserTurn = hasEmittedFirstUser;
-            hasEmittedFirstUser = true;
-
             return (
-              <React.Fragment key={msg.sequence}>
-                {!userOnly && isNewUserTurn && (
-                  <div className="w-full my-4 flex items-center">
-                    <div className="flex-1 h-px bg-border/40" />
-                  </div>
-                )}
-                {userOnly ? (
-                  <div
-                    className="cursor-pointer transition-all hover:brightness-125"
-                    onClick={() => {
-                      setAnchorSequence(msg.sequence);
-                      setUserOnly(false);
-                    }}
-                  >
-                    <MessageBubble
-                      message={msg}
-                      highlight={highlightMsg === String(msg.sequence)}
-                    />
-                  </div>
-                ) : (
-                  <MessageBubble
-                    message={msg}
-                    highlight={highlightMsg === String(msg.sequence)}
-                  />
-                )}
-              </React.Fragment>
+              <div
+                key={virtualItem.key}
+                data-index={virtualItem.index}
+                ref={rowVirtualizer.measureElement}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${virtualItem.start - scrollMargin}px)`,
+                }}
+              >
+                {rowContent}
+              </div>
             );
-          });
-        })()}
+          })}
+        </div>
+
+        {loadingMore && (
+          <div className="flex items-center justify-center gap-2 py-4 text-xs text-text-dim">
+            <div className="spinner w-3 h-3" />
+            Loading more messages…
+          </div>
+        )}
+        {loadMoreError && (
+          <div className="flex items-center justify-center gap-2 py-4 text-xs text-[#f85149]">
+            <span>{loadMoreError}</span>
+            <button className="text-accent-blue hover:underline" onClick={() => void loadMorePage()}>
+              Retry
+            </button>
+          </div>
+        )}
       </div>
     </div>
+    </ExpandStoreContext.Provider>
   );
 }

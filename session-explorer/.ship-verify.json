@@ -1,0 +1,6 @@
+{
+  "lintRoots": ["server", "web"],
+  "typecheckLintCmd": "bunx tsc --noEmit",
+  "backendTestPattern": "^server/.*\\.test\\.ts$",
+  "backendTestCmdTemplate": "bun test {files}"
+}

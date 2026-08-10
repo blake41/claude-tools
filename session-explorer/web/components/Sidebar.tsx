@@ -48,6 +48,42 @@ function formatDate(dateStr: string | null): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+// ── Ingest health (plan U6) ────────────────────────────────────────
+// Mirrors GET /api/ingest/status's new fields (server/ingest.ts's
+// `IngestHealth` + the pre-existing progress fields) — see that endpoint for
+// the source of truth.
+interface IngestFailure {
+  sessionId: string;
+  message: string;
+  timestamp: string;
+}
+
+interface IngestStatusPayload {
+  running: boolean;
+  lastTickAt: string | null;
+  pendingCount: number;
+  recentFailures: IngestFailure[];
+}
+
+/** Same 30s cadence as the server's auto-ingest tick (server/config.ts's
+ * `autoIngestIntervalMs`) — polling faster wouldn't show anything new. */
+const INGEST_STATUS_POLL_MS = 30_000;
+/** A tick is "stale" once it's this far behind — one full cadence of slack
+ * beyond the 30s interval before flagging it, so a single slow tick doesn't
+ * flash a false warning. */
+const STALE_TICK_MS = 2 * 60 * 1000;
+
+function formatTickAgo(iso: string): string {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  if (diffMs < 0 || Number.isNaN(diffMs)) return "just now";
+  const s = Math.floor(diffMs / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ago`;
+}
+
 function loadStarredIds(): Set<number> {
   try {
     const raw = localStorage.getItem("starred-workspaces");
@@ -66,6 +102,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   const [newTagName, setNewTagName] = useState("");
   const [newTagColor, setNewTagColor] = useState(PRESET_COLORS[0]);
   const [ingesting, setIngesting] = useState(false);
+  const [ingestHealth, setIngestHealth] = useState<IngestStatusPayload | null>(null);
   const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([]);
   const [refreshingTag, setRefreshingTag] = useState<number | null>(null);
   const [starredIds, setStarredIds] = useState<Set<number>>(loadStarredIds);
@@ -108,6 +145,21 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
       .then((r) => r.json())
       .then((data) => setSavedSearches(data))
       .catch(() => {});
+  }, []);
+
+  // Ingest health readout (plan U6) — polled independently of the manual
+  // re-ingest button's own status poll below, on the same cadence as the
+  // server's auto-ingest tick.
+  useEffect(() => {
+    function poll() {
+      fetch("/api/ingest/status")
+        .then((r) => r.json())
+        .then((d: IngestStatusPayload) => setIngestHealth(d))
+        .catch(() => {});
+    }
+    poll();
+    const interval = setInterval(poll, INGEST_STATUS_POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   const savedSearchByTagId = new Map(savedSearches.map((ss) => [ss.tag_id, ss]));
@@ -482,6 +534,33 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
           </svg>
           {ingesting ? "Ingesting..." : "Re-ingest sessions"}
         </button>
+        {ingestHealth && (() => {
+          const stale = ingestHealth.lastTickAt
+            ? Date.now() - new Date(ingestHealth.lastTickAt).getTime() > STALE_TICK_MS
+            : false;
+          const hasFailures = ingestHealth.recentFailures.length > 0;
+          const warn = stale || hasFailures;
+          const failureTitle = hasFailures
+            ? ingestHealth.recentFailures.map((f) => `${f.sessionId}: ${f.message}`).join("\n")
+            : undefined;
+          return (
+            <div
+              className={`flex items-center gap-1.5 mt-1.5 text-[10px] ${warn ? "text-accent-red" : "text-text-dim"}`}
+              title={failureTitle}
+            >
+              <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${warn ? "bg-accent-red" : "bg-accent-green"}`} />
+              <span>
+                {stale
+                  ? "Ingest stale"
+                  : ingestHealth.lastTickAt
+                    ? `Last tick ${formatTickAgo(ingestHealth.lastTickAt)}`
+                    : "No tick yet"}
+                {ingestHealth.pendingCount > 0 && ` · ${ingestHealth.pendingCount} pending`}
+                {hasFailures && ` · ${ingestHealth.recentFailures.length} failed`}
+              </span>
+            </div>
+          );
+        })()}
       </div>
     </aside>
   );

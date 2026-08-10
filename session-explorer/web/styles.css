@@ -836,6 +836,30 @@ button {
   color: var(--color-text, #e6edf3);
   background: rgba(0, 0, 0, 0.2);
 }
+/* Big tool result collapse/expand (plan U7, string-length gated) */
+.tool-result-expand-btn {
+  display: block;
+  width: 100%;
+  padding: 5px 12px;
+  background: none;
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  color: var(--color-accent-blue);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: center;
+  opacity: 0.75;
+  transition: opacity 0.1s;
+}
+.tool-result-expand-btn:hover { opacity: 1; }
+.tool-result-expand-btn:disabled { cursor: default; opacity: 0.4; }
+.tool-result-error {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: #f85149;
+  border-top: 1px solid rgba(248, 81, 73, 0.15);
+  background: rgba(248, 81, 73, 0.06);
+}
 
 /* Snippet highlight text (FTS matches) */
 .result-snippet .snippet-highlight {

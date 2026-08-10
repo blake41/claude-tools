@@ -38,15 +38,17 @@ function buildSystemPrompt(): string {
 ## Schema
 
 workspaces: id INTEGER PRIMARY KEY, path TEXT, dir_name TEXT, display_name TEXT, session_count INTEGER, last_activity TEXT
-sessions: id TEXT PRIMARY KEY, workspace_id INTEGER REFERENCES workspaces(id), source_path TEXT, started_at TEXT, ended_at TEXT, git_branch TEXT, title TEXT, message_count INTEGER, user_message_count INTEGER, summary TEXT, ingested_at TEXT
-messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role TEXT (user|assistant), content TEXT, timestamp TEXT, sequence INTEGER, message_type TEXT (text|tool_use|tool_result)
+sessions: id TEXT PRIMARY KEY, workspace_id INTEGER REFERENCES workspaces(id), source_path TEXT, started_at TEXT, ended_at TEXT, git_branch TEXT, title TEXT, message_count INTEGER, user_message_count INTEGER, summary TEXT, ingested_at TEXT, trace_meta TEXT (JSON — the LeanSessionDetail envelope minus chunks; NULL until this session has been ingested by the unified parser)
+messages: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), role TEXT (user|assistant), content TEXT, timestamp TEXT, sequence INTEGER, message_type TEXT (text|tool_use|tool_result|system|subagent_prompt), record_uuid TEXT (join key into raw_records; NULL on rows ingested before the unified parser), title TEXT, workspace TEXT (FTS facet columns — denormalized copies of the session's title/workspace display name, present on every row of a session so faceted MATCH queries work)
+raw_records: session_id TEXT, uuid TEXT, seq INTEGER, raw TEXT — one row per VERBATIM original JSONL record (parent + subagent files both). PRIMARY KEY (session_id, uuid). This is the full-fidelity source behind every messages row: join on messages.record_uuid = raw_records.uuid AND messages.session_id = raw_records.session_id to recover the exact original record, unredacted and uncapped.
+trace_chunks: session_id TEXT, chunk_seq INTEGER, chunk_type TEXT (user|system|compact|ai), started_at TEXT, ended_at TEXT, payload TEXT (JSON — one LeanChunk per row, steps embedded). PRIMARY KEY (session_id, chunk_seq). The materialized trace view's data; not usually needed for search/analytics questions.
 tags: id INTEGER PRIMARY KEY, name TEXT UNIQUE, color TEXT, description TEXT, created_at TEXT
 session_tags: session_id TEXT, tag_id INTEGER, added_at TEXT
 session_files: id INTEGER PRIMARY KEY, session_id TEXT, file_path TEXT, file_name TEXT, operation TEXT (write|edit|read), timestamp TEXT, sequence INTEGER
 insights: id INTEGER PRIMARY KEY, session_id TEXT REFERENCES sessions(id), type TEXT (correction|decision|gotcha|pattern|discovery|preference), content TEXT, canonical_form TEXT, canonical_hash TEXT, context TEXT, entities TEXT (JSON array), source TEXT (parent|subagent), observation_count INTEGER, score REAL, upvotes INTEGER, downvotes INTEGER, deleted_at TEXT, extracted_at TEXT, last_observed_at TEXT
 insight_files: insight_id INTEGER, file_path TEXT — PRIMARY KEY (insight_id, file_path)
 insight_sessions: insight_id INTEGER, session_id TEXT, extracted_at TEXT — junction table linking insights to all sessions where observed
-messages_fts: FTS5 virtual table on messages.content — JOIN via messages_fts.rowid = messages.id
+messages_fts: FTS5 virtual table (porter-stemmed) on messages.content/title/workspace — JOIN via messages_fts.rowid = messages.id. content is column 0 — always pass 0 to snippet()/highlight(), never title/workspace's positions.
 
 ## Data Profile
 
@@ -54,7 +56,7 @@ messages_fts: FTS5 virtual table on messages.content — JOIN via messages_fts.r
 - Date range: ${dateRange}
 - Dates are ISO 8601 strings. Use datetime() for comparisons.
 - file_path contains absolute paths. Use LIKE '%pattern%' for matching.
-- message_type values: 'text' (conversation), 'tool_use' (format: "ToolName: summary"), 'tool_result' (truncated first 500 chars)
+- message_type values: 'text' (conversation), 'tool_use' (format: "ToolName: summary"), 'tool_result' (redacted for secrets, then capped at 4000 chars — content ending in "… [truncated]" was cut; the full body is always recoverable via raw_records, see the json_extract recipe below), 'system', 'subagent_prompt' (internal, see below)
 - session_files.operation values: 'write' | 'edit' | 'read'
 - Filter out image files (png/jpg/gif/webp/svg) from file queries unless asked.
 
@@ -69,6 +71,16 @@ Topic search (always use FTS5, not LIKE):
   JOIN sessions s ON s.id = m.session_id
   JOIN workspaces w ON w.id = s.workspace_id
   WHERE messages_fts MATCH '"exact phrase" OR term1 AND term2'
+  ORDER BY s.started_at DESC LIMIT 50
+
+Faceted search (title/workspace columns are indexed alongside content — MATCH
+can restrict which column a term must hit with a {column}: term prefix):
+  SELECT DISTINCT s.id, s.title, s.started_at, w.display_name
+  FROM messages_fts fts
+  JOIN messages m ON m.id = fts.rowid
+  JOIN sessions s ON s.id = m.session_id
+  JOIN workspaces w ON w.id = s.workspace_id
+  WHERE messages_fts MATCH 'workspace: terra AND content: fts5'
   ORDER BY s.started_at DESC LIMIT 50
 
 File search:
@@ -87,6 +99,14 @@ Time-bounded:
 
 Tool usage:
   SELECT * FROM messages WHERE message_type = 'tool_use' AND content LIKE 'ToolName:%'
+
+Full-fidelity tool result via raw_records (the projected messages.content is
+redacted and capped at 4000 chars — go here for the unredacted original, or to
+pull structured fields the projection never stored, e.g. a tool's exit code):
+  SELECT m.session_id, m.sequence, json_extract(r.raw, '$.toolUseResult.stdout') as stdout
+  FROM messages m
+  JOIN raw_records r ON r.session_id = m.session_id AND r.uuid = m.record_uuid
+  WHERE m.message_type = 'tool_result' AND m.session_id = ?
 
 Most frequent corrections:
   SELECT type, content, observation_count, score FROM insights

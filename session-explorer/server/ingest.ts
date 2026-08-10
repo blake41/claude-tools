@@ -1,12 +1,31 @@
-import { readdirSync, statSync, existsSync, readFileSync } from "fs";
-import { join, basename } from "path";
-import { homedir } from "os";
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "fs";
+import { basename, dirname, join } from "path";
+import { homedir, tmpdir } from "os";
+import { gunzipSync } from "zlib";
 import db from "./db.js";
-import { stripSession } from "./strip.js";
 import { pickTitle } from "./title.js";
-import { archiveSession } from "./archive.js";
+import { archivePathFor, archiveSession } from "./archive.js";
 import { tallyUnknownRecordTypes, parseJsonlLines } from "./canary.js";
 import { isSummaryStale } from "./summary-staleness.js";
+import {
+  extractFileReferences,
+  projectHeader,
+  projectMessages,
+  type ProjectedRow,
+  type ProjectionSource,
+} from "./projection.js";
+import { buildTraceFromFile, shapeTraceForResponse } from "./trace/index.js";
 
 // ── Config ─────────────────────────────────────────────────────────
 
@@ -98,6 +117,58 @@ function displayName(workspacePath: string): string {
 // Title-picking (isTitleWorthy, stripAnsiCodes, pickTitle) lives in ./title.ts
 // — pure, DB-free, and unit-tested there.
 
+// ── Cheap header read ──────────────────────────────────────────────
+
+/** How many bytes off the front of a transcript `readSessionHeader` reads.
+ *  Generous enough to hold several real records (a Claude Code JSONL line is
+ *  typically well under 8 KB) and small enough that reading it off a 47 MB
+ *  transcript is free. */
+const HEADER_READ_BYTES = 64 * 1024;
+/** How many leading records to inspect for a `cwd`. */
+const HEADER_SCAN_RECORDS = 20;
+
+/**
+ * Read a transcript's workspace path (`cwd`) by JSON-parsing only the first
+ * few records. Used solely to resolve a never-seen project directory to a
+ * workspace — the one place ingest needs a single header field and nothing
+ * else.
+ *
+ * This replaces a full `stripSession` (now: a full vendored parse) of up to
+ * three files per unknown directory. Parsing a 47 MB transcript to read one
+ * string is the kind of cost that used to make every ~30s tick expensive.
+ *
+ * Returns `{ cwd: null }` for anything unreadable, empty, or headerless —
+ * callers fall back to decoding the directory name.
+ */
+export function readSessionHeader(jsonlPath: string): { cwd: string | null } {
+  let fd: number | null = null;
+  try {
+    fd = openSync(jsonlPath, "r");
+    const buffer = Buffer.alloc(HEADER_READ_BYTES);
+    const bytesRead = readSync(fd, buffer, 0, HEADER_READ_BYTES, 0);
+    const lines = buffer.subarray(0, bytesRead).toString("utf-8").split("\n");
+    // The last line is a partial record whenever the read hit the byte cap
+    // rather than EOF — dropping it avoids a guaranteed JSON.parse failure.
+    if (bytesRead === HEADER_READ_BYTES) lines.pop();
+
+    for (const line of lines.slice(0, HEADER_SCAN_RECORDS)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const record = JSON.parse(trimmed) as { cwd?: unknown };
+        if (typeof record.cwd === "string" && record.cwd) return { cwd: record.cwd };
+      } catch {
+        // malformed line — try the next one
+      }
+    }
+  } catch {
+    // unreadable file — caller falls back to decodeDirName
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+  return { cwd: null };
+}
+
 // ── Prepared Statements ────────────────────────────────────────────
 
 const getWorkspace = db.prepare(`SELECT id FROM workspaces WHERE path = ?`);
@@ -117,7 +188,127 @@ const updateWorkspaceStats = db.prepare(`
 `);
 
 const sessionExists = db.prepare(`SELECT 1 FROM sessions WHERE id = ?`);
-const sessionFileSize = db.prepare(`SELECT file_size FROM sessions WHERE id = ?`);
+const sessionFileStat = db.prepare(
+  `SELECT file_size, file_mtime FROM sessions WHERE id = ?`
+);
+
+/**
+ * The reingest predicate (D10): a session is stale when its file's size OR its
+ * mtime differs from what was recorded at the last ingest. Size alone missed
+ * in-place rewrites that landed on the same byte count.
+ *
+ * `storedMtime === null` (every row written before the `file_mtime` column
+ * existed) deliberately falls back to size-only. Treating NULL as "differs"
+ * would mark all ~3,300 legacy sessions stale at once and make the next 30s
+ * tick try to re-parse the entire 14 GB corpus. The planned force-reingest
+ * (plan U8) is the controlled way to backfill those rows.
+ *
+ * Pure so the trigger and any future health/pending count share one
+ * definition (plan U6 depends on that).
+ */
+export function needsReingestForStat(
+  stored: { file_size: number | null; file_mtime: number | null },
+  current: { size: number; mtimeMs: number }
+): boolean {
+  if (stored.file_size !== current.size) return true;
+  if (stored.file_mtime === null || stored.file_mtime === undefined) return false;
+  return stored.file_mtime !== Math.round(current.mtimeMs);
+}
+
+// ── Ingest Health (plan U6) ────────────────────────────────────────
+// Truthful health surface for `GET /api/ingest/status`: in-memory only, no
+// new tables. `lastTickAt` marks when a `runIngestion` tick last RESOLVED —
+// not set if a tick throws, since a tick that never finished isn't "the last
+// completed one". `recentFailures` is a capped ring buffer fed from
+// `ingestSession`'s catch/skip paths that represent a REAL failure (bytes
+// that couldn't be found or parsed) — deliberately NOT the routine
+// "unchanged, nothing to do" skip that ~all sessions hit on ~every tick.
+
+export interface IngestFailure {
+  sessionId: string;
+  message: string;
+  timestamp: string;
+}
+
+/** ~20 per the plan — enough recent history to be useful, small enough that
+ * a bad run can't grow this without bound. */
+export const MAX_RECENT_FAILURES = 20;
+
+let lastTickAt: string | null = null;
+const recentFailures: IngestFailure[] = [];
+
+function recordIngestFailure(sessionId: string, message: string): void {
+  recentFailures.push({ sessionId, message, timestamp: new Date().toISOString() });
+  if (recentFailures.length > MAX_RECENT_FAILURES) {
+    recentFailures.splice(0, recentFailures.length - MAX_RECENT_FAILURES);
+  }
+}
+
+const getAllSessionsWithSourcePath = db.prepare(
+  `SELECT id, source_path, file_size, file_mtime FROM sessions WHERE source_path IS NOT NULL`
+);
+
+/**
+ * Number of ingested sessions whose on-disk transcript has changed since the
+ * last ingest — i.e. what the next auto-ingest tick would pick up. Runs the
+ * SAME `needsReingestForStat` predicate `ingestSession`'s own auto-reingest
+ * gate (above) uses, so the health count and the trigger can never drift
+ * apart (plan U6's whole point). A session whose file no longer exists on
+ * disk is NOT "pending" — there's nothing to stat against, and the archive
+ * fallback (a separate mechanism) is what covers that case.
+ */
+export function getPendingCount(): number {
+  const rows = getAllSessionsWithSourcePath.all() as Array<{
+    id: string;
+    source_path: string;
+    file_size: number | null;
+    file_mtime: number | null;
+  }>;
+
+  let pending = 0;
+  for (const row of rows) {
+    try {
+      const stat = statSync(row.source_path);
+      if (needsReingestForStat({ file_size: row.file_size, file_mtime: row.file_mtime }, stat)) {
+        pending++;
+      }
+    } catch {
+      // File gone — nothing on disk to compare against.
+    }
+  }
+  return pending;
+}
+
+export interface IngestHealth {
+  lastTickAt: string | null;
+  pendingCount: number;
+  recentFailures: IngestFailure[];
+}
+
+/** Never throws — a status endpoint reporting on ingest health must not
+ * itself become a new way for ingest health to be unreportable. */
+export function getIngestHealth(): IngestHealth {
+  let pendingCount = 0;
+  try {
+    pendingCount = getPendingCount();
+  } catch {
+    // A DB hiccup here shouldn't take the whole status endpoint down with it.
+  }
+  return {
+    lastTickAt,
+    pendingCount,
+    recentFailures: [...recentFailures],
+  };
+}
+
+/** Test-only. The state above is a process-lifetime singleton — correct for
+ * production, but `bun test` runs many independent cases in one process, so
+ * tests need a way to zero it between cases. Not used by any production
+ * code path. */
+export function __resetIngestHealthForTesting(): void {
+  lastTickAt = null;
+  recentFailures.length = 0;
+}
 
 // Reingest (triggered by a file-size change) deletes and reinserts the
 // session row, which would otherwise silently wipe every LLM-derived column
@@ -159,14 +350,37 @@ const restoreSummaryFields = db.prepare(`
 const getMessageCount = db.prepare(`SELECT message_count FROM sessions WHERE id = ?`);
 
 const insertSession = db.prepare(`
-  INSERT INTO sessions (id, workspace_id, source_path, started_at, ended_at, git_branch, title, message_count, user_message_count, file_size, ingested_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO sessions (id, workspace_id, source_path, started_at, ended_at, git_branch, title, message_count, user_message_count, file_size, file_mtime, trace_meta, ingested_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
+// `title`/`workspace` are the FTS facet columns (D4): external-content FTS5
+// reads each indexed column from the SAME-NAMED column of `messages`, so
+// faceted search only works if every row carries them. `record_uuid` is the
+// join key into `raw_records` (D2).
 const insertMessage = db.prepare(`
-  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type, source, tool_use_id, tool_name, tool_input)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO messages (session_id, role, content, timestamp, sequence, message_type, source, tool_use_id, tool_name, tool_input, record_uuid, title, workspace)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
+
+// One row per RAW JSONL record, verbatim (D2) — the full-fidelity half of
+// "clean projection + raw payload side by side".
+const insertRawRecord = db.prepare(`
+  INSERT INTO raw_records (session_id, uuid, seq, raw) VALUES (?, ?, ?, ?)
+`);
+
+// One row per lean trace chunk (D3), so `GET /api/sessions/:id/trace` becomes
+// a pure SQL read instead of a per-request re-parse of the original JSONL.
+const insertTraceChunk = db.prepare(`
+  INSERT INTO trace_chunks (session_id, chunk_seq, chunk_type, started_at, ended_at, payload)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+// The `workspace` facet stores the workspace's display name (what the UI and
+// a faceted `workspace: terra` MATCH both show), not its numeric id.
+const getWorkspaceDisplayName = db.prepare(
+  `SELECT display_name FROM workspaces WHERE id = ?`
+);
 
 const insertFile = db.prepare(`
   INSERT INTO session_files (session_id, file_path, file_name, operation, timestamp, sequence)
@@ -182,7 +396,8 @@ const updateSessionCounts = db.prepare(`
 
 const deleteSessionFiles = db.prepare(`DELETE FROM session_files WHERE session_id = ?`);
 const deleteSessionMessages = db.prepare(`DELETE FROM messages WHERE session_id = ?`);
-const deleteSessionTags = db.prepare(`DELETE FROM session_tags WHERE session_id = ?`);
+const deleteSessionRawRecords = db.prepare(`DELETE FROM raw_records WHERE session_id = ?`);
+const deleteSessionTraceChunks = db.prepare(`DELETE FROM trace_chunks WHERE session_id = ?`);
 const deleteSession = db.prepare(`DELETE FROM sessions WHERE id = ?`);
 
 // ── Schema-Drift Canary ────────────────────────────────────────────
@@ -215,12 +430,13 @@ try {
 }
 
 /**
- * Independently tally raw JSONL record types (duplicates a lightweight
- * version of strip.ts's line-parsing since strip.ts is out of scope to
- * modify/export from) and record any type strip.ts neither handles nor
- * deliberately skips. Logs once per newly-discovered type per process
- * lifetime; persists the full per-session tally whenever the session row
- * exists (it may not yet, e.g. a first-ingest parse failure).
+ * Independently tally raw JSONL record types (a lightweight line-parse of its
+ * own, deliberately not routed through the vendored parser — a canary that
+ * shares the parser it is watching cannot see that parser go blind) and record
+ * any type the parse step neither handles nor deliberately skips. Logs once
+ * per newly-discovered type per process lifetime; persists the full
+ * per-session tally whenever the session row exists (it may not yet, e.g. a
+ * first-ingest parse failure).
  */
 function recordUnknownTypesForSession(
   sessionId: string,
@@ -242,7 +458,7 @@ function recordUnknownTypesForSession(
     if (!seenUnknownTypes.has(type)) {
       seenUnknownTypes.add(type);
       console.warn(
-        `[canary] new unknown JSONL record type "${type}" (session ${sessionId}, ${tally[type]} occurrence${tally[type] === 1 ? "" : "s"}) — strip.ts does not handle or skip it; data of this type is being silently dropped.`
+        `[canary] new unknown JSONL record type "${type}" (session ${sessionId}, ${tally[type]} occurrence${tally[type] === 1 ? "" : "s"}) — the vendored parser does not handle or skip it; data of this type is being silently dropped.`
       );
     }
   }
@@ -271,26 +487,104 @@ function getOrCreateWorkspace(
   return Number(result.lastInsertRowid);
 }
 
-function ingestSession(
+// ── Parse-source resolution (archive fallback) ─────────────────────
+
+interface ParseSource {
+  /** Absolute path of the file to hand the vendored parser. */
+  filePath: string;
+  /** Encoded `~/.claude/projects` directory name, or null when the bytes came
+   *  from the gzip archive (no `subagents/` sibling directory exists there, so
+   *  subagent linking is skipped — a parent-only trace, not a failure). */
+  projectId: string | null;
+  /** Removes the temp file, if one was created. No-op otherwise. */
+  cleanup: () => void;
+}
+
+/**
+ * Resolve the bytes to parse for a session: the original transcript when it is
+ * still on disk, otherwise `data/archive/<id>.jsonl.gz` gunzipped to a temp
+ * file. This is what makes the archive LOAD-BEARING (plan R4) — before this,
+ * once Claude Code pruned a transcript the session could never be reingested
+ * and its lossy rows were all that remained forever.
+ *
+ * Mirrors the temp-file pattern in `server/trace/index.ts`'s
+ * `resolveTranscript`. Returns null when neither source exists, which the
+ * caller treats exactly like a parse failure: old rows stay untouched.
+ */
+function resolveParseSource(sessionId: string, jsonlPath: string): ParseSource | null {
+  if (existsSync(jsonlPath)) {
+    // `<projects>/<projectId>/<sessionId>.jsonl` — the directory name IS the
+    // projectId the vendored SubagentResolver needs to find sibling subagents.
+    return { filePath: jsonlPath, projectId: basename(dirname(jsonlPath)), cleanup: () => {} };
+  }
+
+  const archivePath = archivePathFor(sessionId);
+  if (!existsSync(archivePath)) return null;
+
+  try {
+    const tempDir = mkdtempSync(join(tmpdir(), "session-explorer-ingest-"));
+    const tempFile = join(tempDir, `${sessionId}.jsonl`);
+    writeFileSync(tempFile, gunzipSync(readFileSync(archivePath)));
+    return {
+      filePath: tempFile,
+      projectId: null,
+      cleanup: () => {
+        try {
+          rmSync(tempDir, { recursive: true, force: true });
+        } catch {
+          // best-effort cleanup
+        }
+      },
+    };
+  } catch {
+    // corrupt/unreadable archive — same contract as a parse failure
+    return null;
+  }
+}
+
+/** A projected row plus which transcript it came from (the `messages.source`
+ *  column). The projection itself is source-agnostic apart from the
+ *  subagent_prompt override, which it already applies. */
+interface SourcedRow {
+  row: ProjectedRow;
+  source: ProjectionSource;
+}
+
+function isoOrNull(value: unknown): string | null {
+  return value instanceof Date && !Number.isNaN(value.getTime()) ? value.toISOString() : null;
+}
+
+/**
+ * Ingest (or re-ingest) one session: run the vendored parser ONCE and write
+ * every derived representation from that single parse — the clean projection
+ * (`messages`), the verbatim records (`raw_records`), and the materialized
+ * trace (`trace_chunks` + `sessions.trace_meta`).
+ *
+ * The ordering below is load-bearing; see the numbered comments.
+ */
+export async function ingestSession(
   jsonlPath: string,
   workspaceId: number,
   forceReingest: boolean
-): boolean {
+): Promise<boolean> {
   const sessionId = basename(jsonlPath, ".jsonl");
 
   const alreadyExists = !!sessionExists.get(sessionId);
 
-  // Auto-reingest if file size has changed (session grew since last ingest)
+  // 1. Auto-reingest if the file's size OR mtime changed since the last ingest
+  // (D10) — see needsReingestForStat for why a NULL mtime falls back to size.
   let needsReingest = forceReingest;
   if (alreadyExists && !forceReingest) {
     try {
-      const stored = sessionFileSize.get(sessionId) as { file_size: number } | undefined;
-      const currentSize = statSync(jsonlPath).size;
-      if (stored && stored.file_size !== currentSize) {
+      const stored = sessionFileStat.get(sessionId) as
+        | { file_size: number | null; file_mtime: number | null }
+        | undefined;
+      const stat = statSync(jsonlPath);
+      if (stored && needsReingestForStat(stored, stat)) {
         needsReingest = true;
       }
     } catch {
-      // stat failed, skip size check
+      // stat failed, skip the staleness check
     }
   }
 
@@ -298,37 +592,81 @@ function ingestSession(
     return false;
   }
 
-  // Keep the raw-archive fallback fresh regardless of whether stripSession
-  // can parse the file below — it's a byte-for-byte gzip copy independent of
-  // parsing, so even a broken/unparseable session still gets archived before
-  // Claude Code eventually prunes the original. See server/archive.ts for
-  // the skip-if-unchanged manifest check (cheap stat-only comparison).
+  // 2. Keep the raw-archive fallback fresh regardless of whether the parse
+  // below succeeds — it's a byte-for-byte gzip copy independent of parsing, so
+  // even a broken/unparseable session still gets archived before Claude Code
+  // eventually prunes the original. See server/archive.ts for the
+  // skip-if-unchanged manifest check (cheap stat-only comparison).
   archiveSession(sessionId, jsonlPath);
 
-  // Parse BEFORE touching any existing rows. A parse failure must leave the
+  // 3. Resolve what to parse: the original file, or the archive gunzipped to a
+  // temp file when Claude Code has already pruned it.
+  const parseSource = resolveParseSource(sessionId, jsonlPath);
+  if (!parseSource) {
+    console.error(`  [SKIP] No transcript or archive for ${sessionId}`);
+    recordUnknownTypesForSession(sessionId, jsonlPath, alreadyExists);
+    recordIngestFailure(sessionId, "No transcript or archive found");
+    return false;
+  }
+
+  // 4. Parse BEFORE touching any existing rows. A parse failure must leave the
   // old session+messages+files fully intact — previously the delete ran
   // first and a subsequent parse failure silently destroyed the session.
-  let result;
+  //
+  // ONE parse feeds everything downstream (R1): `detail` carries the full
+  // per-message model AND the raw line behind each record, and `lean` is the
+  // pure reshape the trace UI consumes.
+  let detail;
+  let lean;
   try {
-    result = stripSession(jsonlPath);
+    detail = await buildTraceFromFile(parseSource.filePath, parseSource.projectId, sessionId);
+    lean = shapeTraceForResponse(detail);
   } catch (err) {
-    console.error(`  [SKIP] Failed to strip ${sessionId}: ${err}`);
+    console.error(`  [SKIP] Failed to parse ${sessionId}: ${err}`);
     // Best-effort schema-drift signal even on parse failure — a new/renamed
-    // record type strip.ts can't handle is a plausible cause. Only persists
+    // record type the parser can't handle is a plausible cause. Only persists
     // if the (untouched) session row already exists.
     recordUnknownTypesForSession(sessionId, jsonlPath, alreadyExists);
+    recordIngestFailure(sessionId, `Failed to parse: ${err}`);
     return false;
+  } finally {
+    parseSource.cleanup();
   }
 
-  const { header, messages, files, toolCalls } = result;
-  if (messages.length === 0) {
+  // 5. Project. Subagent messages come from the RESOLVER's output, not from a
+  // second parser pass over `subagents/*.jsonl` — that second pass was the
+  // duplicate-parser problem this migration exists to remove. The
+  // `subagent_prompt` override for subagent user text lives in the projection
+  // (server/projection.ts), which is why only the source hint is passed here.
+  const sourcedRows: SourcedRow[] = [];
+  for (const row of projectMessages(detail.messages, "parent")) {
+    sourcedRows.push({ row, source: "parent" });
+  }
+  for (const process of detail.processes) {
+    for (const row of projectMessages(process.messages, "subagent")) {
+      sourcedRows.push({ row, source: "subagent" });
+    }
+  }
+
+  if (sourcedRows.length === 0) {
     // Still worth a canary check: a session whose every record is an
-    // unrecognized type would strip down to zero messages here.
+    // unrecognized type would project to zero rows here.
     recordUnknownTypesForSession(sessionId, jsonlPath, alreadyExists);
+    recordIngestFailure(sessionId, "Parsed to zero message rows");
     return false;
   }
 
-  // Preserve LLM-derived columns across reingest so we don't trigger
+  // File references are extracted over parent + subagent messages in one call
+  // so the dedupe key (`filePath|operation`) and the sequence numbering are
+  // global, not per-transcript.
+  const fileReferences = extractFileReferences([
+    ...detail.messages,
+    ...detail.processes.flatMap((p) => p.messages),
+  ]);
+
+  const header = projectHeader(detail.messages);
+
+  // 6. Preserve LLM-derived columns across reingest so we don't trigger
   // unnecessary resummarization/re-extraction (see sessionDerivedData above).
   // Read BEFORE the delete+reinsert transaction below — parsing has already
   // succeeded at this point, so it's now safe to plan the destructive part.
@@ -339,60 +677,113 @@ function ingestSession(
       null;
   }
 
-  const userMessages = messages.filter((m) => m.role === "user");
-  const title = pickTitle(userMessages);
-  const startedAt = messages[0]?.timestamp || null;
-  const endedAt = messages[messages.length - 1]?.timestamp || null;
+  const parentRows = sourcedRows.filter((r) => r.source === "parent").map((r) => r.row);
+  const title = pickTitle(parentRows.filter((r) => r.role === "user"));
+  const userRowCount = sourcedRows.filter((r) => r.row.role === "user").length;
+  const parentTimestamps = parentRows
+    .map((r) => r.timestamp)
+    .filter((t): t is string => typeof t === "string" && t.length > 0);
+  const startedAt = parentTimestamps[0] ?? null;
+  const endedAt = parentTimestamps[parentTimestamps.length - 1] ?? null;
 
-  // Get file size for change detection
+  // FTS facet values (D4), denormalized onto every message row of this session.
+  const workspaceRow = getWorkspaceDisplayName.get(workspaceId) as
+    | { display_name: string }
+    | undefined;
+  const workspaceName = workspaceRow?.display_name ?? null;
+
+  // The LeanSessionDetail envelope minus its chunks — the chunks become rows,
+  // the rest becomes one JSON column the trace endpoint reassembles around
+  // them (D3).
+  const { chunks: leanChunks, ...traceMeta } = lean;
+
+  // Size + mtime, the two halves of the reingest trigger (D10). Both are read
+  // AFTER the parse so they describe the bytes that were actually parsed.
+  // Both stay NULL for an archive-sourced ingest: there is no file to stat,
+  // and a fabricated value would make the next tick think it was current.
   let fileSize: number | null = null;
+  let fileMtime: number | null = null;
   try {
-    fileSize = statSync(jsonlPath).size;
+    const stat = statSync(jsonlPath);
+    fileSize = stat.size;
+    fileMtime = Math.round(stat.mtimeMs);
   } catch {
-    // file may have been removed between strip and stat
+    // file may have been removed between parse and stat, or was never there
+    // (archive-sourced ingest)
   }
 
-  // Delete (if reingesting) and reinsert atomically in ONE transaction —
+  // 7. Delete (if reingesting) and reinsert atomically in ONE transaction —
   // now that parsing has already succeeded, a crash mid-transaction can't
   // leave the DB in a deleted-but-not-reinserted state either.
   const ingestTx = db.transaction(() => {
-    if (alreadyExists && needsReingest) {
-      deleteSessionFiles.run(sessionId);
-      deleteSessionMessages.run(sessionId);
-      // Preserve session_tags — tags are user data, not derived from JSONL
-      deleteSession.run(sessionId);
-    }
+    // Unconditional, not gated on `alreadyExists`: `raw_records` and
+    // `trace_chunks` are keyed by (session_id, uuid) / (session_id, chunk_seq),
+    // so ANY orphan row left behind by an earlier partial state would make the
+    // insert below fail with SQLITE_CONSTRAINT_PRIMARYKEY and abort the whole
+    // ingest. On a genuine first ingest all five statements are no-ops.
+    deleteSessionFiles.run(sessionId);
+    deleteSessionMessages.run(sessionId);
+    deleteSessionRawRecords.run(sessionId);
+    deleteSessionTraceChunks.run(sessionId);
+    // Preserve session_tags — tags are user data, not derived from JSONL
+    deleteSession.run(sessionId);
 
     insertSession.run(
       sessionId,
       workspaceId,
+      // The canonical on-disk location, even when the bytes came from the
+      // archive: the file may reappear, and the stale sweep keys off this.
       jsonlPath,
       startedAt,
       endedAt,
       header.branch || null,
       title,
-      messages.length,
-      userMessages.length,
+      sourcedRows.length,
+      userRowCount,
       fileSize,
+      fileMtime,
+      JSON.stringify(traceMeta),
       new Date().toISOString()
     );
 
-    for (const msg of messages) {
+    let sequence = 0;
+    for (const { row, source } of sourcedRows) {
       insertMessage.run(
         sessionId,
-        msg.role,
-        msg.content,
-        msg.timestamp,
-        msg.sequence,
-        msg.messageType || 'text',
-        'parent',
-        msg.toolUseId ?? null,
-        msg.toolName ?? null,
-        msg.toolInput ?? null
+        row.role,
+        row.content,
+        row.timestamp,
+        sequence++,
+        row.messageType,
+        source,
+        row.toolUseId,
+        row.toolName,
+        row.toolInput,
+        row.recordUuid,
+        title,
+        workspaceName
       );
     }
 
-    for (const file of files) {
+    // Verbatim raw lines for every record that survived the active-path
+    // filter, parent and subagent alike. Map iteration order is file order.
+    let rawSeq = 0;
+    for (const [uuid, raw] of detail.rawLinesByUuid) {
+      insertRawRecord.run(sessionId, uuid, rawSeq++, raw);
+    }
+
+    leanChunks.forEach((chunk, index) => {
+      insertTraceChunk.run(
+        sessionId,
+        index,
+        chunk.chunkType,
+        isoOrNull(chunk.startTime),
+        isoOrNull(chunk.endTime),
+        JSON.stringify(chunk)
+      );
+    });
+
+    for (const file of fileReferences) {
       if (isImageFile(file.filePath)) continue;
       insertFile.run(
         sessionId,
@@ -403,78 +794,20 @@ function ingestSession(
         file.sequence
       );
     }
-
-    // Ingest subagent sessions — merge their messages/files into the parent
-    const subagentDir = join(
-      jsonlPath.replace(/\.jsonl$/, ""),
-      "subagents"
-    );
-    if (existsSync(subagentDir)) {
-      let subagentFiles: string[];
-      try {
-        subagentFiles = readdirSync(subagentDir).filter((f) =>
-          f.endsWith(".jsonl")
-        );
-      } catch {
-        subagentFiles = [];
-      }
-
-      let seqOffset = messages.length + files.length + toolCalls.length;
-      for (const sf of subagentFiles) {
-        try {
-          const subResult = stripSession(join(subagentDir, sf));
-          for (const msg of subResult.messages) {
-            // Tag subagent user text messages as 'subagent_prompt' so they're
-            // excluded from queries that filter on message_type = 'text'
-            const messageType = (msg.role === 'user' && (msg.messageType || 'text') === 'text')
-              ? 'subagent_prompt'
-              : msg.messageType || 'text';
-            insertMessage.run(
-              sessionId,
-              msg.role,
-              msg.content,
-              msg.timestamp,
-              seqOffset + msg.sequence,
-              messageType,
-              'subagent',
-              msg.toolUseId ?? null,
-              msg.toolName ?? null,
-              msg.toolInput ?? null
-            );
-          }
-          for (const file of subResult.files) {
-            if (isImageFile(file.filePath)) continue;
-            insertFile.run(
-              sessionId,
-              file.filePath,
-              file.fileName,
-              file.operation,
-              file.timestamp,
-              seqOffset + file.sequence
-            );
-          }
-          seqOffset += subResult.messages.length + subResult.files.length + subResult.toolCalls.length;
-        } catch {
-          // skip broken subagent files
-        }
-      }
-    }
   });
 
   ingestTx();
 
-  // Session row is guaranteed to exist now — persist the canary tally.
+  // 8. Session row is guaranteed to exist now — persist the canary tally.
   recordUnknownTypesForSession(sessionId, jsonlPath, true);
 
-  // Update counts to include subagent messages BEFORE computing summary
+  // Recompute counts from the rows actually written BEFORE computing summary
   // staleness below, so that check uses the final authoritative count.
-  const subagentDir = join(jsonlPath.replace(/\.jsonl$/, ""), "subagents");
-  let finalMessageCount = messages.length;
-  if (existsSync(subagentDir)) {
-    updateSessionCounts.run(sessionId, sessionId, sessionId);
-    const row = getMessageCount.get(sessionId) as { message_count: number } | undefined;
-    if (row) finalMessageCount = row.message_count;
-  }
+  // (Previously conditional on a `subagents/` directory existing; subagent
+  // rows now arrive through the resolver, so there is no directory to test.)
+  updateSessionCounts.run(sessionId, sessionId, sessionId);
+  const countRow = getMessageCount.get(sessionId) as { message_count: number } | undefined;
+  const finalMessageCount = countRow?.message_count ?? sourcedRows.length;
 
   // Restore LLM-derived columns wiped by the delete+reinsert above.
   if (preserved) {
@@ -547,22 +880,78 @@ export function getStaleSessionsNeedingReingest(
   return stale;
 }
 
-export function reingestSession(sourcePath: string, workspaceId: number): boolean {
+export function reingestSession(
+  sourcePath: string,
+  workspaceId: number
+): Promise<boolean> {
   return ingestSession(sourcePath, workspaceId, true);
 }
 
+// ── Force-mode archive sweep (plan U8, D13) ────────────────────────
+//
+// `runIngestion`'s disk walk only ever visits files that still exist under
+// `~/.claude/projects` — once Claude Code prunes a transcript, that session
+// is invisible to the walk forever, even though `ingestSession`'s own
+// `resolveParseSource` already knows how to fall back to
+// `data/archive/<id>.jsonl.gz` when handed a `jsonlPath` that no longer
+// exists (see the archive-fallback comment above `resolveParseSource`). This
+// is the second sweep the force run needs: enumerate every DB session whose
+// recorded `source_path` is gone, and hand each one straight back into
+// `ingestSession` so that existing fallback does the reingest.
+
+const getAllSessionsWithSourcePathForSweep = db.prepare(
+  `SELECT id, source_path, workspace_id FROM sessions WHERE source_path IS NOT NULL`
+);
+
+/**
+ * Deliberately does NOT pre-filter on archive existence — a session with
+ * neither the original file nor an archive is included here too, and
+ * `ingestSession` itself is what decides its fate (its own
+ * `resolveParseSource` returns null for that case, which is logged as a
+ * `[SKIP] No transcript or archive for ...` and counted as a normal ingest
+ * failure via `recordIngestFailure`). Keeping that single decision point in
+ * `ingestSession` means this sweep can never disagree with it about which
+ * sessions are truly unrecoverable.
+ *
+ * Pure DB-plus-`existsSync` read, no writes — safe to call from tests and
+ * from `runIngestion`'s progress-total calculation alike.
+ */
+export function getPrunedSessionsForArchiveSweep(): Array<{
+  sessionId: string;
+  sourcePath: string;
+  workspaceId: number;
+}> {
+  const rows = getAllSessionsWithSourcePathForSweep.all() as Array<{
+    id: string;
+    source_path: string;
+    workspace_id: number;
+  }>;
+  return rows
+    .filter((row) => !existsSync(row.source_path))
+    .map((row) => ({
+      sessionId: row.id,
+      sourcePath: row.source_path,
+      workspaceId: row.workspace_id,
+    }));
+}
+
 export async function runIngestion(
-  options: { force?: boolean } = {},
+  // `projectsDir` defaults to the real `~/.claude/projects` in production;
+  // tests point it at a synthetic fixture tree so a unit test never scans
+  // (or depends on the contents of) whatever real transcripts happen to
+  // exist on the machine running it.
+  options: { force?: boolean; projectsDir?: string } = {},
   onProgress?: (progress: IngestProgress) => void
 ): Promise<IngestProgress> {
   const forceReingest = !!options.force;
+  const projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
 
-  if (!existsSync(CLAUDE_PROJECTS_DIR)) {
-    throw new Error(`Claude projects directory not found: ${CLAUDE_PROJECTS_DIR}`);
+  if (!existsSync(projectsDir)) {
+    throw new Error(`Claude projects directory not found: ${projectsDir}`);
   }
 
-  const projectDirs = readdirSync(CLAUDE_PROJECTS_DIR).filter((d) => {
-    const fullPath = join(CLAUDE_PROJECTS_DIR, d);
+  const projectDirs = readdirSync(projectsDir).filter((d) => {
+    const fullPath = join(projectsDir, d);
     try {
       return statSync(fullPath).isDirectory();
     } catch {
@@ -580,7 +969,7 @@ export async function runIngestion(
   const workspaceDirs: Array<{ dirName: string; jsonlFiles: string[]; workspacePath: string; workspaceId: number }> = [];
 
   for (const dirName of projectDirs) {
-    const projectDir = join(CLAUDE_PROJECTS_DIR, dirName);
+    const projectDir = join(projectsDir, dirName);
 
     let jsonlFiles: string[];
     try {
@@ -608,17 +997,16 @@ export async function runIngestion(
       workspacePath = known.path;
       workspaceId = known.id;
     } else {
-      // Resolve workspace path from first session's cwd, falling back to dir name decode
+      // Resolve workspace path from the first session's cwd, falling back to
+      // dir name decode. `readSessionHeader` JSON-parses only the first few
+      // records — a full parse here would run the whole vendored pipeline over
+      // (potentially) a 47 MB transcript to read one string.
       workspacePath = null;
       for (const f of jsonlFiles.slice(0, 3)) {
-        try {
-          const { header } = stripSession(join(projectDir, f));
-          if (header.cwd) {
-            workspacePath = header.cwd;
-            break;
-          }
-        } catch {
-          // try next file
+        const { cwd } = readSessionHeader(join(projectDir, f));
+        if (cwd) {
+          workspacePath = cwd;
+          break;
         }
       }
 
@@ -638,19 +1026,37 @@ export async function runIngestion(
     workspaceDirs.push({ dirName, jsonlFiles, workspacePath, workspaceId });
   }
 
+  // D13: discovered up front (independent of the disk walk above) so the
+  // progress total accounts for the archive-only sweep from the very first
+  // `onProgress` call, instead of jumping partway through the run.
+  const prunedSessions = forceReingest ? getPrunedSessionsForArchiveSweep() : [];
+  if (forceReingest) {
+    console.log(
+      `Archive sweep: ${prunedSessions.length} DB session(s) whose source file is gone from disk`
+    );
+  }
+
   let totalIngested = 0;
   let totalSkipped = 0;
 
-  const progress: IngestProgress = { total: totalFiles, ingested: 0, skipped: 0, running: true };
+  const progress: IngestProgress = {
+    total: totalFiles + prunedSessions.length,
+    ingested: 0,
+    skipped: 0,
+    running: true,
+  };
   onProgress?.(progress);
 
   for (const { dirName, jsonlFiles, workspacePath, workspaceId } of workspaceDirs) {
-    const projectDir = join(CLAUDE_PROJECTS_DIR, dirName);
+    const projectDir = join(projectsDir, dirName);
     let dirIngested = 0;
 
     for (const f of jsonlFiles) {
       const fullPath = join(projectDir, f);
-      const ingested = ingestSession(fullPath, workspaceId, forceReingest);
+      // `await` is load-bearing now that ingestSession is async: without it
+      // every file's delete+reinsert transaction would be started in parallel
+      // and the progress counters below would advance before any work landed.
+      const ingested = await ingestSession(fullPath, workspaceId, forceReingest);
       if (ingested) {
         dirIngested++;
         totalIngested++;
@@ -670,9 +1076,51 @@ export async function runIngestion(
     }
   }
 
+  // D13 archive sweep, second pass: sessions the disk walk above could never
+  // see because their original file is gone. `ingestSession` already
+  // implements the archive fallback (`resolveParseSource`) — this loop's
+  // only job is to hand it sessions it wouldn't otherwise be called with.
+  // Passing `true` for `forceReingest` unconditionally (not the outer
+  // `forceReingest` variable, which is always true here anyway, since
+  // `prunedSessions` is empty unless force mode) mirrors the disk walk: a
+  // pruned session with `alreadyExists=true` needs its `needsReingest` gate
+  // forced open the same way a still-present file does under `--force`.
+  let archiveReingested = 0;
+  let neitherFileNorArchive = 0;
+  for (const { sessionId, sourcePath, workspaceId } of prunedSessions) {
+    const hadArchive = existsSync(archivePathFor(sessionId));
+    const ingested = await ingestSession(sourcePath, workspaceId, true);
+    if (ingested) {
+      archiveReingested++;
+      totalIngested++;
+      progress.ingested = totalIngested;
+    } else {
+      // `ingestSession` itself already logged/recorded WHY this session was
+      // skipped (missing archive vs. a parse failure against a present
+      // archive) — this tally only distinguishes the "truly unrecoverable,
+      // old lossy rows kept as-is" case for the post-run checklist (plan U8:
+      // "log a count, never destroy").
+      if (!hadArchive) neitherFileNorArchive++;
+      totalSkipped++;
+      progress.skipped = totalSkipped;
+    }
+    onProgress?.(progress);
+  }
+  if (prunedSessions.length > 0) {
+    console.log(
+      `Archive sweep done: reingested ${archiveReingested} session(s) from archive; ` +
+        `${neitherFileNorArchive} had neither the original file nor an archive and were left untouched (old rows preserved).`
+    );
+  }
+
   console.log(
     `\nDone. Ingested ${totalIngested} new sessions, skipped ${totalSkipped}.`
   );
+
+  // Plan U6: only set once the tick has actually resolved — a tick that
+  // throws above never reaches here, so it correctly does NOT count as
+  // "last completed".
+  lastTickAt = new Date().toISOString();
 
   return { total: totalFiles, ingested: totalIngested, skipped: totalSkipped, running: false };
 }

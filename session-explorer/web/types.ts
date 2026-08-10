@@ -51,6 +51,14 @@ export interface Message {
   tool_use_id?: string | null;
   tool_name?: string | null;
   tool_input?: string | null;
+  /** Join key into `raw_records` (plan D2/U5) — the expand-on-click source
+   *  for this row. Absent on sessions ingested before the unified parser
+   *  migration; the U7 UI hides/disables "expand" when this is missing. */
+  record_uuid?: string | null;
+  /** True when the projection capped this row's content at the 4000-char
+   *  cap (D7) — the row ends in `PROJECTION_TRUNCATION_MARKER`. Gates
+   *  whether "load full result" (records/:uuid) is worth offering (U7). */
+  truncated?: boolean;
 }
 
 export interface SessionDetail extends SessionSummary {

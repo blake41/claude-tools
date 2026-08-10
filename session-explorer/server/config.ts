@@ -1,8 +1,9 @@
 // ── Session Explorer Configuration ─────────────────────────────────
 
 export const config = {
-  // Server
-  port: 5198,
+  // Server. Override via `PORT` env var so a worktree's dev server can run
+  // alongside the main checkout's without a port clash (U7 browser QA).
+  port: Number(process.env.PORT) || 5198,
 
   // Models
   chatModel: "claude-sonnet-4-6",

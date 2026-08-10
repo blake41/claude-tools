@@ -8,8 +8,11 @@
  * ISO strings (JSON has no Date type), so every `Date` field on the server
  * side is a `string` here.
  *
- * Pass `?full=1` to the endpoint for the untrimmed model (not typed here —
- * only the trace view's own tooling needs it, and it's several MB larger).
+ * The endpoint is served from rows (`sessions.trace_meta` + `trace_chunks`,
+ * plan U5/D3) rather than parsed on demand — this is the only shape it
+ * returns now. The old `?full=1` untrimmed-model bypass was dropped (D8):
+ * that raw model had no consumer once trace serving moved to rows, and full
+ * fidelity is still reachable via `raw_records` and the gzip archive.
  */
 
 export interface TraceSessionMetrics {

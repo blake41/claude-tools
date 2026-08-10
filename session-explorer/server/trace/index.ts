@@ -32,7 +32,7 @@ import { ProjectScanner } from "./vendor/main/services/discovery/ProjectScanner"
 import { SubagentResolver } from "./vendor/main/services/discovery/SubagentResolver";
 import { LocalFileSystemProvider } from "./vendor/main/services/infrastructure/LocalFileSystemProvider";
 import { SessionParser } from "./vendor/main/services/parsing/SessionParser";
-import { filterActivePath } from "./active-path";
+import { computeActivePath } from "./active-path";
 
 import {
   isAIChunk,
@@ -179,37 +179,58 @@ function resolveTranscript(sessionId: string): { resolved: ResolvedTranscript; c
 }
 
 /**
- * Parse a session's transcript and run the full claude-devtools chunk/step +
- * subagent-linking pipeline, returning the complete (unstripped) analysis model.
- *
- * Mirrors upstream's `get-session-detail` IPC handler (ServiceContext-composed
- * ProjectScanner + SessionParser + SubagentResolver + ChunkBuilder), minus the
- * IPC-boundary stripping of `messages` — this endpoint is explicitly lossless.
- */
-/**
  * Pre-filter a transcript to its active path (drop abandoned rewind
  * branches) before handing it to the vendored pipeline, which parses in
  * file order and has no branch semantics of its own. When nothing is
  * dropped the original file is parsed directly — no temp-file cost.
  * Subagent sibling files are deliberately NOT pre-filtered (the resolver
  * reads them from the project dir; rewinds inside subagent runs are rare).
+ *
+ * Also returns `rawLinesByUuid`: the verbatim original line for every
+ * surviving record, keyed by its `uuid`. This is the one place in the
+ * pipeline that has both the raw text and the record's identity — the
+ * vendored `ParsedMessage` drops the original line, and re-reading the file
+ * later to recover it would be a second full pass. Records the filter
+ * dropped are deliberately absent: they're abandoned branches, and the gzip
+ * archive keeps them.
+ *
+ * `computeActivePath` (rather than `filterActivePath`) is used so the file is
+ * JSON-parsed exactly once; the keep/pass-through logic below mirrors
+ * `filterActivePath` line for line, including rule #5 (records with no
+ * usable uuid always pass through in place — they also can't be keyed, so
+ * they contribute no raw-line entry).
  */
 function materializeActivePath(
   filePath: string,
   sessionId: string
-): { parsePath: string; cleanup: () => void } {
+): { parsePath: string; cleanup: () => void; rawLinesByUuid: Map<string, string> } {
   const rawLines = readFileSync(filePath, "utf-8")
     .split("\n")
     .filter((l) => l.length > 0);
-  const activeLines = filterActivePath(rawLines);
+
+  const { parsed, keep } = computeActivePath(rawLines);
+  const activeLines: string[] = [];
+  const rawLinesByUuid = new Map<string, string>();
+  for (const p of parsed) {
+    const uuid = p.record?.uuid;
+    if (typeof uuid !== "string" || uuid.length === 0) {
+      activeLines.push(p.raw);
+      continue;
+    }
+    if (!keep.has(uuid)) continue;
+    activeLines.push(p.raw);
+    rawLinesByUuid.set(uuid, p.raw);
+  }
+
   if (activeLines.length >= rawLines.length) {
-    return { parsePath: filePath, cleanup: () => {} };
+    return { parsePath: filePath, cleanup: () => {}, rawLinesByUuid };
   }
   const tempDir = mkdtempSync(join(tmpdir(), "session-explorer-activepath-"));
   const parsePath = join(tempDir, `${sessionId}.jsonl`);
   writeFileSync(parsePath, activeLines.join("\n") + "\n");
   return {
     parsePath,
+    rawLinesByUuid,
     cleanup: () => {
       try {
         rmSync(tempDir, { recursive: true, force: true });
@@ -220,25 +241,75 @@ function materializeActivePath(
   };
 }
 
-export async function buildTrace(sessionId: string): Promise<SessionDetail> {
-  const { resolved, cleanup: resolveCleanup } = resolveTranscript(sessionId);
-  // resolveTranscript may have created a temp dir (archive fallback) —
-  // if materializeActivePath throws, that temp must still be cleaned.
-  let parsePath: string;
-  let filterCleanup: () => void;
+/**
+ * Read a subagent transcript's lines into an existing uuid -> raw-line map.
+ * Subagent files are siblings the parent's active-path pass never touches, so
+ * without this their records would have no raw line at all. Best-effort: a
+ * malformed or unreadable subagent file must not fail the parent trace (same
+ * contract the resolver itself follows).
+ */
+function collectSubagentRawLines(filePath: string, into: Map<string, string>): void {
+  let content: string;
   try {
-    ({ parsePath, cleanup: filterCleanup } = materializeActivePath(
-      resolved.filePath,
-      sessionId
-    ));
-  } catch (err) {
-    resolveCleanup();
-    throw err;
+    content = readFileSync(filePath, "utf-8");
+  } catch {
+    return;
   }
-  const cleanup = () => {
-    filterCleanup();
-    resolveCleanup();
-  };
+  for (const line of content.split("\n")) {
+    if (line.length === 0) continue;
+    try {
+      const record = JSON.parse(line) as { uuid?: unknown };
+      if (typeof record.uuid === "string" && record.uuid.length > 0) {
+        into.set(record.uuid, line);
+      }
+    } catch {
+      // malformed line — nothing to key it by, skip (same tolerance as the
+      // active-path filter's rule #5)
+    }
+  }
+}
+
+/**
+ * The full `SessionDetail` plus the raw JSONL line behind each record.
+ *
+ * Ingest needs the verbatim line for `raw_records` (plan D2) and the vendored
+ * `ParsedMessage` doesn't retain it. Kept as a superset of `SessionDetail` so
+ * every existing consumer (the trace endpoint, `shapeTraceForResponse`) is
+ * unaffected — the extra field is simply ignored by them and dropped by
+ * JSON serialization of the lean payload.
+ */
+export type TraceFromFile = SessionDetail & {
+  /**
+   * uuid -> the verbatim original JSONL line. Covers the parent transcript's
+   * active-path records plus every linked subagent file's records. Records
+   * dropped as abandoned rewind branches are intentionally absent.
+   */
+  rawLinesByUuid: Map<string, string>;
+};
+
+/**
+ * Parse an already-resolved transcript file and run the full claude-devtools
+ * chunk/step + subagent-linking pipeline over it, returning the complete
+ * (unstripped) analysis model.
+ *
+ * Mirrors upstream's `get-session-detail` IPC handler (ServiceContext-composed
+ * ProjectScanner + SessionParser + SubagentResolver + ChunkBuilder), minus the
+ * IPC-boundary stripping of `messages` — this path is explicitly lossless.
+ *
+ * This is `buildTrace` minus session-id resolution: callers that already know
+ * the path (ingest, which resolves the original file or its gzip archive
+ * itself) use this directly instead of round-tripping through the DB/glob
+ * lookup. `projectId` is the encoded `~/.claude/projects` directory name, or
+ * null when the file lives outside that tree (archive fallback) — in which
+ * case subagent linking is skipped, since the `subagents/` sibling directory
+ * doesn't exist there.
+ */
+export async function buildTraceFromFile(
+  filePath: string,
+  projectId: string | null,
+  sessionId: string
+): Promise<TraceFromFile> {
+  const { parsePath, cleanup, rawLinesByUuid } = materializeActivePath(filePath, sessionId);
 
   try {
     const fsProvider = new LocalFileSystemProvider();
@@ -246,7 +317,17 @@ export async function buildTrace(sessionId: string): Promise<SessionDetail> {
     // sibling subagent files; archived (temp-file) transcripts have no such
     // sibling directory, so subagent linking is skipped for those (degrades
     // gracefully — the parent trace still returns in full).
-    const projectsDir = resolved.projectId ? PROJECTS_DIR : dirname(resolved.filePath);
+    //
+    // `projectId` is the encoded project directory NAME and the scanner joins
+    // it onto this base (`<projectsDir>/<projectId>/<sessionId>/subagents/`),
+    // so the base must be the PARENT of that directory. Deriving it from the
+    // transcript's own location is byte-identical to the hardcoded
+    // PROJECTS_DIR for every real resolution path — a session file always sits
+    // exactly two levels down (`~/.claude/projects/<projectId>/<id>.jsonl`),
+    // via both the DB `source_path` lookup and the glob. Deriving it (rather
+    // than hardcoding) additionally lets ingest's tests drive the real
+    // subagent-linking path against a fixture tree outside `~/.claude`.
+    const projectsDir = projectId ? dirname(dirname(filePath)) : dirname(filePath);
     const projectScanner = new ProjectScanner(projectsDir, TODOS_DIR, fsProvider);
     const sessionParser = new SessionParser(projectScanner);
     const chunkBuilder = new ChunkBuilder();
@@ -264,11 +345,11 @@ export async function buildTrace(sessionId: string): Promise<SessionDetail> {
     let subagents: Process[] = [];
     let session: Session | null = null;
 
-    if (resolved.projectId) {
+    if (projectId) {
       const subagentResolver = new SubagentResolver(projectScanner);
       try {
         subagents = await subagentResolver.resolveSubagents(
-          resolved.projectId,
+          projectId,
           sessionId,
           parsedSession.taskCalls,
           parsedSession.messages
@@ -279,16 +360,50 @@ export async function buildTrace(sessionId: string): Promise<SessionDetail> {
         subagents = [];
       }
 
-      session = await projectScanner.getSession(resolved.projectId, sessionId);
+      session = await projectScanner.getSession(projectId, sessionId);
+    }
+
+    // Raw lines for the subagent records the resolver just linked. Done here,
+    // beside the resolver output, rather than in vendor/ — the vendored
+    // pipeline is pinned and never modified.
+    for (const process of subagents) {
+      collectSubagentRawLines(process.filePath, rawLinesByUuid);
     }
 
     if (!session) {
-      session = buildStubSession(sessionId, resolved.projectId, resolved.filePath);
+      session = buildStubSession(sessionId, projectId, filePath);
     }
     session.hasSubagents = subagents.length > 0;
     session.messageCount = parsedSession.messages.length;
 
-    return chunkBuilder.buildSessionDetail(session, parsedSession.messages, subagents);
+    const detail = chunkBuilder.buildSessionDetail(session, parsedSession.messages, subagents);
+    return { ...detail, rawLinesByUuid };
+  } finally {
+    cleanup();
+  }
+}
+
+/**
+ * Resolve a session id to a transcript (DB -> glob -> gzip archive) and build
+ * its full analysis model. Resolution is all this does now; the parsing half
+ * lives in `buildTraceFromFile`.
+ */
+export async function buildTrace(sessionId: string): Promise<SessionDetail> {
+  const { resolved, cleanup } = resolveTranscript(sessionId);
+  // resolveTranscript may have created a temp dir (archive fallback), so its
+  // cleanup has to run even if buildTraceFromFile throws before it starts its
+  // own try/finally.
+  try {
+    // `rawLinesByUuid` is dropped here on purpose: it exists for ingest, and
+    // this function's result is JSON-serialized by the `?full=1` trace route,
+    // where an extra (always-empty, since Maps don't serialize) key would be a
+    // gratuitous response-shape change.
+    const { rawLinesByUuid: _rawLinesByUuid, ...detail } = await buildTraceFromFile(
+      resolved.filePath,
+      resolved.projectId,
+      sessionId
+    );
+    return detail;
   } finally {
     cleanup();
   }

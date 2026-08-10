@@ -10,3 +10,4 @@ bun.lock
 
 .env
 .claude/worktrees/
+.baton/

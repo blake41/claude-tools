@@ -4,6 +4,19 @@ import {
   parseJsonlLines,
   tallyUnknownRecordTypes,
 } from "./canary.js";
+import { SKIP_RECORD_TYPES } from "./projection";
+import { parseJsonlLine } from "./trace/vendor/main/utils/jsonl";
+
+/** Minimal valid raw record for each known type, matching what the vendored
+ * parser's `parseChatHistoryEntry` needs to not throw: `user`/`assistant`
+ * additionally require a `message` object (it reads `.role`/`.content`
+ * before anything else). */
+function minimalRecordFor(type: string): Record<string, unknown> {
+  const base = { uuid: "11111111-1111-1111-1111-111111111111", type };
+  if (type === "user") return { ...base, message: { role: "user", content: "hi" } };
+  if (type === "assistant") return { ...base, message: { role: "assistant", content: "hi" } };
+  return base;
+}
 
 describe("parseJsonlLines", () => {
   test("parses one JSON object per non-blank line", () => {
@@ -41,10 +54,11 @@ describe("tallyUnknownRecordTypes", () => {
     const records = [
       { type: "user" },
       { type: "assistant" },
-      { type: "file-history-snapshot" },
-      { type: "progress" },
-      { type: "queue-operation" },
       { type: "system" },
+      { type: "summary" },
+      { type: "file-history-snapshot" },
+      { type: "queue-operation" },
+      { type: "progress" },
     ];
     expect(tallyUnknownRecordTypes(records)).toEqual({});
   });
@@ -77,18 +91,29 @@ describe("tallyUnknownRecordTypes", () => {
     expect(tallyUnknownRecordTypes(records)).toEqual({});
   });
 
-  test("KNOWN_RECORD_TYPES covers exactly strip.ts's handled + skipped vocabulary", () => {
-    // Regression guard: if strip.ts's SKIP_TYPES set changes, this constant
-    // must be updated in lockstep or the canary will start false-alarming.
-    expect([...KNOWN_RECORD_TYPES].sort()).toEqual(
-      [
-        "user",
-        "assistant",
-        "file-history-snapshot",
-        "progress",
-        "queue-operation",
-        "system",
-      ].sort()
-    );
+  // Regression guard, behavioral rather than a hand-copied literal: every
+  // KNOWN type except the legacy "progress" must be a type the vendored
+  // parser actually recognizes (parseJsonlLine returns non-null), and
+  // projection.ts's SKIP_RECORD_TYPES — its own structural-skip vocabulary —
+  // must be a subset of KNOWN. This fails loudly the moment the parser's or
+  // projection's vocabulary drifts from what canary.ts thinks it's policing,
+  // instead of silently pinning whatever the constant happened to say.
+  test("every KNOWN type except legacy 'progress' is recognized by the vendored parser", () => {
+    for (const type of KNOWN_RECORD_TYPES) {
+      if (type === "progress") continue;
+      const parsed = parseJsonlLine(JSON.stringify(minimalRecordFor(type)));
+      expect(parsed).not.toBeNull();
+    }
+  });
+
+  test("'progress' (legacy) and an unrecognized type are both dropped by the vendored parser", () => {
+    expect(parseJsonlLine(JSON.stringify(minimalRecordFor("progress")))).toBeNull();
+    expect(parseJsonlLine(JSON.stringify(minimalRecordFor("compact-boundary")))).toBeNull();
+  });
+
+  test("projection.ts's SKIP_RECORD_TYPES is a subset of KNOWN_RECORD_TYPES", () => {
+    for (const type of SKIP_RECORD_TYPES) {
+      expect(KNOWN_RECORD_TYPES.has(type)).toBe(true);
+    }
   });
 });

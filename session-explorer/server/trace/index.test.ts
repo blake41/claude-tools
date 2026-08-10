@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, statSync } from "fs";
-import { homedir } from "os";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 
-import { buildTrace, shapeTraceForResponse, TraceError, type LeanAIChunk, type LeanCompactChunk, type LeanUserChunk } from "./index";
+import { buildTrace, buildTraceFromFile, shapeTraceForResponse, TraceError, type LeanAIChunk, type LeanCompactChunk, type LeanUserChunk } from "./index";
 import { ChunkBuilder } from "./vendor/main/services/analysis/ChunkBuilder";
 import type { ParsedMessage, Process, Session, SessionMetrics } from "./vendor/main/types/index";
 
@@ -431,4 +431,255 @@ describe("shapeTraceForResponse (lean trace payload)", () => {
     const lean = shapeTraceForResponse(detail);
     expect(lean.models).toEqual(["claude-sonnet-5"]);
   });
+
+  test("a subagent whose every message is isSidechain still yields non-zero steps", () => {
+    // Guard for the production fix in shapeSubagent: ChunkBuilder.buildChunks()
+    // filters `!m.isSidechain`, and real subagent JSONL flags EVERY record
+    // isSidechain: true (relative to the parent). Without the re-flag this
+    // assertion goes to 0 and every subagent renders empty.
+    const messages: ParsedMessage[] = [
+      baseMessage({
+        uuid: "sx1",
+        type: "user",
+        role: "user",
+        content: "Do the thing",
+        agentId: "agent-sidechain",
+        isSidechain: true,
+        timestamp: new Date("2026-08-01T00:00:05.200Z"),
+      }),
+      baseMessage({
+        uuid: "sx2",
+        type: "assistant",
+        role: "assistant",
+        model: "claude-haiku-5",
+        agentId: "agent-sidechain",
+        isSidechain: true,
+        timestamp: new Date("2026-08-01T00:00:05.400Z"),
+        usage: { input_tokens: 10, output_tokens: 5 },
+        content: [{ type: "text", text: "Did the thing." }],
+      }),
+    ];
+    const subagent: Process = {
+      id: "agent-sidechain",
+      filePath: "/fake/agent-sidechain.jsonl",
+      messages,
+      startTime: new Date("2026-08-01T00:00:05.200Z"),
+      endTime: new Date("2026-08-01T00:00:05.400Z"),
+      durationMs: 200,
+      metrics: {
+        durationMs: 200,
+        totalTokens: 15,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        messageCount: messages.length,
+      },
+      isParallel: false,
+    };
+
+    const lean = shapeTraceForResponse(buildDetailWithProcesses([subagent]));
+    const shaped = (lean.chunks[1] as LeanAIChunk).subagents[0];
+    expect(shaped.steps.length).toBeGreaterThan(0);
+    // The input objects must not be mutated — the re-flag copies.
+    expect(messages.every((m) => m.isSidechain)).toBe(true);
+  });
+});
+
+// =============================================================================
+// buildTraceFromFile — the file-addressed core extracted from buildTrace
+// =============================================================================
+//
+// buildTrace resolves a session id to a path (DB -> glob -> gzip archive) and
+// then delegates here. Ingest (plan U4) calls buildTraceFromFile directly with
+// a path it resolved itself, so this half must be testable against an ordinary
+// JSONL file with no DB row, no ~/.claude/projects entry, and no archive.
+//
+// It also returns `rawLinesByUuid` — the verbatim original JSONL line for each
+// record that survived the active-path filter, keyed by uuid. The vendored
+// ParsedMessage drops the original text, and ingest needs it byte-for-byte for
+// the `raw_records` table, so the adapter captures it at the one place that
+// already reads and splits the file.
+
+interface FixtureTranscript {
+  dir: string;
+  filePath: string;
+  /** The exact strings written to disk, in file order. */
+  lines: string[];
+}
+
+function writeFixtureTranscript(sessionId: string, records: Record<string, unknown>[]): FixtureTranscript {
+  const dir = mkdtempSync(join(tmpdir(), "trace-from-file-"));
+  const filePath = join(dir, `${sessionId}.jsonl`);
+  const lines = records.map((r) => JSON.stringify(r));
+  writeFileSync(filePath, lines.join("\n") + "\n");
+  return { dir, filePath, lines };
+}
+
+function userRecord(uuid: string, parentUuid: string | null, text: string, minute: number) {
+  return {
+    type: "user",
+    uuid,
+    parentUuid,
+    sessionId: "fixture",
+    timestamp: `2026-08-01T00:0${minute}:00.000Z`,
+    cwd: "/repo",
+    gitBranch: "main",
+    isSidechain: false,
+    message: { role: "user", content: text },
+  };
+}
+
+function assistantRecord(uuid: string, parentUuid: string, text: string, minute: number) {
+  return {
+    type: "assistant",
+    uuid,
+    parentUuid,
+    sessionId: "fixture",
+    timestamp: `2026-08-01T00:0${minute}:00.000Z`,
+    isSidechain: false,
+    message: {
+      role: "assistant",
+      model: "claude-sonnet-5",
+      content: [{ type: "text", text }],
+      usage: { input_tokens: 100, output_tokens: 20 },
+    },
+  };
+}
+
+describe("buildTraceFromFile", () => {
+  test("parses an arbitrary JSONL path with no DB row, no project id, and no archive", async () => {
+    const fixture = writeFixtureTranscript("fixture-session-1", [
+      userRecord("u1", null, "Explain the trace adapter", 1),
+      assistantRecord("a1", "u1", "It resolves a session id then parses the transcript.", 2),
+    ]);
+    try {
+      const detail = await buildTraceFromFile(fixture.filePath, null, "fixture-session-1");
+
+      expect(detail.session.id).toBe("fixture-session-1");
+      expect(detail.messages.length).toBe(2);
+      expect(detail.chunks.length).toBeGreaterThan(0);
+      expect(detail.metrics.messageCount).toBe(2);
+      // No project id -> no subagent resolution attempted (the archive-fallback
+      // degradation path), and the stub session carries the file's directory.
+      expect(detail.processes).toHaveLength(0);
+      expect(detail.session.hasSubagents).toBe(false);
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns rawLinesByUuid holding the verbatim original line for every parsed record", async () => {
+    const fixture = writeFixtureTranscript("fixture-session-2", [
+      userRecord("u1", null, "Explain the trace adapter", 1),
+      assistantRecord("a1", "u1", "It resolves a session id then parses the transcript.", 2),
+    ]);
+    try {
+      const detail = await buildTraceFromFile(fixture.filePath, null, "fixture-session-2");
+
+      expect(detail.rawLinesByUuid.get("u1")).toBe(fixture.lines[0]);
+      expect(detail.rawLinesByUuid.get("a1")).toBe(fixture.lines[1]);
+      expect(detail.rawLinesByUuid.size).toBe(2);
+
+      // Verbatim means re-parseable into the original record — this is what
+      // lands in `raw_records.raw`.
+      const reparsed = JSON.parse(detail.rawLinesByUuid.get("a1")!) as { uuid: string };
+      expect(reparsed.uuid).toBe("a1");
+
+      // Every message the pipeline produced can find its raw line.
+      for (const msg of detail.messages) {
+        expect(detail.rawLinesByUuid.has(msg.uuid)).toBe(true);
+      }
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves the raw line byte-for-byte, not a re-serialization of it", async () => {
+    // Hand-written line with non-canonical spacing: a JSON.stringify round trip
+    // would silently normalize it away.
+    const dir = mkdtempSync(join(tmpdir(), "trace-from-file-verbatim-"));
+    const filePath = join(dir, "fixture-session-3.jsonl");
+    const spaced =
+      '{"type":"user",  "uuid":"u1", "parentUuid":null, "sessionId":"fixture", "timestamp":"2026-08-01T00:01:00.000Z", "cwd":"/repo", "isSidechain":false, "message":{"role":"user","content":"spacing matters"}}';
+    writeFileSync(filePath, spaced + "\n");
+    try {
+      const detail = await buildTraceFromFile(filePath, null, "fixture-session-3");
+      expect(detail.rawLinesByUuid.get("u1")).toBe(spaced);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("omits records the active-path filter dropped (abandoned rewind branches)", async () => {
+    // u2a and u2b are both children of a1 — a rewind fork. The active leaf is
+    // the later branch (a2 <- u2b); u2a's subtree is a human re-prompt, i.e. a
+    // genuinely abandoned branch. Those records stay out of BOTH the parsed
+    // model and rawLinesByUuid; the gzip archive remains their only home.
+    const fixture = writeFixtureTranscript("fixture-session-4", [
+      userRecord("u1", null, "First question about the parser", 1),
+      assistantRecord("a1", "u1", "Here is the first answer to that question.", 2),
+      userRecord("u2a", "a1", "Abandoned follow-up that was rewound away", 3),
+      userRecord("u2b", "a1", "The follow-up that actually happened", 4),
+      assistantRecord("a2", "u2b", "Here is the answer on the surviving branch.", 5),
+    ]);
+    try {
+      const detail = await buildTraceFromFile(fixture.filePath, null, "fixture-session-4");
+
+      expect(detail.rawLinesByUuid.has("u2b")).toBe(true);
+      expect(detail.rawLinesByUuid.has("u2a")).toBe(false);
+      expect(detail.messages.map((m) => m.uuid)).not.toContain("u2a");
+      expect(detail.messages.map((m) => m.uuid)).toContain("u2b");
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("throws PARSE_FAILED when the path can't be read", async () => {
+    let caught: unknown;
+    try {
+      await buildTraceFromFile(join(tmpdir(), "definitely-not-a-transcript-9182.jsonl"), null, "nope");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+  });
+
+  test.if(!!smallestOverall)(
+    "buildTrace delegates to it: same session, same message count, for a real transcript",
+    async () => {
+      const viaId = await buildTrace(smallestOverall!.sessionId);
+      const viaPath = await buildTraceFromFile(
+        join(smallestOverall!.projectDir, `${smallestOverall!.sessionId}.jsonl`),
+        smallestOverall!.projectDir.split("/").pop()!,
+        smallestOverall!.sessionId
+      );
+
+      expect(viaPath.session.id).toBe(viaId.session.id);
+      expect(viaPath.messages.length).toBe(viaId.messages.length);
+      expect(viaPath.chunks.length).toBe(viaId.chunks.length);
+      expect(viaPath.rawLinesByUuid.size).toBeGreaterThan(0);
+    }
+  );
+
+  test.if(!!smallestWithSubagents)(
+    "captures subagent files' raw lines alongside the parent's",
+    async () => {
+      const detail = await buildTraceFromFile(
+        join(smallestWithSubagents!.projectDir, `${smallestWithSubagents!.sessionId}.jsonl`),
+        smallestWithSubagents!.projectDir.split("/").pop()!,
+        smallestWithSubagents!.sessionId
+      );
+
+      expect(detail.processes.length).toBeGreaterThan(0);
+      const subagentMessages = detail.processes.flatMap((p) => p.messages);
+      expect(subagentMessages.length).toBeGreaterThan(0);
+
+      // Subagent records live in sibling files the parent's active-path pass
+      // never reads, so the adapter must read them too — otherwise ingest
+      // writes messages whose record_uuid has no raw_records row.
+      const missing = subagentMessages.filter((m) => !detail.rawLinesByUuid.has(m.uuid));
+      expect(missing).toHaveLength(0);
+    }
+  );
 });

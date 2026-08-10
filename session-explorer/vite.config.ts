@@ -10,9 +10,11 @@ export default defineConfig({
     alias: { "@": path.resolve(__dirname, "web") },
   },
   server: {
-    port: 5199,
+    // Override via `VITE_PORT`/`API_PORT` so a worktree's dev server can run
+    // alongside the main checkout's without a port clash (U7 browser QA).
+    port: Number(process.env.VITE_PORT) || 5199,
     proxy: {
-      "/api": "http://localhost:5198",
+      "/api": `http://localhost:${Number(process.env.API_PORT) || 5198}`,
     },
   },
   build: {
