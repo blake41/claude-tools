@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
+import { runOnce } from "./db-migrations.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_DIR = join(__dirname, "..", "data");
@@ -220,8 +221,13 @@ db.exec(`DROP TABLE IF EXISTS tool_calls`);
 db.exec(`DROP INDEX IF EXISTS idx_tool_calls_session`);
 db.exec(`DROP INDEX IF EXISTS idx_tool_calls_name`);
 
-// Rebuild FTS index to cover any data ingested before FTS5 was added
-db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
+// Rebuild FTS index to cover any data ingested before FTS5 was added — this
+// is a full scan of every row in `messages` (1.4M+), so it must run exactly
+// once, not on every server boot. Tracked via the `settings` table (created
+// above, in the Insights Tables block).
+runOnce(db, "fts_rebuild_v1", () => {
+  db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
+});
 
 // ── Meta Layer Tables ─────────────────────────────────────────────
 
@@ -307,6 +313,54 @@ try {
 // Migration: add note column to session_tags — personal note for why a session was tagged
 try {
   db.exec(`ALTER TABLE session_tags ADD COLUMN note TEXT`);
+} catch {
+  // Column already exists
+}
+
+// Migration: add summarization retry/backoff tracking to sessions — without
+// this, a session whose summary parse fails writes NULL forever and gets
+// re-selected (and re-billed against the Haiku API) on every ~30s
+// auto-summarize tick. See server/summarize-backoff.ts for the backoff rule.
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summary_retry_count INTEGER DEFAULT 0`);
+} catch {
+  // Column already exists
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summary_failed_at TEXT`);
+} catch {
+  // Column already exists
+}
+
+// Migration: schema-drift canary — per-session tally of JSONL record `type`
+// values ingest.ts saw that strip.ts neither actively handles nor
+// deliberately skips (JSON: {type: count}). NULL means none seen. See
+// server/canary.ts.
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN unknown_record_types TEXT`);
+} catch {
+  // Column already exists
+}
+
+// Migration: summary staleness tracking — the message_count a session had
+// at the moment its summary/summary_short were last written. NULL means
+// "never summarized" OR "summarized before this column existed" — both
+// treated as never-stale by server/summary-staleness.ts so pre-existing
+// sessions aren't stampede-resummarized. Set wherever a summary is recorded
+// (see server/summary-staleness.ts for the restore-time predicate).
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summarized_message_count INTEGER`);
+} catch {
+  // Column already exists
+}
+
+// Migration: timestamp of the last successful summarize — lets the
+// staleness rule debounce by elapsed time (not just message-count growth)
+// so an actively-growing session doesn't get re-summarized on every ~30s
+// reingest tick. NULL means "never summarized" (never-stale, same as
+// summarized_message_count). See server/summary-staleness.ts.
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summarized_at TEXT`);
 } catch {
   // Column already exists
 }

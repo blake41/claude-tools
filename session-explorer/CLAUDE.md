@@ -12,7 +12,7 @@ Auto-ingest runs every 30s, re-ingesting sessions whose JSONL file size changed 
 
 ## Stack
 
-Express + React + SQLite (better-sqlite3) + Tailwind CSS 4.2 + Vite. Config in `server/config.ts`.
+Express + React + SQLite (bun:sqlite) + Tailwind CSS 4.2 + Vite. Config in `server/config.ts`.
 
 ## Key Concepts
 

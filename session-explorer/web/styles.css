@@ -159,9 +159,19 @@ button {
   list-style-type: disc;
 }
 
+.message-content ol {
+  padding-left: 20px;
+  margin: 8px 0;
+  list-style-type: decimal;
+}
+
 .message-content li {
   margin-bottom: 4px;
   display: list-item;
+}
+
+.message-content li > input[type="checkbox"] {
+  margin-right: 6px;
 }
 
 .message-content hr {
@@ -542,7 +552,10 @@ button {
 /* User bubble: right-aligned, blue */
 .result-snippet.type-user {
   align-self: flex-end;
-  max-width: 85%;
+  /* Wide viewports get a much wider column overall (see SessionDetail's
+     max-w-[1400px]) so prose stays capped to a readable measure here, while
+     tool output / code blocks below are allowed to use the full column. */
+  max-width: min(720px, 85%);
   background: rgba(88, 166, 255, 0.15);
   border-radius: 14px 14px 4px 14px;
   padding: 10px 14px;
@@ -565,7 +578,7 @@ button {
 /* Claude bubble: left-aligned, warm */
 .result-snippet.type-claude {
   align-self: flex-start;
-  max-width: 85%;
+  max-width: min(720px, 85%);
   background: rgba(196, 181, 160, 0.1);
   border-radius: 14px 14px 14px 4px;
   padding: 10px 14px;

@@ -11,6 +11,10 @@ import { config } from "./config.js";
 import chatRouter, { buildSystemPrompt, tools, executeSql, parseResult } from "./chat.js";
 import libraryRouter from "./library/api.js";
 import { loadLibrary } from "./library/cache.js";
+import { UNSUMMARIZED_BACKOFF_SQL } from "./summarize-backoff.js";
+import { sampleHeadTail } from "./text-sampling.js";
+import { parseSummaryOutput } from "./summary-parse.js";
+import { buildTrace, shapeTraceForResponse, TraceError } from "./trace/index.js";
 
 function cleanXmlNoise(text: string): string {
   return text
@@ -270,14 +274,41 @@ function hasUnderscoreTerms(query: string): boolean {
 const getUnsummarizedSessions = db.prepare(`
   SELECT id, title FROM sessions
   WHERE workspace_id = ? AND (summary IS NULL OR summary_short IS NULL) AND message_count > 0
+    AND ${UNSUMMARIZED_BACKOFF_SQL}
 `);
 
 const getAllUnsummarizedSessions = db.prepare(`
   SELECT id, title FROM sessions WHERE (summary IS NULL OR summary_short IS NULL) AND message_count > 0
+    AND ${UNSUMMARIZED_BACKOFF_SQL}
 `);
 
+// A successful summary resets the retry/backoff state and records how many
+// messages the summary covered plus when — the reingest staleness rule
+// compares the count against fresh message_count and debounces off the
+// timestamp to decide when a grown session earns a re-summarize (see
+// server/summary-staleness.ts).
 const updateSessionSummary = db.prepare(`
-  UPDATE sessions SET summary = ?, summary_short = ? WHERE id = ?
+  UPDATE sessions
+  SET summary = ?, summary_short = ?, summary_retry_count = 0, summary_failed_at = NULL,
+      summarized_message_count = ?, summarized_at = ?
+  WHERE id = ?
+`);
+
+// A failed parse/API-call increments the retry count and stamps when it
+// failed, instead of leaving summary/summary_short as NULL forever — that
+// used to make the session get re-selected (and re-billed) every ~30s tick.
+const recordSummaryFailure = db.prepare(`
+  UPDATE sessions SET summary_retry_count = summary_retry_count + 1, summary_failed_at = ? WHERE id = ?
+`);
+
+// Partial parse (headline XOR bullets): keep whatever arrived so the UI has
+// something, but do NOT touch the retry/backoff columns — only a complete
+// summary may reset them, otherwise a partial slips back into the
+// re-selected-every-tick loop via the NULL side of the WHERE clause.
+const updatePartialSummary = db.prepare(`
+  UPDATE sessions
+  SET summary = COALESCE(?, summary), summary_short = COALESCE(?, summary_short)
+  WHERE id = ?
 `);
 
 // ── Insight Stats Prepared Statements ─────────────────────────────
@@ -362,6 +393,18 @@ const anthropic = new Anthropic();
 const summarizeJob = new BackgroundJob(config.summaryConcurrency);
 
 async function summarizeSession(sessionId: string): Promise<void> {
+  try {
+    await summarizeSessionInner(sessionId);
+  } catch (err) {
+    // Any throw outside the inner handlers (e.g. a transient sqlite error in
+    // getMessages) must still record a failure — otherwise the session stays
+    // immediately eligible and the every-tick retry loop reopens.
+    console.error(`[summarize] unexpected failure for session ${sessionId}:`, err);
+    recordSummaryFailure.run(new Date().toISOString(), sessionId);
+  }
+}
+
+async function summarizeSessionInner(sessionId: string): Promise<void> {
   const rawMessages = getMessages.all(sessionId) as Array<{
     role: string;
     content: string;
@@ -378,17 +421,27 @@ async function summarizeSession(sessionId: string): Promise<void> {
     .filter(Boolean)
     .join("\n\n");
 
-  if (!transcript) return;
+  if (!transcript) {
+    // Nothing to summarize (all content stripped to empty) — treat like a
+    // failure so this session backs off instead of being re-selected on
+    // every auto-summarize tick forever.
+    recordSummaryFailure.run(new Date().toISOString(), sessionId);
+    return;
+  }
 
-  const truncated = transcript.slice(0, 32000);
+  // Sample head + tail instead of just the first 32k chars, so long sessions
+  // are summarized by how they ended too, not only how they began.
+  const truncated = sampleHeadTail(transcript, 16000, 16000);
 
-  const response = await anthropic.messages.create({
-    model: config.summaryModel,
-    max_tokens: config.summaryMaxTokens,
-    messages: [
-      {
-        role: "user",
-        content: `Summarize this coding session. Output a single one-line headline followed by 2-3 bullets.
+  let response;
+  try {
+    response = await anthropic.messages.create({
+      model: config.summaryModel,
+      max_tokens: config.summaryMaxTokens,
+      messages: [
+        {
+          role: "user",
+          content: `Summarize this coding session. Output a single one-line headline followed by 2-3 bullets.
 
 Format — output ONLY this, nothing else:
 ONELINE: <past-tense verb + what + where, max 16 words, concrete. e.g. "Fixed FTS5 search ranking to use NEAR queries for multi-word matches">
@@ -406,29 +459,34 @@ Rules:
 
 Conversation:
 ${truncated}`,
-      },
-    ],
-  });
+        },
+      ],
+    });
+  } catch (err) {
+    console.error(`[summarize] API call failed for session ${sessionId}:`, err);
+    recordSummaryFailure.run(new Date().toISOString(), sessionId);
+    return;
+  }
 
   const raw =
-    response.content[0].type === "text" ? response.content[0].text : "";
+    response.content[0]?.type === "text" ? response.content[0].text : "";
 
-  if (!raw) return;
-
-  // Split into one-liner and bullets
-  const lines = raw.split("\n");
-  let oneLine = "";
-  const bulletLines: string[] = [];
-  for (const line of lines) {
-    const m = line.match(/^\s*ONELINE\s*:\s*(.*)$/i);
-    if (m && !oneLine) {
-      oneLine = m[1].trim();
-    } else if (line.trim().startsWith("-")) {
-      bulletLines.push(line);
-    }
+  if (!raw) {
+    recordSummaryFailure.run(new Date().toISOString(), sessionId);
+    return;
   }
-  const bullets = bulletLines.join("\n").trim();
-  updateSessionSummary.run(bullets || null, oneLine || null, sessionId);
+
+  const { oneLine, bullets } = parseSummaryOutput(raw);
+
+  if (oneLine && bullets) {
+    // Complete summary — the only outcome allowed to reset backoff state.
+    updateSessionSummary.run(bullets, oneLine, rawMessages.length, new Date().toISOString(), sessionId);
+    return;
+  }
+
+  // Missing one or both parts: keep any partial content, back off.
+  updatePartialSummary.run(bullets || null, oneLine || null, sessionId);
+  recordSummaryFailure.run(new Date().toISOString(), sessionId);
 }
 
 // ── Routes ─────────────────────────────────────────────────────────
@@ -478,8 +536,8 @@ app.get("/api/sessions", (req, res) => {
   // Enrich sessions with tags and created files
   const enriched = (sessions as Array<Record<string, unknown>>).map((s) => ({
     ...s,
-    tags: getTagsForSession.all(s.id),
-    files_changed: changedFilesForSession.all(s.id),
+    tags: getTagsForSession.all(s.id as string),
+    files_changed: changedFilesForSession.all(s.id as string),
   }));
 
   res.json({
@@ -527,6 +585,11 @@ app.get("/api/sessions/:id", (req, res) => {
     res.status(404).json({ error: "Session not found" });
     return;
   }
+
+  // Fire-and-forget: extract insights the first time this session is
+  // actually opened, instead of a periodic background sweep. No-op if
+  // already extracted, too short, or already in flight.
+  maybeExtractInsightsOnOpen(req.params.id);
 
   const rawMessages = getMessages.all(req.params.id) as Array<{
     role: string;
@@ -764,6 +827,10 @@ app.get("/api/search", (req, res) => {
     WHERE (sf.file_name LIKE ? OR sf.file_path LIKE ?)
     AND sf.file_path NOT LIKE '%.png'
     AND sf.file_path NOT LIKE '%.jpg'
+    AND sf.file_path NOT LIKE '%.jpeg'
+    AND sf.file_path NOT LIKE '%.gif'
+    AND sf.file_path NOT LIKE '%.webp'
+    AND sf.file_path NOT LIKE '%.svg'
     LIMIT 200
   `).all(fileSearchPattern, fileSearchPattern) as Array<{ session_id: string; file_name: string; file_path: string }>;
 
@@ -1125,6 +1192,10 @@ const searchFiles = db.prepare(`
   WHERE (sf.file_path LIKE ? OR sf.file_name LIKE ?)
   AND sf.file_path NOT LIKE '%.png'
   AND sf.file_path NOT LIKE '%.jpg'
+  AND sf.file_path NOT LIKE '%.jpeg'
+  AND sf.file_path NOT LIKE '%.gif'
+  AND sf.file_path NOT LIKE '%.webp'
+  AND sf.file_path NOT LIKE '%.svg'
   GROUP BY sf.file_path, sf.operation
   ORDER BY last_seen DESC
   LIMIT 200
@@ -1140,6 +1211,10 @@ const searchFilesInWorkspace = db.prepare(`
   AND s.workspace_id = ?
   AND sf.file_path NOT LIKE '%.png'
   AND sf.file_path NOT LIKE '%.jpg'
+  AND sf.file_path NOT LIKE '%.jpeg'
+  AND sf.file_path NOT LIKE '%.gif'
+  AND sf.file_path NOT LIKE '%.webp'
+  AND sf.file_path NOT LIKE '%.svg'
   GROUP BY sf.file_path, sf.operation
   ORDER BY last_seen DESC
   LIMIT 200
@@ -1386,8 +1461,7 @@ import {
   upvoteInsight,
   downvoteInsight,
   deleteInsight,
-  getExtractionSettings,
-  setExtractionInterval,
+  maybeExtractInsightsOnOpen,
 } from "./insights.js";
 import { runIngestion, getStaleSessionsNeedingReingest, reingestSession } from "./ingest.js";
 import type { IngestProgress } from "./ingest.js";
@@ -1397,6 +1471,13 @@ let ingestProgress: IngestProgress | null = null;
 app.post("/api/ingest", async (req, res) => {
   if (ingestProgress?.running) {
     res.status(409).json({ error: "Ingestion already running" });
+    return;
+  }
+  // Same guard the auto-tick uses: a reingest racing an in-flight
+  // summarize pass would stamp summarized_message_count from the
+  // pre-reingest snapshot against the post-reingest row.
+  if (summarizeJob.isRunning) {
+    res.status(409).json({ error: "Summarization in progress — retry shortly" });
     return;
   }
 
@@ -1523,7 +1604,7 @@ app.get("/api/insights", (req, res) => {
   const offset = Math.max(0, Number(req.query.offset) || 0);
 
   const conditions: string[] = ["i.deleted_at IS NULL"];
-  const params: unknown[] = [];
+  const params: (string | number)[] = [];
 
   if (type) {
     conditions.push("i.type = ?");
@@ -1648,22 +1729,6 @@ app.delete("/api/insights/:id", (req, res) => {
     return;
   }
   res.json({ ok: true });
-});
-
-// ── Extraction Settings Routes ──────────────────────────────────
-
-app.get("/api/settings/extraction", (_req, res) => {
-  res.json(getExtractionSettings());
-});
-
-app.put("/api/settings/extraction", (req, res) => {
-  const { interval_days } = req.body;
-  if (typeof interval_days !== "number" || interval_days < 1) {
-    res.status(400).json({ error: "interval_days must be a positive number" });
-    return;
-  }
-  setExtractionInterval(interval_days);
-  res.json(getExtractionSettings());
 });
 
 // ── Meta Layer Routes ────────────────────────────────────────────
@@ -1818,6 +1883,30 @@ app.put("/api/meta/settings", (req, res) => {
   res.json(updated);
 });
 
+// Lossless parse-on-demand trace: parses the raw JSONL (not the stripped DB) via
+// the vendored claude-devtools pipeline. See server/trace/index.ts for resolution
+// order (DB source_path -> ~/.claude/projects glob -> gzipped archive fallback).
+//
+// Default response is the lean shape (shapeTraceForResponse) — the full model
+// duplicates message content across messages[]/chunks[]/processes[] and can
+// serialize to ~7x the raw transcript size. Pass ?full=1 for the untrimmed
+// model (e.g. for scripts/tooling that want the lossless payload).
+app.get("/api/sessions/:id/trace", async (req, res) => {
+  try {
+    const trace = await buildTrace(req.params.id);
+    res.json(req.query.full === "1" ? trace : shapeTraceForResponse(trace));
+  } catch (err) {
+    if (err instanceof TraceError && err.code === "NOT_FOUND") {
+      res.status(404).json({ error: err.message });
+      return;
+    }
+    console.error(`[trace] failed for session ${req.params.id}:`, err);
+    res.status(500).json({
+      error: err instanceof TraceError ? err.message : "Failed to build session trace",
+    });
+  }
+});
+
 // Initialize cron trigger on server start
 setupCronTrigger();
 
@@ -1859,19 +1948,10 @@ app.listen(PORT, () => {
         async (s) => summarizeSession(s.id)
       );
 
-      // Phase 3: Auto-extract insights if interval has elapsed
-      // Only auto-triggers after the first manual run (last_run must be non-null)
-      if (!getExtractionStatus().running) {
-        const settings = getExtractionSettings();
-        if (settings.interval_days > 0 && settings.last_run) {
-          const lastRun = new Date(settings.last_run).getTime();
-          const intervalMs = settings.interval_days * 24 * 60 * 60 * 1000;
-          if (Date.now() - lastRun >= intervalMs) {
-            console.log(`[auto-ingest] Extraction interval elapsed, starting insight extraction`);
-            startExtraction(0);
-          }
-        }
-      }
+      // Insight extraction is triggered lazily when a session is opened
+      // (see maybeExtractInsightsOnOpen, wired into GET /api/sessions/:id)
+      // rather than on a periodic sweep here — avoids spending Sonnet cost
+      // on sessions nobody reopens.
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[auto-ingest] Error:", msg);

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { useParams, useNavigate, useSearch } from "@tanstack/react-router";
 import type { SessionDetail as SessionDetailType, Message, Tag, FileReference } from "../types";
 import { categorizeFileRefs } from "../fileCategories";
-import { renderMarkdown, cleanUserContent } from "../sessionFormat";
+import { MarkdownBody, cleanUserContent } from "../sessionFormat";
 import { INSIGHT_TYPE_COLORS } from "../insight-shared";
 import { useExtraction } from "../hooks/useExtraction";
 import SessionHeader from "./SessionHeader";
@@ -83,8 +83,9 @@ function ToolBlock({ label, content, timestamp, highlight, sequence }: {
 }
 
 // ── Mermaid hydration ────────────────────────────────────────────────────────
-// renderMarkdown emits <div class="mermaid-placeholder" data-mermaid="base64">
-// MermaidHost finds these after mount and renders them in-place.
+// MarkdownBody's FencedCodeBlock renders <div class="mermaid-placeholder"
+// data-mermaid="base64"> for ```mermaid fences. MermaidHost finds these
+// after mount and renders them in-place.
 function MermaidHost({ containerRef }: { containerRef: React.RefObject<HTMLDivElement | null> }) {
   useEffect(() => {
     const el = containerRef.current;
@@ -121,24 +122,28 @@ function MermaidHost({ containerRef }: { containerRef: React.RefObject<HTMLDivEl
 
 const COLLAPSE_PX = 320; // ~20 lines at 14px/1.5lh
 
-function CollapsibleContent({ html, className }: { html: string; className?: string }) {
+function CollapsibleContent({ children, className, contentKey }: { children: React.ReactNode; className?: string; contentKey: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [overflows, setOverflows] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
+  // Keyed on the content STRING, not the children element: an element is a
+  // new object every render, which made this scrollHeight read (a forced
+  // synchronous layout) fire for every visible bubble on every re-render.
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     setOverflows(el.scrollHeight > COLLAPSE_PX + 10);
-  }, [html]);
+  }, [contentKey]);
 
   return (
     <>
       <div
         ref={ref}
         className={`message-content collapsible-wrap${overflows && !expanded ? " collapsed" : ""} ${className ?? ""}`}
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
+      >
+        {children}
+      </div>
       <MermaidHost containerRef={ref} />
       {overflows && (
         <button className="collapsible-btn" onClick={() => setExpanded((e) => !e)}>
@@ -198,7 +203,9 @@ function MessageBubble({ message, highlight }: { message: Message; highlight?: b
           <span className="font-mono text-[10px] opacity-50 font-normal ml-1.5">{formatTime(message.timestamp)}</span>
         )}
       </div>
-      <CollapsibleContent html={renderMarkdown(displayContent)} />
+      <CollapsibleContent contentKey={displayContent}>
+        <MarkdownBody text={displayContent} />
+      </CollapsibleContent>
     </div>
   );
 }
@@ -276,11 +283,13 @@ function AssistantTurnBlock({
   highlight,
   userOnly,
   highlightSeq,
+  isLive,
 }: {
   turn: TurnItem & { kind: "assistant" };
   highlight: boolean;
   userOnly: boolean;
   highlightSeq: number;
+  isLive: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -319,7 +328,7 @@ function AssistantTurnBlock({
             if (g.kind === "tools") {
               if (userOnly) return null;
               const groupHighlight = !isNaN(highlightSeq) && g.allSequences.includes(highlightSeq);
-              return <ToolGroupBlock key={`tg-${idx}`} group={g} highlight={groupHighlight} />;
+              return <ToolGroupBlock key={`tg-${idx}`} group={g} highlight={groupHighlight} isLive={isLive} />;
             }
             const msg = g.msg;
             return (
@@ -633,9 +642,11 @@ function formatInputPreview(input: Record<string, unknown>): string {
 function ToolGroupBlock({
   group,
   highlight,
+  isLive,
 }: {
   group: Extract<GroupedItem, { kind: "tools" }>;
   highlight: boolean;
+  isLive: boolean;
 }) {
   const names = group.items.map((it) => readToolCall(it.use).name);
   const unique = Array.from(new Set(names));
@@ -657,7 +668,7 @@ function ToolGroupBlock({
     >
       <summary className="tool-group-summary">
         <span className="tool-group-chevron">▶</span>
-        <span className="tool-group-label">Working</span>
+        <span className="tool-group-label">{isLive ? "Working" : "Tools"}</span>
         <span className="tool-group-desc">{summary}</span>
         {time && <span className="tool-group-time">{time}</span>}
       </summary>
@@ -906,6 +917,10 @@ function InsightsPanel({ sessionId }: { sessionId: string }) {
   );
 }
 
+// A session only counts as "live" when it has no recorded end time AND its
+// most recent message is very recent — see `isLive` below.
+const LIVE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
 export default function SessionDetail() {
   const { id } = useParams({ from: sessionRoute.id });
   const navigate = useNavigate();
@@ -988,6 +1003,25 @@ export default function SessionDetail() {
     if (!highlightMsg) return -1;
     return userMessageSequences.indexOf(highlightMsg);
   }, [highlightMsg, userMessageSequences]);
+
+  // -- Live-session detection (gates the "Working" tool-group label) --
+  // liveTick re-evaluates the window once a minute so a session left open
+  // past LIVE_WINDOW_MS flips from "Working" to "Tools" without a reload.
+  // The interval only runs while the label could still change.
+  const [liveTick, setLiveTick] = useState(0);
+  const isLive = useMemo(() => {
+    void liveTick;
+    if (!session || session.ended_at) return false;
+    const lastMessage = session.messages[session.messages.length - 1];
+    const lastActivity = lastMessage?.timestamp ?? session.started_at;
+    if (!lastActivity) return false;
+    return Date.now() - new Date(lastActivity).getTime() < LIVE_WINDOW_MS;
+  }, [session, liveTick]);
+  useEffect(() => {
+    if (!isLive) return;
+    const id = setInterval(() => setLiveTick((t) => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, [isLive]);
 
   const jumpToUserMessage = useCallback(
     (direction: -1 | 1) => {
@@ -1229,7 +1263,7 @@ export default function SessionDetail() {
   const canGoNext = userMessageSequences.length > 0 && (currentUserIdx === -1 || currentUserIdx < userMessageSequences.length - 1);
 
   return (
-    <div className="max-w-[860px] px-10 pt-0 pb-20">
+    <div className="max-w-[1400px] mx-auto px-10 pt-0 pb-20">
       <div className="sticky top-0 z-10 bg-bg pt-6 pb-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1">
@@ -1268,6 +1302,17 @@ export default function SessionDetail() {
           </div>
 
           <div className="flex items-center gap-1">
+            {/* Trace view — drillable chunk/step/subagent view over the raw JSONL */}
+            <button
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
+              onClick={() => navigate({ to: "/session/$id/trace", params: { id: session.id } })}
+              title="Open drillable trace view (thinking, tool durations, context deltas, subagents)"
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+                <path d="M2 13V9M6 13V5M10 13V7M14 13V3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Trace
+            </button>
             {/* User-only filter toggle */}
             <button
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[13px] rounded-md transition-all hover:text-text hover:bg-white/6 ${userOnly ? "text-accent-blue bg-accent-blue/10" : "text-text-secondary"}`}
@@ -1292,10 +1337,7 @@ export default function SessionDetail() {
             </button>
             <button
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
-              onClick={() => {
-                const main = document.querySelector("main");
-                if (main) main.scrollTo({ top: 0, behavior: "smooth" });
-              }}
+              onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
               title="Scroll to top"
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
@@ -1305,10 +1347,9 @@ export default function SessionDetail() {
             </button>
             <button
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary rounded-md transition-all hover:text-text hover:bg-white/6"
-              onClick={() => {
-                const main = document.querySelector("main");
-                if (main) main.scrollTo({ top: main.scrollHeight, behavior: "smooth" });
-              }}
+              onClick={() =>
+                window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" })
+              }
               title="Scroll to bottom"
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
@@ -1420,6 +1461,7 @@ export default function SessionDetail() {
                   highlight={turnHighlight}
                   userOnly={userOnly}
                   highlightSeq={highlightSeq}
+                  isLive={isLive}
                 />
               );
             }

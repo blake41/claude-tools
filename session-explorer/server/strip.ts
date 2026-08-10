@@ -63,13 +63,109 @@ interface RawMessage {
   [key: string]: unknown;
 }
 
+/** type === "user" with content that is ONLY tool_result block(s). */
+function hasOnlyToolResultContent(content: string | ContentBlock[] | undefined): boolean {
+  if (!Array.isArray(content) || content.length === 0) return false;
+  return content.every((block) => !!block && typeof block === "object" && block.type === "tool_result");
+}
+
+/** type === "user" with real (non-tool-result) content — a human prompt. */
+function isHumanPrompt(m: RawMessage): boolean {
+  return m.type === "user" && !hasOnlyToolResultContent(m.message?.content);
+}
+
 /**
- * Filter msgs to only the canonical (active) branch.
+ * A divergent (off-canonical) subtree is a genuinely ABANDONED rewind
+ * branch only when a human re-prompted — i.e. the subtree contains a real
+ * user prompt. Anything else hanging off the canonical chain is
+ * machine-generated work: tool-result plumbing, structural records, or —
+ * critically — PARALLEL Task/subagent dispatches, which Claude Code
+ * encodes as sibling parent→child chains (only one sibling can carry the
+ * chain onward; the others dead-end structurally while being completed,
+ * live work). Ported from server/trace/active-path.ts's isAbandonedBranch,
+ * which fixed the identical bug in the trace pipeline: the old
+ * "keep only the single leaf's ancestor chain" rule silently dropped
+ * completed parallel-dispatch content from this search index.
+ */
+function isAbandonedBranch(root: string, byUuid: Map<string, RawMessage>, childrenOf: Map<string, string[]>): boolean {
+  const stack = [root];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const uuid = stack.pop()!;
+    if (seen.has(uuid)) continue;
+    seen.add(uuid);
+    const msg = byUuid.get(uuid);
+    if (!msg) continue;
+    if (isHumanPrompt(msg)) return true;
+    for (const child of childrenOf.get(uuid) ?? []) stack.push(child);
+  }
+  return false;
+}
+
+function collectSubtree(root: string, childrenOf: Map<string, string[]>, into: Set<string>): void {
+  const stack = [root];
+  while (stack.length > 0) {
+    const uuid = stack.pop()!;
+    if (into.has(uuid)) continue;
+    into.add(uuid);
+    for (const child of childrenOf.get(uuid) ?? []) stack.push(child);
+  }
+}
+
+/**
+ * Expand the canonical ancestor set with sibling subtrees that must be
+ * kept even though they aren't on the leaf's direct ancestor chain — see
+ * isAbandonedBranch. Same-timestamp sibling groups (compaction replays)
+ * are kept wholesale, mirroring active-path.ts's rule #3.
+ */
+function expandWithPlumbingAndReplays(
+  canonical: Set<string>,
+  byUuid: Map<string, RawMessage>,
+  childrenOf: Map<string, string[]>
+): Set<string> {
+  const keep = new Set(canonical);
+
+  for (const uuid of canonical) {
+    const kids = childrenOf.get(uuid) ?? [];
+    if (kids.length === 0) continue;
+
+    const byTimestamp = new Map<string, string[]>();
+    for (const kid of kids) {
+      const ts = byUuid.get(kid)?.timestamp ?? "";
+      const group = byTimestamp.get(ts);
+      if (group) group.push(kid);
+      else byTimestamp.set(ts, [kid]);
+    }
+
+    for (const group of byTimestamp.values()) {
+      if (group.length > 1) {
+        // Compaction-replay group: keep every member's full subtree.
+        for (const member of group) collectSubtree(member, childrenOf, keep);
+        continue;
+      }
+      const [child] = group;
+      if (keep.has(child)) continue;
+      if (!isAbandonedBranch(child, byUuid, childrenOf)) {
+        collectSubtree(child, childrenOf, keep);
+      }
+      // else: subtree contains a human re-prompt — a real abandoned
+      // rewind fork. Left out of `keep`.
+    }
+  }
+
+  return keep;
+}
+
+/**
+ * Filter msgs to the active branch plus any legitimate parallel-dispatch
+ * or replay siblings.
  *
  * Claude Code stores ALL turns including rewound/abandoned branches.
  * Each message has a uuid and parentUuid forming a tree. The active
- * branch is the path from root to the deepest leaf — everything else
- * is an orphaned branch from a rewind.
+ * branch is the path from root to the deepest leaf. Anything else hanging
+ * off that chain is dropped ONLY if it's a genuinely abandoned rewind
+ * fork (contains a real human re-prompt) — plumbing, replays, and
+ * parallel Task/subagent dispatch chains are kept (see isAbandonedBranch).
  *
  * If uuid/parentUuid are missing (older sessions), return msgs as-is.
  */
@@ -91,40 +187,52 @@ function canonicalBranch(msgs: RawMessage[]): RawMessage[] {
     childrenOf.get(parent)!.push(m.uuid);
   }
 
-  // Find the deepest leaf node by walking up from each leaf
-  let deepestLeaf: string | null = null;
-  let maxDepth = -1;
+  // Find the leaf of the active branch: latest timestamp wins, since a
+  // rewind can leave an abandoned branch deeper than the live one. Depth
+  // breaks ties (and covers legacy sessions with no timestamps). Visited
+  // sets guard both walks — rewind/replay can produce parentUuid cycles.
+  let bestLeaf: string | null = null;
+  let bestTs = "";
+  let bestDepth = -1;
   for (const uuid of byUuid.keys()) {
     const children = childrenOf.get(uuid);
     if (!children || children.length === 0) {
+      const ts = byUuid.get(uuid)?.timestamp ?? "";
       let trueDepth = 0;
+      const seen = new Set<string>();
       let cur: string | undefined = uuid;
-      while (cur) {
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
         trueDepth++;
         const msg = byUuid.get(cur);
         cur = msg?.parentUuid && byUuid.has(msg.parentUuid) ? msg.parentUuid : undefined;
       }
-      if (trueDepth > maxDepth) {
-        maxDepth = trueDepth;
-        deepestLeaf = uuid;
+      if (ts > bestTs || (ts === bestTs && trueDepth > bestDepth)) {
+        bestTs = ts;
+        bestDepth = trueDepth;
+        bestLeaf = uuid;
       }
     }
   }
 
-  if (!deepestLeaf) return msgs;
+  if (!bestLeaf) return msgs;
 
   // Walk from leaf back to root, collecting canonical UUIDs
   const canonical = new Set<string>();
-  let cur: string | undefined = deepestLeaf;
-  while (cur) {
+  let cur: string | undefined = bestLeaf;
+  while (cur && !canonical.has(cur)) {
     canonical.add(cur);
     const msg = byUuid.get(cur);
     cur = msg?.parentUuid && byUuid.has(msg.parentUuid) ? msg.parentUuid : undefined;
   }
 
-  // Return only messages whose uuid is on the canonical path,
-  // plus any messages without a uuid (preserve legacy format)
-  return msgs.filter((m) => !m.uuid || canonical.has(m.uuid));
+  // Expand with parallel-dispatch/plumbing/replay siblings — only a
+  // genuinely abandoned rewind fork is left out.
+  const keep = expandWithPlumbingAndReplays(canonical, byUuid, childrenOf);
+
+  // Return only messages whose uuid is kept, plus any messages without a
+  // uuid (preserve legacy format).
+  return msgs.filter((m) => !m.uuid || keep.has(m.uuid));
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -136,17 +244,93 @@ const SKIP_TYPES = new Set([
   "system",
 ]);
 
-function countHeaders(text: string): number {
-  const matches = text.match(/^#{1,4}\s/gm);
-  return matches ? matches.length : 0;
+// Classification below is marker-based, NOT size/header-based. The previous
+// heuristic (>2000 chars + >5 headers → skill, >1500 chars + >3 headers →
+// system) destroyed genuine user-pasted markdown (plans, design docs) that
+// happened to be long and well-structured — real data loss, visible in the
+// UI as "[Skill loaded: …]" over content the user actually typed.
+//
+// Markers below were grounded by inspecting real transcripts under
+// ~/.claude/projects/**/*.jsonl (user-type messages, plain text blocks):
+//
+//  - "Base directory for this skill:" — literal prefix Claude Code emits
+//    when auto-loading a SKILL.md body into a user turn (no <command-name>
+//    wrapper, since these are description-triggered, not explicit slash
+//    commands). Confirmed present verbatim in real sessions for the `cass`
+//    skill (27,567 chars), the `claude-api` skill (464K–616K chars), and the
+//    `create_handoff` skill (3,953 chars) — e.g.
+//    ~/.claude/projects/-Users-blake--claude--claude-worktrees-parallelism-overhaul/158708a4-*.jsonl
+//    and ~/.claude/projects/-Users-blake-Documents-Development-clay-keystone/9f4f5030-*.jsonl.
+//
+//  - "<system-reminder>" — wrapper tag the harness uses for injected
+//    reminders of any size. Confirmed present verbatim, short form (~123
+//    chars, e.g. `~/.claude/projects/.../a4cc76d7-*.jsonl`: "The user named
+//    this session \"osman-sync\"...") and also found wrapping/adjacent to
+//    large skill-load bodies in the same samples above.
+//
+//  - "# claudeMd" / "(user's private global instructions for all
+//    projects)" / "(project instructions, checked into the codebase)" —
+//    the literal heading and phrasing the harness uses when dumping
+//    CLAUDE.md file contents into a system-reminder block. Not found via
+//    disk grep across the sampled transcripts (this exact dump format
+//    wasn't present in the older sessions searched), but directly observed
+//    live in this very task's own injected context, which is the same
+//    harness feature — included as defense-in-depth since the phrasing is
+//    extremely distinctive and has effectively zero false-positive risk
+//    against genuine user prose.
+//
+// A short length floor is applied ALONGSIDE the marker check (not instead
+// of it). Verified against stripXmlNoise below: a short, complete
+// "<system-reminder>...</system-reminder>" block (e.g. the 123-char
+// session-name reminder above) is already dropped entirely by
+// stripXmlNoise's full-block-removal regex when it falls through to the
+// plain-text branch — correct existing behavior, since that kind of stub
+// carries no real conversational content. Without the floor,
+// isSystemContext would instead fire first and hand it to
+// truncateSystemContext, which strips the closing tag in the process and
+// leaves a bare "[system context truncated]" stub behind as a visible,
+// meaningless message — a regression from "silently dropped" to "visible
+// noise". The floor keeps that path length-gated to content where
+// truncating to one line is actually worth doing (real skill/CLAUDE.md
+// dumps, thousands of chars). It never causes a false positive: unmarked
+// user content of any length still passes through untouched regardless of
+// this floor.
+const SKILL_INJECTION_MARKERS = ["Base directory for this skill:"];
+
+const SYSTEM_CONTEXT_MARKERS = [
+  "<system-reminder>",
+  "# claudeMd",
+  "(user's private global instructions for all projects)",
+  "(project instructions, checked into the codebase)",
+];
+
+const TRUNCATION_WORTH_IT_FLOOR = 500;
+
+// Markers must appear near the START of the message. Harness injections
+// (skill loads, system-reminders, CLAUDE.md dumps) always lead with their
+// marker; genuine user prose that merely QUOTES one of these strings
+// mid-message (e.g. discussing Claude Code internals) must not be
+// destroyed by truncation. Anywhere-in-message matching was a real
+// data-loss path for exactly that kind of message.
+const MARKER_HEAD_WINDOW = 500;
+
+function hasLeadingMarker(text: string, markers: string[]): boolean {
+  const head = text.slice(0, MARKER_HEAD_WINDOW);
+  return markers.some((marker) => head.includes(marker));
 }
 
 function isSkillInjection(text: string): boolean {
-  return text.length > 2000 && countHeaders(text) > 5;
+  return (
+    text.length > TRUNCATION_WORTH_IT_FLOOR &&
+    hasLeadingMarker(text, SKILL_INJECTION_MARKERS)
+  );
 }
 
 function isSystemContext(text: string): boolean {
-  return text.length > 1500 && countHeaders(text) > 3;
+  return (
+    text.length > TRUNCATION_WORTH_IT_FLOOR &&
+    hasLeadingMarker(text, SYSTEM_CONTEXT_MARKERS)
+  );
 }
 
 function truncateSkill(text: string): string {
@@ -290,7 +474,9 @@ export function stripSession(jsonlPath: string): {
 
   // Filter to canonical branch — drop rewound/abandoned turns.
   // Must run before sorting so the tree walk uses file order for tie-breaking.
-  const canonical = canonicalBranch(msgs);
+  // Copy: canonicalBranch may return `msgs` itself (legacy sessions without
+  // uuids), and the reassignment below would empty both aliased arrays.
+  const canonical = [...canonicalBranch(msgs)];
   // Sort canonical branch by timestamp for correct sequence assignment.
   canonical.sort((a, b) => {
     if (!a.timestamp) return 1;

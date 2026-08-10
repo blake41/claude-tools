@@ -1,8 +1,12 @@
-import { readdirSync, statSync, existsSync } from "fs";
+import { readdirSync, statSync, existsSync, readFileSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
 import db from "./db.js";
-import { stripSession, type StrippedMessage } from "./strip.js";
+import { stripSession } from "./strip.js";
+import { pickTitle } from "./title.js";
+import { archiveSession } from "./archive.js";
+import { tallyUnknownRecordTypes, parseJsonlLines } from "./canary.js";
+import { isSummaryStale } from "./summary-staleness.js";
 
 // ── Config ─────────────────────────────────────────────────────────
 
@@ -64,6 +68,16 @@ function decodeDirName(dirName: string): string | null {
   return currentPath;
 }
 
+const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"];
+
+/** Screenshots/images pasted into a session are excluded from session_files
+ * — they're not "created files" worth tracking. Extended beyond png/jpg so
+ * gif/webp/svg pastes don't leak into file search/listing either. */
+function isImageFile(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  return IMAGE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
 function displayName(workspacePath: string): string {
   const parts = workspacePath.split("/").filter(Boolean);
   // Return last 2-3 meaningful segments
@@ -81,28 +95,15 @@ function displayName(workspacePath: string): string {
   return parts.slice(-2).join("/");
 }
 
-/**
- * A bare slash command with no argument text (e.g. "/model", "/clear") makes a
- * useless title even though it's real "text" content — skip it in favor of the
- * next user turn. A command WITH argument text (e.g. "/ship-lite fix the bug")
- * is still title-worthy.
- */
-function isTitleWorthy(content: string): boolean {
-  const trimmed = content.trim();
-  return trimmed.length > 0 && !/^\/\S+\s*$/.test(trimmed);
-}
-
-function pickTitle(userMessages: StrippedMessage[]): string {
-  // System-context/caveat boilerplate is already classified messageType "system"
-  // by strip.ts, not "text" — restrict to real text turns first.
-  const textMessages = userMessages.filter((m) => m.messageType === "text");
-  const best = textMessages.find((m) => isTitleWorthy(m.content)) ?? textMessages[0];
-  return best?.content.slice(0, 200) || "";
-}
+// Title-picking (isTitleWorthy, stripAnsiCodes, pickTitle) lives in ./title.ts
+// — pure, DB-free, and unit-tested there.
 
 // ── Prepared Statements ────────────────────────────────────────────
 
 const getWorkspace = db.prepare(`SELECT id FROM workspaces WHERE path = ?`);
+const getWorkspaceByDirName = db.prepare(
+  `SELECT id, path FROM workspaces WHERE dir_name = ?`
+);
 
 const insertWorkspace = db.prepare(`
   INSERT INTO workspaces (path, dir_name, display_name) VALUES (?, ?, ?)
@@ -117,8 +118,45 @@ const updateWorkspaceStats = db.prepare(`
 
 const sessionExists = db.prepare(`SELECT 1 FROM sessions WHERE id = ?`);
 const sessionFileSize = db.prepare(`SELECT file_size FROM sessions WHERE id = ?`);
-const sessionSummary = db.prepare(`SELECT summary FROM sessions WHERE id = ?`);
-const restoreSessionSummary = db.prepare(`UPDATE sessions SET summary = ? WHERE id = ?`);
+
+// Reingest (triggered by a file-size change) deletes and reinserts the
+// session row, which would otherwise silently wipe every LLM-derived column
+// — not just `summary` (the old bug), but `summary_short` and the
+// insights/events extraction flags too. Preserve all of them so a session
+// growing on disk never re-triggers redundant LLM work. summary_retry_count
+// and summary_failed_at are intentionally NOT preserved here — reingest is a
+// reasonable point to give a previously-stuck summary a fresh attempt (and
+// insertSession's fresh row naturally defaults both back to 0/NULL anyway).
+//
+// summary/summary_short/summarized_message_count are the exception: they're
+// only restored when the summary isn't stale (see isSummaryStale in
+// summary-staleness.ts) — a session that grew a lot since it was summarized
+// gets its summary dropped instead, so the next auto-summarize tick redoes
+// it once rather than keeping a permanently-stale summary forever.
+// insights_extracted/events_extracted stay preserved unconditionally
+// (expensive Sonnet work — deliberate).
+interface PreservedDerivedData {
+  summary: string | null;
+  summary_short: string | null;
+  summarized_message_count: number | null;
+  summarized_at: string | null;
+  insights_extracted: number;
+  events_extracted: number;
+}
+
+const sessionDerivedData = db.prepare(`
+  SELECT summary, summary_short, summarized_message_count, summarized_at, insights_extracted, events_extracted
+  FROM sessions WHERE id = ?
+`);
+const restoreInsightsAndEvents = db.prepare(`
+  UPDATE sessions SET insights_extracted = ?, events_extracted = ? WHERE id = ?
+`);
+const restoreSummaryFields = db.prepare(`
+  UPDATE sessions
+  SET summary = ?, summary_short = ?, summarized_message_count = ?, summarized_at = ?
+  WHERE id = ?
+`);
+const getMessageCount = db.prepare(`SELECT message_count FROM sessions WHERE id = ?`);
 
 const insertSession = db.prepare(`
   INSERT INTO sessions (id, workspace_id, source_path, started_at, ended_at, git_branch, title, message_count, user_message_count, file_size, ingested_at)
@@ -146,6 +184,73 @@ const deleteSessionFiles = db.prepare(`DELETE FROM session_files WHERE session_i
 const deleteSessionMessages = db.prepare(`DELETE FROM messages WHERE session_id = ?`);
 const deleteSessionTags = db.prepare(`DELETE FROM session_tags WHERE session_id = ?`);
 const deleteSession = db.prepare(`DELETE FROM sessions WHERE id = ?`);
+
+// ── Schema-Drift Canary ────────────────────────────────────────────
+// See server/canary.ts for the pure tally logic. This section is the
+// stateful wiring: per-session persistence + a process-lifetime "have we
+// already warned about this type" set, bootstrapped from whatever's already
+// on disk so a server restart doesn't re-warn about long-known drift.
+
+const updateUnknownRecordTypes = db.prepare(
+  `UPDATE sessions SET unknown_record_types = ? WHERE id = ?`
+);
+
+const seenUnknownTypes = new Set<string>();
+try {
+  const existingRows = db
+    .prepare(
+      `SELECT unknown_record_types FROM sessions WHERE unknown_record_types IS NOT NULL`
+    )
+    .all() as Array<{ unknown_record_types: string }>;
+  for (const row of existingRows) {
+    try {
+      const tally = JSON.parse(row.unknown_record_types) as Record<string, number>;
+      for (const type of Object.keys(tally)) seenUnknownTypes.add(type);
+    } catch {
+      // malformed JSON in an existing row — ignore, not worth crashing startup over
+    }
+  }
+} catch {
+  // unknown_record_types column not present yet somehow — treat as "nothing seen"
+}
+
+/**
+ * Independently tally raw JSONL record types (duplicates a lightweight
+ * version of strip.ts's line-parsing since strip.ts is out of scope to
+ * modify/export from) and record any type strip.ts neither handles nor
+ * deliberately skips. Logs once per newly-discovered type per process
+ * lifetime; persists the full per-session tally whenever the session row
+ * exists (it may not yet, e.g. a first-ingest parse failure).
+ */
+function recordUnknownTypesForSession(
+  sessionId: string,
+  jsonlPath: string,
+  sessionRowExists: boolean
+): void {
+  let raw: string;
+  try {
+    raw = readFileSync(jsonlPath, "utf-8");
+  } catch {
+    return;
+  }
+
+  const tally = tallyUnknownRecordTypes(parseJsonlLines(raw));
+  const types = Object.keys(tally);
+  if (types.length === 0) return;
+
+  for (const type of types) {
+    if (!seenUnknownTypes.has(type)) {
+      seenUnknownTypes.add(type);
+      console.warn(
+        `[canary] new unknown JSONL record type "${type}" (session ${sessionId}, ${tally[type]} occurrence${tally[type] === 1 ? "" : "s"}) — strip.ts does not handle or skip it; data of this type is being silently dropped.`
+      );
+    }
+  }
+
+  if (sessionRowExists) {
+    updateUnknownRecordTypes.run(JSON.stringify(tally), sessionId);
+  }
+}
 
 // ── Main ───────────────────────────────────────────────────────────
 
@@ -189,32 +294,50 @@ function ingestSession(
     }
   }
 
-  // Preserve summary across reingest so we don't trigger unnecessary resummarization
-  let existingSummary: string | null = null;
-  if (alreadyExists && needsReingest) {
-    const row = sessionSummary.get(sessionId) as { summary: string | null } | undefined;
-    existingSummary = row?.summary ?? null;
-    const deleteTx = db.transaction(() => {
-      deleteSessionFiles.run(sessionId);
-      deleteSessionMessages.run(sessionId);
-      // Preserve session_tags — tags are user data, not derived from JSONL
-      deleteSession.run(sessionId);
-    });
-    deleteTx();
-  } else if (alreadyExists) {
+  if (alreadyExists && !needsReingest) {
     return false;
   }
 
+  // Keep the raw-archive fallback fresh regardless of whether stripSession
+  // can parse the file below — it's a byte-for-byte gzip copy independent of
+  // parsing, so even a broken/unparseable session still gets archived before
+  // Claude Code eventually prunes the original. See server/archive.ts for
+  // the skip-if-unchanged manifest check (cheap stat-only comparison).
+  archiveSession(sessionId, jsonlPath);
+
+  // Parse BEFORE touching any existing rows. A parse failure must leave the
+  // old session+messages+files fully intact — previously the delete ran
+  // first and a subsequent parse failure silently destroyed the session.
   let result;
   try {
     result = stripSession(jsonlPath);
   } catch (err) {
     console.error(`  [SKIP] Failed to strip ${sessionId}: ${err}`);
+    // Best-effort schema-drift signal even on parse failure — a new/renamed
+    // record type strip.ts can't handle is a plausible cause. Only persists
+    // if the (untouched) session row already exists.
+    recordUnknownTypesForSession(sessionId, jsonlPath, alreadyExists);
     return false;
   }
 
   const { header, messages, files, toolCalls } = result;
-  if (messages.length === 0) return false;
+  if (messages.length === 0) {
+    // Still worth a canary check: a session whose every record is an
+    // unrecognized type would strip down to zero messages here.
+    recordUnknownTypesForSession(sessionId, jsonlPath, alreadyExists);
+    return false;
+  }
+
+  // Preserve LLM-derived columns across reingest so we don't trigger
+  // unnecessary resummarization/re-extraction (see sessionDerivedData above).
+  // Read BEFORE the delete+reinsert transaction below — parsing has already
+  // succeeded at this point, so it's now safe to plan the destructive part.
+  let preserved: PreservedDerivedData | null = null;
+  if (alreadyExists && needsReingest) {
+    preserved =
+      (sessionDerivedData.get(sessionId) as PreservedDerivedData | undefined) ??
+      null;
+  }
 
   const userMessages = messages.filter((m) => m.role === "user");
   const title = pickTitle(userMessages);
@@ -229,7 +352,17 @@ function ingestSession(
     // file may have been removed between strip and stat
   }
 
+  // Delete (if reingesting) and reinsert atomically in ONE transaction —
+  // now that parsing has already succeeded, a crash mid-transaction can't
+  // leave the DB in a deleted-but-not-reinserted state either.
   const ingestTx = db.transaction(() => {
+    if (alreadyExists && needsReingest) {
+      deleteSessionFiles.run(sessionId);
+      deleteSessionMessages.run(sessionId);
+      // Preserve session_tags — tags are user data, not derived from JSONL
+      deleteSession.run(sessionId);
+    }
+
     insertSession.run(
       sessionId,
       workspaceId,
@@ -260,7 +393,7 @@ function ingestSession(
     }
 
     for (const file of files) {
-      if (file.filePath.endsWith('.png') || file.filePath.endsWith('.jpg')) continue;
+      if (isImageFile(file.filePath)) continue;
       insertFile.run(
         sessionId,
         file.filePath,
@@ -310,7 +443,7 @@ function ingestSession(
             );
           }
           for (const file of subResult.files) {
-            if (file.filePath.endsWith('.png') || file.filePath.endsWith('.jpg')) continue;
+            if (isImageFile(file.filePath)) continue;
             insertFile.run(
               sessionId,
               file.filePath,
@@ -330,15 +463,48 @@ function ingestSession(
 
   ingestTx();
 
-  // Restore existing summary so reingest doesn't trigger resummarization
-  if (existingSummary) {
-    restoreSessionSummary.run(existingSummary, sessionId);
-  }
+  // Session row is guaranteed to exist now — persist the canary tally.
+  recordUnknownTypesForSession(sessionId, jsonlPath, true);
 
-  // Update counts to include subagent messages
+  // Update counts to include subagent messages BEFORE computing summary
+  // staleness below, so that check uses the final authoritative count.
   const subagentDir = join(jsonlPath.replace(/\.jsonl$/, ""), "subagents");
+  let finalMessageCount = messages.length;
   if (existsSync(subagentDir)) {
     updateSessionCounts.run(sessionId, sessionId, sessionId);
+    const row = getMessageCount.get(sessionId) as { message_count: number } | undefined;
+    if (row) finalMessageCount = row.message_count;
+  }
+
+  // Restore LLM-derived columns wiped by the delete+reinsert above.
+  if (preserved) {
+    // insights/events extraction is expensive Sonnet work — always preserved.
+    restoreInsightsAndEvents.run(
+      preserved.insights_extracted,
+      preserved.events_extracted,
+      sessionId
+    );
+
+    const stale = isSummaryStale({
+      storedSummarizedCount: preserved.summarized_message_count,
+      freshMessageCount: finalMessageCount,
+      storedSummarizedAt: preserved.summarized_at,
+      now: Date.now(),
+    });
+
+    if (!stale) {
+      restoreSummaryFields.run(
+        preserved.summary,
+        preserved.summary_short,
+        preserved.summarized_message_count,
+        preserved.summarized_at,
+        sessionId
+      );
+    }
+    // else: deliberately skip restoring summary/summary_short/
+    // summarized_message_count — insertSession's fresh row already left
+    // them at their defaults (NULL), so the next auto-summarize tick
+    // (WHERE summary IS NULL) re-summarizes this session exactly once.
   }
 
   return true;
@@ -427,31 +593,47 @@ export async function runIngestion(
 
     if (jsonlFiles.length === 0) continue;
 
-    // Resolve workspace path from first session's cwd, falling back to dir name decode
-    let workspacePath: string | null = null;
+    // The workspace for this dir_name is already known once ingested once —
+    // don't re-parse a JSONL file just to resolve cwd again. Without this,
+    // every ~30s auto-ingest tick JSON-parsed the first ~3 sessions of all
+    // ~240 project dirs purely to recompute a value that never changes.
+    const known = getWorkspaceByDirName.get(dirName) as
+      | { id: number; path: string }
+      | undefined;
 
-    for (const f of jsonlFiles.slice(0, 3)) {
-      try {
-        const { header } = stripSession(join(projectDir, f));
-        if (header.cwd) {
-          workspacePath = header.cwd;
-          break;
+    let workspacePath: string | null;
+    let workspaceId: number;
+
+    if (known) {
+      workspacePath = known.path;
+      workspaceId = known.id;
+    } else {
+      // Resolve workspace path from first session's cwd, falling back to dir name decode
+      workspacePath = null;
+      for (const f of jsonlFiles.slice(0, 3)) {
+        try {
+          const { header } = stripSession(join(projectDir, f));
+          if (header.cwd) {
+            workspacePath = header.cwd;
+            break;
+          }
+        } catch {
+          // try next file
         }
-      } catch {
-        // try next file
       }
+
+      if (!workspacePath) {
+        workspacePath = decodeDirName(dirName);
+      }
+
+      if (!workspacePath) {
+        console.log(`  [SKIP] Could not resolve path for: ${dirName}`);
+        continue;
+      }
+
+      workspaceId = getOrCreateWorkspace(workspacePath, dirName);
     }
 
-    if (!workspacePath) {
-      workspacePath = decodeDirName(dirName);
-    }
-
-    if (!workspacePath) {
-      console.log(`  [SKIP] Could not resolve path for: ${dirName}`);
-      continue;
-    }
-
-    const workspaceId = getOrCreateWorkspace(workspacePath, dirName);
     totalFiles += jsonlFiles.length;
     workspaceDirs.push({ dirName, jsonlFiles, workspacePath, workspaceId });
   }

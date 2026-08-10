@@ -41,6 +41,7 @@
 ~/Library/Developer/CoreSimulator/
 ~/.cursor
 ~/.lavish-axi
+~/.local/bin
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf

@@ -83,13 +83,13 @@ export default function SessionList({ workspace }: SessionListProps) {
     }
   }, [sessions, offset, hasMore, cacheKey]);
 
-  // Save scroll position before navigating away
+  // Save scroll position before navigating away.
+  // Content now scrolls with the browser window (not a nested container),
+  // so scroll position lives on `window`, not on a `<main>` element.
   useEffect(() => {
-    const main = containerRef.current?.closest("main");
-    if (!main) return;
-    const saveScroll = () => sessionStorage.setItem(scrollKey, String(main.scrollTop));
-    main.addEventListener("scroll", saveScroll, { passive: true });
-    return () => main.removeEventListener("scroll", saveScroll);
+    const saveScroll = () => sessionStorage.setItem(scrollKey, String(window.scrollY));
+    window.addEventListener("scroll", saveScroll, { passive: true });
+    return () => window.removeEventListener("scroll", saveScroll);
   }, [scrollKey]);
 
   // Restore scroll position after render
@@ -97,8 +97,7 @@ export default function SessionList({ workspace }: SessionListProps) {
     if (!loading && sessions.length > 0) {
       const saved = sessionStorage.getItem(scrollKey);
       if (saved) {
-        const main = containerRef.current?.closest("main");
-        if (main) requestAnimationFrame(() => { main.scrollTop = Number(saved); });
+        requestAnimationFrame(() => window.scrollTo({ top: Number(saved) }));
       }
     }
   }, [loading, scrollKey, sessions.length > 0]);

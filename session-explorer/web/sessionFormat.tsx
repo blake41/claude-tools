@@ -5,7 +5,19 @@
  * for Claude session content displayed throughout the app.
  * Inspired by gist.github.com's code rendering style.
  */
-import React from "react";
+import React, { useContext, useEffect, useState } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
+
+// Module-scope so the array keeps a stable identity: react-markdown gates
+// its full re-parse behind a useEffect keyed on [children, ...plugins] — an
+// inline array literal defeats that and forces a remark re-parse of every
+// mounted message on every re-render (e.g. each search-box keystroke).
+// remark-breaks keeps the old renderer's single-\n → <br> behavior; plain
+// CommonMark soft-breaks would join line-separated prose into run-on
+// paragraphs, which real transcripts hit constantly.
+const REMARK_PLUGINS = [remarkGfm, remarkBreaks];
 
 // ── Strip harness noise from user message content ───────────────
 // Claude Code injects many XML-tagged blocks into user turns that are
@@ -34,166 +46,149 @@ function esc(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
-// ── Syntax highlighting ─────────────────────────────────────────
-const KW: Record<string, Set<string>> = {};
-const TS_KW = new Set(["import","export","from","const","let","var","function","class","interface","type","enum","return","if","else","for","while","do","switch","case","break","continue","try","catch","finally","throw","new","this","super","extends","implements","async","await","public","private","protected","static","readonly","abstract","as","typeof","instanceof","in","of","keyof","void","never","unknown","any","null","undefined","true","false","default","declare"]);
-KW["typescript"] = KW["ts"] = KW["tsx"] = KW["javascript"] = KW["js"] = KW["jsx"] = TS_KW;
-KW["python"] = KW["py"] = new Set(["def","class","import","from","as","if","elif","else","for","while","try","except","finally","raise","return","yield","with","pass","break","continue","and","or","not","in","is","lambda","global","nonlocal","del","assert","True","False","None","async","await"]);
-KW["go"] = new Set(["package","import","func","var","const","type","struct","interface","map","chan","go","select","defer","return","if","else","for","range","switch","case","break","continue","fallthrough","goto","nil","true","false","make","new","append","len","cap","delete","close","panic","recover","print","println"]);
-KW["rust"] = new Set(["fn","let","mut","const","static","struct","enum","impl","trait","use","mod","pub","crate","super","self","type","where","match","if","else","loop","while","for","in","return","break","continue","true","false","async","await","move","ref","dyn","Box","Vec","Option","Result","Some","None","Ok","Err"]);
+// ── Full markdown rendering (message bodies) ────────────────────
+// Renders full markdown (headers, lists, tables, code fences, etc.) as a
+// real React tree via react-markdown + remark-gfm, instead of hand-rolled
+// regex → HTML strings (fragile escaping, broken code fences on nesting).
+// Code fences are syntax-highlighted lazily via shiki, off the main render
+// path, so large pasted blocks don't block the initial paint.
 
-function syntaxHL(raw: string, lang: string): string {
-  const keywords = KW[lang] ?? new Set<string>();
-  const lines = raw.split("\n");
-  return lines.map(line => {
-    let out = "";
-    let i = 0;
-    while (i < line.length) {
-      const rest = line.slice(i);
+const MAX_HIGHLIGHT_CHARS = 20000; // skip highlighting past this size — perf guard
+const SHIKI_THEME = "github-dark-default"; // bg #0d1117 / fg #e6edf3 — matches this app's own dark palette
+type ShikiHighlighter = import("shiki/core").HighlighterCore;
+let highlighterPromise: Promise<ShikiHighlighter> | null = null;
 
-      // line comment
-      if (rest.startsWith("//") || (rest.startsWith("#") && (lang === "python" || lang === "py" || lang === "bash" || lang === "sh"))) {
-        out += `<span style="color:#71717a;font-style:italic">${esc(rest)}</span>`;
-        break;
-      }
-
-      // string literals
-      const q = rest[0];
-      if (q === '"' || q === "'" || q === "`") {
-        let end = rest.indexOf(q, 1);
-        while (end !== -1 && rest[end - 1] === "\\") end = rest.indexOf(q, end + 1);
-        const str = end === -1 ? rest : rest.slice(0, end + 1);
-        out += `<span style="color:#4ade80">${esc(str)}</span>`;
-        i += str.length;
-        continue;
-      }
-
-      // number
-      const num = /^(\d+\.?\d*)/.exec(rest);
-      if (num && (i === 0 || /\W/.test(line[i - 1]))) {
-        out += `<span style="color:#fb923c">${esc(num[1])}</span>`;
-        i += num[1].length;
-        continue;
-      }
-
-      // word / keyword
-      const word = /^([a-zA-Z_$][a-zA-Z0-9_$]*)/.exec(rest);
-      if (word) {
-        const w = word[1];
-        if (keywords.has(w)) {
-          out += `<span style="color:#c084fc;font-weight:500">${esc(w)}</span>`;
-        } else if (w[0] === w[0].toUpperCase() && w.length > 1 && /[a-z]/.test(w)) {
-          out += `<span style="color:#facc15">${esc(w)}</span>`;
-        } else {
-          out += esc(w);
-        }
-        i += w.length;
-        continue;
-      }
-
-      out += esc(rest[0]);
-      i++;
-    }
-    return out;
-  }).join("\n");
+// Loads shiki's core highlighter engine on first use only (never at module
+// load — the `import()` calls below don't fire until this function runs).
+// Languages are imported by exact file path (the "fine-grained bundle"
+// pattern) rather than through `createHighlighter`/`bundledLanguages` — that
+// convenience map is one big object reachable from ~200 dynamic imports,
+// which makes bundlers emit a chunk for every language shiki knows about
+// instead of just the ones we actually expect in agent session logs. Add a
+// line to the `langs` array below if one is missing; don't switch back to
+// the full bundle.
+function getHighlighter(): Promise<ShikiHighlighter> {
+  if (!highlighterPromise) {
+    highlighterPromise = Promise.all([
+      import("shiki/core"),
+      import("shiki/engine/javascript"),
+      import("shiki/themes/github-dark-default.mjs"),
+    ]).then(([{ createHighlighterCore }, { createJavaScriptRegexEngine }, theme]) =>
+      createHighlighterCore({
+        themes: [theme],
+        langs: [
+          import("shiki/langs/typescript.mjs"),
+          import("shiki/langs/tsx.mjs"),
+          import("shiki/langs/javascript.mjs"),
+          import("shiki/langs/jsx.mjs"),
+          import("shiki/langs/python.mjs"),
+          import("shiki/langs/bash.mjs"),
+          import("shiki/langs/json.mjs"),
+          import("shiki/langs/go.mjs"),
+          import("shiki/langs/rust.mjs"),
+          import("shiki/langs/yaml.mjs"),
+          import("shiki/langs/markdown.mjs"),
+          import("shiki/langs/css.mjs"),
+          import("shiki/langs/html.mjs"),
+          import("shiki/langs/sql.mjs"),
+          import("shiki/langs/diff.mjs"),
+          import("shiki/langs/toml.mjs"),
+          import("shiki/langs/c.mjs"),
+          import("shiki/langs/cpp.mjs"),
+          import("shiki/langs/java.mjs"),
+          import("shiki/langs/ruby.mjs"),
+          import("shiki/langs/php.mjs"),
+          import("shiki/langs/dockerfile.mjs"),
+        ],
+        engine: createJavaScriptRegexEngine(),
+      })
+    );
+  }
+  return highlighterPromise;
 }
 
-// ── Full markdown → HTML (for message bodies) ───────────────────
-export function renderMarkdown(text: string): string {
-  // Extract code blocks BEFORE escaping so syntax highlighting sees raw text
-  const codeSlots: string[] = [];
-  let src = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, code) => {
-    const trimmed = code.trimEnd();
-    // Mermaid diagrams: emit a data attribute placeholder picked up by MermaidBlock
-    if (lang === "mermaid") {
-      const encoded = btoa(unescape(encodeURIComponent(trimmed)));
-      const block = `<div class="mermaid-placeholder" data-mermaid="${encoded}"></div>`;
-      codeSlots.push(block);
-      return `\x00CB${codeSlots.length - 1}\x00`;
-    }
-    const highlighted = lang ? syntaxHL(trimmed, lang) : esc(trimmed);
-    const langLabel = lang ? `<span class="code-lang">${esc(lang)}</span>` : "";
-    const block = `<div class="code-block">${langLabel}<pre><code>${highlighted}</code></pre></div>`;
-    codeSlots.push(block);
-    return `\x00CB${codeSlots.length - 1}\x00`;
-  });
+// react-markdown (v9+) no longer passes an `inline` flag to the `code`
+// renderer, so we thread "am I inside a fenced block?" via context: the
+// `pre` renderer (only used for fenced blocks) sets it to true for its
+// children before the nested `code` renderer reads it.
+const InFencedBlockContext = React.createContext(false);
 
-  let html = esc(src);
-
-  // Restore code blocks (placeholders survived escaping since \x00 isn't escaped)
-  html = html.replace(/\x00CB(\d+)\x00/g, (_, i) => codeSlots[Number(i)]);
-
-  // Inline code
-  html = html.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
-
-  // Headers
-  html = html.replace(/^#### (.+)$/gm, "<h4>$1</h4>");
-  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
-  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
-
-  // Bold and italic
-  html = html.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-
-  // Lists — both ordered (1. ) and unordered (- *) rendered as <ul> to match terminal
-  html = html.replace(/^\s*(?:[-*]|\d+\.)\s+(.+)$/gm, "<li>$1</li>");
-  html = html.replace(/((?:\s*<li>.*<\/li>\s*)+)/g, "<ul>$1</ul>");
-
-  // Horizontal rules
-  html = html.replace(/^---+$/gm, "<hr />");
-
-  // Tables — must run before paragraph conversion
-  // Matches: header row | separator row | body rows
-  html = html.replace(
-    /^(\|.+\|)\n\|[-| :]+\|\n((?:\|.+\|\n?)*)/gm,
-    (_match, headerRow, bodyRows) => {
-      const parseRow = (row: string) =>
-        row
-          .split("|")
-          .slice(1, -1)
-          .map((c) => c.trim());
-
-      const headers = parseRow(headerRow);
-      const rows = bodyRows
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map(parseRow);
-
-      const th = headers.map((h) => `<th>${h}</th>`).join("");
-      const tbody = rows
-        .map((cells: string[]) => `<tr>${cells.map((c: string) => `<td>${c}</td>`).join("")}</tr>`)
-        .join("");
-
-      return `<table class="md-table"><thead><tr>${th}</tr></thead><tbody>${tbody}</tbody></table>`;
-    }
-  );
-
-  // Blockquotes
-  html = html.replace(
-    /((?:^&gt; .+\n?)+)/gm,
-    (block) => {
-      const inner = block
-        .replace(/^&gt; /gm, "")
-        .trimEnd();
-      return `<blockquote>${inner}</blockquote>`;
-    }
-  );
-
-  // Links
-  html = html.replace(
-    /\[([^\]]+)\]\(([^)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener">$1</a>'
-  );
-
-  // Paragraphs
-  html = html.replace(/\n\n/g, "</p><p>");
-  html = html.replace(/\n/g, "<br />");
-
-  return html;
+function MarkdownPre({ children }: { children?: React.ReactNode }) {
+  return <InFencedBlockContext.Provider value={true}>{children}</InFencedBlockContext.Provider>;
 }
+
+function FencedCodeBlock({ lang, code }: { lang?: string; code: string }) {
+  const [html, setHtml] = useState<string | null>(null);
+
+  useEffect(() => {
+    setHtml(null);
+    if (!lang || lang === "mermaid" || code.length > MAX_HIGHLIGHT_CHARS) return;
+    let cancelled = false;
+    getHighlighter().then((hl) => {
+      if (cancelled) return;
+      const loaded = hl.getLoadedLanguages() as string[];
+      const useLang = loaded.includes(lang) ? lang : "text";
+      try {
+        setHtml(hl.codeToHtml(code, { lang: useLang, theme: SHIKI_THEME }));
+      } catch {
+        // Unrecognized language/token error — leave the plain fallback rendered.
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [code, lang]);
+
+  if (lang === "mermaid") {
+    const encoded = btoa(unescape(encodeURIComponent(code)));
+    return <div className="mermaid-placeholder" data-mermaid={encoded} />;
+  }
+
+  return (
+    <div className="code-block">
+      {lang && <span className="code-lang">{lang}</span>}
+      {html ? (
+        <div className="shiki-wrap" dangerouslySetInnerHTML={{ __html: html }} />
+      ) : (
+        <pre>
+          <code>{code}</code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function MarkdownCode({ className, children }: { className?: string; children?: React.ReactNode }) {
+  const isFenced = useContext(InFencedBlockContext);
+  const code = String(children ?? "").replace(/\n$/, "");
+
+  if (!isFenced) {
+    return <code className="inline-code">{code}</code>;
+  }
+
+  const lang = /language-(\w+)/.exec(className || "")?.[1];
+  return <FencedCodeBlock lang={lang} code={code} />;
+}
+
+const markdownComponents: Components = {
+  pre: MarkdownPre,
+  code: MarkdownCode,
+  table: ({ children }) => <table className="md-table">{children}</table>,
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
+  ),
+};
+
+/** Render full markdown (message bodies) as a React tree. */
+export const MarkdownBody = React.memo(function MarkdownBody({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>
+      {text}
+    </ReactMarkdown>
+  );
+});
 
 // ── Inline format (for snippets, previews, context lines) ───────
 // Renders inline markdown (bold, code, italic) as HTML string.

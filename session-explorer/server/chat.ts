@@ -171,7 +171,8 @@ function executeSql(
   }
   try {
     const stmt = readDb.prepare(query);
-    const rows = stmt.all(...params);
+    // params arrive as JSON from the chat tool call — plain scalars only.
+    const rows = stmt.all(...(params as (string | number | boolean | null)[]));
     return { rows };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

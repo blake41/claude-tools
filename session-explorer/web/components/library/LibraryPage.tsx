@@ -104,7 +104,10 @@ export default function LibraryPage() {
   const inspirations = data?.facets.inspiration ?? [];
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-screen">
+      {/* Own bounded height + internal scroll panes, independent of the
+          (now window-scrolling) outer <main> — this two-pane layout still
+          scrolls internally by design, unlike SessionDetail. */}
       {/* Filters sidebar */}
       <aside className="w-[220px] min-w-[220px] border-r border-border/40 px-4 py-5 overflow-y-auto bg-[#0c0c12]">
         <div className="mb-5">

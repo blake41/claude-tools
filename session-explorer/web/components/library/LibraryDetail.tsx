@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { libraryDetailRoute } from "../../router";
-import { renderMarkdown } from "../../sessionFormat";
+import { MarkdownBody } from "../../sessionFormat";
 import {
   type LibraryArtifact,
   type LibraryListItem,
@@ -210,10 +210,9 @@ export default function LibraryDetail() {
             </pre>
           </>
         ) : (
-          <div
-            className="message-body"
-            dangerouslySetInnerHTML={{ __html: `<p>${renderMarkdown(artifact.body)}</p>` }}
-          />
+          <div className="message-body">
+            <MarkdownBody text={artifact.body} />
+          </div>
         )}
       </section>
 

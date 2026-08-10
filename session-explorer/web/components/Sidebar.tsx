@@ -161,7 +161,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
 
   if (collapsed) {
     return (
-      <aside className="w-[44px] min-w-[44px] bg-[#101018] border-r border-border/50 flex flex-col items-center py-3 gap-1.5">
+      <aside className="sticky top-0 h-screen w-[44px] min-w-[44px] bg-[#101018] border-r border-border/50 flex flex-col items-center py-3 gap-1.5">
         <button
           className="p-1.5 rounded-md text-text-dim transition-all hover:text-text hover:bg-white/8"
           onClick={() => setCollapsed(false)}
@@ -219,7 +219,7 @@ export default function Sidebar({ workspaces, onSearchClick }: SidebarProps) {
   }
 
   return (
-    <aside className="w-[230px] min-w-[230px] bg-[#101018] border-r border-border/50 flex flex-col overflow-hidden">
+    <aside className="sticky top-0 h-screen w-[230px] min-w-[230px] bg-[#101018] border-r border-border/50 flex flex-col overflow-hidden">
       {/* Header: Diamond icon + Explorer + Search + Collapse */}
       <div className="flex items-center gap-1.5 px-4 pt-5 pb-3">
         <Link to="/" className="flex items-center gap-2.5 no-underline text-inherit hover:no-underline flex-1 min-w-0">

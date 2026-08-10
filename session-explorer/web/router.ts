@@ -24,6 +24,11 @@ export const sessionRoute = createRoute({
   }),
 });
 
+export const sessionTraceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/session/$id/trace",
+});
+
 export const tagRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/tag/$name",
@@ -118,6 +123,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   workspaceRoute,
   sessionRoute,
+  sessionTraceRoute,
   tagRoute,
   fileRoute,
   askRoute,

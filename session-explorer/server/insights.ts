@@ -98,15 +98,6 @@ const getSessionSourceBreakdown = db.prepare(`
   WHERE session_id = ? GROUP BY source
 `);
 
-const getSetting = db.prepare(`
-  SELECT value FROM settings WHERE key = ?
-`);
-
-const upsertSetting = db.prepare(`
-  INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-`);
-
 // ── XML Noise Cleanup ──────────────────────────────────────────────
 
 function cleanXmlNoise(text: string): string {
@@ -409,9 +400,41 @@ export function startExtraction(workspaceId: number, force?: boolean): {
   return extractionJob.start(
     sessions,
     (s) => s.id,
-    async (s) => extractFromSession(s.id),
-    () => upsertSetting.run("extraction_last_run", new Date().toISOString())
+    async (s) => extractFromSession(s.id)
   );
+}
+
+// ── Lazy on-open extraction ──────────────────────────────────────────
+//
+// The old trigger was a periodic background sweep (interval_days elapsed)
+// across every unextracted session in the DB, whether or not anyone ever
+// reopened it — real Sonnet cost spent on sessions nobody looks at again.
+// Extraction now fires only when a session is actually opened, gated on
+// the same insights_extracted flag. `extractingSessions` guards against a
+// double-fire from rapid repeat opens of the same session.
+
+const sessionExtractionEligibility = db.prepare(`
+  SELECT insights_extracted, message_count FROM sessions WHERE id = ?
+`);
+
+const extractingSessions = new Set<string>();
+
+export function maybeExtractInsightsOnOpen(sessionId: string): void {
+  if (extractionJob.isRunning || extractingSessions.has(sessionId)) return;
+
+  const row = sessionExtractionEligibility.get(sessionId) as
+    | { insights_extracted: number; message_count: number }
+    | undefined;
+  if (!row || row.insights_extracted || row.message_count <= 5) return;
+
+  extractingSessions.add(sessionId);
+  extractFromSession(sessionId)
+    .catch((err) => {
+      console.error(`[insights] on-open extraction failed for session ${sessionId}:`, err);
+    })
+    .finally(() => {
+      extractingSessions.delete(sessionId);
+    });
 }
 
 export function getExtractionStatus() {
@@ -464,15 +487,3 @@ export function deleteInsight(insightId: number): boolean {
   return true;
 }
 
-export function getExtractionSettings(): { interval_days: number; last_run: string | null } {
-  const interval = getSetting.get("extraction_interval_days") as { value: string } | undefined;
-  const lastRun = getSetting.get("extraction_last_run") as { value: string } | undefined;
-  return {
-    interval_days: interval ? Number(interval.value) : 7,
-    last_run: lastRun?.value ?? null,
-  };
-}
-
-export function setExtractionInterval(days: number): void {
-  upsertSetting.run("extraction_interval_days", String(days));
-}

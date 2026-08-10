@@ -3,6 +3,7 @@ import { Outlet, useNavigate, useLocation, useParams, useSearch } from "@tanstac
 import Sidebar from "./components/Sidebar";
 import SessionList from "./components/SessionList";
 import SessionDetail from "./components/SessionDetail";
+import TraceView from "./components/TraceView";
 import Search from "./components/Search";
 import SessionCard from "./components/SessionCard";
 // AskView is now rendered inside the Search overlay's "Ask AI" tab
@@ -20,6 +21,7 @@ import {
   indexRoute,
   workspaceRoute,
   sessionRoute,
+  sessionTraceRoute,
   tagRoute,
   fileRoute,
   askRoute,
@@ -233,6 +235,10 @@ function WorkspaceView() {
 
 function SessionView() {
   return <SessionDetail />;
+}
+
+function SessionTraceView() {
+  return <TraceView />;
 }
 
 function formatTagDate(dateStr: string): string {
@@ -542,9 +548,12 @@ function RootLayout() {
   return (
     <WorkspacesContext.Provider value={workspaces}>
       <SearchClickContext.Provider value={handleSearchClick}>
-        <div className="flex h-full">
+        <div className="flex min-h-full">
           <Sidebar workspaces={workspaces} onSearchClick={handleSearchClick} />
-          <main className="flex-1 overflow-y-auto relative">
+          {/* No overflow/height constraint here — content scrolls with the
+              browser window (space bar, Home/End, automation all work).
+              Sidebar is sticky so it stays put as the window scrolls. */}
+          <main className="flex-1 relative">
             {isSearchOpen && <SearchOverlay />}
             <Outlet />
           </main>
@@ -560,6 +569,7 @@ rootRoute.update({ component: RootLayout });
 indexRoute.update({ component: Dashboard });
 workspaceRoute.update({ component: WorkspaceView });
 sessionRoute.update({ component: SessionView });
+sessionTraceRoute.update({ component: SessionTraceView });
 tagRoute.update({ component: TagView });
 fileRoute.update({ component: FileView });
 askRoute.update({ component: () => null });

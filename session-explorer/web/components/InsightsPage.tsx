@@ -40,7 +40,6 @@ export default function InsightsPage() {
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [extractionInterval, setExtractionInterval] = useState(3);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<InsightDetail | null>(null);
   const [votes, setVotes] = useState<Record<number, { upvotes: number; downvotes: number }>>({});
@@ -60,16 +59,6 @@ export default function InsightsPage() {
     fetch("/api/insights/stats")
       .then((r) => r.json())
       .then((data) => setStats(data))
-      .catch(() => {});
-  }, []);
-
-  // Fetch extraction settings
-  useEffect(() => {
-    fetch("/api/settings/extraction")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.interval_days) setExtractionInterval(data.interval_days);
-      })
       .catch(() => {});
   }, []);
 
@@ -93,15 +82,6 @@ export default function InsightsPage() {
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [typeFilter, sort, refreshKey]);
-
-  function handleIntervalChange(days: number) {
-    setExtractionInterval(days);
-    fetch("/api/settings/extraction", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ interval_days: days }),
-    }).catch(() => {});
-  }
 
   function handleExpand(id: number) {
     if (expandedId === id) {
@@ -175,15 +155,6 @@ export default function InsightsPage() {
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-[22px] font-semibold tracking-tight text-text">Insights</h1>
         <div className="flex items-center gap-3">
-          <select
-            className="bg-white/6 border border-border rounded-md px-2.5 py-1.5 text-[11px] text-text-secondary outline-none cursor-pointer hover:border-border/80"
-            value={extractionInterval}
-            onChange={(e) => handleIntervalChange(Number(e.target.value))}
-          >
-            <option value={1}>Every 1 day</option>
-            <option value={3}>Every 3 days</option>
-            <option value={7}>Every 7 days</option>
-          </select>
           <button
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-text bg-accent-purple/15 border border-accent-purple/30 rounded-lg transition-all hover:bg-accent-purple/25 disabled:opacity-40"
             onClick={handleExtract}
