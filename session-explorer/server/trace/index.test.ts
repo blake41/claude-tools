@@ -388,7 +388,9 @@ describe("shapeTraceForResponse (lean trace payload)", () => {
     expect(JSON.stringify(lean).length).toBeLessThan(JSON.stringify(detail).length);
   });
 
-  test("drops a user chunk that's entirely harness noise (e.g. a <task-notification>-only turn), matching what the CLI itself never shows", () => {
+  test("extracts a <task-notification>-only turn into a structured taskNotifications entry, not raw text", () => {
+    // Mirrors claude-devtools' UserChatGroup.tsx: the notification renders as
+    // a distinct status card, not the raw XML and not a blank bubble.
     const realMsg = baseMessage({
       uuid: "u-real",
       type: "user",
@@ -401,15 +403,40 @@ describe("shapeTraceForResponse (lean trace payload)", () => {
       type: "user",
       role: "user",
       content:
-        '<task-notification>\n<task-id>beenj16rq</task-id>\n<summary>Monitor event</summary>\n</task-notification>',
+        '<task-notification>\n<task-id>beenj16rq</task-id>\n<status>completed</status>\n<summary>Background command "Run foo" completed (exit code 0)</summary>\n<output-file>/tmp/out.log</output-file>\n</task-notification>',
       timestamp: new Date("2026-08-01T00:00:01.000Z"),
     });
     const session = fixtureSession({ messageCount: 2 });
     const detail = new ChunkBuilder().buildSessionDetail(session, [realMsg, noiseMsg], []);
     const lean = shapeTraceForResponse(detail);
 
-    expect(lean.chunks).toHaveLength(1);
+    expect(lean.chunks).toHaveLength(2);
     expect((lean.chunks[0] as LeanUserChunk).text).toBe("a real question");
+
+    const noiseChunk = lean.chunks[1] as LeanUserChunk;
+    expect(noiseChunk.text).toBe("");
+    expect(noiseChunk.taskNotifications).toHaveLength(1);
+    expect(noiseChunk.taskNotifications![0]).toEqual({
+      taskId: "beenj16rq",
+      status: "completed",
+      summary: 'Background command "Run foo" completed (exit code 0)',
+      outputFile: "/tmp/out.log",
+    });
+  });
+
+  test("drops a user chunk with no text, no image, and no task-notification — genuinely nothing to show", () => {
+    const noiseMsg = baseMessage({
+      uuid: "u-bare-noise",
+      type: "user",
+      role: "user",
+      content: "<system-reminder>internal context, no task notification here</system-reminder>",
+      timestamp: new Date("2026-08-01T00:00:00.000Z"),
+    });
+    const session = fixtureSession({ messageCount: 1 });
+    const detail = new ChunkBuilder().buildSessionDetail(session, [noiseMsg], []);
+    const lean = shapeTraceForResponse(detail);
+
+    expect(lean.chunks).toHaveLength(0);
   });
 
   test("renders a compact_boundary message as a 'compact' lean chunk", () => {

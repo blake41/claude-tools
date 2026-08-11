@@ -114,11 +114,19 @@ interface TraceChunkBase {
   metrics: TraceSessionMetrics;
 }
 
+export interface TraceTaskNotification {
+  taskId: string;
+  status: string;
+  summary: string;
+  outputFile: string;
+}
+
 export interface TraceUserChunk extends TraceChunkBase {
   chunkType: "user";
   text: string;
   textTruncated?: boolean;
   hasImage: boolean;
+  taskNotifications?: TraceTaskNotification[];
 }
 
 export interface TraceSystemChunk extends TraceChunkBase {

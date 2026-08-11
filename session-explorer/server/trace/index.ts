@@ -32,7 +32,7 @@ import { ProjectScanner } from "./vendor/main/services/discovery/ProjectScanner"
 import { SubagentResolver } from "./vendor/main/services/discovery/SubagentResolver";
 import { LocalFileSystemProvider } from "./vendor/main/services/infrastructure/LocalFileSystemProvider";
 import { SessionParser } from "./vendor/main/services/parsing/SessionParser";
-import { sanitizeDisplayContent } from "./vendor/shared/utils/contentSanitizer";
+import { parseTaskNotifications, sanitizeDisplayContent, type TaskNotification } from "./vendor/shared/utils/contentSanitizer";
 import { computeActivePath } from "./active-path";
 
 import {
@@ -496,20 +496,22 @@ function capDeep(value: unknown, cap: number, budget: { remaining: number } = { 
   return { value, truncated: false };
 }
 
-/** Extract plain text (+ whether an image block is present) from a ParsedMessage's content. */
-function messageText(msg: ParsedMessage): { text: string; hasImage: boolean } {
+/** Extract plain text (+ whether an image block is present) from a ParsedMessage's content. `rawText` is the same text before sanitizeDisplayContent runs — needed by callers that want to parse structured info (e.g. task notifications) out of the original XML-tagged content, same split as claude-devtools' own UserChatGroup.tsx (sanitizes for the bubble, re-reads the raw message content separately for notification cards). */
+function messageText(msg: ParsedMessage): { text: string; rawText: string; hasImage: boolean } {
   const content = msg.content;
-  if (typeof content === "string") return { text: sanitizeDisplayContent(content), hasImage: false };
-  if (!Array.isArray(content)) return { text: "", hasImage: false };
+  if (typeof content === "string") return { text: sanitizeDisplayContent(content), rawText: content, hasImage: false };
+  if (!Array.isArray(content)) return { text: "", rawText: "", hasImage: false };
   let hasImage = false;
+  const rawParts: string[] = [];
   const parts: string[] = [];
   for (const block of content) {
     if (block.type === "text") {
+      rawParts.push(block.text);
       const sanitized = sanitizeDisplayContent(block.text);
       if (sanitized.length > 0) parts.push(sanitized);
     } else if (block.type === "image") hasImage = true;
   }
-  return { text: parts.join("\n"), hasImage };
+  return { text: parts.join("\n"), rawText: rawParts.join(""), hasImage };
 }
 
 export interface LeanStep {
@@ -672,6 +674,8 @@ export interface LeanUserChunk extends LeanChunkBase {
   text: string;
   textTruncated?: boolean;
   hasImage: boolean;
+  /** Structured background-task-completion events extracted from this message's raw (pre-sanitize) content via the vendored parseTaskNotifications — same split as claude-devtools' UserChatGroup.tsx, which renders these as distinct status cards rather than raw XML or blank text. */
+  taskNotifications?: TaskNotification[];
 }
 
 export interface LeanSystemChunk extends LeanChunkBase {
@@ -708,9 +712,17 @@ function shapeChunk(chunk: Chunk, chunkBuilder: ChunkBuilder): LeanChunk {
   };
 
   if (isUserChunk(chunk)) {
-    const { text, hasImage } = messageText(chunk.userMessage);
+    const { text, rawText, hasImage } = messageText(chunk.userMessage);
     const capped = capString(text, CHUNK_TEXT_CAP);
-    return { ...base, chunkType: "user", text: capped.value, textTruncated: capped.truncated || undefined, hasImage };
+    const taskNotifications = parseTaskNotifications(rawText);
+    return {
+      ...base,
+      chunkType: "user",
+      text: capped.value,
+      textTruncated: capped.truncated || undefined,
+      hasImage,
+      taskNotifications: taskNotifications.length > 0 ? taskNotifications : undefined,
+    };
   }
 
   if (isSystemChunk(chunk)) {
@@ -768,15 +780,17 @@ export interface LeanSessionDetail {
  */
 export function shapeTraceForResponse(detail: SessionDetail): LeanSessionDetail {
   const chunkBuilder = new ChunkBuilder();
-  // A user chunk whose entire message was harness noise (e.g. a
-  // <task-notification>-only turn injected by a background job) sanitizes
-  // down to an empty string with no image — the CLI never shows these turns
-  // at all, and UserChunkRow renders unconditionally regardless of content,
-  // so an unfiltered empty chunk here would show up as a hollow "You" bubble
-  // with nothing in it. Drop them, matching the CLI's own behavior.
+  // A user chunk with no text, no image, AND no task-notification card has
+  // nothing to show at all — same as claude-devtools' own UserChatGroup.tsx,
+  // which conditionally renders the text bubble (`{textContent && ...}`) and
+  // the notification cards (`{taskNotifications.length > 0 && ...}`)
+  // independently, but has nothing left to display when both are absent
+  // (e.g. a user message that was purely a bare <system-reminder>, with no
+  // task-notification content). Drop only that fully-empty case; a chunk
+  // with a notification card but no free text still renders (just the card).
   const chunks = detail.chunks
     .map((c) => shapeChunk(c, chunkBuilder))
-    .filter((c) => !(c.chunkType === "user" && c.text === "" && !c.hasImage));
+    .filter((c) => !(c.chunkType === "user" && c.text === "" && !c.hasImage && !c.taskNotifications?.length));
 
   const attachedIds = new Set<string>();
   for (const chunk of detail.chunks) {

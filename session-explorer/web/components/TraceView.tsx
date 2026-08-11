@@ -64,6 +64,43 @@ function ChunkContextBar({ tokens, max }: { tokens: number | undefined; max: num
   );
 }
 
+const CHECK_ICON = (
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.3" /><path d="M5.5 8.2l1.7 1.7 3.3-3.8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" /></svg>
+);
+const X_ICON = (
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.3" /><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
+);
+const CIRCLE_ICON = (
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.3" /></svg>
+);
+
+/** Mirrors claude-devtools' UserChatGroup.tsx task-notification card — same status/exit-code extraction regexes over notif.summary, reusing the vendored parseTaskNotifications output (see server/trace/index.ts's shapeChunk). A background-task-completion event, not a literal user message; shown as a status card, not raw XML or a blank bubble. */
+function TaskNotificationCard({ notif }: { notif: NonNullable<TraceUserChunk["taskNotifications"]>[number] }) {
+  const isCompleted = notif.status === "completed";
+  const isFailed = notif.status === "failed" || notif.status === "error";
+  const icon = isFailed ? X_ICON : isCompleted ? CHECK_ICON : CIRCLE_ICON;
+  const color = isFailed ? "text-accent-red" : isCompleted ? "text-accent-green" : "text-text-dim";
+
+  const cmdMatch = /"([^"]+)"/.exec(notif.summary);
+  const cmdName = cmdMatch?.[1] ?? notif.summary;
+  const exitMatch = /\(exit code (\d+)\)/.exec(notif.summary);
+  const exitCode = exitMatch?.[1];
+
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-border bg-bg-card/60 px-2.5 py-1.5">
+      <span className={`mt-0.5 shrink-0 ${color}`}>{icon}</span>
+      <div className="min-w-0 flex-1">
+        <div className="text-[12px] font-medium text-text-secondary truncate">{cmdName}</div>
+        <div className="flex items-center gap-1.5 text-[10px] text-text-dim">
+          <span className="capitalize">{notif.status}</span>
+          {exitCode != null && <span>exit {exitCode}</span>}
+          {notif.outputFile && <span className="truncate">{notif.outputFile.split("/").pop()}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function UserChunkRow({ chunk, highlight }: { chunk: TraceUserChunk; highlight: boolean }) {
   const [storedExpanded, setExpanded] = usePersistedExpand(`chunk-${chunk.id}`);
   const expanded = storedExpanded || highlight;
@@ -76,13 +113,22 @@ function UserChunkRow({ chunk, highlight }: { chunk: TraceUserChunk; highlight: 
         {chunk.hasImage && <span className="text-[10px] text-text-dim">(includes image)</span>}
         <span className="ml-auto text-[10px] font-mono text-text-dim/60">{formatClockTime(chunk.startTime)}</span>
       </div>
-      <div className="text-[13px] text-text leading-relaxed whitespace-pre-wrap">
-        <MarkdownBody text={expanded && chunk.textTruncated ? preview + "\n… (truncated)" : preview} />
-      </div>
+      {chunk.text && (
+        <div className="text-[13px] text-text leading-relaxed whitespace-pre-wrap">
+          <MarkdownBody text={expanded && chunk.textTruncated ? preview + "\n… (truncated)" : preview} />
+        </div>
+      )}
       {long && (
         <button className="text-[11px] text-accent-blue mt-1 opacity-80 hover:opacity-100" onClick={() => setExpanded((e) => !e)}>
           {expanded ? "Show less" : "Show more"}
         </button>
+      )}
+      {chunk.taskNotifications && chunk.taskNotifications.length > 0 && (
+        <div className={`space-y-1.5 ${chunk.text ? "mt-2" : ""}`}>
+          {chunk.taskNotifications.map((n) => (
+            <TaskNotificationCard key={n.taskId} notif={n} />
+          ))}
+        </div>
       )}
     </div>
   );
