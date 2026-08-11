@@ -388,6 +388,30 @@ describe("shapeTraceForResponse (lean trace payload)", () => {
     expect(JSON.stringify(lean).length).toBeLessThan(JSON.stringify(detail).length);
   });
 
+  test("drops a user chunk that's entirely harness noise (e.g. a <task-notification>-only turn), matching what the CLI itself never shows", () => {
+    const realMsg = baseMessage({
+      uuid: "u-real",
+      type: "user",
+      role: "user",
+      content: "a real question",
+      timestamp: new Date("2026-08-01T00:00:00.000Z"),
+    });
+    const noiseMsg = baseMessage({
+      uuid: "u-noise",
+      type: "user",
+      role: "user",
+      content:
+        '<task-notification>\n<task-id>beenj16rq</task-id>\n<summary>Monitor event</summary>\n</task-notification>',
+      timestamp: new Date("2026-08-01T00:00:01.000Z"),
+    });
+    const session = fixtureSession({ messageCount: 2 });
+    const detail = new ChunkBuilder().buildSessionDetail(session, [realMsg, noiseMsg], []);
+    const lean = shapeTraceForResponse(detail);
+
+    expect(lean.chunks).toHaveLength(1);
+    expect((lean.chunks[0] as LeanUserChunk).text).toBe("a real question");
+  });
+
   test("renders a compact_boundary message as a 'compact' lean chunk", () => {
     const compactMsg = baseMessage({
       uuid: "c1",

@@ -768,7 +768,15 @@ export interface LeanSessionDetail {
  */
 export function shapeTraceForResponse(detail: SessionDetail): LeanSessionDetail {
   const chunkBuilder = new ChunkBuilder();
-  const chunks = detail.chunks.map((c) => shapeChunk(c, chunkBuilder));
+  // A user chunk whose entire message was harness noise (e.g. a
+  // <task-notification>-only turn injected by a background job) sanitizes
+  // down to an empty string with no image — the CLI never shows these turns
+  // at all, and UserChunkRow renders unconditionally regardless of content,
+  // so an unfiltered empty chunk here would show up as a hollow "You" bubble
+  // with nothing in it. Drop them, matching the CLI's own behavior.
+  const chunks = detail.chunks
+    .map((c) => shapeChunk(c, chunkBuilder))
+    .filter((c) => !(c.chunkType === "user" && c.text === "" && !c.hasImage));
 
   const attachedIds = new Set<string>();
   for (const chunk of detail.chunks) {
