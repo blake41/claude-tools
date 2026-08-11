@@ -427,7 +427,12 @@ function SearchResultCard({
                 className={`result-snippet ${isToolMatch ? 'type-tool' : isUser ? 'type-user' : 'type-claude'}`}
                 onClick={(e) => {
                   e.stopPropagation();
-                  onNavigate(`/session/${result.id}?msg=${match.sequence}`);
+                  // Deep-link by timestamp, not `sequence` — trace chunk ids
+                  // (what SessionDetail resolves `?msg=` against) have no
+                  // relation to the old numeric `messages.sequence`. See
+                  // SessionDetail's `resolvedTsChunkId` for how `ts` is
+                  // turned into the right chunk to scroll to/highlight.
+                  onNavigate(`/session/${result.id}?ts=${encodeURIComponent(match.timestamp)}`);
                 }}
               >
                 {isToolMatch ? (

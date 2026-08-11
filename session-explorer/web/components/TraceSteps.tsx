@@ -2,6 +2,7 @@ import React, { useMemo, useState } from "react";
 import { MarkdownBody } from "../sessionFormat";
 import { formatClockTime, formatDuration, formatTokens, isLong } from "../traceFormat";
 import type { StructuredPatchHunk, TraceStep, TraceSubagent } from "../traceTypes";
+import { usePersistedExpand } from "../hooks/usePersistedExpand";
 import TraceDiff from "./TraceDiff";
 
 // ─── Row model ──────────────────────────────────────────────────────────────
@@ -131,21 +132,37 @@ function ThinkingStepRow({ step }: { step: TraceStep }) {
   );
 }
 
+// The assistant's actual response text — unlike thinking/tool-call steps,
+// this is the payload the user came here to read, so it renders fully
+// visible by default (same full-text/"Show more" pattern as TraceView's
+// UserChunkRow) instead of behind the click-to-reveal StepRow accordion.
+// Keyed by the step's own id (unique per step, see the Row model doc at the
+// top of this file) rather than a chunk id, so expand state persists across
+// virtualization remounts without colliding with the parent chunk's own
+// persisted-expand entry.
 function OutputStepRow({ step }: { step: TraceStep }) {
   const text = step.outputText ?? "";
-  const preview = isLong(text) ? text.slice(0, 200) + "…" : text;
+  const [expanded, setExpanded] = usePersistedExpand(`step-${step.id}`);
+  const long = isLong(text);
+  const preview = long && !expanded ? text.slice(0, 280) + "…" : text;
   return (
-    <StepRow
-      icon={OUTPUT_ICON}
-      label={isLong(text) ? preview : text || "(empty)"}
-      time={formatClockTime(step.startTime)}
-      badges={<>
+    <div className="border border-border/60 rounded-md bg-bg-card/60 px-2.5 py-2">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="shrink-0 text-text-dim">{OUTPUT_ICON}</span>
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-text-dim flex-1 min-w-0">Response</span>
         {step.tokenCount !== undefined && <Badge>{formatTokens(step.tokenCount)} tok</Badge>}
         {step.outputTruncated && <Badge tone="error">truncated</Badge>}
-      </>}
-    >
-      {isLong(text) && <MarkdownBody text={text} />}
-    </StepRow>
+        <span className="text-[10px] font-mono text-text-dim/60 shrink-0">{formatClockTime(step.startTime)}</span>
+      </div>
+      <div className="text-[13px] text-text leading-relaxed whitespace-pre-wrap">
+        {text ? <MarkdownBody text={preview} /> : <span className="text-text-dim italic">(empty)</span>}
+      </div>
+      {long && (
+        <button className="text-[11px] text-accent-blue mt-1 opacity-80 hover:opacity-100" onClick={() => setExpanded((e) => !e)}>
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
   );
 }
 

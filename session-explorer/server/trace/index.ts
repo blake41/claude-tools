@@ -32,6 +32,7 @@ import { ProjectScanner } from "./vendor/main/services/discovery/ProjectScanner"
 import { SubagentResolver } from "./vendor/main/services/discovery/SubagentResolver";
 import { LocalFileSystemProvider } from "./vendor/main/services/infrastructure/LocalFileSystemProvider";
 import { SessionParser } from "./vendor/main/services/parsing/SessionParser";
+import { sanitizeDisplayContent } from "./vendor/shared/utils/contentSanitizer";
 import { computeActivePath } from "./active-path";
 
 import {
@@ -437,6 +438,10 @@ export async function buildTrace(sessionId: string): Promise<SessionDetail> {
 const TOOL_PAYLOAD_CAP = 4000;
 /** Cap for prose fields (thinking/output text) — generous enough to keep virtually all real content, just a backstop against pathological outliers. */
 const PROSE_CAP = 8000;
+/** Cap for user/system/compact chunk `text` — these come straight from messageText() with no per-field cap at all otherwise. 64k covers the largest legitimate pasted-content prompt observed across a real transcript sample (~51k) with headroom; a session with a single 47MB pasted string (console-log spam) is what this actually guards against. */
+const CHUNK_TEXT_CAP = 64_000;
+/** Aggregate budget per capDeep() invocation (i.e. per tool_use input / toolUseResult field) — bounds the case where many leaves each pass the per-string TOOL_PAYLOAD_CAP but the total still balloons (e.g. a huge array of capped-but-numerous strings, or a structuredPatch with thousands of lines). Not a session-global budget: each field gets its own fresh allowance, so truncation of one field never depends on how much other fields in the same chunk already used. */
+const TOOL_PAYLOAD_AGGREGATE_CAP = 100_000;
 
 interface Capped<T> {
   value: T;
@@ -447,23 +452,42 @@ function capString(s: string, cap: number): Capped<string> {
   return s.length <= cap ? { value: s, truncated: false } : { value: s.slice(0, cap), truncated: true };
 }
 
-/** Recursively cap string leaves inside an arbitrary JSON-ish tool payload (tool_use input / toolUseResult). Non-string structure (arrays, structuredPatch hunks, numbers, booleans) passes through untouched. */
-function capDeep(value: unknown, cap: number): Capped<unknown> {
-  if (typeof value === "string") return capString(value, cap);
+/** Recursively cap string leaves inside an arbitrary JSON-ish tool payload (tool_use input / toolUseResult), also enforcing an aggregate size budget across the whole value so many small-but-numerous leaves can't add up past a reasonable total. Non-string structure (arrays, structuredPatch hunks, numbers, booleans) passes through untouched except for the aggregate-budget array/object truncation markers below. */
+function capDeep(value: unknown, cap: number, budget: { remaining: number } = { remaining: TOOL_PAYLOAD_AGGREGATE_CAP }): Capped<unknown> {
+  if (typeof value === "string") {
+    if (budget.remaining <= 0) return { value: "", truncated: true };
+    const allowed = Math.min(cap, budget.remaining);
+    const kept = value.length <= allowed ? value : value.slice(0, allowed);
+    budget.remaining -= kept.length;
+    return { value: kept, truncated: kept.length < value.length };
+  }
   if (Array.isArray(value)) {
     let truncated = false;
-    const arr = value.map((item) => {
-      const r = capDeep(item, cap);
+    const arr: unknown[] = [];
+    for (let i = 0; i < value.length; i++) {
+      if (budget.remaining <= 0) {
+        arr.push(`… [${value.length - i} more items truncated]`);
+        truncated = true;
+        break;
+      }
+      const r = capDeep(value[i], cap, budget);
       if (r.truncated) truncated = true;
-      return r.value;
-    });
+      arr.push(r.value);
+    }
     return { value: arr, truncated };
   }
   if (value !== null && typeof value === "object") {
     let truncated = false;
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const r = capDeep(v, cap);
+    const entries = Object.entries(value as Record<string, unknown>);
+    for (let i = 0; i < entries.length; i++) {
+      const [k, v] = entries[i];
+      if (budget.remaining <= 0) {
+        out["…truncated"] = `${entries.length - i} more fields truncated`;
+        truncated = true;
+        break;
+      }
+      const r = capDeep(v, cap, budget);
       if (r.truncated) truncated = true;
       out[k] = r.value;
     }
@@ -475,13 +499,15 @@ function capDeep(value: unknown, cap: number): Capped<unknown> {
 /** Extract plain text (+ whether an image block is present) from a ParsedMessage's content. */
 function messageText(msg: ParsedMessage): { text: string; hasImage: boolean } {
   const content = msg.content;
-  if (typeof content === "string") return { text: content, hasImage: false };
+  if (typeof content === "string") return { text: sanitizeDisplayContent(content), hasImage: false };
   if (!Array.isArray(content)) return { text: "", hasImage: false };
   let hasImage = false;
   const parts: string[] = [];
   for (const block of content) {
-    if (block.type === "text") parts.push(block.text);
-    else if (block.type === "image") hasImage = true;
+    if (block.type === "text") {
+      const sanitized = sanitizeDisplayContent(block.text);
+      if (sanitized.length > 0) parts.push(sanitized);
+    } else if (block.type === "image") hasImage = true;
   }
   return { text: parts.join("\n"), hasImage };
 }
@@ -644,12 +670,14 @@ interface LeanChunkBase {
 export interface LeanUserChunk extends LeanChunkBase {
   chunkType: "user";
   text: string;
+  textTruncated?: boolean;
   hasImage: boolean;
 }
 
 export interface LeanSystemChunk extends LeanChunkBase {
   chunkType: "system";
   text: string;
+  textTruncated?: boolean;
   commandOutput: string;
   commandOutputTruncated?: boolean;
 }
@@ -657,6 +685,7 @@ export interface LeanSystemChunk extends LeanChunkBase {
 export interface LeanCompactChunk extends LeanChunkBase {
   chunkType: "compact";
   text: string;
+  textTruncated?: boolean;
 }
 
 export interface LeanAIChunk extends LeanChunkBase {
@@ -680,16 +709,19 @@ function shapeChunk(chunk: Chunk, chunkBuilder: ChunkBuilder): LeanChunk {
 
   if (isUserChunk(chunk)) {
     const { text, hasImage } = messageText(chunk.userMessage);
-    return { ...base, chunkType: "user", text, hasImage };
+    const capped = capString(text, CHUNK_TEXT_CAP);
+    return { ...base, chunkType: "user", text: capped.value, textTruncated: capped.truncated || undefined, hasImage };
   }
 
   if (isSystemChunk(chunk)) {
     const { text } = messageText(chunk.message);
+    const cappedText = capString(text, CHUNK_TEXT_CAP);
     const capped = capString(chunk.commandOutput, TOOL_PAYLOAD_CAP);
     return {
       ...base,
       chunkType: "system",
-      text,
+      text: cappedText.value,
+      textTruncated: cappedText.truncated || undefined,
       commandOutput: capped.value,
       commandOutputTruncated: capped.truncated || undefined,
     };
@@ -697,7 +729,8 @@ function shapeChunk(chunk: Chunk, chunkBuilder: ChunkBuilder): LeanChunk {
 
   if (isCompactChunk(chunk)) {
     const { text } = messageText(chunk.message);
-    return { ...base, chunkType: "compact", text };
+    const capped = capString(text, CHUNK_TEXT_CAP);
+    return { ...base, chunkType: "compact", text: capped.value, textTruncated: capped.truncated || undefined };
   }
 
   // AI chunk. ChunkBuilder.buildChunks() (called by buildSessionDetail above)

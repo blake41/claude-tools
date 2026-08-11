@@ -117,12 +117,14 @@ interface TraceChunkBase {
 export interface TraceUserChunk extends TraceChunkBase {
   chunkType: "user";
   text: string;
+  textTruncated?: boolean;
   hasImage: boolean;
 }
 
 export interface TraceSystemChunk extends TraceChunkBase {
   chunkType: "system";
   text: string;
+  textTruncated?: boolean;
   commandOutput: string;
   commandOutputTruncated?: boolean;
 }
@@ -130,6 +132,7 @@ export interface TraceSystemChunk extends TraceChunkBase {
 export interface TraceCompactChunk extends TraceChunkBase {
   chunkType: "compact";
   text: string;
+  textTruncated?: boolean;
 }
 
 export interface TraceAIChunk extends TraceChunkBase {

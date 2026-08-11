@@ -1,4 +1,4 @@
-import { createRouter, createRootRouteWithContext, createRoute } from "@tanstack/react-router";
+import { createRouter, createRootRouteWithContext, createRoute, redirect } from "@tanstack/react-router";
 
 export interface RouterContext {
   // empty — we don't need beforeLoad context for now
@@ -19,14 +19,27 @@ export const workspaceRoute = createRoute({
 export const sessionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/session/$id",
-  validateSearch: (search: Record<string, unknown>): { msg?: string } => ({
+  validateSearch: (search: Record<string, unknown>): { msg?: string; ts?: string } => ({
     msg: (search.msg as string) || undefined,
+    // `ts` is a deep-link ISO timestamp from global search (Search.tsx) —
+    // search matches carry a message timestamp, not a trace chunk id, so
+    // SessionDetail resolves it to the containing/nearest chunk itself.
+    // `msg` (a chunk id) still wins when both are present.
+    ts: (search.ts as string) || undefined,
   }),
 });
 
+// The standalone full-fidelity trace page was merged into `/session/$id`
+// (plan U9/M1) — this route now exists only so old bookmarked/open
+// `/session/$id/trace` URLs degrade gracefully instead of 404ing. It never
+// renders a component: `beforeLoad` always redirects to the plain session
+// route first.
 export const sessionTraceRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/session/$id/trace",
+  beforeLoad: ({ params }) => {
+    throw redirect({ to: "/session/$id", params: { id: params.id } });
+  },
 });
 
 export const tagRoute = createRoute({

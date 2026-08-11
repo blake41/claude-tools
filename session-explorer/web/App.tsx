@@ -3,7 +3,6 @@ import { Outlet, useNavigate, useLocation, useParams, useSearch } from "@tanstac
 import Sidebar from "./components/Sidebar";
 import SessionList from "./components/SessionList";
 import SessionDetail from "./components/SessionDetail";
-import TraceView from "./components/TraceView";
 import Search from "./components/Search";
 import SessionCard from "./components/SessionCard";
 // AskView is now rendered inside the Search overlay's "Ask AI" tab
@@ -21,7 +20,6 @@ import {
   indexRoute,
   workspaceRoute,
   sessionRoute,
-  sessionTraceRoute,
   tagRoute,
   fileRoute,
   askRoute,
@@ -235,10 +233,6 @@ function WorkspaceView() {
 
 function SessionView() {
   return <SessionDetail />;
-}
-
-function SessionTraceView() {
-  return <TraceView />;
 }
 
 function formatTagDate(dateStr: string): string {
@@ -569,7 +563,6 @@ rootRoute.update({ component: RootLayout });
 indexRoute.update({ component: Dashboard });
 workspaceRoute.update({ component: WorkspaceView });
 sessionRoute.update({ component: SessionView });
-sessionTraceRoute.update({ component: SessionTraceView });
 tagRoute.update({ component: TagView });
 fileRoute.update({ component: FileView });
 askRoute.update({ component: () => null });

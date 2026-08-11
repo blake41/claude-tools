@@ -1935,13 +1935,16 @@ app.get("/api/sessions/:id/trace", (req, res) => {
   const result = reassembleTrace(db, req.params.id);
   if (!result.ok) {
     if (result.reason === "not_found") {
-      res.status(404).json({ error: "Session not found" });
+      res.status(404).json({ error: "Session not found", reason: result.reason });
       return;
     }
     // trace_meta IS NULL — either pre-unified-parser ingest, or a session
-    // that was never successfully ingested at all.
+    // that was never successfully ingested at all. `reason` lets the
+    // frontend tell this apart from a transient fetch failure and fall back
+    // to the legacy `/messages` rows instead of showing an error string.
     res.status(404).json({
       error: "No trace data for this session yet — reingest to enable trace.",
+      reason: result.reason,
     });
     return;
   }

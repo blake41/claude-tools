@@ -315,6 +315,69 @@ describe("shapeTraceForResponse (lean trace payload)", () => {
     expect(patch[0].lines).toEqual(["+" + "z".repeat(20)]);
   });
 
+  test("caps a pathologically huge user-message text (e.g. a 47MB pasted console dump) and flags it", () => {
+    // Regression for session 13119fd6: a single user message whose entire
+    // content was one ~47M-char pasted string, uncapped by anything else in
+    // this module (capDeep only guards tool_use input/toolUseResult, not
+    // plain user-chunk text) — the trace payload for that one 166-message
+    // session ballooned to 48MB. CHUNK_TEXT_CAP guards the user/system/compact
+    // `text` field itself.
+    const hugeUserText = "Q".repeat(70_000);
+    const userMsg = baseMessage({
+      uuid: "u-huge",
+      type: "user",
+      role: "user",
+      content: hugeUserText,
+      timestamp: new Date("2026-08-01T00:00:00.000Z"),
+    });
+    const session = fixtureSession({ messageCount: 1 });
+    const detail = new ChunkBuilder().buildSessionDetail(session, [userMsg], []);
+    const lean = shapeTraceForResponse(detail);
+
+    const userChunk = lean.chunks[0] as LeanUserChunk;
+    expect(userChunk.chunkType).toBe("user");
+    expect(userChunk.text.length).toBe(64_000);
+    expect(userChunk.textTruncated).toBe(true);
+  });
+
+  test("enforces an aggregate budget across many small-but-numerous tool_use input leaves, each under the per-string cap", () => {
+    // Each item is exactly at TOOL_PAYLOAD_CAP (4000 chars) — no single leaf
+    // trips the per-string cap — but 50 of them total 200k chars, well past
+    // the 100k aggregate budget. capDeep must stop partway through the array
+    // and mark the rest truncated, rather than letting the total balloon.
+    const manySmallLeaves = Array.from({ length: 50 }, () => "s".repeat(4000));
+    const userMsg = baseMessage({
+      uuid: "u1",
+      type: "user",
+      role: "user",
+      content: "Process this batch",
+      timestamp: new Date("2026-08-01T00:00:00.000Z"),
+    });
+    const assistantMsg = baseMessage({
+      uuid: "a1",
+      type: "assistant",
+      role: "assistant",
+      model: "claude-sonnet-5",
+      timestamp: new Date("2026-08-01T00:00:01.000Z"),
+      usage: { input_tokens: 10, output_tokens: 10 },
+      content: [{ type: "tool_use", id: "tool-batch", name: "BatchTool", input: { items: manySmallLeaves } }],
+    });
+    const session = fixtureSession({ messageCount: 2 });
+    const detail = new ChunkBuilder().buildSessionDetail(session, [userMsg, assistantMsg], []);
+    const lean = shapeTraceForResponse(detail);
+
+    const aiChunk = lean.chunks[1] as LeanAIChunk;
+    const toolCall = aiChunk.steps.find((s) => s.type === "tool_call")!;
+    expect(toolCall.toolInputTruncated).toBe(true);
+
+    const items = (toolCall.toolInput as { items: string[] }).items;
+    const marker = items[items.length - 1];
+    const realItems = items.slice(0, -1);
+    const totalKept = realItems.reduce((sum, s) => sum + s.length, 0);
+    expect(totalKept).toBeLessThanOrEqual(100_000);
+    expect(marker).toContain("more items truncated");
+  });
+
   test("drops the raw messages[]/rawMessages duplication that the full model carries", () => {
     const detail = buildDetailWithProcesses([]);
     const lean = shapeTraceForResponse(detail);
