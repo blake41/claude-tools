@@ -81,7 +81,9 @@ function TaskNotificationCard({ notif }: { notif: NonNullable<TraceUserChunk["ta
   const icon = isFailed ? X_ICON : isCompleted ? CHECK_ICON : CIRCLE_ICON;
   const color = isFailed ? "text-accent-red" : isCompleted ? "text-accent-green" : "text-text-dim";
 
-  const cmdMatch = /"([^"]+)"/.exec(notif.summary);
+  // Greedy to the last quote: Monitor-event summaries nest quotes ('..."X "Y" Z"'),
+  // and non-greedy would stop at the first inner quote, chopping the text short.
+  const cmdMatch = /"(.+)"/.exec(notif.summary);
   const cmdName = cmdMatch?.[1] ?? notif.summary;
   const exitMatch = /\(exit code (\d+)\)/.exec(notif.summary);
   const exitCode = exitMatch?.[1];
@@ -107,29 +109,33 @@ function UserChunkRow({ chunk, highlight }: { chunk: TraceUserChunk; highlight: 
   const long = isLong(chunk.text);
   const preview = long && !expanded ? chunk.text.slice(0, 280) + "…" : chunk.text;
   return (
-    <div className={`rounded-lg border border-accent-blue/25 bg-accent-blue/6 px-3.5 py-2.5 ${highlight ? "message-highlight" : ""}`}>
-      <div className="flex items-center gap-2 mb-1">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-accent-blue">You</span>
-        {chunk.hasImage && <span className="text-[10px] text-text-dim">(includes image)</span>}
-        <span className="ml-auto text-[10px] font-mono text-text-dim/60">{formatClockTime(chunk.startTime)}</span>
+    // Right-aligned, narrower bubble — mirrors claude-devtools' user/assistant
+    // side split so the two roles read apart at a glance without reading the label.
+    <div className="flex flex-col items-end gap-1">
+      <div className="flex items-center gap-1.5 text-[10px]">
+        <span className="font-mono text-text-dim/60">{formatClockTime(chunk.startTime)}</span>
+        <span className="font-semibold uppercase tracking-wider text-accent-blue">You</span>
       </div>
-      {chunk.text && (
-        <div className="text-[13px] text-text leading-relaxed whitespace-pre-wrap">
-          <MarkdownBody text={expanded && chunk.textTruncated ? preview + "\n… (truncated)" : preview} />
-        </div>
-      )}
-      {long && (
-        <button className="text-[11px] text-accent-blue mt-1 opacity-80 hover:opacity-100" onClick={() => setExpanded((e) => !e)}>
-          {expanded ? "Show less" : "Show more"}
-        </button>
-      )}
-      {chunk.taskNotifications && chunk.taskNotifications.length > 0 && (
-        <div className={`space-y-1.5 ${chunk.text ? "mt-2" : ""}`}>
-          {chunk.taskNotifications.map((n) => (
-            <TaskNotificationCard key={n.taskId} notif={n} />
-          ))}
-        </div>
-      )}
+      <div className={`max-w-[85%] rounded-lg border border-accent-blue/25 bg-accent-blue/6 px-3.5 py-2.5 ${highlight ? "message-highlight" : ""}`}>
+        {chunk.hasImage && <div className="text-[10px] text-text-dim mb-1">(includes image)</div>}
+        {chunk.text && (
+          <div className="message-content text-[13px] text-text leading-relaxed whitespace-pre-wrap">
+            <MarkdownBody text={expanded && chunk.textTruncated ? preview + "\n… (truncated)" : preview} />
+          </div>
+        )}
+        {long && (
+          <button className="text-[11px] text-accent-blue mt-1 opacity-80 hover:opacity-100" onClick={() => setExpanded((e) => !e)}>
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        )}
+        {chunk.taskNotifications && chunk.taskNotifications.length > 0 && (
+          <div className={`space-y-1.5 ${chunk.text ? "mt-2" : ""}`}>
+            {chunk.taskNotifications.map((n) => (
+              <TaskNotificationCard key={n.taskId} notif={n} />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -167,7 +173,7 @@ function CompactChunkRow({ chunk, highlight }: { chunk: TraceCompactChunk; highl
         <div className="flex-1 h-px bg-accent-orange/30" />
       </button>
       {expanded && chunk.text && (
-        <div className="mt-2 text-[12px] text-text-secondary bg-bg-card/60 border border-border rounded-lg px-3 py-2">
+        <div className="message-content mt-2 text-[12px] text-text-secondary bg-bg-card/60 border border-border rounded-lg px-3 py-2">
           <MarkdownBody text={chunk.textTruncated ? chunk.text + "\n… (truncated)" : chunk.text} />
         </div>
       )}
@@ -196,8 +202,17 @@ function AIChunkRow({ chunk, maxContextTokens, highlight }: { chunk: TraceAIChun
   if (chunk.subagents.length > 0) summaryParts.push(`${chunk.subagents.length} subagent${chunk.subagents.length !== 1 ? "s" : ""}`);
   if (counts.interruptions > 0) summaryParts.push(`${counts.interruptions} interruption${counts.interruptions !== 1 ? "s" : ""}`);
 
+  // The response text is the payload; it renders unconditionally below the
+  // header. Thinking/tool-calls/subagents are drill-down only, behind the
+  // chevron — matches claude-devtools: rolled up by default, response always shown.
+  const outputText = useMemo(
+    () => chunk.steps.filter((s) => s.type === "output" && s.outputText).map((s) => s.outputText).join("\n\n"),
+    [chunk.steps]
+  );
+  const drillDownSteps = useMemo(() => chunk.steps.filter((s) => s.type !== "output"), [chunk.steps]);
+
   return (
-    <div className={`rounded-lg border border-border bg-bg-card px-3.5 py-2.5 ${highlight ? "message-highlight" : ""}`}>
+    <div className={`rounded-lg border border-border border-l-2 border-l-accent-purple/40 bg-bg-card px-3.5 py-2.5 ${highlight ? "message-highlight" : ""}`}>
       <button className="flex items-center gap-2.5 w-full text-left" onClick={() => setExpanded((e) => !e)}>
         <span className="text-[10px] font-semibold uppercase tracking-wider text-accent-purple shrink-0">Claude</span>
         <span className="text-[12px] text-text-secondary truncate flex-1 min-w-0">{summaryParts.join(" · ") || "(no steps)"}</span>
@@ -207,9 +222,14 @@ function AIChunkRow({ chunk, maxContextTokens, highlight }: { chunk: TraceAIChun
           <path d="M4 2L8 6L4 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
+      {outputText && (
+        <div className="message-content mt-2 text-[13px] text-text leading-relaxed whitespace-pre-wrap">
+          <MarkdownBody text={outputText} />
+        </div>
+      )}
       {expanded && (
         <div className="mt-2.5 pt-2.5 border-t border-border/40">
-          <StepList steps={chunk.steps} subagents={chunk.subagents} />
+          <StepList steps={drillDownSteps} subagents={chunk.subagents} />
         </div>
       )}
     </div>

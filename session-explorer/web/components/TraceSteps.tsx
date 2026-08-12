@@ -92,7 +92,7 @@ function StepRow({ icon, label, badges, time, children, defaultOpen }: {
           </svg>
         )}
       </button>
-      {open && hasBody && <div className="px-2.5 pb-2.5 pt-1 border-t border-border/40">{children}</div>}
+      {open && hasBody && <div className="message-content px-2.5 pb-2.5 pt-1 border-t border-border/40">{children}</div>}
     </div>
   );
 }
@@ -154,7 +154,7 @@ function OutputStepRow({ step }: { step: TraceStep }) {
         {step.outputTruncated && <Badge tone="error">truncated</Badge>}
         <span className="text-[10px] font-mono text-text-dim/60 shrink-0">{formatClockTime(step.startTime)}</span>
       </div>
-      <div className="text-[13px] text-text leading-relaxed whitespace-pre-wrap">
+      <div className="message-content text-[13px] text-text leading-relaxed whitespace-pre-wrap">
         {text ? <MarkdownBody text={preview} /> : <span className="text-text-dim italic">(empty)</span>}
       </div>
       {long && (
