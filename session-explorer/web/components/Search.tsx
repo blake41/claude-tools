@@ -513,7 +513,7 @@ function relativeTime(ts: number): string {
 
 export default function Search({ onClose, onNavigate }: SearchProps) {
   const [query, setQuery] = useQueryState("q", parseAsString.withDefault(""));
-  const [tab, setTab] = useQueryState("tab", parseAsStringLiteral(["messages", "files", "ask"] as const).withDefault("messages"));
+  const [tab, setTab] = useQueryState("tab", parseAsStringLiteral(["messages", "files", "ask"] as const).withDefault("ask"));
   const [exact, setExact] = useState(false);
   const [sort, setSort] = useState<SortMode>("date");
   const [results, setResults] = useState<SearchResult[]>([]);
