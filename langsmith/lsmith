@@ -164,11 +164,12 @@ cmd_trace_list() {
   local last_n_minutes=""
   local error_only=""
   local min_latency=""
-  local name=""
+  local names=()
   local abs_start=""
   local abs_end=""
   local metadata_pairs=()
   local tags=()
+  local search_terms=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --project) project="$2"; shift 2 ;;
@@ -176,14 +177,15 @@ cmd_trace_list() {
       --last-n-minutes) last_n_minutes="$2"; shift 2 ;;
       --error) error_only="true"; shift ;;
       --min-latency) min_latency="$2"; shift 2 ;;
-      --name) name="$2"; shift 2 ;;
+      --name) names+=("$2"); shift 2 ;;
       --start) abs_start="$2"; shift 2 ;;
       --end) abs_end="$2"; shift 2 ;;
       --before) abs_end="$2"; shift 2 ;;
       --metadata) metadata_pairs+=("$2"); shift 2 ;;
       --tag) tags+=("$2"); shift 2 ;;
+      --search) search_terms+=("$2"); shift 2 ;;
       *) json_error "$TOOL_NAME trace list" "Unknown option: $1" "INVALID_ARG" \
-           "Usage: lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--before ISO8601] [--error] [--min-latency SECONDS] [--name STRING] [--metadata KEY=VALUE]... [--tag STRING]..." ;;
+           "Usage: lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--before ISO8601] [--error] [--min-latency SECONDS] [--name STRING]... [--metadata KEY=VALUE]... [--tag STRING]... [--search STRING]..." ;;
     esac
   done
 
@@ -249,6 +251,33 @@ cmd_trace_list() {
     [[ -z "$tag" ]] && continue
     filter_clauses+=("has(tags, \"${tag}\")")
   done
+  if [[ ${#names[@]} -gt 0 ]]; then
+    # Must go into this same filter= DSL string as everything else above —
+    # the API silently ignores a separate top-level `name` body field
+    # (confirmed 2026-08-11: a bogus name string still returned unfiltered
+    # results when sent that way). Multiple --name flags OR-combine into one
+    # clause (e.g. matching a family of `mcp-tool:*` names in one query)
+    # instead of requiring N separate invocations.
+    if [[ ${#names[@]} -eq 1 ]]; then
+      filter_clauses+=("eq(name, \"${names[0]}\")")
+    else
+      local name_eqs=()
+      for n in "${names[@]}"; do
+        name_eqs+=("eq(name, \"${n}\")")
+      done
+      filter_clauses+=("or($(IFS=,; echo "${name_eqs[*]}"))")
+    fi
+  fi
+  for term in "${search_terms[@]:-}"; do
+    [[ -z "$term" ]] && continue
+    # Substring match over indexed string fields (LangSmith indexes up to 250
+    # chars per field) — NOT exact-value, and NOT confirmed to reach inside a
+    # JSON-encoded string nested in `outputs` (e.g. the MCP tool-response
+    # envelope's `content[].text`). Use as a candidate-narrowing filter only;
+    # always re-verify the actual match client-side, never trust a search()
+    # hit as proof of an exact value.
+    filter_clauses+=("search(\"${term}\")")
+  done
 
   local combined_filter=""
   if [[ ${#filter_clauses[@]} -eq 1 ]]; then
@@ -275,9 +304,6 @@ cmd_trace_list() {
   fi
   if [[ -n "$error_only" ]]; then
     body_json=$(echo "$body_json" | jq '. + {error: true}')
-  fi
-  if [[ -n "$name" ]]; then
-    body_json=$(echo "$body_json" | jq --arg n "$name" '. + {name: [$n]}')
   fi
 
   local resp
@@ -399,7 +425,7 @@ dispatch_trace() {
     get)  cmd_trace_get "$@" ;;
     "")
       cmd_tree "$TOOL_NAME trace" "Trace (root run) commands" "$(jq -n '[
-        {name: "list", description: "List recent traces in a project (default 7-day window, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--error] [--min-latency SEC] [--name STRING] [--metadata KEY=VALUE]... [--tag STRING]..."},
+        {name: "list", description: "List recent traces in a project (default 7-day window, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--error] [--min-latency SEC] [--name STRING]... [--metadata KEY=VALUE]... [--tag STRING]... [--search STRING]..."},
         {name: "get",  description: "Get a single trace by ID (full root-run record)", usage: "lsmith trace get <trace-id>"}
       ]')"
       ;;
@@ -428,7 +454,7 @@ dispatch_run() {
 if [[ $# -lt 1 ]]; then
   cmd_tree "$TOOL_NAME" "LangSmith CLI for AI agents (read-only debug surface)" "$(jq -n '[
     {name: "project list", description: "List tracing projects",                                  usage: "lsmith project list [--limit N] [--name-contains STRING]"},
-    {name: "trace list",   description: "List recent traces in a project (default 7d, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--error] [--min-latency SEC] [--name STRING] [--metadata KEY=VALUE]... [--tag STRING]..."},
+    {name: "trace list",   description: "List recent traces in a project (default 7d, newest first)", usage: "lsmith trace list --project NAME [--limit N] [--last-n-minutes N] [--start ISO8601] [--end ISO8601] [--error] [--min-latency SEC] [--name STRING]... [--metadata KEY=VALUE]... [--tag STRING]... [--search STRING]..."},
     {name: "trace get",    description: "Get a single trace by ID",                                usage: "lsmith trace get <trace-id>"},
     {name: "run get",      description: "Get a single run by ID",                                  usage: "lsmith run get <run-id>"}
   ]')"
