@@ -52,10 +52,17 @@ load_workspace() {
 }
 
 # API helpers
+#
+# These route through safe_api_call (cli-envelope.sh) rather than calling
+# curl directly. Bare curl here had no status-code check at all — an
+# HTTP error just returned the raw error body as if it were a normal
+# response, which a caller like render-logs would then try to parse as
+# log data and silently see as "zero results". safe_api_call adds status
+# checking, a loud json_error envelope on failure, and 429/503 retry.
 render_api() {
     local endpoint="$1"
     shift
-    curl -sS "https://api.render.com/v1$endpoint" \
+    safe_api_call "GET $endpoint" "https://api.render.com/v1$endpoint" \
         -H "Authorization: Bearer $RENDER_API_KEY" \
         -H "Accept: application/json" \
         "$@"
@@ -64,7 +71,7 @@ render_api() {
 render_api_post() {
     local endpoint="$1"
     local data="$2"
-    curl -sS "https://api.render.com/v1$endpoint" \
+    safe_api_call "POST $endpoint" "https://api.render.com/v1$endpoint" \
         -H "Authorization: Bearer $RENDER_API_KEY" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json" \
@@ -74,7 +81,7 @@ render_api_post() {
 render_api_put() {
     local endpoint="$1"
     local data="$2"
-    curl -sS "https://api.render.com/v1$endpoint" \
+    safe_api_call "PUT $endpoint" "https://api.render.com/v1$endpoint" \
         -H "Authorization: Bearer $RENDER_API_KEY" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json" \
@@ -83,7 +90,7 @@ render_api_put() {
 
 render_api_delete() {
     local endpoint="$1"
-    curl -sS "https://api.render.com/v1$endpoint" \
+    safe_api_call "DELETE $endpoint" "https://api.render.com/v1$endpoint" \
         -H "Authorization: Bearer $RENDER_API_KEY" \
         -X DELETE
 }
