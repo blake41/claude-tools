@@ -3,6 +3,9 @@
 # Uses git cherry (patch-id comparison) instead of --merged (SHA comparison).
 # Also treats a branch as prunable if it has a closed-but-unmerged PR (via gh),
 # since an abandoned/superseded PR's branch is just as dead as a merged one.
+# And if it has a MERGED PR whose squash commit git cherry can't patch-match
+# (squash-merge combines commits into a diff that doesn't match any single
+# source commit, so cherry alone reports these branches as falsely unmerged).
 #
 # Two extra worktree-only detectors handle cases branch-merge detection can't see:
 #   --stale-prs  a review worktree (often detached HEAD, named pr-N / pr-N-review)
@@ -15,12 +18,14 @@ set -euo pipefail
 PROTECTED="master main develop staging production release"
 
 # Lazily populated by fetch_closed_prs(): "headRefName<TAB>number" lines for
-# closed (not merged) PRs. GH_OK stays false if gh is missing, unauthenticated,
-# or rate-limited — closed-PR pruning silently degrades to merged-only in that
-# case rather than failing the whole run.
+# closed (not merged) PRs, and separately for merged PRs. GH_OK stays false
+# if gh is missing, unauthenticated, or rate-limited — closed/merged-PR
+# pruning silently degrades to cherry-only detection in that case rather
+# than failing the whole run.
 GH_CHECKED=false
 GH_OK=false
 CLOSED_PR_CACHE=""
+MERGED_PR_CACHE=""
 
 usage() {
   cat <<'EOF'
@@ -79,9 +84,10 @@ is_fully_merged() {
   ! echo "$output" | grep -q '^\+'
 }
 
-# One-shot, best-effort fetch of closed-but-unmerged PRs. Never fails the
-# script — any error just leaves GH_OK=false and callers fall back to
-# merged-only detection.
+# One-shot, best-effort fetch of closed-but-unmerged PRs and merged PRs
+# (one batched `gh pr list --state all` call, split into two caches). Never
+# fails the script — any error just leaves GH_OK=false and callers fall
+# back to cherry-only detection.
 fetch_closed_prs() {
   $GH_CHECKED && return
   GH_CHECKED=true
@@ -90,11 +96,12 @@ fetch_closed_prs() {
   command -v jq >/dev/null 2>&1 || return
 
   local json
-  json=$(gh pr list --state closed --json headRefName,number,mergedAt --limit 500 2>/dev/null) || return
+  json=$(gh pr list --state all --json headRefName,number,mergedAt,state --limit 500 2>/dev/null) || return
   echo "$json" | jq -e . >/dev/null 2>&1 || return
 
   GH_OK=true
-  CLOSED_PR_CACHE=$(echo "$json" | jq -r '.[] | select(.mergedAt == null) | "\(.headRefName)\t\(.number)"')
+  CLOSED_PR_CACHE=$(echo "$json" | jq -r '.[] | select(.state == "CLOSED" and .mergedAt == null) | "\(.headRefName)\t\(.number)"')
+  MERGED_PR_CACHE=$(echo "$json" | jq -r '.[] | select(.state == "MERGED") | "\(.headRefName)\t\(.number)"')
 }
 
 # Prints the PR number on stdout and returns 0 if branch has a closed
@@ -109,8 +116,24 @@ closed_pr_number() {
   echo "$num"
 }
 
-# Prints "merged" or "closed:<PR#>" and returns 0 if branch should be
-# considered prunable; returns 1 if it's still live.
+# Prints the PR number on stdout and returns 0 if branch has a MERGED PR
+# on GitHub; returns 1 otherwise. This is what catches squash-merges that
+# `git cherry` (patch-id, per-commit comparison) can't see — a squash
+# combines the branch's commits into one master commit whose diff doesn't
+# patch-match any individual source commit, so cherry reports the branch
+# as unmerged even though its PR shipped.
+merged_pr_number() {
+  local branch="$1"
+  $GH_OK || return 1
+  [[ -z "$MERGED_PR_CACHE" ]] && return 1
+  local num
+  num=$(awk -F'\t' -v b="$branch" '$1 == b { print $2; exit }' <<<"$MERGED_PR_CACHE")
+  [[ -n "$num" ]] || return 1
+  echo "$num"
+}
+
+# Prints "merged", "squash-merged:<PR#>", or "closed:<PR#>" and returns 0
+# if branch should be considered prunable; returns 1 if it's still live.
 prune_status() {
   local base="$1" branch="$2"
   if is_fully_merged "$base" "$branch"; then
@@ -120,10 +143,38 @@ prune_status() {
 
   fetch_closed_prs
   local prnum
+  if prnum=$(merged_pr_number "$branch"); then
+    echo "squash-merged:$prnum"
+    return 0
+  fi
   if prnum=$(closed_pr_number "$branch"); then
     echo "closed:$prnum"
     return 0
   fi
+  return 1
+}
+
+# Returns 0 if wt_path contains a nested worktree (under .claude/worktrees/,
+# any depth) with uncommitted changes. Plain `git status` on the outer
+# worktree can't see this: a nested worktree is a separate git repo, and
+# .claude/worktrees/ is gitignored, so it's invisible to the outer status
+# even though deleting the outer directory destroys its uncommitted diff.
+is_untracked_only_dirty() {
+  local wt_path="$1"
+  local lines
+  lines=$(git -C "$wt_path" status --porcelain 2>/dev/null)
+  [[ -z "$lines" ]] && return 1
+  ! grep -qv '^?? ' <<<"$lines"
+}
+
+has_nested_uncommitted() {
+  local wt_path="$1"
+  local nested
+  for nested in "$wt_path"/.claude/worktrees/*/; do
+    [[ -d "$nested" ]] || continue
+    [[ -n $(git -C "$nested" status --porcelain 2>/dev/null) ]] && return 0
+    has_nested_uncommitted "$nested" && return 0
+  done
   return 1
 }
 
@@ -165,9 +216,10 @@ pr_review_status() {
 status_suffix() {
   local status="$1"
   case "$status" in
-    closed:*)    echo ", PR #${status#closed:}" ;;
-    pr-merged:*) echo ", target PR #${status#pr-merged:} merged" ;;
-    pr-closed:*) echo ", target PR #${status#pr-closed:} closed" ;;
+    closed:*)        echo ", PR #${status#closed:}" ;;
+    squash-merged:*) echo ", PR #${status#squash-merged:} (squash-merged)" ;;
+    pr-merged:*)     echo ", target PR #${status#pr-merged:} merged" ;;
+    pr-closed:*)     echo ", target PR #${status#pr-closed:} closed" ;;
   esac
 }
 
@@ -206,11 +258,11 @@ cmd_branches() {
         echo "  FAILED   $branch — could not delete (checked out in a worktree?)"
       fi
     else
-      if [[ "$status" == closed:* ]]; then
-        echo "  closed   $branch ($sha$suffix)"
-      else
-        echo "  merged   $branch ($sha)"
-      fi
+      case "$status" in
+        closed:*)        echo "  closed   $branch ($sha$suffix)" ;;
+        squash-merged:*) echo "  merged   $branch ($sha$suffix)" ;;
+        *)               echo "  merged   $branch ($sha)" ;;
+      esac
     fi
   done
 
@@ -229,6 +281,18 @@ cmd_branches() {
 WT_LIVE_PATHS=()
 WT_LIVE_BRANCHES=()
 
+# Populated by _check_worktree with worktrees that ARE prunable (merged/closed)
+# but have uncommitted changes consisting ENTIRELY of untracked files (no
+# modified/staged tracked files) — e.g. a stray plan doc, a `.beads` db
+# journal, a leftover lockfile. These are reported as their own bucket
+# (MERGED-DIRTY) instead of blending into the generic DIRTY line, since a
+# merged branch with one harmless untracked file looks identical to real
+# unshipped work otherwise. Never auto-deleted; --delete prompts once for
+# the whole batch, listing the untracked files so the call is informed.
+WT_UNTRACKED_PATHS=()
+WT_UNTRACKED_BRANCHES=()
+WT_UNTRACKED_SUFFIXES=()
+
 cmd_worktrees() {
   local base="master" delete=false stale_prs=false stale_age=false
   while [[ $# -gt 0 ]]; do
@@ -244,6 +308,9 @@ cmd_worktrees() {
   local found=0
   WT_LIVE_PATHS=()
   WT_LIVE_BRANCHES=()
+  WT_UNTRACKED_PATHS=()
+  WT_UNTRACKED_BRANCHES=()
+  WT_UNTRACKED_SUFFIXES=()
 
   # Parse worktree list (skip the main worktree — first entry)
   local first=true
@@ -278,6 +345,8 @@ cmd_worktrees() {
     _check_worktree "$base" "$wt_path" "$wt_branch" "$delete" "$stale_prs" && found=1
   fi
 
+  _report_merged_untracked "$delete"
+
   if $stale_age; then
     _report_stale_age "$delete"
   fi
@@ -287,6 +356,46 @@ cmd_worktrees() {
   elif ! $delete && [[ $found -gt 0 ]]; then
     echo ""
     echo "Run with --delete to remove these worktrees and their branches."
+  fi
+}
+
+# Prints the untracked files for each MERGED-DIRTY worktree collected during
+# the main pass, and — in --delete mode — asks ONE batch confirmation before
+# removing them (along with their untracked files). A worktree with real
+# tracked changes never lands here; this is strictly "already merged/closed,
+# only harmless-looking leftover files in the way."
+_report_merged_untracked() {
+  local delete="$1"
+  [[ ${#WT_UNTRACKED_PATHS[@]} -eq 0 ]] && return 0
+
+  echo ""
+  echo "== Merged, but has untracked files only (${#WT_UNTRACKED_PATHS[@]}) =="
+  local i
+  for i in "${!WT_UNTRACKED_PATHS[@]}"; do
+    local wt_path="${WT_UNTRACKED_PATHS[$i]}"
+    echo "  $wt_path"
+    git -C "$wt_path" status --porcelain 2>/dev/null | sed 's/^/    /'
+  done
+
+  if $delete; then
+    local reply
+    read -r -p "Delete these ${#WT_UNTRACKED_PATHS[@]} merged worktrees, including their untracked files? [y/N] " reply < /dev/tty || reply="n"
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+      for i in "${!WT_UNTRACKED_PATHS[@]}"; do
+        local wt_path="${WT_UNTRACKED_PATHS[$i]}" wt_branch="${WT_UNTRACKED_BRANCHES[$i]}" suffix="${WT_UNTRACKED_SUFFIXES[$i]}"
+        if git worktree remove --force "$wt_path" 2>&1; then
+          [[ -n "$wt_branch" ]] && git branch -D "$wt_branch" >/dev/null 2>&1
+          echo "  removed  $wt_path$suffix"
+        else
+          echo "  FAILED   $wt_path — could not remove"
+        fi
+      done
+    else
+      echo "  skipped"
+    fi
+  else
+    echo ""
+    echo "Run with --delete to review and remove these (one batch confirmation)."
   fi
 }
 
@@ -308,9 +417,32 @@ _check_worktree() {
     return 1
   fi
 
-  # Check for uncommitted changes
-  if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
+  local porcelain
+  porcelain=$(git -C "$wt_path" status --porcelain 2>/dev/null)
+
+  # Real uncommitted changes (any modified/staged/deleted tracked file) —
+  # always blocks, exactly like before.
+  if [[ -n "$porcelain" ]] && grep -qv '^?? ' <<<"$porcelain"; then
     echo "  DIRTY    $wt_path (${wt_branch:-detached}) — has uncommitted changes, skipping"
+    return 0
+  fi
+
+  if has_nested_uncommitted "$wt_path"; then
+    echo "  NESTED-DIRTY $wt_path (${wt_branch:-detached}) — a nested sub-worktree has uncommitted changes, skipping"
+    return 0
+  fi
+
+  # Merged/closed AND clean of tracked changes, but has untracked files —
+  # report as its own bucket instead of blending into plain DIRTY, and
+  # queue for a single batch confirm at the end (never auto-deleted here).
+  if [[ -n "$porcelain" ]]; then
+    local sha suffix
+    sha=$(git -C "$wt_path" rev-parse --short HEAD)
+    suffix=$(status_suffix "$status")
+    echo "  MERGED-DIRTY $wt_path (${wt_branch:-detached}, $sha$suffix) — untracked files only, see summary below"
+    WT_UNTRACKED_PATHS+=("$wt_path")
+    WT_UNTRACKED_BRANCHES+=("$wt_branch")
+    WT_UNTRACKED_SUFFIXES+=("$suffix")
     return 0
   fi
 
@@ -335,6 +467,8 @@ _check_worktree() {
     case "$status" in
       closed:*)
         echo "  closed    $wt_path ($wt_branch, $sha$suffix)" ;;
+      squash-merged:*)
+        echo "  merged    $wt_path ($wt_branch, $sha$suffix)" ;;
       pr-merged:*|pr-closed:*)
         echo "  stale-pr  $wt_path (${wt_branch:-detached}$suffix), $sha" ;;
       *)
@@ -399,7 +533,7 @@ _handle_bucket() {
   local i
   for i in "${indices[@]}"; do
     local wt_path="${WT_LIVE_PATHS[$i]}"
-    if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
+    if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]] || has_nested_uncommitted "$wt_path"; then
       dirty_idx+=("$i")
     else
       clean_idx+=("$i")
@@ -432,6 +566,10 @@ _handle_bucket() {
         local wt_path="${WT_LIVE_PATHS[$i]}" wt_branch="${WT_LIVE_BRANCHES[$i]}"
         if [[ -n $(git -C "$wt_path" status --porcelain 2>/dev/null) ]]; then
           echo "  DIRTY    $wt_path — skipping"
+          continue
+        fi
+        if has_nested_uncommitted "$wt_path"; then
+          echo "  NESTED-DIRTY $wt_path — a nested sub-worktree has uncommitted changes, skipping"
           continue
         fi
         if lsof +D "$wt_path" >/dev/null 2>&1; then
