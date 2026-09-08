@@ -338,7 +338,7 @@ resolve_user_id() {
   fi
 
   local result
-  result=$(graphql "{ users(filter: { displayName: { containsi: \\\"$name\\\" } }) { nodes { id name email } } }")
+  result=$(graphql "{ users(filter: { displayName: { contains: \\\"$name\\\" } }) { nodes { id name email } } }")
 
   local user_id
   user_id=$(echo "$result" | jq -r '.data.users.nodes[0].id // empty')
