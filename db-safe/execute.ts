@@ -281,40 +281,37 @@ async function executePrisma(
     );
   }
 
-  const prisma = new PrismaClient({ datasourceUrl: url });
+  const writeActions = [
+    "create", "createMany", "createManyAndReturn",
+    "update", "updateMany", "upsert",
+    "delete", "deleteMany",
+  ];
 
-  // Add write protection middleware
-  if (writeToken) {
-    prisma.$use(async (params: any, next: any) => {
-      const writeActions = [
-        "create", "createMany", "createManyAndReturn",
-        "update", "updateMany", "upsert",
-        "delete", "deleteMany",
-      ];
-      if (writeActions.includes(params.action)) {
-        if (!writeToken.startsWith("db-safe-")) {
-          throw new Error("Invalid write token. Blocked by db-safe middleware.");
-        }
-      }
-      return next(params);
-    });
-  } else {
-    // Read mode: block all writes
-    prisma.$use(async (params: any, next: any) => {
-      const writeActions = [
-        "create", "createMany", "createManyAndReturn",
-        "update", "updateMany", "upsert",
-        "delete", "deleteMany",
-      ];
-      if (writeActions.includes(params.action)) {
-        throw new Error(
-          `Write operation blocked: ${params.model}.${params.action}\n` +
-            "Use 'db-safe write' for write operations."
-        );
-      }
-      return next(params);
-    });
-  }
+  // Add write protection via a client extension — `$use` middleware was
+  // removed in Prisma 5+ (this project's client is on a version where
+  // `prisma.$use` is undefined; `$extends` is the replacement API).
+  const prisma = new PrismaClient({ datasourceUrl: url }).$extends({
+    query: {
+      $allModels: {
+        async $allOperations({ model, operation, args, query }: any) {
+          if (writeActions.includes(operation)) {
+            if (writeToken) {
+              if (!writeToken.startsWith("db-safe-")) {
+                throw new Error("Invalid write token. Blocked by db-safe middleware.");
+              }
+            } else {
+              // Read mode: block all writes
+              throw new Error(
+                `Write operation blocked: ${model}.${operation}\n` +
+                  "Use 'db-safe write' for write operations."
+              );
+            }
+          }
+          return query(args);
+        },
+      },
+    },
+  });
 
   try {
     // Parse: prisma.model.action({ ... })

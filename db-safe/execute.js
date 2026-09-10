@@ -177,45 +177,35 @@ Make sure Prisma is installed and generated:
 Or use SQL mode instead:
   db-safe sql <env> "SELECT ..."`);
     }
-    const prisma = new PrismaClient({ datasourceUrl: url });
-    if (writeToken) {
-      prisma.$use(async (params, next) => {
-        const writeActions = [
-          "create",
-          "createMany",
-          "createManyAndReturn",
-          "update",
-          "updateMany",
-          "upsert",
-          "delete",
-          "deleteMany"
-        ];
-        if (writeActions.includes(params.action)) {
-          if (!writeToken.startsWith("db-safe-")) {
-            throw new Error("Invalid write token. Blocked by db-safe middleware.");
+    const writeActions = [
+      "create",
+      "createMany",
+      "createManyAndReturn",
+      "update",
+      "updateMany",
+      "upsert",
+      "delete",
+      "deleteMany"
+    ];
+    const prisma = new PrismaClient({ datasourceUrl: url }).$extends({
+      query: {
+        $allModels: {
+          async $allOperations({ model: model2, operation, args: args2, query: query2 }) {
+            if (writeActions.includes(operation)) {
+              if (writeToken) {
+                if (!writeToken.startsWith("db-safe-")) {
+                  throw new Error("Invalid write token. Blocked by db-safe middleware.");
+                }
+              } else {
+                throw new Error(`Write operation blocked: ${model2}.${operation}
+Use 'db-safe write' for write operations.`);
+              }
+            }
+            return query2(args2);
           }
         }
-        return next(params);
-      });
-    } else {
-      prisma.$use(async (params, next) => {
-        const writeActions = [
-          "create",
-          "createMany",
-          "createManyAndReturn",
-          "update",
-          "updateMany",
-          "upsert",
-          "delete",
-          "deleteMany"
-        ];
-        if (writeActions.includes(params.action)) {
-          throw new Error(`Write operation blocked: ${params.model}.${params.action}
-Use 'db-safe write' for write operations.`);
-        }
-        return next(params);
-      });
-    }
+      }
+    });
     try {
       const match = query.match(/^prisma\.([\s\S]+)$/);
       if (!match) {
