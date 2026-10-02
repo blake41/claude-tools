@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# session-export - render a Claude Code session to a redacted static HTML page, optionally publish it
+
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="session-export"
+
+usage() {
+  cat <<'EOF'
+session-export - render a Claude Code session to a redacted static HTML page
+
+Usage:
+  session-export render <session-id|path.jsonl> [--out FILE]
+  session-export publish <session-id|path.jsonl> --slug SLUG
+  session-export build-viewer
+  session-export --help
+
+render        Write a single self-contained HTML file (default /tmp/session-export-<id>.html)
+publish       Render, copy to <internal-pages>/public/<slug>/index.html, run ./publish
+build-viewer  Rebuild the committed viewer bundle in export/viewer/ (needs bun install)
+
+Env: SESSION_EXPORT_PAGES_DIR overrides the internal-pages checkout.
+EOF
+}
+
+CMD="${1:-}"
+case "$CMD" in
+  -h|--help|"") usage; exit 0 ;;
+esac
+shift
+
+command -v bun >/dev/null 2>&1 || json_error "$TOOL_NAME $CMD" "bun is required but not installed" "MISSING_DEP" "Install bun: curl -fsSL https://bun.sh/install | bash"
+
+case "$CMD" in
+  render|publish)
+    set +e
+    out="$(bun run "$SCRIPT_DIR/export/export.ts" "$CMD" "$@")"
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      json_ok "$TOOL_NAME $CMD" "$out" "$(next_actions \
+        "$(next_action "session-export publish <session-id> --slug <slug>" "Publish the rendered page to clay-internal")")"
+    elif jq -e '.error.code' >/dev/null 2>&1 <<<"$out"; then
+      json_error "$TOOL_NAME $CMD" "$(jq -r '.error.message' <<<"$out")" "$(jq -r '.error.code' <<<"$out")" "$(jq -r '.fix' <<<"$out")"
+    else
+      json_error "$TOOL_NAME $CMD" "export.ts exited $rc without a JSON error" "INTERNAL_ERROR" "Run: bun run $SCRIPT_DIR/export/export.ts $CMD $*"
+    fi
+    ;;
+  build-viewer)
+    [[ -d "$SCRIPT_DIR/node_modules" ]] || json_error "$TOOL_NAME build-viewer" "node_modules missing in session-explorer" "MISSING_DEP" "cd session-explorer && bun install"
+    if ! log="$(cd "$SCRIPT_DIR" && bunx vite build -c export/vite.config.ts 2>&1)"; then
+      json_error "$TOOL_NAME build-viewer" "vite build failed: $(tail -3 <<<"$log" | tr '\n' ' ')" "BUILD_FAILED" "cd session-explorer && bunx vite build -c export/vite.config.ts"
+    fi
+    json_ok "$TOOL_NAME build-viewer" "$(jq -n --arg dir "$SCRIPT_DIR/export/viewer" '{viewerDir: $dir}')" \
+      "$(next_actions "$(next_action "git add session-explorer/export/viewer" "Commit the rebuilt viewer")")"
+    ;;
+  *)
+    json_error "$TOOL_NAME $CMD" "Unknown command: $CMD" "BAD_ARGS" "Run: session-export --help"
+    ;;
+esac
