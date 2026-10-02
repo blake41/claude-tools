@@ -361,15 +361,15 @@ async function executePrisma(
 
     let args: any;
     if (argsStr.trim()) {
+      // Strict JSON first (keeps strings like "10:30" intact), then a loose
+      // JS-object-to-JSON conversion. No eval: the arguments are untrusted text.
       try {
-        // Convert JS-like object syntax to JSON
-        const jsonStr = argsStr
-          .replace(/(\w+)\s*:/g, '"$1":')
-          .replace(/'/g, '"');
-        args = JSON.parse(jsonStr);
+        args = JSON.parse(argsStr);
       } catch {
         try {
-          args = eval(`(${argsStr})`);
+          args = JSON.parse(
+            argsStr.replace(/(\w+)\s*:/g, '"$1":').replace(/'/g, '"')
+          );
         } catch {
           throw new Error(
             `Could not parse query arguments: ${argsStr}\n` +
