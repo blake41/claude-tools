@@ -1,0 +1,8 @@
+@import "../web/styles.css";
+@source "../web";
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+}
