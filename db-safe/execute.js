@@ -3,11 +3,11 @@
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
 var __require = import.meta.require;
 
-// execute.ts
+// ../../tools/db-safe/execute.ts
 import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { createInterface } from "readline";
-var require_execute = __commonJS((exports, module) => {
+var require_execute = __commonJS(function(exports, module) {
   function pickFormat() {
     const explicit = process.env.DB_SAFE_FORMAT;
     if (explicit === "table" || explicit === "ndjson" || explicit === "json" || explicit === "pretty") {
@@ -141,7 +141,7 @@ ${count}`;
       });
     });
   }
-  async function executeSql(url2, sql) {
+  async function executeSql(url2, sql, readOnly) {
     let pg;
     try {
       pg = await import("pg");
@@ -155,8 +155,21 @@ ${count}`;
     });
     try {
       await client.connect();
-      const result = await client.query(sql);
-      return result.rows;
+      if (!readOnly) {
+        const result = await client.query(sql);
+        return result.rows;
+      }
+      await client.query("BEGIN READ ONLY");
+      try {
+        const result = await client.query({
+          name: "db-safe-read",
+          text: sql,
+          values: []
+        });
+        return result.rows;
+      } finally {
+        await client.query("ROLLBACK").catch(() => {});
+      }
     } finally {
       await client.end();
     }
@@ -274,7 +287,7 @@ Use JSON-compatible format: { "key": "value" }`);
     try {
       let result;
       if (mode === "sql-read" || mode === "sql-write") {
-        result = await executeSql(url2, query2);
+        result = await executeSql(url2, query2, mode === "sql-read" && !envConfig.allowNonInteractiveWrites);
       } else {
         const writeToken2 = isWrite ? `db-safe-${Date.now()}-${Math.random().toString(36).slice(2, 10)}` : undefined;
         result = await executePrisma(url2, query2, writeToken2);

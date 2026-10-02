@@ -226,7 +226,11 @@ async function confirmWrite(query: string, label: string): Promise<boolean> {
 // SQL execution (raw pg)
 // ---------------------------------------------------------------------------
 
-async function executeSql(url: string, sql: string): Promise<unknown> {
+async function executeSql(
+  url: string,
+  sql: string,
+  readOnly: boolean
+): Promise<unknown> {
   // Try to load pg from the project's node_modules first, then from bun's global
   let pg: any;
   try {
@@ -245,8 +249,24 @@ async function executeSql(url: string, sql: string): Promise<unknown> {
 
   try {
     await client.connect();
-    const result = await client.query(sql);
-    return result.rows;
+    if (!readOnly) {
+      const result = await client.query(sql);
+      return result.rows;
+    }
+    // Read mode: Postgres itself refuses writes. A named query forces the
+    // extended protocol, which rejects multi-statement strings, so the SQL
+    // cannot COMMIT out of the read-only transaction and then write.
+    await client.query("BEGIN READ ONLY");
+    try {
+      const result = await client.query({
+        name: "db-safe-read",
+        text: sql,
+        values: [],
+      });
+      return result.rows;
+    } finally {
+      await client.query("ROLLBACK").catch(() => {});
+    }
   } finally {
     await client.end();
   }
@@ -413,7 +433,13 @@ async function main() {
     let result: unknown;
 
     if (mode === "sql-read" || mode === "sql-write") {
-      result = await executeSql(url, query);
+      // Only envs without allowNonInteractiveWrites (prod) get a read-only
+      // transaction; staging/dev/local keep the old unguarded behavior.
+      result = await executeSql(
+        url,
+        query,
+        mode === "sql-read" && !envConfig.allowNonInteractiveWrites
+      );
     } else {
       const writeToken = isWrite
         ? `db-safe-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
