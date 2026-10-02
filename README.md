@@ -21,7 +21,7 @@ tools/
 ├── linear/               # Linear issue tracking
 ├── notion/               # Notion kanban board
 ├── api-probe/            # API endpoint discovery
-├── session-explorer/     # Claude session history browser (web app)
+├── session-explorer/     # Claude session history browser (web app) + session-export CLI
 ├── skill-gen/            # Skill file generator
 ├── beam/                 # Breadboard-to-TLDraw CLI
 ├── mermaid-render/       # Mermaid diagram renderer
@@ -119,6 +119,14 @@ exa-search "query" --num-results 5        # Limit results
 ```bash
 c7 search react --query "hooks"           # Find a library ID
 c7 docs /facebook/react --query "useState useEffect" --tokens 5000
+```
+
+### Session Export (session-export)
+
+```bash
+session-export render <session-id|path.jsonl> [--out FILE]   # Redacted static HTML (default /tmp/session-export-<id>.html)
+session-export publish <session-id|path.jsonl> --slug SLUG   # Render + publish to clay-internal
+session-export build-viewer                                  # Rebuild committed viewer bundle (needs bun install)
 ```
 
 ### Codex (codex-ask)

@@ -113,6 +113,7 @@ Easy — credentials only, no code changes needed
 | `c7` | `~/.local/bin/c7` | Context7 documentation lookup |
 | `cloudflare/cf-*` | `~/.local/bin/cf-*` | Cloudflare Workers + logs |
 | `codex-ask` | `~/.local/bin/codex-ask` | OpenAI Codex API wrapper |
+| `session-export` | `~/.local/bin/session-export` | Redacted static HTML export of a session, optional publish to clay-internal |
 | `db-safe` | `~/.local/bin/db-safe` | Safe database CLI — read/write with guardrails |
 | `drawbridge` | `~/.local/bin/drawbridge` | Real-time diagram server |
 | `git-prune-merged` | `~/.local/bin/git-prune-merged` | Rebase-aware branch cleanup |
