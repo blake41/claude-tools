@@ -450,6 +450,48 @@ cmd_pre_deploy() {
     fi
 }
 
+cmd_docker_command() {
+    local service_id="${1:-}"
+    local command="${2:-}"
+    if [[ -z "$service_id" ]]; then
+        json_error "$TOOL_NAME docker-command" "Service ID required" "MISSING_ARG" \
+            "Usage: render-services docker-command <service-id> [command]"
+    fi
+
+    load_api_key || json_error "$TOOL_NAME docker-command" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    if [[ -z "$command" ]]; then
+        local result
+        result=$(render_api "/services/$service_id")
+        local current
+        current=$(echo "$result" | jq -r '.serviceDetails.envSpecificDetails.dockerCommand // "(not set; image CMD applies)"')
+
+        local na
+        na=$(next_actions \
+            "$(next_action "render-services docker-command $service_id \"./scripts/docker-entrypoint.sh dist/worker.js\"" "Set docker command override")" \
+            "$(next_action "render-services get $service_id" "View service details")")
+
+        json_ok "$TOOL_NAME docker-command" "$(jq -n --arg cmd "$current" '{dockerCommand: $cmd}')" "$na"
+    else
+        # SET mode: a config change; Render applies it on the next deploy, not on restart.
+        local result
+        result=$(curl -sS -X PATCH "https://api.render.com/v1/services/$service_id" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg cmd "$command" '{serviceDetails: {envSpecificDetails: {dockerCommand: $cmd}}}')")
+
+        local actual
+        actual=$(echo "$result" | jq -r '.serviceDetails.envSpecificDetails.dockerCommand // "(not set)"')
+
+        local na
+        na=$(next_actions \
+            "$(next_action "render-services docker-command $service_id" "Verify docker command")" \
+            "$(next_action "render-services deploy $service_id --wait" "Deploy to apply it")")
+
+        json_ok "$TOOL_NAME docker-command" "$(jq -n --arg cmd "$actual" '{dockerCommand: $cmd, updated: true}')" "$na"
+    fi
+}
+
 cmd_env_group_create() {
     local name="${1:-}"
     if [[ -z "$name" ]]; then
@@ -648,6 +690,9 @@ case "${1:-}" in
     env-group-set)
         shift; cmd_env_group_set "$@"
         ;;
+    docker-command)
+        shift; cmd_docker_command "$@"
+        ;;
     pre-deploy)
         shift; cmd_pre_deploy "$@"
         ;;
@@ -672,7 +717,8 @@ case "${1:-}" in
             {name: "env-group-delete", description: "Delete an env group", usage: "render-services env-group-delete <env-group-id>"},
             {name: "env-group-env", description: "List env group variables (masked)", usage: "render-services env-group-env <env-group-id>"},
             {name: "env-group-set", description: "Set an env group variable", usage: "render-services env-group-set <env-group-id> <KEY> <VALUE>"},
-            {name: "pre-deploy", description: "Get or set pre-deploy command", usage: "render-services pre-deploy <service-id> [command]"}
+            {name: "pre-deploy", description: "Get or set pre-deploy command", usage: "render-services pre-deploy <service-id> [command]"},
+            {name: "docker-command", description: "Get or set the dockerCommand override (applies on next deploy)", usage: "render-services docker-command <service-id> [command]"}
         ]')"
         ;;
 esac
