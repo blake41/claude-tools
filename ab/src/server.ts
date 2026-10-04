@@ -54,8 +54,6 @@ const AuthLoginRequestSchema = z.object({
   sessionId: z.string().min(1),
   port: z.number().int().positive(),
   email: z.string().email().optional(),
-  slackUserId: z.string().optional(),
-  apiBaseUrl: z.string().optional(),
   appBaseUrl: z.string().optional(),
   clerkSecretKey: z.string().optional(),
 });

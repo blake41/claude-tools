@@ -38,8 +38,6 @@ import { z } from "zod";
 const AuthLoginRequestSchema = z.object({
   sessionId: z.string().min(1),
   port: z.number().int().positive(),
-  slackUserId: z.string().optional(),
-  apiBaseUrl: z.string().optional(),
   appBaseUrl: z.string().optional(),
 });
 
@@ -173,7 +171,7 @@ beforeAll(() => {
           }
 
           // Fake success
-          return json({ ok: true, user: { slackUserId: parsed.data.slackUserId ?? "unknown", email: "test@clay.com" } });
+          return json({ ok: true, user: { email: "test@clay.com" } });
         })();
       }
 
@@ -384,13 +382,11 @@ describe("server RPC contract", () => {
     const { status, data } = await rpc<AuthLoginResponse>("POST", "/auth/login", {
       sessionId: "test-session",
       port: 9333,
-      slackUserId: "U0839QH8MMY",
     });
 
     expect(status).toBe(200);
     expect(data.ok).toBe(true);
     if (data.user) {
-      expect(typeof data.user.slackUserId).toBe("string");
       expect(typeof data.user.email).toBe("string");
     }
   });

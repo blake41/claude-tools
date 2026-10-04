@@ -194,21 +194,18 @@ export interface AuthLoginRequest {
   sessionId: string;
   port: number;
   email?: string;
-  slackUserId?: string;
-  apiBaseUrl?: string;
   appBaseUrl?: string;
   /**
    * Clerk development-instance secret key (sk_test_...) used to mint an
-   * Agent Task. Read from the CLI's CLERK_SECRET_KEY; falls back to the
-   * daemon's own env when omitted. Never persisted or logged.
+   * Agent Task. Read from the CLI's CLERK_SECRET_KEY and required in the
+   * request: the launchd daemon has no such variable. Never persisted or logged.
    */
   clerkSecretKey?: string;
 }
 
 export interface AuthLoginResponse {
   ok: boolean;
-  // slackUserId is optional because callers may auth by email alone.
-  user?: { slackUserId?: string; email: string };
+  user?: { email: string };
   error?: string;
 }
 
@@ -219,6 +216,6 @@ export interface AuthLoginResponse {
 export interface AuthStatusResponse {
   ok: boolean;
   authenticated: boolean;
-  user: { slackUserId?: string; email: string } | null;
+  user: { email: string } | null;
   lastLogin: string | null;
 }

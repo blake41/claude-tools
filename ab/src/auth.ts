@@ -20,8 +20,7 @@ const log = new Logger({ component: "auth" });
 
 interface AuthState {
   authenticated: boolean;
-  // slackUserId is optional because the caller may auth by email alone.
-  user: { slackUserId?: string; email: string } | null;
+  user: { email: string } | null;
   timestamp: number | null;
 }
 
@@ -184,10 +183,9 @@ export async function authenticate(
   const { sessionId, port } = req;
   const appBaseUrl = req.appBaseUrl || DEFAULT_APP_BASE;
   const email = req.email;
-  const slackUserId = req.slackUserId;
 
   // Never log the secret key.
-  log.info("Starting auth flow", { sessionId, port, appBaseUrl, email, slackUserId });
+  log.info("Starting auth flow", { sessionId, port, appBaseUrl, email });
 
   // -----------------------------------------------------------------------
   // Step 1: Check if already authenticated
@@ -240,15 +238,10 @@ export async function authenticate(
   // -----------------------------------------------------------------------
 
   if (!email) {
-    return {
-      ok: false,
-      error: slackUserId
-        ? "slackUserId login is not supported: cannot map a Slack ID to an email. Set AB_AUTH_EMAIL to the account's email."
-        : "email is required: set AB_AUTH_EMAIL to the account's email.",
-    };
+    return { ok: false, error: "email is required: set AB_AUTH_EMAIL to the account's email." };
   }
 
-  const secretKey = req.clerkSecretKey || process.env.CLERK_SECRET_KEY;
+  const secretKey = req.clerkSecretKey;
   const guard = checkAgentTaskGuards({ secretKey, appBaseUrl });
   if (!guard.ok) {
     log.warn("Agent Task guard refused", { reason: guard.error });
@@ -351,7 +344,7 @@ export async function authenticate(
   // Step 6: Update in-memory auth state
   // -----------------------------------------------------------------------
 
-  const user = { slackUserId, email };
+  const user = { email };
   authState = {
     authenticated: true,
     user,

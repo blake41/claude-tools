@@ -2,7 +2,7 @@
  * Auth contract tests.
  *
  * Tests the authenticate() flow against an injected fake Clerk client and mocked agent-browser responses (no network).
- * Verifies the shapes that cli.ts reads: { ok, user: { slackUserId, email }, error }.
+ * Verifies the shapes that cli.ts reads: { ok, user: { email }, error }.
  */
 import { test, expect, describe, beforeEach, afterEach, mock } from "bun:test";
 import * as fs from "fs";
@@ -57,11 +57,9 @@ afterEach(() => {
 
 function assertLoginSuccess(result: AuthLoginResponse): void {
   expect(result.ok).toBe(true);
-  // cli.ts reads result.user?.email and result.user?.slackUserId
+  // cli.ts reads result.user?.email
   if (result.user) {
     expect(typeof result.user.email).toBe("string");
-    // slackUserId is optional now: reauth identifies by email.
-    if (result.user.slackUserId !== undefined) expect(typeof result.user.slackUserId).toBe("string");
   }
 }
 
@@ -74,9 +72,8 @@ function assertLoginFailure(result: AuthLoginResponse): void {
 function assertAuthStatusShape(status: AuthStatusResponse): void {
   expect(typeof status.ok).toBe("boolean");
   expect(typeof status.authenticated).toBe("boolean");
-  // user is { slackUserId, email } | null
+  // user is { email } | null
   if (status.user !== null) {
-    if (status.user.slackUserId !== undefined) expect(typeof status.user.slackUserId).toBe("string");
     expect(typeof status.user.email).toBe("string");
   }
   // lastLogin is ISO string | null
@@ -139,28 +136,13 @@ function allLogs(): string {
 }
 
 describe("auth contract", () => {
-  test("authenticate without email or slackUserId returns failure telling the user to pass an email", async () => {
+  test("authenticate without email returns failure telling the user to pass an email", async () => {
     scriptBrowser(["about:blank"]);
     const { factory } = fakeClerk();
 
     const result = await authenticate({ sessionId: "test", port: 9333, clerkSecretKey: TEST_KEY }, { createClerkClient: factory });
 
     assertLoginFailure(result);
-    expect(result.error).toContain("email");
-    expect(factory).not.toHaveBeenCalled();
-  });
-
-  test("slackUserId alone is rejected with a clear 'pass an email' error (no Slack lookup)", async () => {
-    scriptBrowser(["about:blank"]);
-    const { factory } = fakeClerk();
-
-    const result = await authenticate(
-      { sessionId: "test", port: 9333, slackUserId: "U0839QH8MMY", clerkSecretKey: TEST_KEY },
-      { createClerkClient: factory },
-    );
-
-    assertLoginFailure(result);
-    expect(result.error).toContain("slackUserId");
     expect(result.error).toContain("email");
     expect(factory).not.toHaveBeenCalled();
   });
@@ -196,15 +178,17 @@ describe("auth contract", () => {
     expect(calls.some((a) => a[0] === "open")).toBe(false);
   });
 
-  test("falls back to the daemon's CLERK_SECRET_KEY when the request omits it", async () => {
+  test("ignores the daemon's own CLERK_SECRET_KEY: the request must carry the key", async () => {
     const original = process.env.CLERK_SECRET_KEY;
     process.env.CLERK_SECRET_KEY = TEST_KEY;
     try {
-      scriptBrowser(["about:blank", "http://localhost:5173/"]);
+      const calls = scriptBrowser(["about:blank", "http://localhost:5173/"]);
       const { factory } = fakeClerk();
       const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, { createClerkClient: factory });
-      assertLoginSuccess(result);
-      expect(factory).toHaveBeenCalledWith(TEST_KEY);
+      assertLoginFailure(result);
+      expect(result.error).toContain("CLERK_SECRET_KEY");
+      expect(factory).not.toHaveBeenCalled();
+      expect(calls.some((a) => a[0] === "open")).toBe(false);
     } finally {
       if (original === undefined) delete process.env.CLERK_SECRET_KEY;
       else process.env.CLERK_SECRET_KEY = original;
@@ -524,7 +508,6 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
     // Verify that the logic works via the exported function from cli.ts
     const { resolveReauthBaseUrls } = await import("../cli");
     const r = resolveReauthBaseUrls([], {}, "https://worktree-foo.terra.localhost/some-page");
-    expect(r.apiBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.appBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.error).toBeUndefined();
   });
@@ -532,7 +515,6 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
   test("auto-detect: non-terra browser URL falls back to undefined (localhost defaults)", async () => {
     const { resolveReauthBaseUrls } = await import("../cli");
     const r = resolveReauthBaseUrls([], {}, "https://example.com/page");
-    expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
     expect(r.error).toBeUndefined();
   });
@@ -545,7 +527,6 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
       "https://worktree-foo.terra.localhost/some-page",
     );
     // Explicit --host wins over auto-detected browser URL
-    expect(r.apiBaseUrl).toBe("https://worktree-bar.terra.localhost");
     expect(r.appBaseUrl).toBe("https://worktree-bar.terra.localhost");
   });
 
@@ -553,10 +534,9 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
     const { resolveReauthBaseUrls } = await import("../cli");
     const r = resolveReauthBaseUrls(
       [],
-      { AB_API_BASE_URL: "https://custom.example.com", AB_APP_BASE_URL: "https://custom.example.com" },
+      { AB_APP_BASE_URL: "https://custom.example.com" },
       "https://worktree-foo.terra.localhost/some-page",
     );
-    expect(r.apiBaseUrl).toBe("https://custom.example.com");
     expect(r.appBaseUrl).toBe("https://custom.example.com");
   });
 });
@@ -653,7 +633,7 @@ describe("reauth is shard-aware (chrome-pool-plan Unit 3)", () => {
       }
       if (pathname === "/auth/login") {
         return new Response(
-          JSON.stringify({ ok: true, user: { email: "blake.johnson@clay.com", slackUserId: "U08M03CDY73" } }),
+          JSON.stringify({ ok: true, user: { email: "blake.johnson@clay.com" } }),
           { status: 200 },
         );
       }
