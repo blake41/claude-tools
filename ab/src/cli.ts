@@ -16,6 +16,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
+import { isAuthenticatedUrl } from "./auth";
 import { HEADLESS_POOL_SIZE } from "./types";
 import type { ChromeState, ShardDiagnostics } from "./types";
 
@@ -1211,17 +1212,32 @@ export async function cmdOpen(
   return 0;
 }
 
-async function cmdImport(): Promise<number> {
+export interface ImportDeps {
+  openUrl: (port: number, url: string) => Promise<unknown>;
+  waitForEnter: () => Promise<void>;
+  getBrowserUrl: (port: number) => Promise<string | undefined>;
+}
+
+const importDefaults: ImportDeps = {
+  openUrl: (port, url) => runAgentBrowser(port, null, ["open", url]),
+  waitForEnter: () =>
+    new Promise<void>((resolve) => {
+      process.stdin.once("data", () => resolve());
+      process.stdin.resume();
+    }),
+  getBrowserUrl: (port) => getBrowserCurrentUrl(port, null),
+};
+
+export async function cmdImport(overrides: Partial<ImportDeps> = {}): Promise<number> {
+  const deps = { ...importDefaults, ...overrides };
   if (process.env.CCO_SESSION_ID) {
     stderr("Cannot import inside sandbox. Run 'ab import' from a terminal.");
     return 1;
   }
 
-  // Ensure headed Chrome
   const result = await rpc.ensureChromeHeaded();
   stderr(`Headed Chrome on port ${result.port}`);
 
-  // Open the exchange URL
   const exchangeUrl = "http://localhost:5173/?renderer=v4";
   stderr("");
   stderr("A Chrome window is available. Log into Google/Clerk on:");
@@ -1229,23 +1245,25 @@ async function cmdImport(): Promise<number> {
   stderr("  2. https://slack-feedback-staging.onrender.com (staging)");
   stderr("  3. https://terra.clay.com (production)");
   stderr("");
-  stderr("Press Enter here when done logging in.");
+  stderr("Leave the window on the logged-in app page, then press Enter here.");
   stderr("");
 
-  await runAgentBrowser(result.port, null, ["open", exchangeUrl]);
+  await deps.openUrl(result.port, exchangeUrl);
+  await deps.waitForEnter();
 
-  // Wait for stdin Enter
-  await new Promise<void>((resolve) => {
-    process.stdin.once("data", () => resolve());
-    process.stdin.resume();
-  });
+  const browserUrl = await deps.getBrowserUrl(result.port);
+  if (!browserUrl || !isAuthenticatedUrl(browserUrl)) {
+    stderr(`Import found no authenticated page (browser is at ${browserUrl ?? "an unknown URL"}). Log in, leave the window on the app, and run 'ab import' again.`);
+    return 1;
+  }
 
-  // Trigger auth grab via daemon
+  // Pinning appBaseUrl to the browser's own origin makes the daemon's
+  // already-authenticated shortcut match, so import never mints.
   const authResult = await rpc.authLogin({
     sessionId: "import",
     port: result.port,
     email: DEFAULT_AUTH_EMAIL,
-    appBaseUrl: process.env.AB_APP_BASE_URL,
+    appBaseUrl: new URL(browserUrl).origin,
   });
 
   if (authResult.ok) {

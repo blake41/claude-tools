@@ -873,3 +873,69 @@ describe("fresh-profile hint on ensureChromePort", () => {
     expect(stderrLines.some((l) => l.includes("fresh profile"))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ab import: auth is grabbed from the browser's own origin, never minted
+// ---------------------------------------------------------------------------
+
+describe("cmdImport pins appBaseUrl to the browser's origin", () => {
+  const originalCco = process.env.CCO_SESSION_ID;
+  beforeEach(() => { delete process.env.CCO_SESSION_ID; });
+  afterEach(() => {
+    if (originalCco === undefined) delete process.env.CCO_SESSION_ID;
+    else process.env.CCO_SESSION_ID = originalCco;
+  });
+
+  function routeDaemon(): Array<{ path: string; body: Record<string, unknown> | undefined }> {
+    const calls: Array<{ path: string; body: Record<string, unknown> | undefined }> = [];
+    fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : (url as Request).url;
+      const pathname = new URL(urlStr, "http://localhost").pathname;
+      calls.push({ path: pathname, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (pathname === "/chrome/ensure-headed") {
+        return new Response(JSON.stringify({ ok: true, pid: 200, port: 9444, alreadyRunning: true, profileFresh: false }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true, user: { email: "blake.johnson@clay.com" } }), { status: 200 });
+    });
+    return calls;
+  }
+
+  test("sends the browser's origin (staging) and no clerkSecretKey", async () => {
+    const calls = routeDaemon();
+    const { cmdImport } = await import("../cli");
+    const code = await cmdImport({
+      openUrl: async () => {},
+      waitForEnter: async () => {},
+      getBrowserUrl: async () => "https://slack-feedback-staging.onrender.com/accounts?x=1",
+    });
+    expect(code).toBe(0);
+    const login = calls.find((c) => c.path === "/auth/login");
+    expect(login?.body?.appBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
+    expect(login?.body?.port).toBe(9444);
+    expect(login?.body).not.toHaveProperty("clerkSecretKey");
+  });
+
+  test("an unauthenticated browser (/sign-in) is reported and never reaches the daemon's login", async () => {
+    const calls = routeDaemon();
+    const { cmdImport } = await import("../cli");
+    const code = await cmdImport({
+      openUrl: async () => {},
+      waitForEnter: async () => {},
+      getBrowserUrl: async () => "http://localhost:5173/sign-in",
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.path === "/auth/login")).toBe(false);
+  });
+
+  test("an unreadable browser URL is reported and never reaches the daemon's login", async () => {
+    const calls = routeDaemon();
+    const { cmdImport } = await import("../cli");
+    const code = await cmdImport({
+      openUrl: async () => {},
+      waitForEnter: async () => {},
+      getBrowserUrl: async () => undefined,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.path === "/auth/login")).toBe(false);
+  });
+});
