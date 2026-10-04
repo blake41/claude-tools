@@ -102,12 +102,12 @@ function fakeClerk(opts: { url?: string; throws?: unknown } = {}): { client: Fak
   const client: FakeClient = {
     calls,
     agentTasks: {
-      create: async (params) => {
-        calls.push(params as unknown as Record<string, unknown>);
+      create: async (params: unknown) => {
+        calls.push(params as Record<string, unknown>);
         if (opts.throws) throw opts.throws;
         return { agentId: "agent_1", taskId: "task_1", url: opts.url ?? MINTED_URL };
       },
-    },
+    } as unknown as AgentTaskClient["agentTasks"],
   };
   const factory = mock((_secretKey: string) => client);
   return { client, factory };
@@ -243,9 +243,31 @@ describe("auth contract", () => {
     expect(logs).not.toContain("clerk.accounts.dev");
   });
 
-  test("secret key and ticket never appear in logs or errors when Clerk fails with them in the message", async () => {
+  test("secret key never appears in logs or errors when Clerk fails with it in the message", async () => {
     scriptBrowser(["about:blank"]);
-    const { factory } = fakeClerk({ throws: new Error(`boom ${TEST_KEY} ${MINTED_URL}`) });
+    const { factory } = fakeClerk({ throws: new Error(`boom ${TEST_KEY}`) });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    assertLoginFailure(result);
+    expect(allLogs() + (result.error ?? "")).not.toContain("UNITTESTSECRET");
+  });
+
+  test("minted url, ticket and key never appear in logs when browser navigation fails with them in stderr", async () => {
+    const calls: string[][] = [];
+    spawnMock.mockImplementation((cmd: string[]) => {
+      const args = cmd.slice(5);
+      calls.push(args);
+      const failing = args[0] === "open";
+      const out = failing ? "" : args[0] === "get" ? "about:blank" : "";
+      const err = failing ? `navigation to ${MINTED_URL} failed ticket=TICKETSECRET ${TEST_KEY}` : "";
+      const stream = (t: string) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(t)); c.close(); } });
+      return { pid: 1, exitCode: failing ? 1 : 0, exited: Promise.resolve(failing ? 1 : 0), stdout: stream(out), stderr: stream(err), kill: () => {} };
+    });
+    const { factory } = fakeClerk();
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
@@ -256,6 +278,7 @@ describe("auth contract", () => {
     const blob = allLogs() + (result.error ?? "");
     expect(blob).not.toContain("UNITTESTSECRET");
     expect(blob).not.toContain("TICKETSECRET");
+    expect(blob).not.toContain("clerk.accounts.dev");
   });
 
   test("Clerk user-not-found (404 / *_not_found) maps to the friendly 'no Clerk account' error", async () => {

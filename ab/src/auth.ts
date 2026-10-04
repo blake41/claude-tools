@@ -9,6 +9,7 @@
  * The minted URL and the Clerk secret key are never logged.
  */
 
+import type { ClerkClient } from "@clerk/backend";
 import { Logger } from "./logger";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "./types";
 
@@ -41,18 +42,7 @@ const DEFAULT_APP_BASE = "http://localhost:5173";
 // ---------------------------------------------------------------------------
 
 /** The slice of @clerk/backend's client that authenticate() uses. */
-export interface AgentTaskClient {
-  agentTasks: {
-    create(params: {
-      onBehalfOf: { identifier: string };
-      permissions: string;
-      agentName: string;
-      taskDescription: string;
-      redirectUrl: string;
-      sessionMaxDurationInSeconds?: number;
-    }): Promise<{ agentId: string; taskId: string; url: string }>;
-  };
-}
+export type AgentTaskClient = Pick<ClerkClient, "agentTasks">;
 
 export interface AuthenticateDeps {
   createClerkClient: (secretKey: string) => AgentTaskClient | Promise<AgentTaskClient>;
@@ -63,7 +53,7 @@ export interface AuthenticateDeps {
 const defaultDeps: AuthenticateDeps = {
   createClerkClient: async (secretKey) => {
     const { createClerkClient } = await import("@clerk/backend");
-    return createClerkClient({ secretKey }) as unknown as AgentTaskClient;
+    return createClerkClient({ secretKey });
   },
 };
 
@@ -76,6 +66,14 @@ function isClerkUserNotFound(err: unknown): boolean {
   if (e.status === 404) return true;
   return Array.isArray(e.errors)
     && e.errors.some((x) => typeof (x as { code?: unknown })?.code === "string" && (x as { code: string }).code.includes("not_found"));
+}
+
+function ticketOf(url: string): string | undefined {
+  try {
+    return new URL(url).searchParams.get("ticket") ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function redactSecrets(text: string, secrets: Array<string | undefined>): string {
@@ -308,7 +306,7 @@ export async function authenticate(
       };
     }
     const raw = err instanceof Error ? err.message : String(err);
-    const message = redactSecrets(raw, [secretKey]).replace(/https?:\/\/\S*ticket=\S*/g, "[redacted-url]");
+    const message = redactSecrets(raw, [secretKey]);
     log.error("Agent Task mint failed", { message });
     return { ok: false, error: `Agent Task mint failed: ${message}` };
   }
@@ -317,9 +315,10 @@ export async function authenticate(
   // Step 3: Open the one-time Clerk-hosted URL (never logged)
   // -----------------------------------------------------------------------
 
+  const secrets = [secretKey, taskUrl, ticketOf(taskUrl)];
   const navResult = await runAgentBrowser(sessionId, port, ["open", taskUrl]);
   if (!navResult.ok) {
-    log.error("Navigation failed", { stderr: redactSecrets(navResult.stderr, [secretKey, taskUrl]) });
+    log.error("Navigation failed", { stderr: redactSecrets(navResult.stderr, secrets) });
     return { ok: false, error: "Auth exchange failed: browser navigation error" };
   }
 
@@ -329,7 +328,7 @@ export async function authenticate(
 
   const waitResult = await runAgentBrowser(sessionId, port, ["wait", "--load", "networkidle"], 30_000);
   if (!waitResult.ok) {
-    log.warn("Wait for networkidle returned non-zero", { stderr: redactSecrets(waitResult.stderr, [secretKey, taskUrl]) });
+    log.warn("Wait for networkidle returned non-zero", { stderr: redactSecrets(waitResult.stderr, secrets) });
     // Continue anyway — the page may have loaded fine
   }
 
