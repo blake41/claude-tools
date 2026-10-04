@@ -1,19 +1,21 @@
 /**
  * Auth contract tests.
  *
- * Tests the authenticate() flow against mocked HTTP and agent-browser responses.
+ * Tests the authenticate() flow against an injected fake Clerk client and mocked agent-browser responses (no network).
  * Verifies the shapes that cli.ts reads: { ok, user: { slackUserId, email }, error }.
  */
 import { test, expect, describe, beforeEach, afterEach, mock } from "bun:test";
 import * as fs from "fs";
 import { resetAuthState, getAuthStatus, authenticate, isAuthenticatedUrl } from "../auth";
+import type { AgentTaskClient } from "../auth";
+import { getRecentLogs } from "../logger";
 import type { AuthLoginResponse, AuthStatusResponse } from "../types";
 
 // ---------------------------------------------------------------------------
 // Mock setup
 // ---------------------------------------------------------------------------
 
-// We need to mock both global fetch (for dev-login POST) and Bun.spawn (for agent-browser).
+// We mock global fetch (the ab daemon RPC in cmdReauth tests) and Bun.spawn (for agent-browser).
 // Bun.spawn is used by the internal runAgentBrowser helper.
 
 const originalFetch = globalThis.fetch;
@@ -58,7 +60,8 @@ function assertLoginSuccess(result: AuthLoginResponse): void {
   // cli.ts reads result.user?.email and result.user?.slackUserId
   if (result.user) {
     expect(typeof result.user.email).toBe("string");
-    expect(typeof result.user.slackUserId).toBe("string");
+    // slackUserId is optional now: reauth identifies by email.
+    if (result.user.slackUserId !== undefined) expect(typeof result.user.slackUserId).toBe("string");
   }
 }
 
@@ -73,7 +76,7 @@ function assertAuthStatusShape(status: AuthStatusResponse): void {
   expect(typeof status.authenticated).toBe("boolean");
   // user is { slackUserId, email } | null
   if (status.user !== null) {
-    expect(typeof status.user.slackUserId).toBe("string");
+    if (status.user.slackUserId !== undefined) expect(typeof status.user.slackUserId).toBe("string");
     expect(typeof status.user.email).toBe("string");
   }
   // lastLogin is ISO string | null
@@ -88,172 +91,252 @@ function assertAuthStatusShape(status: AuthStatusResponse): void {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("auth contract", () => {
-  test("authenticate with missing slackUserId returns failure with descriptive error", async () => {
-    // agent-browser "get url" returns about:blank (not authenticated)
-    spawnMock.mockImplementation(() => ({
+const TEST_KEY = "sk_test_UNITTESTSECRET";
+const MINTED_URL = "https://fake-instance.clerk.accounts.dev/v1/tickets/accept?ticket=TICKETSECRET";
+
+interface FakeClient extends AgentTaskClient {
+  calls: Array<Record<string, unknown>>;
+}
+
+function fakeClerk(opts: { url?: string; throws?: unknown } = {}): { client: FakeClient; factory: ReturnType<typeof mock> } {
+  const calls: Array<Record<string, unknown>> = [];
+  const client: FakeClient = {
+    calls,
+    agentTasks: {
+      create: async (params) => {
+        calls.push(params as unknown as Record<string, unknown>);
+        if (opts.throws) throw opts.throws;
+        return { agentId: "agent_1", taskId: "task_1", url: opts.url ?? MINTED_URL };
+      },
+    },
+  };
+  const factory = mock((_secretKey: string) => client);
+  return { client, factory };
+}
+
+/** Mock agent-browser: record args per call, answer `get url` from `urls` in order. */
+function scriptBrowser(urls: string[]): string[][] {
+  const calls: string[][] = [];
+  let urlIdx = 0;
+  spawnMock.mockImplementation((cmd: string[]) => {
+    const args = cmd.slice(5); // after: agent-browser --session <id> --cdp <port>
+    calls.push(args);
+    const stdout = args[0] === "get" && args[1] === "url" ? (urls[Math.min(urlIdx++, urls.length - 1)] ?? "") : "";
+    return {
       pid: 1,
       exitCode: 0,
       exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("about:blank")); c.close(); },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
+      stdout: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(stdout)); c.close(); } }),
+      stderr: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); } }),
       kill: () => {},
-    }));
+    };
+  });
+  return calls;
+}
 
-    const result = await authenticate({
-      sessionId: "test",
-      port: 9333,
-      // No slackUserId
-    });
+function allLogs(): string {
+  return JSON.stringify(getRecentLogs());
+}
+
+describe("auth contract", () => {
+  test("authenticate without email or slackUserId returns failure telling the user to pass an email", async () => {
+    scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate({ sessionId: "test", port: 9333, clerkSecretKey: TEST_KEY }, { createClerkClient: factory });
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("email");
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  test("slackUserId alone is rejected with a clear 'pass an email' error (no Slack lookup)", async () => {
+    scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, slackUserId: "U0839QH8MMY", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
 
     assertLoginFailure(result);
     expect(result.error).toContain("slackUserId");
+    expect(result.error).toContain("email");
+    expect(factory).not.toHaveBeenCalled();
   });
 
-  test("authenticate with unreachable dev server returns failure", async () => {
-    // agent-browser "get url" returns about:blank
-    spawnMock.mockImplementation(() => ({
-      pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("about:blank")); c.close(); },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
-      kill: () => {},
-    }));
+  test("refuses sk_live_ key before any Clerk call or browser navigation", async () => {
+    const calls = scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk();
 
-    // fetch throws ECONNREFUSED
-    fetchMock.mockImplementation(() => {
-      throw new Error("fetch failed: ECONNREFUSED");
-    });
-
-    const result = await authenticate({
-      sessionId: "test",
-      port: 9333,
-      slackUserId: "U0839QH8MMY",
-      apiBaseUrl: "http://localhost:9999",
-    });
-
-    assertLoginFailure(result);
-    expect(result.error).toContain("unreachable");
-  });
-
-  test("authenticate with valid dev-login response returns success shape", async () => {
-    let callCount = 0;
-
-    // Mock agent-browser calls in sequence:
-    //   1. "get url" → about:blank (not authenticated)
-    //   2. "open <exchange>" → ok
-    //   3. "wait --load networkidle" → ok
-    //   4. "get url" → http://localhost:5173/ (authenticated, not /dev-login)
-    spawnMock.mockImplementation(() => {
-      callCount++;
-      let stdout = "";
-      if (callCount === 1) stdout = "about:blank";
-      else if (callCount === 4) stdout = "http://localhost:5173/";
-
-      return {
-        pid: 1,
-        exitCode: 0,
-        exited: Promise.resolve(0),
-        stdout: new ReadableStream({
-          start(c) { c.enqueue(new TextEncoder().encode(stdout)); c.close(); },
-        }),
-        stderr: new ReadableStream({
-          start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-        }),
-        kill: () => {},
-      };
-    });
-
-    // dev-login returns a token
-    fetchMock.mockImplementation(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({ token: "test-ticket-123", email: "blake@clay.com", exchangeUrl: "http://localhost:5173/dev-login?ticket=test-ticket-123" }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-      ),
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: "sk_live_LIVESECRET" },
+      { createClerkClient: factory },
     );
 
-    const result = await authenticate({
-      sessionId: "test",
-      port: 9333,
-      slackUserId: "U0839QH8MMY",
-    });
+    assertLoginFailure(result);
+    expect(result.error).toContain("sk_test_");
+    expect(factory).not.toHaveBeenCalled();
+    expect(calls.some((a) => a[0] === "open")).toBe(false);
+    expect(allLogs()).not.toContain("LIVESECRET");
+  });
 
-    assertLoginSuccess(result);
-    expect(result.user).toBeDefined();
-    expect(result.user!.slackUserId).toBe("U0839QH8MMY");
-    expect(result.user!.email).toBe("blake@clay.com");
+  test("refuses the production app host", async () => {
+    const calls = scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://terra.clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("terra.clay.com");
+    expect(factory).not.toHaveBeenCalled();
+    expect(calls.some((a) => a[0] === "open")).toBe(false);
+  });
+
+  test("falls back to the daemon's CLERK_SECRET_KEY when the request omits it", async () => {
+    const original = process.env.CLERK_SECRET_KEY;
+    process.env.CLERK_SECRET_KEY = TEST_KEY;
+    try {
+      scriptBrowser(["about:blank", "http://localhost:5173/"]);
+      const { factory } = fakeClerk();
+      const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, { createClerkClient: factory });
+      assertLoginSuccess(result);
+      expect(factory).toHaveBeenCalledWith(TEST_KEY);
+    } finally {
+      if (original === undefined) delete process.env.CLERK_SECRET_KEY;
+      else process.env.CLERK_SECRET_KEY = original;
+    }
+  });
+
+  test("success: mints an Agent Task for the email, opens the minted url, polls until on the app origin", async () => {
+    // get url sequence: initial (about:blank), then poll #1 still on Clerk-hosted page, poll #2 on app
+    const calls = scriptBrowser(["about:blank", "https://fake-instance.clerk.accounts.dev/v1/tickets/accept", "http://localhost:5173/"]);
+    const { client, factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.user?.email).toBe("blake@clay.com");
+    expect(factory).toHaveBeenCalledWith(TEST_KEY);
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]).toMatchObject({
+      onBehalfOf: { identifier: "blake@clay.com" },
+      permissions: "*",
+      agentName: "ab",
+      taskDescription: "ab reauth",
+      redirectUrl: "http://localhost:5173/",
+      sessionMaxDurationInSeconds: 3600,
+    });
+    const open = calls.find((a) => a[0] === "open");
+    expect(open).toEqual(["open", MINTED_URL]);
+    expect(calls.some((a) => a[0] === "wait" && a.includes("networkidle"))).toBe(true);
+    expect(calls.filter((a) => a[0] === "get" && a[1] === "url").length).toBeGreaterThanOrEqual(3);
+  });
+
+  test("secret key, minted url and ticket never appear in logs (success path)", async () => {
+    scriptBrowser(["about:blank", "http://localhost:5173/"]);
+    const { factory } = fakeClerk();
+
+    await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    const logs = allLogs();
+    expect(logs.length).toBeGreaterThan(2);
+    expect(logs).not.toContain("UNITTESTSECRET");
+    expect(logs).not.toContain("TICKETSECRET");
+    expect(logs).not.toContain("clerk.accounts.dev");
+  });
+
+  test("secret key and ticket never appear in logs or errors when Clerk fails with them in the message", async () => {
+    scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk({ throws: new Error(`boom ${TEST_KEY} ${MINTED_URL}`) });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    assertLoginFailure(result);
+    const blob = allLogs() + (result.error ?? "");
+    expect(blob).not.toContain("UNITTESTSECRET");
+    expect(blob).not.toContain("TICKETSECRET");
+  });
+
+  test("Clerk user-not-found (404 / *_not_found) maps to the friendly 'no Clerk account' error", async () => {
+    scriptBrowser(["about:blank"]);
+    const notFound = Object.assign(new Error("Not Found"), {
+      status: 404,
+      errors: [{ code: "resource_not_found", message: "not found" }],
+    });
+    const { factory } = fakeClerk({ throws: notFound });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "nobody@clay.com", appBaseUrl: "http://localhost:5173", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("nobody@clay.com");
+    expect(result.error).toContain("no Clerk account in this environment");
+  });
+
+  test("other Clerk errors surface as a generic mint failure", async () => {
+    scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk({ throws: Object.assign(new Error("Unauthorized"), { status: 401 }) });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("Agent Task");
+    expect(result.error).not.toContain("no Clerk account");
+  });
+
+  test("a minted response without a url returns failure", async () => {
+    scriptBrowser(["about:blank"]);
+    const { factory } = fakeClerk({ url: "" });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("missing url");
+  });
+
+  test("times out when the browser never lands on the app origin", async () => {
+    scriptBrowser(["about:blank", "https://fake-instance.clerk.accounts.dev/v1/tickets/accept"]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("timed out");
   });
 
   test("authenticate when browser already on authenticated page skips login", async () => {
-    // agent-browser "get url" returns authenticated URL
-    spawnMock.mockImplementation(() => ({
-      pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("http://localhost:5173/")); c.close(); },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
-      kill: () => {},
-    }));
+    scriptBrowser(["http://localhost:5173/"]);
+    const { factory } = fakeClerk();
 
-    const result = await authenticate({
-      sessionId: "test",
-      port: 9333,
-      slackUserId: "U0839QH8MMY",
-    });
+    const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, { createClerkClient: factory });
 
-    assertLoginSuccess(result);
-    // fetch should NOT have been called (no dev-login needed)
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  test("dev-login returning missing token returns failure", async () => {
-    // agent-browser "get url" returns about:blank
-    spawnMock.mockImplementation(() => ({
-      pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("about:blank")); c.close(); },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
-      kill: () => {},
-    }));
-
-    // dev-login returns 200 but no token
-    fetchMock.mockImplementation(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({ email: "blake@clay.com" }), // missing token!
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-      ),
-    );
-
-    const result = await authenticate({
-      sessionId: "test",
-      port: 9333,
-      slackUserId: "U0839QH8MMY",
-    });
-
-    assertLoginFailure(result);
-    expect(result.error).toContain("missing token");
+    expect(result.ok).toBe(true);
+    // No key, no Clerk client needed when already authenticated on the same origin.
+    expect(factory).not.toHaveBeenCalled();
   });
 
   test("getAuthStatus returns correct shape when not authenticated", () => {
@@ -279,7 +362,7 @@ describe("auth contract", () => {
       kill: () => {},
     }));
 
-    await authenticate({ sessionId: "test", port: 9333, slackUserId: "U0839QH8MMY" });
+    await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
 
     const before = getAuthStatus();
     expect(before.authenticated).toBe(true);
@@ -299,12 +382,12 @@ describe("auth contract", () => {
 // ---------------------------------------------------------------------------
 
 describe("isAuthenticatedUrl", () => {
-  test("returns true for localhost:5173 page (not /dev-login)", () => {
+  test("returns true for localhost:5173 page (not /sign-in)", () => {
     expect(isAuthenticatedUrl("http://localhost:5173/")).toBe(true);
   });
 
-  test("returns false for localhost:5173 /dev-login", () => {
-    expect(isAuthenticatedUrl("http://localhost:5173/dev-login")).toBe(false);
+  test("returns false for localhost:5173 /sign-in", () => {
+    expect(isAuthenticatedUrl("http://localhost:5173/sign-in")).toBe(false);
   });
 
   test("returns true for onrender.com page", () => {
@@ -315,7 +398,7 @@ describe("isAuthenticatedUrl", () => {
     expect(isAuthenticatedUrl("https://terra.clay.com/home")).toBe(true);
   });
 
-  test("returns true for *.terra.localhost page (not /dev-login)", () => {
+  test("returns true for *.terra.localhost page (not /sign-in)", () => {
     // BUG BEFORE FIX: clayPatterns was missing .terra.localhost, so this returned false
     expect(isAuthenticatedUrl("https://worktree-foo.terra.localhost/home")).toBe(true);
   });
@@ -324,8 +407,8 @@ describe("isAuthenticatedUrl", () => {
     expect(isAuthenticatedUrl("https://terra.localhost/home")).toBe(true);
   });
 
-  test("returns false for *.terra.localhost /dev-login page", () => {
-    expect(isAuthenticatedUrl("https://worktree-foo.terra.localhost/dev-login")).toBe(false);
+  test("returns false for *.terra.localhost /sign-in page", () => {
+    expect(isAuthenticatedUrl("https://worktree-foo.terra.localhost/sign-in")).toBe(false);
   });
 
   test("returns false for about:blank", () => {
@@ -346,42 +429,25 @@ describe("origin-aware short-circuit", () => {
   // target is worktree-B, we must NOT skip the auth flow.
 
   test("does NOT skip login when browser origin is worktree-A but appBaseUrl targets worktree-B", async () => {
-    // Browser is authenticated on worktree-A
-    spawnMock.mockImplementation(() => ({
-      pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) {
-          c.enqueue(new TextEncoder().encode("https://worktree-a.terra.localhost/home"));
-          c.close();
-        },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
-      kill: () => {},
-    }));
+    // Browser is authenticated on worktree-A; the mint must run for worktree-B
+    const calls = scriptBrowser(["https://worktree-a.terra.localhost/home", "https://worktree-b.terra.localhost/home"]);
+    const { client, factory } = fakeClerk();
 
-    // fetch should be called because we're targeting worktree-B (different origin)
-    fetchMock.mockImplementation(() => {
-      throw new Error("fetch failed: ECONNREFUSED");
-    });
+    const result = await authenticate(
+      {
+        sessionId: "test",
+        port: 9333,
+        email: "blake@clay.com",
+        appBaseUrl: "https://worktree-b.terra.localhost",
+        clerkSecretKey: TEST_KEY,
+      },
+      { createClerkClient: factory },
+    );
 
-    const result = await authenticate({
-      sessionId: "test",
-      port: 9333,
-      slackUserId: "U0839QH8MMY",
-      apiBaseUrl: "https://worktree-b.terra.localhost",
-      appBaseUrl: "https://worktree-b.terra.localhost",
-    });
-
-    // fetch WAS called (did not short-circuit)
-    expect(fetchMock).toHaveBeenCalled();
-    // Result is failure because worktree-B is unreachable, but that's expected —
-    // the important thing is that we didn't silently skip
-    assertLoginFailure(result);
-    expect(result.error).toContain("unreachable");
+    // Did not short-circuit: minted a task redirecting to worktree-B and opened it.
+    expect(client.calls[0]).toMatchObject({ redirectUrl: "https://worktree-b.terra.localhost/" });
+    expect(calls.some((a) => a[0] === "open" && a[1] === MINTED_URL)).toBe(true);
+    assertLoginSuccess(result);
   });
 
   test("DOES skip login when browser origin matches appBaseUrl (worktree-A to worktree-A)", async () => {
@@ -405,13 +471,12 @@ describe("origin-aware short-circuit", () => {
     const result = await authenticate({
       sessionId: "test",
       port: 9333,
-      slackUserId: "U0839QH8MMY",
-      apiBaseUrl: "https://worktree-a.terra.localhost",
+      email: "blake@clay.com",
       appBaseUrl: "https://worktree-a.terra.localhost",
     });
 
-    // fetch should NOT have been called (same origin, skip is valid)
-    expect(fetchMock).not.toHaveBeenCalled();
+    // same origin: skip is valid, no minting
+    expect(spawnMock.mock.calls.some((c) => (c[0] as string[]).includes("open"))).toBe(false);
     assertLoginSuccess(result);
   });
 
@@ -436,11 +501,11 @@ describe("origin-aware short-circuit", () => {
     const result = await authenticate({
       sessionId: "test",
       port: 9333,
-      slackUserId: "U0839QH8MMY",
+      email: "blake@clay.com",
       // no appBaseUrl → defaults to localhost:5173
     });
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(spawnMock.mock.calls.some((c) => (c[0] as string[]).includes("open"))).toBe(false);
     assertLoginSuccess(result);
   });
 });
@@ -611,6 +676,27 @@ describe("reauth is shard-aware (chrome-pool-plan Unit 3)", () => {
     const loginCall = calls.find((c) => c.path === "/auth/login");
     expect(loginCall).toBeDefined();
     expect((loginCall!.body as { port: number }).port).toBe(9334);
+  });
+
+  test("reauth forwards CLERK_SECRET_KEY from the CLI env in the login RPC body, and logs no secret", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=0\n`);
+    const calls = installDaemonRouter();
+    const original = process.env.CLERK_SECRET_KEY;
+    process.env.CLERK_SECRET_KEY = "sk_test_CLIFORWARDSECRET";
+    const writes: string[] = [];
+    const origStderr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      const { cmdReauth } = await import("../cli");
+      await cmdReauth([], 9333, `ab-${testPid}`);
+    } finally {
+      process.stderr.write = origStderr;
+      if (original === undefined) delete process.env.CLERK_SECRET_KEY;
+      else process.env.CLERK_SECRET_KEY = original;
+    }
+    const loginCall = calls.find((c) => c.path === "/auth/login");
+    expect((loginCall!.body as { clerkSecretKey?: string }).clerkSecretKey).toBe("sk_test_CLIFORWARDSECRET");
+    expect(writes.join("")).not.toContain("CLIFORWARDSECRET");
   });
 
   test("headed reauth keeps port 9444 regardless of the session's headless shard assignment", async () => {
