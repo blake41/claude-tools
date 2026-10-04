@@ -1,0 +1,156 @@
+#!/bin/bash
+# websearch - live web search + browser-rendered fetch for agents
+# Thin wrapper over TinyFish's Search/Fetch API. Not the TinyFish CLI itself
+# (that's `tinyfish`, kept separate for agent/browser automation escalation).
+set -euo pipefail
+
+REAL_SCRIPT="$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+source "$SCRIPT_DIR/../cli-envelope.sh"
+
+TOOL_NAME="websearch"
+CONFIG_DIR="${HOME}/.config/websearch"
+
+load_api_key() {
+    if [[ -f ".env" ]]; then
+        local env_key
+        env_key=$(grep -E "^WEBSEARCH_API_KEY=" .env 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        if [[ -n "$env_key" ]]; then
+            export WEBSEARCH_API_KEY="$env_key"
+            return 0
+        fi
+    fi
+
+    if [[ -f "$CONFIG_DIR/api_key" ]]; then
+        export WEBSEARCH_API_KEY=$(cat "$CONFIG_DIR/api_key")
+        return 0
+    fi
+
+    return 1
+}
+
+cmd_search() {
+    local query="${1:-}"
+    [[ -n "$query" ]] || json_error "$TOOL_NAME search" "Missing query" "INVALID_ARG" "Usage: websearch search <query> [--max-results N]"
+    shift || true
+
+    local max_results=10
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-results)
+                max_results="${2:-}"
+                [[ "$max_results" =~ ^[0-9]+$ ]] || json_error "$TOOL_NAME search" "--max-results must be a number, got '$max_results'" "INVALID_ARG" "Usage: websearch search <query> --max-results 5"
+                shift 2
+                ;;
+            *)
+                json_error "$TOOL_NAME search" "Unknown flag: $1" "INVALID_ARG" "Run 'websearch search' with no flags to see accepted ones: --max-results N"
+                ;;
+        esac
+    done
+
+    load_api_key || json_error "$TOOL_NAME search" "WEBSEARCH_API_KEY not found" "AUTH_MISSING" "mkdir -p $CONFIG_DIR && echo '<key>' > $CONFIG_DIR/api_key && chmod 600 $CONFIG_DIR/api_key"
+
+    local tmpfile http_code
+    tmpfile=$(mktemp)
+    http_code=$(curl -sS -w '%{http_code}' -o "$tmpfile" -G "https://api.search.tinyfish.ai" \
+        --data-urlencode "query=$query" \
+        -H "X-API-Key: $WEBSEARCH_API_KEY") || {
+        rm -f "$tmpfile"
+        json_error "$TOOL_NAME search" "curl request failed" "NETWORK_ERROR" "Check network connectivity and retry"
+    }
+
+    local body
+    body=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+
+    if [[ "$http_code" != "200" ]]; then
+        json_error "$TOOL_NAME search" "HTTP $http_code: $body" "API_ERROR" "Check the query and that $CONFIG_DIR/api_key is valid"
+    fi
+
+    local trimmed
+    trimmed=$(echo "$body" | jq --argjson n "$max_results" '.results |= .[0:$n]')
+    json_ok "$TOOL_NAME search" "$trimmed"
+}
+
+cmd_fetch() {
+    [[ $# -ge 1 ]] || json_error "$TOOL_NAME fetch" "Missing URL(s)" "INVALID_ARG" "Usage: websearch fetch <url> [url2...] [--max-chars N] (max 10 URLs)"
+
+    local urls=()
+    local max_chars=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-chars)
+                max_chars="${2:-}"
+                [[ "$max_chars" =~ ^[0-9]+$ ]] || json_error "$TOOL_NAME fetch" "--max-chars must be a number, got '$max_chars'" "INVALID_ARG" "Usage: websearch fetch <url> --max-chars 2000"
+                shift 2
+                ;;
+            --*)
+                json_error "$TOOL_NAME fetch" "Unknown flag: $1" "INVALID_ARG" "Run 'websearch fetch' with no args to see accepted flags: --max-chars N"
+                ;;
+            *)
+                urls+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [[ ${#urls[@]} -ge 1 ]] || json_error "$TOOL_NAME fetch" "Missing URL(s)" "INVALID_ARG" "Usage: websearch fetch <url> [url2...] [--max-chars N]"
+
+    load_api_key || json_error "$TOOL_NAME fetch" "WEBSEARCH_API_KEY not found" "AUTH_MISSING" "mkdir -p $CONFIG_DIR && echo '<key>' > $CONFIG_DIR/api_key && chmod 600 $CONFIG_DIR/api_key"
+
+    local urls_json payload
+    urls_json=$(printf '%s\n' "${urls[@]}" | jq -R . | jq -s .)
+    payload=$(jq -n --argjson urls "$urls_json" '{urls: $urls}')
+
+    local tmpfile http_code
+    tmpfile=$(mktemp)
+    http_code=$(curl -sS -w '%{http_code}' -o "$tmpfile" -X POST "https://api.fetch.tinyfish.ai" \
+        -H "X-API-Key: $WEBSEARCH_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$payload") || {
+        rm -f "$tmpfile"
+        json_error "$TOOL_NAME fetch" "curl request failed" "NETWORK_ERROR" "Check network connectivity and retry"
+    }
+
+    local body
+    body=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+
+    if [[ "$http_code" != "200" ]]; then
+        json_error "$TOOL_NAME fetch" "HTTP $http_code: $body" "API_ERROR" "Check the URL(s) and that $CONFIG_DIR/api_key is valid"
+    fi
+
+    local trimmed
+    if [[ "$max_chars" -gt 0 ]]; then
+        trimmed=$(echo "$body" | jq --argjson n "$max_chars" '.results |= [.[] | if .text != null and (.text | length) > $n then .text = (.text[0:$n] + "... [truncated, use a higher --max-chars to see more]") else . end]')
+    else
+        trimmed="$body"
+    fi
+    json_ok "$TOOL_NAME fetch" "$trimmed"
+}
+
+# Main -------------------------------------------------------------------
+
+if [[ $# -lt 1 ]]; then
+    cmd_tree "$TOOL_NAME" "Live web search + browser-rendered fetch" "$(jq -n '[
+        {name: "search", description: "Web search, ranked results with title/url/snippet", usage: "websearch search <query> [--max-results N]"},
+        {name: "fetch",  description: "Fetch clean, browser-rendered page content",         usage: "websearch fetch <url> [url2...] [--max-chars N]"}
+    ]')"
+    exit 0
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+    search) cmd_search "$@" ;;
+    fetch)  cmd_fetch "$@" ;;
+    help|--help|-h)
+        cmd_tree "$TOOL_NAME" "Live web search + browser-rendered fetch" "$(jq -n '[
+            {name: "search", description: "Web search, ranked results with title/url/snippet", usage: "websearch search <query> [--max-results N]"},
+            {name: "fetch",  description: "Fetch clean, browser-rendered page content",         usage: "websearch fetch <url> [url2...] [--max-chars N]"}
+        ]')"
+        ;;
+    *)
+        json_error "$TOOL_NAME" "Unknown command: $CMD" "INVALID_ARG" "Run 'websearch' with no args to see available commands"
+        ;;
+esac
