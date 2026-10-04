@@ -159,6 +159,40 @@ export function checkAgentTaskGuards(input: {
 }
 
 /**
+ * True when a Clerk session cookie is visible for the app host: `__session`
+ * with a value, or `__client_uat` with a value other than "0". Cookie names may
+ * carry a per-instance suffix (`__session_<id>`).
+ */
+export function hasClerkSessionCookie(cookies: unknown, appHost: string): boolean {
+  if (!Array.isArray(cookies)) return false;
+  const host = appHost.toLowerCase();
+  return cookies.some((c) => {
+    if (typeof c !== "object" || c === null) return false;
+    const { name, value, domain } = c as { name?: unknown; value?: unknown; domain?: unknown };
+    if (typeof name !== "string" || typeof value !== "string" || !value) return false;
+    if (typeof domain !== "string") return false;
+    const d = domain.toLowerCase().replace(/^\./, "");
+    if (host !== d && !host.endsWith(`.${d}`)) return false;
+    if (name === "__session" || name.startsWith("__session_")) return true;
+    return (name === "__client_uat" || name.startsWith("__client_uat_")) && value !== "0";
+  });
+}
+
+async function confirmClerkSession(sessionId: string, port: number, appOrigin: string): Promise<boolean> {
+  const result = await runAgentBrowser(sessionId, port, ["cookies", "get", "--json"]);
+  if (!result.ok) {
+    log.warn("Could not read browser cookies to confirm the Clerk session");
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(result.stdout) as { data?: { cookies?: unknown } };
+    return hasClerkSessionCookie(parsed?.data?.cookies, new URL(appOrigin).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Check whether the browser is already on an authenticated page.
  * An authenticated page is a Clay URL that is NOT /sign-in.
  */
@@ -300,8 +334,8 @@ export async function authenticate(
   }
 
   // -----------------------------------------------------------------------
-  // Step 5: Poll until the browser lands on the app origin and has left
-  // Clerk-hosted / sign-in pages
+  // Step 5: Poll until the browser lands on the app origin, has left
+  // Clerk-hosted / sign-in pages, and holds a Clerk session cookie
   // -----------------------------------------------------------------------
 
   let appOrigin: string;
@@ -313,6 +347,7 @@ export async function authenticate(
 
   const pollDeadline = Date.now() + pollTimeoutMs;
   let landed = false;
+  let landedWithoutSession = false;
   while (Date.now() < pollDeadline) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
     const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
@@ -325,11 +360,24 @@ export async function authenticate(
       origin = new URL(verifyResult.stdout).origin;
     } catch { /* not a URL yet */ }
     if (origin === appOrigin && !verifyResult.stdout.includes("/sign-in")) {
-      landed = true;
-      log.info("Auth exchange succeeded", { origin });
-      break;
+      if (await confirmClerkSession(sessionId, port, appOrigin)) {
+        landed = true;
+        landedWithoutSession = false;
+        log.info("Auth exchange succeeded", { origin });
+        break;
+      }
+      landedWithoutSession = true;
+      continue;
     }
     log.debug("Not on the app origin yet, waiting...", { origin });
+  }
+
+  if (!landed && landedWithoutSession) {
+    log.error("Browser reached the app origin but no Clerk session cookie exists", { appOrigin });
+    return {
+      ok: false,
+      error: `Browser reached ${appOrigin} but has no Clerk session. CLERK_SECRET_KEY probably belongs to a different Clerk instance than this app. Use this app's development key.`,
+    };
   }
 
   if (!landed) {
