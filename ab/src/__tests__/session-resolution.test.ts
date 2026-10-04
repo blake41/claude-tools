@@ -160,7 +160,7 @@ describe("resolveReauthBaseUrls", () => {
     expect(r.appBaseUrl).toBe("https://bar.example.com");
   });
 
-  test("--prod returns error (dev-login gated off in prod)", () => {
+  test("--prod returns error (reauth refuses production)", () => {
     const r = resolveReauthBaseUrls(["--prod"], {});
     expect(r.error).toContain("--prod is not supported");
   });

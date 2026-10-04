@@ -187,7 +187,7 @@ export interface HealResponse {
 }
 
 // ---------------------------------------------------------------------------
-// RPC: /auth/login  (dev-login flow)
+// RPC: /auth/login  (Agent Tasks flow)
 // ---------------------------------------------------------------------------
 
 export interface AuthLoginRequest {
