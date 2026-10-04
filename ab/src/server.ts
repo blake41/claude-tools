@@ -57,6 +57,7 @@ const AuthLoginRequestSchema = z.object({
   slackUserId: z.string().optional(),
   apiBaseUrl: z.string().optional(),
   appBaseUrl: z.string().optional(),
+  clerkSecretKey: z.string().optional(),
 });
 
 const ChromeEnsureRequestSchema = z.object({

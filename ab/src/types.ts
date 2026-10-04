@@ -197,6 +197,12 @@ export interface AuthLoginRequest {
   slackUserId?: string;
   apiBaseUrl?: string;
   appBaseUrl?: string;
+  /**
+   * Clerk development-instance secret key (sk_test_...) used to mint an
+   * Agent Task. Read from the CLI's CLERK_SECRET_KEY; falls back to the
+   * daemon's own env when omitted. Never persisted or logged.
+   */
+  clerkSecretKey?: string;
 }
 
 export interface AuthLoginResponse {

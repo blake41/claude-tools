@@ -75,6 +75,45 @@ async function runAgentBrowser(
   };
 }
 
+const PRODUCTION_APP_HOST = "terra.clay.com";
+
+/**
+ * Pure safety gate for minting an Agent Task. Refuses anything but a Clerk
+ * development instance (`sk_test_` key) and refuses the production app host.
+ * Error text never contains the key.
+ */
+export function checkAgentTaskGuards(input: {
+  secretKey: string | undefined;
+  appBaseUrl: string;
+}): { ok: true } | { ok: false; error: string } {
+  const { secretKey, appBaseUrl } = input;
+  if (!secretKey) {
+    return {
+      ok: false,
+      error: "CLERK_SECRET_KEY is not set. Export the development-instance key (sk_test_...) in the shell that runs `ab`.",
+    };
+  }
+  if (!secretKey.startsWith("sk_test_")) {
+    return {
+      ok: false,
+      error: "Refusing to mint: CLERK_SECRET_KEY is not a development-instance key (must start with sk_test_). Use `ab import` for production.",
+    };
+  }
+  let host: string;
+  try {
+    host = new URL(appBaseUrl).hostname.toLowerCase();
+  } catch {
+    return { ok: false, error: `Refusing to mint: appBaseUrl is not a valid URL: ${appBaseUrl}` };
+  }
+  if (host === PRODUCTION_APP_HOST) {
+    return {
+      ok: false,
+      error: `Refusing to mint against ${PRODUCTION_APP_HOST}. Production auth uses \`ab import\` (headed Google login).`,
+    };
+  }
+  return { ok: true };
+}
+
 /**
  * Check whether the browser is already on an authenticated page.
  * An authenticated page is a Clay URL that is NOT /dev-login or /sign-in.
