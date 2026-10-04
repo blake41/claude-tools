@@ -33,7 +33,7 @@ allowed-tools: Bash(agent-browser:*), Bash(ab:*)
 2. Do NOT try to fix it yourself — you cannot spawn Chrome from inside the sandbox
 
 **If auth is missing (login screens, 401s):**
-1. Run `ab reauth` — authenticates via dev-login through the daemon (no personal Chrome needed)
+1. Run `ab reauth` — authenticates via a Clerk Agent Task through the daemon (needs `CLERK_SECRET_KEY` = `sk_test_...` in the shell; no personal Chrome needed)
 2. If reauth fails, tell the user to run `ab import` from their terminal for manual Google/Clerk login in a headed Chrome window
 3. Auth persists in the Chrome profile managed by the daemon
 
@@ -88,7 +88,7 @@ Worktrees run on unique ports to avoid collisions with the main dev server. Use 
 |---------|-------------|----------|
 | `ab open <url>` | Navigate (creates tab per session) | sandbox or terminal |
 | `ab import` | Headed Chrome for manual Google/Clerk login | terminal only |
-| `ab reauth` | Re-authenticate via dev-login (through daemon) | terminal or sandbox |
+| `ab reauth` | Re-authenticate via Clerk Agent Task (through daemon) | terminal or sandbox |
 | `ab dashboard <start\|stop\|restart\|status>` | Manage the visual dashboard | terminal or sandbox |
 | `ab heal` | Kill Chrome, restart fresh (through daemon) | terminal or sandbox |
 | `ab record start <file.webm>` | Record video of active tab (auth-safe) | sandbox or terminal |

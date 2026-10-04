@@ -403,7 +403,7 @@ describe("isAuthenticatedUrl", () => {
     expect(isAuthenticatedUrl("https://worktree-foo.terra.localhost/home")).toBe(true);
   });
 
-  test("returns true for terra.localhost page (exact match, not /dev-login)", () => {
+  test("returns true for terra.localhost page (exact match, not /sign-in)", () => {
     expect(isAuthenticatedUrl("https://terra.localhost/home")).toBe(true);
   });
 

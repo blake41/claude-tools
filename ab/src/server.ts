@@ -7,7 +7,7 @@
  *   POST /chrome/ensure    → ensure headless chrome, return port
  *   POST /chrome/ensure-headed → ensure headed chrome, return port
  *   POST /heal             → kill all chrome, restart headless
- *   POST /auth/login       → dev-login auth flow
+ *   POST /auth/login       → Agent Tasks auth flow
  *   GET  /auth/status      → auth state
  *   *    *                 → 404
  */

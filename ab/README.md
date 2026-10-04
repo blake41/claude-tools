@@ -9,10 +9,10 @@
 │  ab-server daemon (Bun, managed by launchd)          │
 │  ~/.agent-browser/ab-server.sock                     │
 │                                                      │
-│  Chrome Supervisor          Auth (dev-login)          │
-│  ├─ headless (9333)         POST /auth/dev-login      │
-│  │   always-on              → mint Clerk token        │
-│  │   auto-restart           → exchange in browser     │
+│  Chrome Supervisor          Auth (Agent Tasks)        │
+│  ├─ headless (9333)         clerk.agentTasks.create   │
+│  │   always-on              → one-time Clerk URL      │
+│  │   auto-restart           → open it in browser      │
 │  └─ headed (9444)           → real Clerk session      │
 │      on-demand                                        │
 │      10min idle timeout                               │
@@ -76,16 +76,16 @@ ab record start /tmp/demo.webm
 ab record stop
 
 # Auth (automatic on first open, or manual)
-ab reauth               # authenticate via dev-login
+ab reauth               # authenticate via a Clerk Agent Task (needs CLERK_SECRET_KEY, sk_test_)
 ab heal                  # kill all sessions, restart Chrome
 ab status               # daemon health + Chrome state
 ```
 
 ## Auth
 
-Agents authenticate via **dev-login** — a Clerk sign-in token is minted by the backend and exchanged in the browser for a real session. No Google OAuth, no cookie stealing.
+Agents authenticate via a **Clerk Agent Task** — `ab` mints it directly against the development Clerk instance (`CLERK_SECRET_KEY` from the `ab` CLI env, `sk_test_` only, never `terra.clay.com`) and opens the one-time URL for a real session. No Google OAuth, no cookie stealing. Production uses `ab import`.
 
-See **[docs/dev-login-auth.md](docs/dev-login-auth.md)** for the full flow, configuration, and troubleshooting.
+See **[docs/agent-tasks-auth.md](docs/agent-tasks-auth.md)** for the full flow, configuration, and troubleshooting.
 
 ## Daemon Management
 
@@ -116,7 +116,7 @@ bun run install.ts --uninstall  # Uninstall, restore old ab
 | `src/daemon.ts` | Daemon entry point |
 | `src/chrome-supervisor.ts` | Chrome lifecycle (launch, health, restart) |
 | `src/server.ts` | Unix socket HTTP server |
-| `src/auth.ts` | Dev-login auth flow |
+| `src/auth.ts` | Agent Tasks auth flow |
 | `src/cli.ts` | CLI entry point (replaces old bash ab) |
 | `src/rpc.ts` | CLI → daemon RPC client |
 | `src/state.ts` | Chrome state machine |
@@ -132,5 +132,5 @@ bun run install.ts --uninstall  # Uninstall, restore old ab
 
 ## Docs
 
-- **[docs/dev-login-auth.md](docs/dev-login-auth.md)** — Auth flow, configuration, troubleshooting
+- **[docs/agent-tasks-auth.md](docs/agent-tasks-auth.md)** — Auth flow, configuration, troubleshooting
 - **[docs/agent-browser-reference/SKILL.md](docs/agent-browser-reference/SKILL.md)** — Agent-browser command reference
