@@ -15,12 +15,12 @@
  *   ab click-xy 420 180
  */
 
+import { pickTabWs, TARGET_ID_ENV, type CdpTab } from "./cdp-target";
+
 async function findPageWs(port: number): Promise<string> {
   const res = await fetch(`http://localhost:${port}/json`);
-  const tabs = (await res.json()) as { type: string; webSocketDebuggerUrl: string }[];
-  const pages = tabs.filter((t) => t.type === "page");
-  if (pages.length === 0) throw new Error("No page tabs found");
-  return pages[0].webSocketDebuggerUrl;
+  const tabs = (await res.json()) as CdpTab[];
+  return pickTabWs(tabs, process.env[TARGET_ID_ENV]);
 }
 
 let msgId = 0;

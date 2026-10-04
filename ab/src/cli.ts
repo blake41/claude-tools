@@ -2072,27 +2072,34 @@ async function cmdGc(args: string[]): Promise<number> {
   return 0;
 }
 
-async function cmdConsoleTail(args: string[], cdpPort: number): Promise<number> {
+/** Env handing a spawned CDP script this session's most recent tab, so it never
+ *  acts in another agent's tab on a shared shard. Empty when none is recorded. */
+export function sessionTargetEnv(pid: string, cdpPort: number): Record<string, string> {
+  const targets = readSessionTargets(pid, cdpPort);
+  return { AB_TARGET_ID: targets[targets.length - 1] ?? "" };
+}
+
+async function cmdConsoleTail(args: string[], cdpPort: number, pid: string): Promise<number> {
   const script = path.join(AB_DIR, "console-tail.ts");
-  const result = await execInherit("bun", ["run", script, ...args, String(cdpPort)]);
+  const result = await execInherit("bun", ["run", script, ...args, String(cdpPort)], sessionTargetEnv(pid, cdpPort));
   return result.exitCode;
 }
 
-async function cmdWatch(args: string[], cdpPort: number): Promise<number> {
+async function cmdWatch(args: string[], cdpPort: number, pid: string): Promise<number> {
   const script = path.join(AB_DIR, "console-tail.ts");
-  const result = await execInherit("bun", ["run", script, "--watch", ...args, String(cdpPort)]);
+  const result = await execInherit("bun", ["run", script, "--watch", ...args, String(cdpPort)], sessionTargetEnv(pid, cdpPort));
   return result.exitCode;
 }
 
-async function cmdClickJs(args: string[], cdpPort: number): Promise<number> {
+async function cmdClickJs(args: string[], cdpPort: number, pid: string): Promise<number> {
   const script = path.join(AB_DIR, "cdp-click.ts");
-  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args]);
+  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args], sessionTargetEnv(pid, cdpPort));
   return result.exitCode;
 }
 
-async function cmdClickXy(args: string[], cdpPort: number): Promise<number> {
+async function cmdClickXy(args: string[], cdpPort: number, pid: string): Promise<number> {
   const script = path.join(AB_DIR, "cdp-click-xy.ts");
-  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args]);
+  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args], sessionTargetEnv(pid, cdpPort));
   return result.exitCode;
 }
 
@@ -2318,10 +2325,10 @@ async function main(): Promise<number> {
     if (command === "new-session") return cmdNewSession();
     if (command === "ps") return cmdPs(rest);
     if (command === "gc") return await cmdGc(rest);
-    if (command === "console-tail") return await cmdConsoleTail(rest, cdpPort);
-    if (command === "watch") return await cmdWatch(rest, cdpPort);
-    if (command === "click-js") return await cmdClickJs(rest, cdpPort);
-    if (command === "click-xy") return await cmdClickXy(rest, cdpPort);
+    if (command === "console-tail") return await cmdConsoleTail(rest, cdpPort, pid);
+    if (command === "watch") return await cmdWatch(rest, cdpPort, pid);
+    if (command === "click-js") return await cmdClickJs(rest, cdpPort, pid);
+    if (command === "click-xy") return await cmdClickXy(rest, cdpPort, pid);
 
     // -- Interactive --
     if (command === "import") return await cmdImport();
