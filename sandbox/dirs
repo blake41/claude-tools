@@ -15,6 +15,7 @@
 ~/.bun
 ~/.bun/install/cache/
 ~/.cache/prisma
+~/.local/bin/
 
 # === Dev tool state (needs read-write) ===
 ~/.pm2
@@ -42,12 +43,18 @@
 ~/.cursor
 ~/.lavish-axi
 ~/.local/bin
+~/.docker
+~/.local/share/uv/tools/
+~/.plannotator
+~/.local/share/mergiraf
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
 ~/.sfdx
 ~/.infisical
 ~/infisical-keyring/
+~/Library/Preferences/clerk-cli/
+~/.config/anthropic
 
 # === Read-only (Claude can see but not modify) ===
 ~/Library/Preferences:ro
