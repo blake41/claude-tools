@@ -12,4 +12,22 @@
 # preserved on every path. cmux's original shim path is kept in
 # CMUX_CLAUDE_WRAPPER_SHIM_ORIG by the fish config block (unused here; the PATH
 # fallthrough covers it) so it can be restored by hand if needed.
-exec /opt/homebrew/bin/fish -c 'claude $argv' -- "$@"
+printf '%s pid=%s ppid=%s surface=%s args=%s\n' "$(date '+%F %T')" "$$" "$PPID" "${CMUX_SURFACE_ID:-}" "$*" >> "$HOME/.cmux/cco-claude-shim.log" 2>/dev/null
+# cmux spawns the PTY from pre-layout bounds and resizes it during later layout passes,
+# but claude reads its terminal size once at startup and ignores SIGWINCH, so a resume
+# that starts too early renders at the intermediate size forever. Hold until the size
+# has been stable for ~300ms (cap 2s).
+if [ -t 0 ]; then
+    prev=""; stable=0; tries=0; first=""
+    while [ "$stable" -lt 3 ] && [ "$tries" -lt 20 ]; do
+        cur=$(stty size 2>/dev/null)
+        [ -z "$first" ] && first=$cur
+        if [ "$cur" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
+        prev=$cur; tries=$((tries+1)); sleep 0.1
+    done
+    printf '%s   size-settle: first=%s final=%s samples=%s\n' "$(date '+%F %T')" "$first" "$cur" "$tries" >> "$HOME/.cmux/cco-claude-shim.log" 2>/dev/null
+fi
+# config.fish prepends user dirs (~/.local/bin holds the real claude) ahead of cmux's
+# per-surface shim dir; the pane shell gets it re-prepended by cmux's --init-command,
+# this inner fish does not. Re-prepend so `claude` inside cco still hits cmux's wrapper.
+exec /opt/homebrew/bin/fish -c 'test -n "$CMUX_CLAUDE_WRAPPER_SHIM_ROOT"; and test -d "$CMUX_CLAUDE_WRAPPER_SHIM_ROOT"; and set -gx PATH "$CMUX_CLAUDE_WRAPPER_SHIM_ROOT" $PATH; claude $argv' -- "$@"

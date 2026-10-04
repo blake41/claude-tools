@@ -1,0 +1,26 @@
+#!/bin/bash
+# Post-relaunch check for cmux auto-resume: sandbox state per claude, size-settle log, tracking.
+echo "== claude --resume processes =="
+python3 - <<'PY'
+import ctypes, subprocess, re, json
+sb = ctypes.CDLL('/usr/lib/system/libsystem_sandbox.dylib'); sb.sandbox_check.restype = ctypes.c_int
+hooks = json.load(open('/Users/blake/.cmuxterm/claude-hook-sessions.json')).get('sessions', {})
+out = subprocess.run(['pgrep', '-lf', '--', '--resume'], capture_output=True, text=True).stdout.splitlines()
+seen = 0
+for line in out:
+    if '/claude ' not in line and not re.match(r'^\d+ claude ', line): continue
+    pid = int(line.split()[0]); m = re.search(r'--resume ([0-9a-f-]{36})', line)
+    if not m: continue
+    ck = m.group(1); seen += 1
+    sandboxed = sb.sandbox_check(ctypes.c_int(pid), None, ctypes.c_int(0))
+    wrapped = '--settings' in line
+    tracked = hooks.get(ck, {}).get('agentLifecycle')
+    flag = 'OK ' if (sandboxed and wrapped and tracked == 'running') else 'BAD'
+    print(f"{flag} pid={pid} {ck[:8]} sandboxed={sandboxed} wrapper={'yes' if wrapped else 'NO'} hook={tracked}")
+print(f"({seen} resumed claude processes)")
+PY
+echo; echo "== size-settle lines since last boot (first != final means the race was live) =="
+boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+).*/\1/')
+awk -v b="$(date -r "$boot" '+%F %T')" '$0 ~ /size-settle/ && $1" "$2 >= b' ~/.cmux/cco-claude-shim.log 2>/dev/null | tail -20
+echo; echo "== pty vs. pane: sizes of resumed claude ttys =="
+for p in $(pgrep -f -- "local/bin/claude .*--resume"); do t=$(lsof -p "$p" 2>/dev/null | awk '$4=="0u"{print $NF}'); [ -n "$t" ] && printf "pid=%s %s -> %s\n" "$p" "$t" "$(stty -f "$t" size 2>/dev/null)"; done
