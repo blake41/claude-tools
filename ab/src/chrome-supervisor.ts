@@ -743,7 +743,12 @@ async function launchChrome(
   // If Chrome has been crash-looping (exit 133 = SIGTRAP, typically corrupt
   // profile), nuke the profile and let Chrome create a fresh one. We detect
   // this by checking if backoff has escalated, which means repeated crashes.
-  if (rt.backoffMs >= BACKOFF_MAX_MS) {
+  // The headed profile is exempt: it carries a hand-set webauthn.touchid.metadata_secret
+  // (shared with the user's main Chrome profile so its Touch ID passkeys resolve) plus
+  // manual logins. A reset would silently drop both.
+  if (rt.backoffMs >= BACKOFF_MAX_MS && target === "headed") {
+    log.warn(`[${target}] Backoff at max — NOT resetting the headed profile (holds passkey secret + logins); fix or reset it by hand`);
+  } else if (rt.backoffMs >= BACKOFF_MAX_MS) {
     log.warn(`[${target}] Backoff at max — resetting profile to recover from possible corruption`);
     let recovered = false;
     try {
