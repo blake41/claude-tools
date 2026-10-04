@@ -28,8 +28,9 @@ ab-server daemon
     ├─ Open url in headless Chrome, wait networkidle
     │   → Clerk sets the session and redirects to the app origin
     │
-    ├─ Poll the browser URL until it is on the app origin and off /sign-in
-    │   (up to 15s)
+    ├─ Poll until the browser URL is on the app origin, off /sign-in, AND
+    │   `agent-browser cookies get --json` shows a Clerk session cookie for the
+    │   app host (`__session`, or `__client_uat` other than "0"), up to 15s
     │
     └─ Done. Browser has a real Clerk session for 1 hour.
 ```
@@ -46,11 +47,9 @@ The minted URL and the ticket in it are one-time and secret. `ab` never logs the
 
 | Env Var | Default | Purpose |
 |---------|---------|---------|
-| `CLERK_SECRET_KEY` | (none, required) | Development-instance Clerk secret key (`sk_test_...`). Read from the **`ab` CLI process** env (direnv in Terra) and passed to the daemon per request. If the request omits it, the daemon's own env is used. |
+| `CLERK_SECRET_KEY` | (none, required) | Development-instance Clerk secret key (`sk_test_...`). Read from the **`ab` CLI process** env (direnv in Terra) and passed to the daemon per request. The daemon never reads its own env for it: the launchd daemon does not have the variable. |
 | `AB_AUTH_EMAIL` | `blake.johnson@clay.com` | Email of the user to sign in as. Must already have a Clerk account in this instance. |
-| `AB_SLACK_USER_ID` | `U08M03CDY73` | Display only. A Slack ID alone is rejected: mapping Slack ID to email needs Terra's DB, which `ab` does not read. |
 | `AB_APP_BASE_URL` | `http://localhost:5173` (or auto-detected) | App origin the session must land on, and the Agent Task `redirectUrl`. |
-| `AB_API_BASE_URL` | unused | Kept for compatibility. Reauth no longer calls Terra's API. |
 
 For staging:
 
@@ -66,7 +65,9 @@ All in `checkAgentTaskGuards` (`src/auth.ts`), unit-tested:
 - App host `terra.clay.com`: refused, even with a test key.
 - `ab reauth --prod`: errors out. Production uses `ab import` (headed Google login).
 
-The already-authenticated-on-same-origin shortcut runs before the guards, so `ab import` followed by the daemon's auth grab still works against any origin.
+The already-authenticated-on-same-origin shortcut runs before the guards. `ab import` relies on it: after you log in by hand, `ab import` reads the browser's current URL and sends its origin as `appBaseUrl`, so the daemon sees an authenticated page on the same origin and never mints (and never needs a key). If the browser is on `/sign-in` or a non-app page, `ab import` says so and exits 1 without calling the daemon. This works for any origin, production included.
+
+A `sk_test_` key from a different Clerk project passes the guards but mints on the wrong instance. The final cookie check catches it: the browser lands on the app origin with no Clerk session, and `ab reauth` fails with "has no Clerk session" instead of reporting success.
 
 ## Prerequisites
 
@@ -77,7 +78,10 @@ The already-authenticated-on-same-origin shortcut runs before the guards, so `ab
 ## Troubleshooting
 
 **"CLERK_SECRET_KEY is not set"**
-Export the development key in the shell running `ab` (direnv does this inside the Terra repo). The daemon does not need it in its own env.
+Export the development key in the shell running `ab` (direnv does this inside the Terra repo). The `ab` CLI sends it with each request. Setting it in the daemon's environment has no effect. If this appears after `ab import`, you are on an old CLI or daemon (see Upgrading).
+
+**"has no Clerk session"**
+The browser reached the app but holds no Clerk session cookie. `CLERK_SECRET_KEY` is probably the development key of a different Clerk project (for example from another repo's direnv). Use the key for this app's Clerk instance.
 
 **"Refusing to mint: ... not a development-instance key"**
 The key does not start with `sk_test_`. Use the development key. For production use `ab import`.
@@ -85,26 +89,26 @@ The key does not start with `sk_test_`. Use the development key. For production 
 **"has no Clerk account in this environment"**
 Log in via Google OAuth once at the app URL, then retry.
 
-**"slackUserId login is not supported"**
-Set `AB_AUTH_EMAIL`. `ab` cannot map a Slack ID to an email.
-
 **"Auth exchange timed out"**
 The browser did not land on the app origin within 15s. Causes: the dev server is down, the Agent Task `redirectUrl` origin is not allowed by Clerk, or the one-time URL was already used. Retry `ab reauth` (each run mints a fresh task). Check `ab console-tail`.
 
 **Auth works but pages show sign-in**
 The 1 hour session expired. Run `ab reauth`.
 
-## What Replaced What
+## Upgrading
 
-1. Cookie stealing from personal Chrome (fragile, slow).
-2. `POST /auth/dev-login` on Terra plus a `/dev-login?ticket=` page. Removed with Terra's credential-less mint.
-3. Now: direct Clerk Agent Task, development instance only.
+The daemon is long-lived under launchd (`com.clay.ab-server`). After pulling this change:
+
+1. `bun install` in `tools/ab` (adds `@clerk/backend`).
+2. Restart the daemon: `launchctl kickstart -k gui/$(id -u)/com.clay.ab-server`.
+
+Skip the restart and the old daemon keeps running its old code. It strips the unknown `clerkSecretKey` field and still calls Terra's removed `/auth/dev-login`, so `ab reauth` fails.
 
 ## Code References
 
 | File | Purpose |
 |------|---------|
 | `src/auth.ts` | `authenticate()` flow, `checkAgentTaskGuards`, injectable Clerk client seam |
-| `src/cli.ts` | `cmdReauth` (forwards `CLERK_SECRET_KEY`), `resolveReauthBaseUrls` |
+| `src/cli.ts` | `cmdReauth` (forwards `CLERK_SECRET_KEY`), `cmdImport` (pins `appBaseUrl` to the browser origin), `resolveReauthBaseUrls` |
 | `src/types.ts` | `AuthLoginRequest.clerkSecretKey` |
 | `src/__tests__/auth.test.ts`, `auth-guards.test.ts` | Tests (fake Clerk client, no network) |
