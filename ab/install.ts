@@ -214,8 +214,11 @@ function install(): void {
   // 5. Install CLI — make executable and symlink to ~/.local/bin/ab
   log("Installing CLI...");
   fs.chmodSync(CLI_SRC, 0o755);
-  // Write a thin bun shim so the path resolves correctly
-  const shimContent = `#!/usr/bin/env bun\nawait import("${CLI_SRC}");\n`;
+  // Write a thin shim that execs bun with cli.ts as the ENTRY module. An
+  // `await import(...)` bun-script shim leaves cli.ts's `if (import.meta.main)`
+  // guard false (the shim, not cli.ts, is the entry), so every `ab` invocation
+  // silently no-ops with exit 0. See failure-modes.md F11.
+  const shimContent = `#!/bin/sh\nexec bun "${CLI_SRC}" "$@"\n`;
   fs.writeFileSync(AB_BIN, shimContent, { mode: 0o755 });
   log(`Installed ${AB_BIN} (shim -> ${CLI_SRC})`);
 
