@@ -92,6 +92,21 @@ format_status() {
     fi
 }
 
+# Duration in whole seconds between two ISO8601 timestamps (for aggregation math)
+duration_seconds() {
+    local start="$1"
+    local end="$2"
+
+    if [[ -z "$start" || "$start" == "null" || -z "$end" || "$end" == "null" ]]; then
+        echo ""
+        return
+    fi
+
+    local start_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$start" +%s 2>/dev/null || date -d "$start" +%s 2>/dev/null)
+    local end_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$end" +%s 2>/dev/null || date -d "$end" +%s 2>/dev/null)
+    echo $((end_ts - start_ts))
+}
+
 # Format duration
 format_duration() {
     local start="$1"

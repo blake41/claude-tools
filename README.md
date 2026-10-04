@@ -159,6 +159,9 @@ cf-logs <worker-name> --status 500
 gh-actions runs                           # List recent runs
 gh-actions runs --status failure          # Filter by status
 gh-actions logs <run-id> --failed         # Failed step logs
+gh-actions timing --workflow ci.yml       # Slowest jobs, averaged over recent runs
+gh-actions timing --tests -j frontend     # Slowest test files (vitest-style logs only)
+gh-actions timing --repo o/r1 --repo o/r2 # Same, across multiple repos in one call
 gh-actions rerun <run-id> --failed        # Re-run failed jobs
 pr-ship                                   # Create PR → green → merge → cleanup
 ```

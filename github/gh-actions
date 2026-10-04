@@ -266,6 +266,209 @@ cmd_logs() {
 }
 
 # ============================================================================
+# TIMING command - CI wall-clock breakdown and slowest test files
+# ============================================================================
+_timing_strip_log() {
+    # Strip ANSI escapes (perl handles \e portably; BSD sed does not) and the
+    # leading GH Actions ISO-8601 timestamp GitHub prepends to every log line.
+    perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g' | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ?//'
+}
+
+_timing_jobs_for_repo() {
+    local repo="$1" limit="$2" branch="$3" workflow="$4" top="$5"
+
+    local params="per_page=$limit&status=completed"
+    [[ -n "$branch" ]] && params="$params&branch=$branch"
+
+    local runs_response
+    if [[ -n "$workflow" ]]; then
+        runs_response=$(gh_api "/repos/$repo/actions/workflows/$workflow/runs?$params")
+    else
+        runs_response=$(gh_api "/repos/$repo/actions/runs?$params")
+    fi
+
+    local run_ids
+    run_ids=$(echo "$runs_response" | jq -r '.workflow_runs[].id')
+
+    local tmp
+    tmp=$(mktemp)
+    for run_id in $run_ids; do
+        gh_api "/repos/$repo/actions/runs/$run_id/jobs" | jq -r '
+            .jobs[] | select(.conclusion != null and .conclusion != "skipped" and .conclusion != "cancelled") |
+            [.name, .started_at // "", .completed_at // ""] | @tsv
+        ' >> "$tmp"
+    done
+
+    local run_count
+    run_count=$(echo "$run_ids" | grep -c . || true)
+
+    echo -e "${BLUE}=== $repo — job wall-clock (last $run_count completed runs) ===${NC}"
+    echo ""
+
+    while IFS=$'\t' read -r name started completed; do
+        [[ -z "$name" ]] && continue
+        local secs
+        secs=$(duration_seconds "$started" "$completed")
+        [[ -z "$secs" ]] && continue
+        echo -e "$name\t$secs"
+    done < "$tmp" | awk -F'\t' '
+        { count[$1]++; sum[$1]+=$2; if ($2 > max[$1]) max[$1] = $2 }
+        END {
+            for (name in count) printf "%s\t%d\t%.1f\t%d\n", name, count[name], sum[name]/count[name], max[name]
+        }
+    ' | sort -t$'\t' -k3 -n -r | head -n "$top" | \
+    awk -F'\t' 'BEGIN { printf "%-30s %6s %10s %10s\n", "JOB", "RUNS", "AVG", "MAX" }
+        { printf "%-30s %6s %9ss %9ss\n", $1, $2, $3, $4 }'
+
+    rm -f "$tmp"
+    echo ""
+}
+
+_timing_tests_for_repo() {
+    local repo="$1" limit="$2" branch="$3" workflow="$4" job_filter="$5" top="$6"
+
+    local params="per_page=$limit&status=completed"
+    [[ -n "$branch" ]] && params="$params&branch=$branch"
+
+    local runs_response
+    if [[ -n "$workflow" ]]; then
+        runs_response=$(gh_api "/repos/$repo/actions/workflows/$workflow/runs?$params")
+    else
+        runs_response=$(gh_api "/repos/$repo/actions/runs?$params")
+    fi
+
+    local run_ids
+    run_ids=$(echo "$runs_response" | jq -r '.workflow_runs[].id')
+    local run_count
+    run_count=$(echo "$run_ids" | grep -c . || true)
+
+    echo -e "${BLUE}=== $repo — slowest test files (last $run_count completed runs, jobs matching '$job_filter') ===${NC}"
+    echo ""
+
+    local tmp
+    tmp=$(mktemp)
+    for run_id in $run_ids; do
+        local job_ids
+        job_ids=$(gh_api "/repos/$repo/actions/runs/$run_id/jobs" | jq -r --arg f "$job_filter" '
+            .jobs[] | select(.name | test($f; "i")) | select(.conclusion != null and .conclusion != "skipped" and .conclusion != "cancelled") | .id
+        ')
+        for job_id in $job_ids; do
+            gh api "/repos/$repo/actions/jobs/$job_id/logs" 2>/dev/null | _timing_strip_log
+        done
+    done | grep -E '\.test\.(ts|tsx)[[:space:]]*\([0-9]+ tests?\)[[:space:]]+[0-9]+(\.[0-9]+)?(ms|s)$' > "$tmp" || true
+
+    if [[ ! -s "$tmp" ]]; then
+        echo -e "${GRAY}(no matching test-duration lines found — check --job filter, or this repo's test runner doesn't emit vitest-style per-file summaries)${NC}"
+        rm -f "$tmp"
+        echo ""
+        return
+    fi
+
+    awk '{
+        file="";
+        for (i=1;i<=NF;i++) if ($i ~ /\.test\.(ts|tsx)$/) file=$i;
+        dur=$NF;
+        gsub(/ms$/,"",dur);
+        if (dur ~ /s$/) { gsub(/s$/,"",dur); dur = dur*1000 }
+        if (file != "" && dur != "") print file "\t" dur
+    }' "$tmp" | awk -F'\t' '
+        { count[$1]++; sum[$1]+=$2; if ($2 > max[$1]) max[$1] = $2 }
+        END {
+            for (name in count) printf "%s\t%d\t%.0f\t%.0f\t%.0f\n", name, count[name], sum[name], sum[name]/count[name], max[name]
+        }
+    ' | sort -t$'\t' -k3 -n -r | head -n "$top" | \
+    awk -F'\t' 'BEGIN { printf "%-70s %6s %10s %8s %8s\n", "TEST FILE", "SEEN", "TOTAL_MS", "AVG_MS", "MAX_MS" }
+        { printf "%-70s %6s %10s %8s %8s\n", $1, $2, $3, $4, $5 }'
+
+    rm -f "$tmp"
+    echo ""
+}
+
+cmd_timing() {
+    local limit=20 branch="" workflow="" top=15 tests_mode=false job_filter="test"
+    local -a repos=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo)
+                repos+=("$2")
+                shift 2
+                ;;
+            --limit|-n)
+                limit="$2"
+                shift 2
+                ;;
+            --branch|-b)
+                branch="$2"
+                shift 2
+                ;;
+            --workflow|-w)
+                workflow="$2"
+                shift 2
+                ;;
+            --top)
+                top="$2"
+                shift 2
+                ;;
+            --tests)
+                tests_mode=true
+                shift
+                ;;
+            --job|-j)
+                job_filter="$2"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: gh-actions timing [options]"
+                echo ""
+                echo "Break down CI wall-clock time: which jobs are slowest (default), or which"
+                echo "test files are slowest (--tests, parses raw job logs for vitest-style"
+                echo "'<file> (N tests) NNNms' summary lines)."
+                echo ""
+                echo "Options:"
+                echo "  --repo OWNER/REPO   Repeatable. Defaults to the current repo."
+                echo "  --limit, -n N       Completed runs to sample per repo (default: 20)"
+                echo "  --branch, -b NAME   Only sample runs on this branch"
+                echo "  --workflow, -w NAME Only sample runs of this workflow file"
+                echo "  --top N             Rows to show per repo (default: 15)"
+                echo "  --tests             Rank slowest test files instead of jobs"
+                echo "  --job, -j REGEX     (--tests only) job-name filter, case-insensitive (default: test)"
+                echo ""
+                echo "Examples:"
+                echo "  gh-actions timing"
+                echo "  gh-actions timing --repo clay-run/Terra --repo clay-run/keystone"
+                echo "  gh-actions timing --tests --job 'frontend-tests' --limit 10"
+                echo ""
+                echo "Notes:"
+                echo "  --tests only counts test files whose runner prints a vitest-style summary"
+                echo "  line; other runners (bun test, jest default reporter) won't match today."
+                echo "  It also undercounts failed files, since their summary line has a different"
+                echo "  shape ('N failed | M passed' instead of 'N tests')."
+                return 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        local repo
+        repo=$(get_repo) || return 1
+        repos=("$repo")
+    fi
+
+    for repo in "${repos[@]}"; do
+        if [[ "$tests_mode" == true ]]; then
+            _timing_tests_for_repo "$repo" "$limit" "$branch" "$workflow" "$job_filter" "$top"
+        else
+            _timing_jobs_for_repo "$repo" "$limit" "$branch" "$workflow" "$top"
+        fi
+    done
+}
+
+# ============================================================================
 # FAILURES command - Quick view of recent failures
 # ============================================================================
 cmd_failures() {
@@ -448,6 +651,10 @@ case "${1:-help}" in
         shift
         cmd_failures "$@"
         ;;
+    timing|t)
+        shift
+        cmd_timing "$@"
+        ;;
     rerun)
         shift
         cmd_rerun "$@"
@@ -461,6 +668,7 @@ case "${1:-help}" in
         echo "  runs      List recent workflow runs"
         echo "  logs      Get logs for a workflow run"
         echo "  failures  Show recent failures with error summaries"
+        echo "  timing    Break down CI wall-clock time by job, or by test file (--tests)"
         echo "  rerun     Re-run a workflow"
         echo ""
         echo "Run 'gh-actions <command> --help' for more info on a command."
