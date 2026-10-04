@@ -22,6 +22,8 @@
  * Reconnects automatically on tab close/crash.
  */
 
+import { pickTabWs, TARGET_ID_ENV, type CdpTab } from "./cdp-target";
+
 const LEVELS_BY_SEVERITY: Record<string, Set<string>> = {
   verbose: new Set(["log", "debug", "info", "warning", "error"]),
   info: new Set(["info", "warning", "error"]),
@@ -35,17 +37,11 @@ const EXPAND_DEPTH = 3;
 const EXPAND_ARRAY_LIMIT = 20;
 const EXPAND_STRING_LIMIT = 200;
 
-function findTab(port: number, match = "localhost:5173"): string {
+function findTab(port: number): string {
   // Synchronous fetch via Bun.spawnSync to keep the reconnect loop simple
   const res = Bun.spawnSync(["curl", "-s", "--max-time", "3", `http://localhost:${port}/json`]);
-  const tabs: any[] = JSON.parse(res.stdout.toString());
-  const pages = tabs.filter((t) => t.type === "page");
-  for (const tab of pages) {
-    const url = tab.url ?? "";
-    if (url.includes(match) && !url.startsWith("blob:")) return tab.webSocketDebuggerUrl;
-  }
-  if (pages.length > 0) return pages[0].webSocketDebuggerUrl;
-  throw new Error(`No page tabs on port ${port}`);
+  const tabs: CdpTab[] = JSON.parse(res.stdout.toString());
+  return pickTabWs(tabs, process.env[TARGET_ID_ENV]);
 }
 
 // In-page safe stringifier. Shipped as a string body to Runtime.callFunctionOn
