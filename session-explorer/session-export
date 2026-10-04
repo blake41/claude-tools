@@ -14,10 +14,13 @@ usage() {
 session-export - render a Claude Code session to a redacted static HTML page
 
 Usage:
-  session-export render <session-id|path.jsonl> [--out FILE]
-  session-export publish <session-id|path.jsonl> --slug SLUG
+  session-export render [session-id|path.jsonl] [--out FILE]
+  session-export publish [session-id|path.jsonl] [--slug SLUG]
   session-export build-viewer
   session-export --help
+
+With no session argument, render and publish use $CLAUDE_CODE_SESSION_ID (the current session).
+publish without --slug uses the slug s-<session-id>.
 
 render        Write a single self-contained HTML file (default /tmp/session-export-<id>.html)
 publish       Render, copy to <internal-pages>/public/<slug>/index.html, run ./publish

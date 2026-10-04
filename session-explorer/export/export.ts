@@ -83,7 +83,8 @@ export async function render(session: string, outArg?: string) {
 }
 
 export async function publish(session: string, slug: string | undefined) {
-  const safeSlug = validateSlug(slug);
+  const sessionId = basename(resolveSession(session), ".jsonl");
+  const safeSlug = validateSlug(slug ?? `s-${sessionId}`);
   const pages = process.env.SESSION_EXPORT_PAGES_DIR ?? join(homedir(), "Documents", "Development", "clay", "internal-pages");
   if (!existsSync(pages) || !existsSync(join(pages, "publish"))) {
     throw new CliError(`internal-pages checkout or its ./publish not found at ${pages}`, "PAGES_DIR_MISSING", "clone internal-pages or set SESSION_EXPORT_PAGES_DIR");
@@ -120,9 +121,9 @@ async function main() {
   const [command, ...rest] = process.argv.slice(2);
   try {
     const { positional, flags } = parseArgs(rest);
-    const session = positional[0];
+    const session = positional[0] ?? process.env.CLAUDE_CODE_SESSION_ID;
     if ((command === "render" || command === "publish") && !session) {
-      throw new CliError("missing session id or path", "BAD_ARGS", `session-export ${command} <session-id|path.jsonl>`);
+      throw new CliError("missing session id or path, and CLAUDE_CODE_SESSION_ID is not set", "BAD_ARGS", `session-export ${command} <session-id|path.jsonl>`);
     }
     let result;
     if (command === "render") result = await render(session, flags.out);

@@ -72,6 +72,31 @@ describe("publish", () => {
     expect(existsSync(join(pages, "published.marker"))).toBe(true);
   });
 
+  test("no session arg and no --slug publishes the current session under s-<session-id>", () => {
+    const pages = join(tmp, "pages-default");
+    mkdirSync(pages);
+    writeFileSync(join(pages, "publish"), `#!/bin/sh\ntouch "$PWD/published.marker"\n`);
+    chmodSync(join(pages, "publish"), 0o755);
+
+    const id = "11111111-2222-3333-4444-555555555555";
+    const { code, json } = run(["publish"], {
+      SESSION_EXPORT_PAGES_DIR: pages,
+      SESSION_EXPORT_PROJECTS_DIR: tmp,
+      CLAUDE_CODE_SESSION_ID: id,
+    });
+    expect(code).toBe(0);
+    expect(json.url).toBe(`https://clay-internal.pages.dev/s-${id}/`);
+    expect(existsSync(join(pages, "public", `s-${id}`, "index.html"))).toBe(true);
+    expect(existsSync(join(pages, "published.marker"))).toBe(true);
+  });
+
+  test("no session arg and no CLAUDE_CODE_SESSION_ID is BAD_ARGS", () => {
+    const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
+    const p = Bun.spawnSync(["bun", "run", EXPORT_TS, "publish"], { env });
+    expect(p.exitCode).toBe(1);
+    expect(JSON.parse(p.stdout.toString()).error.code).toBe("BAD_ARGS");
+  });
+
   test("missing pages dir is PAGES_DIR_MISSING", () => {
     const { code, json } = run(["publish", session, "--slug", "ok"], { SESSION_EXPORT_PAGES_DIR: join(tmp, "nope") });
     expect(code).toBe(1);
