@@ -1,14 +1,12 @@
 /**
- * Dev-login authentication flow for ab-server.
+ * Agent Tasks authentication flow for ab-server.
  *
- * Uses Terra's POST /auth/dev-login endpoint to mint a Clerk sign-in token,
- * then navigates the browser to the exchange URL to establish a real session.
+ * Mints a Clerk Agent Task directly (development instance only) for the
+ * requested user, then opens the one-time Clerk-hosted URL in the browser.
+ * Clerk establishes the session and redirects to the app origin.
  *
- * Two-origin model (local dev):
- *   apiBaseUrl  → backend (port 8000) — where POST /auth/dev-login goes
- *   appBaseUrl  → frontend (port 5173) — where browser exchanges the ticket
- *
- * In staging both collapse to the same origin.
+ * The flow talks to Clerk directly, not to Terra's API.
+ * The minted URL and the Clerk secret key are never logged.
  */
 
 import { Logger } from "./logger";
@@ -37,8 +35,55 @@ let authState: AuthState = {
 // Defaults
 // ---------------------------------------------------------------------------
 
-const DEFAULT_API_BASE = "http://localhost:8000";
 const DEFAULT_APP_BASE = "http://localhost:5173";
+
+// ---------------------------------------------------------------------------
+// Clerk client seam
+// ---------------------------------------------------------------------------
+
+/** The slice of @clerk/backend's client that authenticate() uses. */
+export interface AgentTaskClient {
+  agentTasks: {
+    create(params: {
+      onBehalfOf: { identifier: string };
+      permissions: string;
+      agentName: string;
+      taskDescription: string;
+      redirectUrl: string;
+      sessionMaxDurationInSeconds?: number;
+    }): Promise<{ agentId: string; taskId: string; url: string }>;
+  };
+}
+
+export interface AuthenticateDeps {
+  createClerkClient: (secretKey: string) => AgentTaskClient | Promise<AgentTaskClient>;
+  pollTimeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
+const defaultDeps: AuthenticateDeps = {
+  createClerkClient: async (secretKey) => {
+    const { createClerkClient } = await import("@clerk/backend");
+    return createClerkClient({ secretKey }) as unknown as AgentTaskClient;
+  },
+};
+
+const AGENT_TASK_SESSION_SECONDS = 3600;
+
+/** Clerk's "no such user" comes back as a 404 / `*_not_found` error code. */
+function isClerkUserNotFound(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { status?: unknown; errors?: unknown };
+  if (e.status === 404) return true;
+  return Array.isArray(e.errors)
+    && e.errors.some((x) => typeof (x as { code?: unknown })?.code === "string" && (x as { code: string }).code.includes("not_found"));
+}
+
+function redactSecrets(text: string, secrets: Array<string | undefined>): string {
+  let out = text;
+  for (const s of secrets) if (s) out = out.split(s).join("[redacted]");
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -116,14 +161,14 @@ export function checkAgentTaskGuards(input: {
 
 /**
  * Check whether the browser is already on an authenticated page.
- * An authenticated page is a Clay URL that is NOT /dev-login or /sign-in.
+ * An authenticated page is a Clay URL that is NOT /sign-in.
  */
 export function isAuthenticatedUrl(url: string): boolean {
   if (!url) return false;
   const clayPatterns = ["localhost:5173", "onrender.com", "terra.clay.com", ".terra.localhost", "terra.localhost"];
   const isClay = clayPatterns.some((p) => url.includes(p));
   if (!isClay) return false;
-  const unauthPaths = ["/dev-login", "/sign-in"];
+  const unauthPaths = ["/sign-in"];
   return !unauthPaths.some((p) => url.includes(p));
 }
 
@@ -131,14 +176,18 @@ export function isAuthenticatedUrl(url: string): boolean {
 // Main authenticate flow
 // ---------------------------------------------------------------------------
 
-export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResponse> {
+export async function authenticate(
+  req: AuthLoginRequest,
+  deps: Partial<AuthenticateDeps> = {},
+): Promise<AuthLoginResponse> {
+  const { createClerkClient, pollTimeoutMs = 15_000, pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
   const { sessionId, port } = req;
-  const apiBaseUrl = req.apiBaseUrl || DEFAULT_API_BASE;
   const appBaseUrl = req.appBaseUrl || DEFAULT_APP_BASE;
   const email = req.email;
   const slackUserId = req.slackUserId;
 
-  log.info("Starting auth flow", { sessionId, port, apiBaseUrl, appBaseUrl, email, slackUserId });
+  // Never log the secret key.
+  log.info("Starting auth flow", { sessionId, port, appBaseUrl, email, slackUserId });
 
   // -----------------------------------------------------------------------
   // Step 1: Check if already authenticated
@@ -187,98 +236,64 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
   }
 
   // -----------------------------------------------------------------------
-  // Step 2: POST /auth/dev-login to get a sign-in token
+  // Step 2: Resolve identity + guards, then mint an Agent Task
   // -----------------------------------------------------------------------
 
-  if (!email && !slackUserId) {
-    return { ok: false, error: "email or slackUserId is required for dev-login" };
-  }
-
-  let token: string;
-  let userEmail: string | undefined = email;
-
-  try {
-    const loginUrl = `${apiBaseUrl}/auth/dev-login`;
-    const loginBody = email ? { email } : { slackUserId };
-    log.info("Requesting dev-login token", { loginUrl, ...loginBody });
-
-    // Portless serves a per-machine self-signed TLS cert (standard 443). Bun's fetch
-    // doesn't read the system keychain by default, so HTTP requests to a
-    // `.localhost` host that 302-redirect to portless's HTTPS endpoint fail
-    // with "self signed certificate in certificate chain". Accept the cert
-    // for any `.localhost` URL — we'll never reach this branch for staging/prod.
-    const loginHost = new URL(loginUrl).hostname;
-    const isLocalDev = loginHost === "localhost" || loginHost.endsWith(".localhost");
-    const fetchOpts: RequestInit & { tls?: { rejectUnauthorized: boolean } } = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(loginBody),
-      signal: AbortSignal.timeout(5_000),
+  if (!email) {
+    return {
+      ok: false,
+      error: slackUserId
+        ? "slackUserId login is not supported: cannot map a Slack ID to an email. Set AB_AUTH_EMAIL to the account's email."
+        : "email is required: set AB_AUTH_EMAIL to the account's email.",
     };
-    if (isLocalDev) {
-      fetchOpts.tls = { rejectUnauthorized: false };
+  }
+
+  const secretKey = req.clerkSecretKey || process.env.CLERK_SECRET_KEY;
+  const guard = checkAgentTaskGuards({ secretKey, appBaseUrl });
+  if (!guard.ok) {
+    log.warn("Agent Task guard refused", { reason: guard.error });
+    return { ok: false, error: guard.error };
+  }
+
+  let taskUrl = "";
+  try {
+    const clerk = await createClerkClient(secretKey!);
+    log.info("Minting Agent Task", { email, appBaseUrl });
+    const task = await clerk.agentTasks.create({
+      onBehalfOf: { identifier: email },
+      permissions: "*",
+      agentName: "ab",
+      taskDescription: "ab reauth",
+      redirectUrl: `${appBaseUrl}/`,
+      sessionMaxDurationInSeconds: AGENT_TASK_SESSION_SECONDS,
+    });
+    if (typeof task?.url !== "string" || !task.url) {
+      return { ok: false, error: "Agent Task mint returned invalid response: missing url" };
     }
-
-    const resp = await fetch(loginUrl, fetchOpts);
-
-    if (!resp.ok) {
-      const body = await resp.json().catch(() => ({}));
-      const msg = (body as Record<string, string>).message || `HTTP ${resp.status}`;
-
-      if (resp.status === 404 && (body as Record<string, string>).error === "user_not_found") {
-        const email = (body as Record<string, string>).email || "this user";
-        return {
-          ok: false,
-          error: `User ${email} has no Clerk account in this environment. `
-            + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
-        };
-      }
-
-      if ((body as Record<string, string>).error === "clerk_user_not_found") {
-        const email = (body as Record<string, string>).email || "this user";
-        return {
-          ok: false,
-          error: `User ${email} has no Clerk account in this environment. `
-            + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
-        };
-      }
-
-      log.error("dev-login request failed", { status: resp.status, msg });
-      return { ok: false, error: `dev-login failed: ${msg}` };
-    }
-
-    const data = await resp.json() as Record<string, unknown>;
-    if (typeof data.token !== 'string' || !data.token) {
-      return { ok: false, error: 'dev-login returned invalid response: missing token' };
-    }
-    token = data.token;
-    // Only override the request email if the server echoed a non-empty one.
-    // Terra's /auth/dev-login historically did not return email at all, which
-    // would clobber the request email we already have.
-    if (typeof data.email === 'string' && data.email) {
-      userEmail = data.email;
-    }
-
-    log.info("Got dev-login token", { exchangeUrl: data.exchangeUrl });
+    taskUrl = task.url;
+    log.info("Minted Agent Task", { taskId: task.taskId });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("fetch") || message.includes("ECONNREFUSED") || message.includes("timeout")) {
-      return { ok: false, error: `Dev server unreachable at ${apiBaseUrl}` };
+    if (isClerkUserNotFound(err)) {
+      return {
+        ok: false,
+        error: `User ${email} has no Clerk account in this environment. `
+          + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
+      };
     }
-    return { ok: false, error: `dev-login request error: ${message}` };
+    const raw = err instanceof Error ? err.message : String(err);
+    const message = redactSecrets(raw, [secretKey]).replace(/https?:\/\/\S*ticket=\S*/g, "[redacted-url]");
+    log.error("Agent Task mint failed", { message });
+    return { ok: false, error: `Agent Task mint failed: ${message}` };
   }
 
   // -----------------------------------------------------------------------
-  // Step 3: Navigate browser to exchange the ticket
+  // Step 3: Open the one-time Clerk-hosted URL (never logged)
   // -----------------------------------------------------------------------
 
-  const exchangeUrl = `${appBaseUrl}/dev-login?ticket=${token}`;
-  log.info("Navigating to exchange URL", { exchangeUrl });
-
-  const navResult = await runAgentBrowser(sessionId, port, ["open", exchangeUrl]);
+  const navResult = await runAgentBrowser(sessionId, port, ["open", taskUrl]);
   if (!navResult.ok) {
-    log.error("Navigation failed", { stderr: navResult.stderr });
-    return { ok: false, error: `Auth exchange failed: browser navigation error` };
+    log.error("Navigation failed", { stderr: redactSecrets(navResult.stderr, [secretKey, taskUrl]) });
+    return { ok: false, error: "Auth exchange failed: browser navigation error" };
   }
 
   // -----------------------------------------------------------------------
@@ -287,43 +302,56 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
 
   const waitResult = await runAgentBrowser(sessionId, port, ["wait", "--load", "networkidle"], 30_000);
   if (!waitResult.ok) {
-    log.warn("Wait for networkidle returned non-zero", { stderr: waitResult.stderr });
+    log.warn("Wait for networkidle returned non-zero", { stderr: redactSecrets(waitResult.stderr, [secretKey, taskUrl]) });
     // Continue anyway — the page may have loaded fine
   }
 
   // -----------------------------------------------------------------------
-  // Step 5: Poll for redirect — Clerk JS needs time to exchange the ticket,
-  // call setActive, and navigate away from /dev-login
+  // Step 5: Poll until the browser lands on the app origin and has left
+  // Clerk-hosted / sign-in pages
   // -----------------------------------------------------------------------
 
-  const pollDeadline = Date.now() + 15_000; // 15s max wait
-  let finalUrl = "";
+  let appOrigin: string;
+  try {
+    appOrigin = new URL(appBaseUrl).origin;
+  } catch {
+    appOrigin = appBaseUrl;
+  }
+
+  const pollDeadline = Date.now() + pollTimeoutMs;
+  let landed = false;
   while (Date.now() < pollDeadline) {
-    await new Promise((r) => setTimeout(r, 1_000));
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
     const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
     if (!verifyResult.ok) {
-      log.warn("Could not read browser URL during poll", { stderr: verifyResult.stderr });
+      log.warn("Could not read browser URL during poll");
       continue;
     }
-    finalUrl = verifyResult.stdout;
-    if (!finalUrl.includes("/dev-login")) {
-      break; // Redirected — auth succeeded
+    let origin = "";
+    try {
+      origin = new URL(verifyResult.stdout).origin;
+    } catch { /* not a URL yet */ }
+    if (origin === appOrigin && !verifyResult.stdout.includes("/sign-in")) {
+      landed = true;
+      log.info("Auth exchange succeeded", { origin });
+      break;
     }
-    log.debug("Still on /dev-login, waiting...", { finalUrl });
+    log.debug("Not on the app origin yet, waiting...", { origin });
   }
 
-  if (finalUrl.includes("/dev-login") || !finalUrl) {
-    log.error("Browser still on /dev-login after 15s", { finalUrl });
-    return { ok: false, error: "Auth exchange timed out: browser did not redirect. Check the DevLogin component." };
+  if (!landed) {
+    log.error("Browser did not land on the app origin", { appOrigin, timeoutMs: pollTimeoutMs });
+    return {
+      ok: false,
+      error: `Auth exchange timed out: browser did not land on ${appOrigin}. The Agent Task URL is one-time, so retry the reauth.`,
+    };
   }
-
-  log.info("Auth exchange succeeded", { finalUrl });
 
   // -----------------------------------------------------------------------
   // Step 6: Update in-memory auth state
   // -----------------------------------------------------------------------
 
-  const user = { slackUserId, email: userEmail ?? "" };
+  const user = { slackUserId, email };
   authState = {
     authenticated: true,
     user,
@@ -339,7 +367,7 @@ export async function authenticate(req: AuthLoginRequest): Promise<AuthLoginResp
 
 /**
  * Reset auth state to defaults. Call when Chrome crashes/restarts
- * so the next agent command triggers a fresh dev-login.
+ * so the next agent command triggers a fresh login.
  */
 export function resetAuthState(): void {
   authState = { authenticated: false, user: null, timestamp: null };

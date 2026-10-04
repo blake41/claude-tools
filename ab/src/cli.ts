@@ -27,9 +27,9 @@ const CDP_PORT_HEADLESS = 9333;
 const CDP_PORT_HEADED = 9444;
 const CDP_PORT_USER = 9222;
 
-// Default user for dev-login auth. Uses email (more reliable than Slack ID
-// since email always maps to a Clerk account if the user has logged in once).
-// Override with AB_AUTH_EMAIL or AB_SLACK_USER_ID env vars.
+// Default user for `reauth`. The Agent Task is minted by email (a Slack ID
+// cannot be mapped to an email without Terra's DB, so slackUserId alone is
+// rejected). Override with AB_AUTH_EMAIL; AB_SLACK_USER_ID is display-only.
 const DEFAULT_AUTH_EMAIL = process.env.AB_AUTH_EMAIL ?? "blake.johnson@clay.com";
 const DEFAULT_SLACK_USER_ID = process.env.AB_SLACK_USER_ID ?? "U08M03CDY73"; // blake (staging)
 
@@ -871,7 +871,7 @@ async function cmdDoctor(): Promise<number> {
     try {
       const auth = await rpc.authStatus();
       checks.push({
-        label: "dev-login auth",
+        label: "terra auth",
         ok: auth.authenticated,
         detail: auth.authenticated
           ? `${auth.user?.email || "unknown"} (last login ${auth.lastLogin ?? "?"})`
@@ -880,7 +880,7 @@ async function cmdDoctor(): Promise<number> {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      checks.push({ label: "dev-login auth", ok: false, detail: msg, fix: "ab reauth" });
+      checks.push({ label: "terra auth", ok: false, detail: msg, fix: "ab reauth" });
     }
   }
 
@@ -933,8 +933,9 @@ async function cmdDoctor(): Promise<number> {
   return allOk ? 0 : 1;
 }
 
-// Environment presets for `ab reauth`. Terra-specific: dev-login is a Terra
-// endpoint and exists only in non-production envs.
+// Environment presets for `ab reauth`. Terra-specific: reauth mints a Clerk
+// Agent Task against the development Clerk instance, so only non-production
+// app hosts are valid targets (production is refused; use `ab import`).
 const REAUTH_ENV_PRESETS: Record<string, string> = {
   staging: "https://slack-feedback-staging.onrender.com",
   dev: "https://slack-feedback-development.onrender.com",
@@ -1007,7 +1008,7 @@ export function resolveReauthBaseUrls(
       return {
         apiBaseUrl: undefined,
         appBaseUrl: undefined,
-        error: "--prod is not supported: dev-login is disabled in production. Use `ab import` for headed Google login.",
+        error: "--prod is not supported: reauth only mints against the development Clerk instance. Production uses `ab import` (headed Google login).",
       };
     } else if (name === "local") {
       // Explicit no-op: use defaults (localhost) from auth.ts.
@@ -1093,6 +1094,8 @@ export async function cmdReauth(
     slackUserId: DEFAULT_SLACK_USER_ID,
     apiBaseUrl: urls.apiBaseUrl,
     appBaseUrl: urls.appBaseUrl,
+    // Sent to the daemon in the request body only; never written to disk or logged.
+    clerkSecretKey: process.env.CLERK_SECRET_KEY,
   });
   if (result.ok) {
     stderr("Reauth complete");
@@ -2474,7 +2477,7 @@ function printUsage(): void {
   stderr("  --user-chrome       Use personal Chrome (port 9222), allows eval");
   stderr("");
   stderr("Environment:");
-  stderr("  AB_SLACK_USER_ID    Override default Slack user for dev-login auth");
+  stderr("  AB_SLACK_USER_ID    Slack user ID shown after reauth (login is by AB_AUTH_EMAIL)");
   stderr("  AB_SESSION_PID      Session pid (set by subagent hook; falls back to CCO_SESSION_ID)");
   stderr("  CCO_SESSION_ID      Claude Code session ID (auto-set by sandbox)");
   stderr("  AB_VIEWPORT_W       Viewport width applied by 'ab open' (default 1440)");
