@@ -300,6 +300,109 @@ cmd_secrets_update() {
     json_ok "$TOOL_NAME secrets update" "$result" "$na"
 }
 
+cmd_secrets_batch_update() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local file=""
+    local mode="failOnNotFound"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            --file) file="$2"; shift 2 ;;
+            --mode) mode="$2"; shift 2 ;;
+            *)
+                json_error "$TOOL_NAME secrets batch-update" "Unknown option: $1" "INVALID_ARG" \
+                    "Usage: infisical-api secrets batch-update --file <path|-> -p <project-id> [-e env] [--path /path] [--mode failOnNotFound|upsert]"
+                ;;
+        esac
+    done
+
+    case "$mode" in
+        failOnNotFound|upsert) ;;
+        *) json_error "$TOOL_NAME secrets batch-update" "Invalid --mode: $mode" "INVALID_ARG" \
+               "--mode must be failOnNotFound (default; every key must already exist) or upsert (create missing keys, one change request for the whole batch)" ;;
+    esac
+
+    if [[ -z "$project_id" || -z "$file" ]]; then
+        json_error "$TOOL_NAME secrets batch-update" "Project ID and --file required" "MISSING_ARG" \
+            "Usage: infisical-api secrets batch-update --file <path|-> -p <project-id> [-e env] [--path /path]"
+    fi
+
+    local secrets_json
+    if [[ "$file" == "-" ]]; then
+        secrets_json=$(cat)
+    else
+        [[ -f "$file" ]] || json_error "$TOOL_NAME secrets batch-update" "File not found: $file" "MISSING_ARG" \
+            'Pass a JSON array file: [{"secretKey":"FOO","secretValue":"bar"}]'
+        secrets_json=$(cat "$file")
+    fi
+
+    echo "$secrets_json" | jq -e \
+        'type == "array" and length > 0 and all(.[]; (.secretKey? // "") != "")' \
+        >/dev/null 2>&1 || \
+        json_error "$TOOL_NAME secrets batch-update" "Input must be a non-empty JSON array of objects with a non-empty secretKey" "INVALID_ARG" \
+            'Example: [{"secretKey":"FOO","secretValue":"bar"}]'
+
+    local dup
+    dup=$(echo "$secrets_json" | jq -r '[.[].secretKey] | group_by(.) | map(select(length > 1) | .[0]) | join(", ")')
+    if [[ -n "$dup" ]]; then
+        json_error "$TOOL_NAME secrets batch-update" "Duplicate secretKey(s) in batch: $dup" "INVALID_ARG" \
+            "Each key can only appear once per batch"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME secrets batch-update" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local api_host token
+    api_host=$(load_api_host)
+    token=$(get_access_token) || json_error "$TOOL_NAME secrets batch-update" "Failed to authenticate" "AUTH_FAILED" \
+        "Check your credentials"
+
+    local payload
+    payload=$(jq -n \
+        --arg pid "$project_id" \
+        --arg env "$environment" \
+        --arg path "$path" \
+        --arg mode "$mode" \
+        --argjson secrets "$secrets_json" \
+        '{projectId: $pid, environment: $env, secretPath: $path, mode: $mode, secrets: $secrets}')
+
+    local tmpfile
+    tmpfile=$(mktemp) && chmod 600 "$tmpfile"
+    trap 'rm -f "$tmpfile"' EXIT
+    printf '%s' "$payload" > "$tmpfile"
+
+    # Routed through safe_api_call, not the bare infisical_api() curl wrapper:
+    # infisical_api() doesn't check HTTP status, so a 4xx/5xx body would
+    # otherwise reach json_ok as if it were a successful batch.
+    local body
+    body=$(safe_api_call "PATCH /v4/secrets/batch" "$api_host/api/v4/secrets/batch" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -X PATCH --data-binary "@$tmpfile")
+
+    rm -f "$tmpfile"
+    trap - EXIT
+
+    local key_count
+    key_count=$(echo "$secrets_json" | jq 'length')
+
+    local na
+    if echo "$body" | jq -e '.approval' >/dev/null 2>&1; then
+        na=$(next_actions \
+            "$(next_action "Review and approve in the Infisical UI" "Batch of $key_count keys is pending approval — not live yet")")
+    else
+        na=$(next_actions \
+            "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List all secrets")")
+    fi
+    json_ok "$TOOL_NAME secrets batch-update" "$body" "$na"
+}
+
 cmd_secrets_delete() {
     local project_id=""
     local environment="prod"
@@ -388,6 +491,50 @@ cmd_folders_list() {
     na=$(next_actions \
         "$(next_action "infisical-api secrets list -p $project_id -e $environment --path /subfolder" "List secrets in a subfolder")")
     json_ok "$TOOL_NAME folders list" "$folders" "$na"
+}
+
+cmd_folders_delete() {
+    local project_id="" environment="prod" path="/" name="" yes=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            --yes) yes=1; shift ;;
+            -*) json_error "$TOOL_NAME folders delete" "Unknown option: $1" "INVALID_ARG" \
+                "Usage: infisical-api folders delete <folder-name> -p <project-id> [-e env] [--path /parent] --yes" ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$project_id" && -n "$name" ]] || json_error "$TOOL_NAME folders delete" "Folder name and project ID required" "MISSING_ARG" \
+        "Usage: infisical-api folders delete <folder-name> -p <project-id> [-e env] [--path /parent] --yes"
+    [[ "$yes" == 1 ]] || json_error "$TOOL_NAME folders delete" "Refusing without --yes" "CONFIRM_REQUIRED" \
+        "Folder deletion removes every secret inside it. Re-run with --yes after listing them: infisical-api secrets list -p $project_id -e $environment --path $path/$name"
+    load_credentials || json_error "$TOOL_NAME folders delete" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+    local payload
+    payload=$(jq -n --arg pid "$project_id" --arg env "$environment" --arg path "$path" '{workspaceId: $pid, environment: $env, path: $path}')
+    local result
+    result=$(infisical_api "/v1/folders/$name" -X DELETE -d "$payload") || \
+        json_error "$TOOL_NAME folders delete" "Failed to delete folder" "API_ERROR" "Check project ID, environment, parent path, and folder name"
+    if echo "$result" | jq -e '.statusCode? // empty' >/dev/null 2>&1; then
+        json_error "$TOOL_NAME folders delete" "$(echo "$result" | jq -r '"HTTP \(.statusCode): \(.message)"')" "API_ERROR" "Infisical rejected the request; a 403 means the machine identity role lacks Delete on Secret Folders"
+    fi
+    json_ok "$TOOL_NAME folders delete" "$result" "$(next_actions "$(next_action "infisical-api folders list -p $project_id -e $environment --path $path" "Confirm the folder is gone")")"
+}
+
+cmd_syncs_delete() {
+    local sync_id="${1:-}" yes="${2:-}"
+    [[ -n "$sync_id" ]] || json_error "$TOOL_NAME syncs delete" "Sync ID required" "MISSING_ARG" "Usage: infisical-api syncs delete <sync-id> --yes"
+    [[ "$yes" == "--yes" ]] || json_error "$TOOL_NAME syncs delete" "Refusing without --yes" "CONFIRM_REQUIRED" \
+        "Deleting a sync stops pushing to its Render env group (the group and its vars stay). Inspect first: infisical-api syncs get $sync_id"
+    load_credentials || json_error "$TOOL_NAME syncs delete" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+    local result
+    result=$(infisical_api "/v1/secret-syncs/render/$sync_id" -X DELETE) || \
+        json_error "$TOOL_NAME syncs delete" "Failed to delete sync" "API_ERROR" "Check the sync ID"
+    if echo "$result" | jq -e '.statusCode? // empty' >/dev/null 2>&1; then
+        json_error "$TOOL_NAME syncs delete" "$(echo "$result" | jq -r '"HTTP \(.statusCode): \(.message)"')" "API_ERROR" "Infisical rejected the request; check the sync ID and the machine identity's secret-sync permissions"
+    fi
+    json_ok "$TOOL_NAME syncs delete" "$result" "$(next_actions "$(next_action "infisical-api syncs list <project-id>" "Confirm the sync is gone")")"
 }
 
 # ============================================================================
@@ -768,9 +915,10 @@ case "${1:-}" in
             get) shift 2; cmd_secrets_get "$@" ;;
             create) shift 2; cmd_secrets_create "$@" ;;
             update) shift 2; cmd_secrets_update "$@" ;;
+            batch-update) shift 2; cmd_secrets_batch_update "$@" ;;
             delete) shift 2; cmd_secrets_delete "$@" ;;
             export) shift 2; cmd_secrets_export "$@" ;;
-            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|create|update|delete|export>" ;;
+            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|create|update|batch-update|delete|export>" ;;
         esac
         ;;
     syncs)
@@ -780,13 +928,15 @@ case "${1:-}" in
             trigger) cmd_syncs_trigger "${3:-}" ;;
             force) cmd_syncs_force "${3:-}" ;;
             remove-secrets) cmd_syncs_remove_secrets "${3:-}" "${4:-}" ;;
-            *) json_error "$TOOL_NAME syncs" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api syncs <list|get|trigger|force|remove-secrets>" ;;
+            delete) cmd_syncs_delete "${3:-}" "${4:-}" ;;
+            *) json_error "$TOOL_NAME syncs" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api syncs <list|get|trigger|force|remove-secrets|delete>" ;;
         esac
         ;;
     folders)
         case "${2:-}" in
             list) shift 2; cmd_folders_list "$@" ;;
-            *) json_error "$TOOL_NAME folders" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api folders <list>" ;;
+            delete) shift 2; cmd_folders_delete "$@" ;;
+            *) json_error "$TOOL_NAME folders" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api folders <list|delete>" ;;
         esac
         ;;
     environments)
@@ -819,6 +969,7 @@ case "${1:-}" in
             {name: "secrets get", description: "Get a specific secret", usage: "infisical-api secrets get <key> -p <project> [-e env]"},
             {name: "secrets create", description: "Create a secret", usage: "infisical-api secrets create <KEY> <VALUE> -p <project> [-e env] [--path /path]"},
             {name: "secrets update", description: "Update a secret value", usage: "infisical-api secrets update <KEY> <NEW_VALUE> -p <project> [-e env] [--path /path]"},
+            {name: "secrets batch-update", description: "Update multiple secrets in one change request/approval/sync", usage: "infisical-api secrets batch-update --file <path|-> -p <project> [-e env] [--path /path]"},
             {name: "secrets delete", description: "Delete a secret", usage: "infisical-api secrets delete <KEY> -p <project> [-e env] [--path /path]"},
             {name: "secrets export", description: "Export secrets", usage: "infisical-api secrets export -p <project> [-f env|json]"},
             {name: "folders list", description: "List secret folders", usage: "infisical-api folders list -p <project> [-e env] [--path /path]"},
