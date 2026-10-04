@@ -15,7 +15,7 @@
 │  │   auto-restart           → open it in browser      │
 │  └─ headed (9444)           → real Clerk session      │
 │      on-demand                                        │
-│      10min idle timeout                               │
+│      90min idle timeout                               │
 └──────────────────────────────────────────────────────┘
         │ Unix socket
         ▼
