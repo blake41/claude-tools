@@ -1302,6 +1302,24 @@ function cmdNewSession(): number {
 const SESSION_FILE_PREFIX = "/tmp/.ab-session-";
 const WRAPPER_PREFIX = "/tmp/ab-";
 const STALE_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Remove a session's marker, wrapper and the opaque `ab-<pid>.config` sidecar
+ * its agent-browser daemon leaves behind (~1,936 had accumulated). Each is
+ * best-effort: any of them may legitimately not exist.
+ */
+export function reapSessionFiles(
+  pid: string,
+  opts: { keepWrapper?: boolean; configDir?: string } = {},
+): void {
+  const configDir = opts.configDir ?? path.join(os.homedir(), ".agent-browser");
+  const targets = [`${SESSION_FILE_PREFIX}${pid}`, path.join(configDir, `ab-${pid}.config`)];
+  if (!opts.keepWrapper) targets.push(`${WRAPPER_PREFIX}${pid}`);
+  for (const t of targets) {
+    try { fs.unlinkSync(t); } catch { /* already gone */ }
+  }
+}
+
 /** Grace window before an idle (daemon-dead, not-yet-stale) session is reaped by `ab gc`. */
 const IDLE_GRACE_MS = Number(process.env.AB_GC_IDLE_GRACE_MS ?? 30 * 60 * 1000);
 
@@ -2024,17 +2042,7 @@ async function cmdGc(args: string[]): Promise<number> {
       const result = await teardownSession(e.pid, port);
       if (!result.ok) stderr(formatTeardownWarning(e.pid, shard, result));
     }
-    try { fs.unlinkSync(sessionFile); } catch { /* race: already gone */ }
-    if (e.state === "stale") {
-      try { fs.unlinkSync(wrapper); } catch { /* wrapper may not exist */ }
-    }
-    // tab-teardown-fix U2/R6: the per-session agent-browser daemon leaves an
-    // opaque `ab-<pid>.config` sidecar behind; gc never cleaned it, which had
-    // accumulated ~1,936 files. Best-effort — a missing one is normal (the
-    // session may never have started a daemon).
-    try {
-      fs.unlinkSync(path.join(os.homedir(), ".agent-browser", `ab-${e.pid}.config`));
-    } catch { /* may not exist */ }
+    reapSessionFiles(e.pid, { keepWrapper: e.state !== "stale" });
     reapedPids.add(e.pid);
     stderr(`reaped: ${e.pid} (${e.state})`);
   }
@@ -2394,8 +2402,7 @@ async function main(): Promise<number> {
       // immediately instead of waiting for the next 30-minute gc cycle
       // (IDLE_GRACE_MS above; the old "24h" here was the stale-LABEL
       // threshold, not the reap trigger).
-      try { fs.unlinkSync(`${SESSION_FILE_PREFIX}${pid}`); } catch { /* already gone */ }
-      try { fs.unlinkSync(`${WRAPPER_PREFIX}${pid}`); } catch { /* may not exist */ }
+      reapSessionFiles(pid);
       return 0;
     }
 
