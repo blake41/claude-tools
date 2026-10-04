@@ -123,6 +123,9 @@ const BACKOFF_MAX_MS = Number(process.env.AB_BACKOFF_MAX_MS) || 30_000;
 // doesn't reset backoff; only surviving this stable window does" without a
 // real 60s wait.
 const BACKOFF_STABLE_RESET_MS = Number(process.env.AB_BACKOFF_STABLE_RESET_MS) || 60_000;
+// Test-only, same pattern: lets a test exercise the "CDP never answered"
+// launch failure without a real 15s wait.
+const CDP_READY_TIMEOUT_MS = Number(process.env.AB_CDP_READY_TIMEOUT_MS) || 15_000;
 
 // Heartbeat re-arm tuning — a benign WS close (Chrome pid still alive) must
 // re-arm the heartbeat, not leave the shard heartbeat-less (2026-08-04
@@ -827,13 +830,14 @@ async function launchChrome(
   });
 
   // Wait for CDP to respond (up to 15s)
-  const ready = await waitForCdp(config.port, 15_000);
+  const ready = await waitForCdp(config.port, CDP_READY_TIMEOUT_MS);
   if (!ready) {
-    log.error(`[${target}] Chrome did not respond within 15s`, {
+    log.error(`[${target}] Chrome did not respond within ${CDP_READY_TIMEOUT_MS}ms`, {
       port: config.port,
     });
     proc.kill();
     rt.proc = null;
+    bumpBackoffAndRetry(rt);
     markCrashed(target, -1);
     if (CONFIGS[target].policy === "always-on") {
       scheduleRestart(target);
