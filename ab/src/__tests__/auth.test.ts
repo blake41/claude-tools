@@ -91,6 +91,8 @@ function assertAuthStatusShape(status: AuthStatusResponse): void {
 const TEST_KEY = "sk_test_UNITTESTSECRET";
 const MINTED_URL = "https://fake-instance.clerk.accounts.dev/v1/tickets/accept?ticket=TICKETSECRET";
 
+const SESSION_COOKIE = { name: "__session", value: "jwt.header.sig", domain: "localhost" };
+
 interface FakeClient extends AgentTaskClient {
   calls: Array<Record<string, unknown>>;
 }
@@ -112,13 +114,15 @@ function fakeClerk(opts: { url?: string; throws?: unknown } = {}): { client: Fak
 }
 
 /** Mock agent-browser: record args per call, answer `get url` from `urls` in order. */
-function scriptBrowser(urls: string[]): string[][] {
+function scriptBrowser(urls: string[], cookies: Array<Record<string, string>> = [SESSION_COOKIE]): string[][] {
   const calls: string[][] = [];
   let urlIdx = 0;
   spawnMock.mockImplementation((cmd: string[]) => {
     const args = cmd.slice(5); // after: agent-browser --session <id> --cdp <port>
     calls.push(args);
-    const stdout = args[0] === "get" && args[1] === "url" ? (urls[Math.min(urlIdx++, urls.length - 1)] ?? "") : "";
+    let stdout = "";
+    if (args[0] === "get" && args[1] === "url") stdout = urls[Math.min(urlIdx++, urls.length - 1)] ?? "";
+    else if (args[0] === "cookies" && args[1] === "get") stdout = JSON.stringify({ success: true, data: { cookies }, error: null });
     return {
       pid: 1,
       exitCode: 0,
@@ -310,6 +314,52 @@ describe("auth contract", () => {
 
     assertLoginFailure(result);
     expect(result.error).toContain("timed out");
+  });
+
+  test("fails when the browser lands on the app origin but no Clerk session cookie exists (wrong Clerk instance)", async () => {
+    const calls = scriptBrowser(["about:blank", "http://localhost:5173/"], [{ name: "unrelated", value: "x", domain: "localhost" }]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("session");
+    expect(result.error).toContain("CLERK_SECRET_KEY");
+    expect(calls.some((a) => a[0] === "cookies")).toBe(true);
+    expect(getAuthStatus().authenticated).toBe(false);
+  });
+
+  test("a __session cookie on another host does not count", async () => {
+    scriptBrowser(["about:blank", "http://localhost:5173/"], [{ name: "__session", value: "jwt", domain: "other.example.com" }]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+    );
+
+    assertLoginFailure(result);
+    expect(getAuthStatus().authenticated).toBe(false);
+  });
+
+  test("__client_uat other than 0 on a parent domain counts as a session; 0 does not", async () => {
+    scriptBrowser(["about:blank", "https://app.terra.localhost/"], [{ name: "__client_uat", value: "1759600000", domain: ".terra.localhost" }]);
+    const ok = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://app.terra.localhost", clerkSecretKey: TEST_KEY },
+      { createClerkClient: fakeClerk().factory },
+    );
+    assertLoginSuccess(ok);
+
+    resetAuthState();
+    scriptBrowser(["about:blank", "https://app.terra.localhost/"], [{ name: "__client_uat", value: "0", domain: ".terra.localhost" }]);
+    const signedOut = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://app.terra.localhost", clerkSecretKey: TEST_KEY },
+      { createClerkClient: fakeClerk().factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+    );
+    assertLoginFailure(signedOut);
   });
 
   test("authenticate when browser already on authenticated page skips login", async () => {
