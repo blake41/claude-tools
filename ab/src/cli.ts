@@ -27,11 +27,9 @@ const CDP_PORT_HEADLESS = 9333;
 const CDP_PORT_HEADED = 9444;
 const CDP_PORT_USER = 9222;
 
-// Default user for `reauth`. The Agent Task is minted by email (a Slack ID
-// cannot be mapped to an email without Terra's DB, so slackUserId alone is
-// rejected). Override with AB_AUTH_EMAIL; AB_SLACK_USER_ID is display-only.
+// Default user for `reauth`. The Agent Task is minted by email.
+// Override with AB_AUTH_EMAIL.
 const DEFAULT_AUTH_EMAIL = process.env.AB_AUTH_EMAIL ?? "blake.johnson@clay.com";
-const DEFAULT_SLACK_USER_ID = process.env.AB_SLACK_USER_ID ?? "U08M03CDY73"; // blake (staging)
 
 const AB_DIR = path.resolve(import.meta.dir, "..");
 
@@ -967,9 +965,9 @@ function detectWorktreeOrigin(browserUrl: string | undefined): string | undefine
 
 export function resolveReauthBaseUrls(
   args: string[],
-  env: { AB_API_BASE_URL?: string; AB_APP_BASE_URL?: string },
+  env: { AB_APP_BASE_URL?: string },
   browserUrl?: string,
-): { apiBaseUrl: string | undefined; appBaseUrl: string | undefined; error?: string } {
+): { appBaseUrl: string | undefined; error?: string } {
   let preset: string | undefined;
   let host: string | undefined;
   for (let i = 0; i < args.length; i++) {
@@ -989,10 +987,10 @@ export function resolveReauthBaseUrls(
         hostValue = arg.slice("--host=".length);
       }
       if (!hostValue) {
-        return { apiBaseUrl: undefined, appBaseUrl: undefined, error: "--host requires a hostname" };
+        return { appBaseUrl: undefined, error: "--host requires a hostname" };
       }
       if (host && host !== hostValue) {
-        return { apiBaseUrl: undefined, appBaseUrl: undefined, error: `Conflicting --host values: ${host} and ${hostValue}` };
+        return { appBaseUrl: undefined, error: `Conflicting --host values: ${host} and ${hostValue}` };
       }
       host = hostValue;
       continue;
@@ -1001,13 +999,12 @@ export function resolveReauthBaseUrls(
     const name = arg.slice(2);
     if (name in REAUTH_ENV_PRESETS) {
       if (preset && preset !== name) {
-        return { apiBaseUrl: undefined, appBaseUrl: undefined, error: `Conflicting env flags: --${preset} and --${name}` };
+        return { appBaseUrl: undefined, error: `Conflicting env flags: --${preset} and --${name}` };
       }
       preset = name;
     } else if (name === "prod" || name === "production") {
       return {
-        apiBaseUrl: undefined,
-        appBaseUrl: undefined,
+          appBaseUrl: undefined,
         error: "--prod is not supported: reauth only mints against the development Clerk instance. Production uses `ab import` (headed Google login).",
       };
     } else if (name === "local") {
@@ -1017,16 +1014,13 @@ export function resolveReauthBaseUrls(
   }
   if (host && preset && preset !== "local") {
     return {
-      apiBaseUrl: undefined,
       appBaseUrl: undefined,
       error: `Cannot combine --host with --${preset}`,
     };
   }
   // --host wins over presets. For bare hostnames, pick the right scheme:
   //   - `*.localhost` subdomains → portless serves standard HTTPS (:443);
-  //     :80 issues a 302 and following the redirect drops the POST body, so
-  //     address https directly. The portless TLS cert is self-signed;
-  //     auth.ts already accepts that for `.localhost` hosts.
+  //     :80 only redirects, so address https directly.
   //   - bare `localhost` → plain HTTP on the default port (no portless).
   const hostUrl = host
     ? host.startsWith("http://") || host.startsWith("https://")
@@ -1044,7 +1038,6 @@ export function resolveReauthBaseUrls(
   const resolved = hostUrl ?? presetUrl ?? autoDetected;
   // Env vars win over flags, flags win over auto-detect, auto-detect wins over undefined (→ auth.ts localhost defaults).
   return {
-    apiBaseUrl: env.AB_API_BASE_URL ?? resolved,
     appBaseUrl: env.AB_APP_BASE_URL ?? resolved,
   };
 }
@@ -1080,7 +1073,6 @@ export async function cmdReauth(
   const browserUrl = await getBrowserCurrentUrl(cdpPort, sessionName);
 
   const urls = resolveReauthBaseUrls(rest, {
-    AB_API_BASE_URL: process.env.AB_API_BASE_URL,
     AB_APP_BASE_URL: process.env.AB_APP_BASE_URL,
   }, browserUrl);
   if (urls.error) {
@@ -1091,8 +1083,6 @@ export async function cmdReauth(
     sessionId: sessionName ?? "default",
     port: cdpPort,
     email: DEFAULT_AUTH_EMAIL,
-    slackUserId: DEFAULT_SLACK_USER_ID,
-    apiBaseUrl: urls.apiBaseUrl,
     appBaseUrl: urls.appBaseUrl,
     // Sent to the daemon in the request body only; never written to disk or logged.
     clerkSecretKey: process.env.CLERK_SECRET_KEY,
@@ -1100,7 +1090,7 @@ export async function cmdReauth(
   if (result.ok) {
     stderr("Reauth complete");
     if (result.user) {
-      stderr(`  User: ${result.user.email} (${result.user.slackUserId})`);
+      stderr(`  User: ${result.user.email}`);
     }
   } else {
     stderr(`Reauth failed: ${result.error}`);
@@ -1255,8 +1245,6 @@ async function cmdImport(): Promise<number> {
     sessionId: "import",
     port: result.port,
     email: DEFAULT_AUTH_EMAIL,
-    slackUserId: DEFAULT_SLACK_USER_ID,
-    apiBaseUrl: process.env.AB_API_BASE_URL,
     appBaseUrl: process.env.AB_APP_BASE_URL,
   });
 
@@ -2477,7 +2465,9 @@ function printUsage(): void {
   stderr("  --user-chrome       Use personal Chrome (port 9222), allows eval");
   stderr("");
   stderr("Environment:");
-  stderr("  AB_SLACK_USER_ID    Slack user ID shown after reauth (login is by AB_AUTH_EMAIL)");
+  stderr("  AB_AUTH_EMAIL       Email reauth signs in as (default blake.johnson@clay.com)");
+  stderr("  AB_APP_BASE_URL     App origin reauth targets (default: auto-detect, else http://localhost:5173)");
+  stderr("  CLERK_SECRET_KEY    Development Clerk key (sk_test_...) reauth mints with");
   stderr("  AB_SESSION_PID      Session pid (set by subagent hook; falls back to CCO_SESSION_ID)");
   stderr("  CCO_SESSION_ID      Claude Code session ID (auto-set by sandbox)");
   stderr("  AB_VIEWPORT_W       Viewport width applied by 'ab open' (default 1440)");

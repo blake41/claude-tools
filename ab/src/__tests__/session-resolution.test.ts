@@ -119,44 +119,36 @@ describe("parseFlags", () => {
 describe("resolveReauthBaseUrls", () => {
   test("no flags and no env → undefined (auth.ts defaults to localhost)", () => {
     const r = resolveReauthBaseUrls([], {});
-    expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
     expect(r.error).toBeUndefined();
   });
 
   test("--staging maps both URLs to staging", () => {
     const r = resolveReauthBaseUrls(["--staging"], {});
-    expect(r.apiBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
     expect(r.appBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
   });
 
   test("--dev maps both URLs to development render env", () => {
     const r = resolveReauthBaseUrls(["--dev"], {});
-    expect(r.apiBaseUrl).toBe("https://slack-feedback-development.onrender.com");
     expect(r.appBaseUrl).toBe("https://slack-feedback-development.onrender.com");
   });
 
   test("--local is explicit no-op (undefined → localhost defaults)", () => {
     const r = resolveReauthBaseUrls(["--local"], {});
-    expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
   });
 
   test("env vars override preset", () => {
     const r = resolveReauthBaseUrls(["--staging"], {
-      AB_API_BASE_URL: "https://custom-api.example.com",
       AB_APP_BASE_URL: "https://custom-app.example.com",
     });
-    expect(r.apiBaseUrl).toBe("https://custom-api.example.com");
     expect(r.appBaseUrl).toBe("https://custom-app.example.com");
   });
 
   test("env vars apply without any preset flag", () => {
     const r = resolveReauthBaseUrls([], {
-      AB_API_BASE_URL: "https://foo.example.com",
       AB_APP_BASE_URL: "https://bar.example.com",
     });
-    expect(r.apiBaseUrl).toBe("https://foo.example.com");
     expect(r.appBaseUrl).toBe("https://bar.example.com");
   });
 
@@ -177,7 +169,6 @@ describe("resolveReauthBaseUrls", () => {
 
   test("unrelated flags are ignored", () => {
     const r = resolveReauthBaseUrls(["--verbose", "--staging"], {});
-    expect(r.apiBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
     expect(r.error).toBeUndefined();
   });
 
@@ -186,31 +177,26 @@ describe("resolveReauthBaseUrls", () => {
     // cert. Going through HTTP:80 would 302 to the same URL but drop the POST
     // body, so we address https (443) directly.
     const r = resolveReauthBaseUrls(["--host", "worktree-foo.terra.localhost"], {});
-    expect(r.apiBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.appBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.error).toBeUndefined();
   });
 
   test("--host=<hostname> equals form works the same", () => {
     const r = resolveReauthBaseUrls(["--host=worktree-bar.terra.localhost"], {});
-    expect(r.apiBaseUrl).toBe("https://worktree-bar.terra.localhost");
     expect(r.appBaseUrl).toBe("https://worktree-bar.terra.localhost");
   });
 
   test("--host bare `localhost` stays HTTP (no portless involved)", () => {
     const r = resolveReauthBaseUrls(["--host", "localhost"], {});
-    expect(r.apiBaseUrl).toBe("http://localhost");
     expect(r.appBaseUrl).toBe("http://localhost");
   });
 
   test("--host non-localhost domain stays HTTP", () => {
     const r = resolveReauthBaseUrls(["--host", "example.com"], {});
-    expect(r.apiBaseUrl).toBe("http://example.com");
   });
 
   test("--host preserves explicit scheme", () => {
     const r = resolveReauthBaseUrls(["--host", "https://my-host.example.com"], {});
-    expect(r.apiBaseUrl).toBe("https://my-host.example.com");
     expect(r.appBaseUrl).toBe("https://my-host.example.com");
   });
 
@@ -236,16 +222,14 @@ describe("resolveReauthBaseUrls", () => {
 
   test("--host combined with --local is allowed (--local is no-op)", () => {
     const r = resolveReauthBaseUrls(["--host", "foo.terra.localhost", "--local"], {});
-    expect(r.apiBaseUrl).toBe("https://foo.terra.localhost");
     expect(r.error).toBeUndefined();
   });
 
   test("env vars still win over --host", () => {
     const r = resolveReauthBaseUrls(["--host", "foo.terra.localhost"], {
-      AB_API_BASE_URL: "https://override.example.com",
+      AB_APP_BASE_URL: "https://override.example.com",
     });
-    expect(r.apiBaseUrl).toBe("https://override.example.com");
-    expect(r.appBaseUrl).toBe("https://foo.terra.localhost");
+    expect(r.appBaseUrl).toBe("https://override.example.com");
   });
 
   // ---------------------------------------------------------------------------
@@ -254,27 +238,23 @@ describe("resolveReauthBaseUrls", () => {
 
   test("browserUrl *.terra.localhost → portless HTTPS (443) when no flags set", () => {
     const r = resolveReauthBaseUrls([], {}, "https://worktree-foo.terra.localhost/home");
-    expect(r.apiBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.appBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.error).toBeUndefined();
   });
 
   test("browserUrl terra.localhost (exact) → portless HTTPS (443)", () => {
     const r = resolveReauthBaseUrls([], {}, "https://terra.localhost/home");
-    expect(r.apiBaseUrl).toBe("https://terra.localhost");
     expect(r.appBaseUrl).toBe("https://terra.localhost");
   });
 
   test("browserUrl non-terra → undefined (fall back to localhost defaults)", () => {
     const r = resolveReauthBaseUrls([], {}, "https://example.com/page");
-    expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
     expect(r.error).toBeUndefined();
   });
 
   test("browserUrl localhost:5173 → undefined (not a terra.localhost, fall back)", () => {
     const r = resolveReauthBaseUrls([], {}, "http://localhost:5173/home");
-    expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
   });
 
@@ -284,7 +264,6 @@ describe("resolveReauthBaseUrls", () => {
       {},
       "https://worktree-foo.terra.localhost/home",
     );
-    expect(r.apiBaseUrl).toBe("https://worktree-bar.terra.localhost");
     expect(r.appBaseUrl).toBe("https://worktree-bar.terra.localhost");
   });
 
@@ -294,23 +273,20 @@ describe("resolveReauthBaseUrls", () => {
       {},
       "https://worktree-foo.terra.localhost/home",
     );
-    expect(r.apiBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
     expect(r.appBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
   });
 
   test("env vars win over browserUrl auto-detect", () => {
     const r = resolveReauthBaseUrls(
       [],
-      { AB_API_BASE_URL: "https://override.example.com", AB_APP_BASE_URL: "https://override.example.com" },
+      { AB_APP_BASE_URL: "https://override.example.com" },
       "https://worktree-foo.terra.localhost/home",
     );
-    expect(r.apiBaseUrl).toBe("https://override.example.com");
     expect(r.appBaseUrl).toBe("https://override.example.com");
   });
 
   test("undefined browserUrl does not change behavior (same as no third arg)", () => {
     const r = resolveReauthBaseUrls([], {}, undefined);
-    expect(r.apiBaseUrl).toBeUndefined();
     expect(r.appBaseUrl).toBeUndefined();
     expect(r.error).toBeUndefined();
   });
