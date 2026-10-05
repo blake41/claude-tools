@@ -61,4 +61,26 @@ describe("stopAll dashboard teardown", () => {
     const { stopAll } = await import("../chrome-supervisor");
     await expect(stopAll()).resolves.toBeUndefined();
   });
+
+  // Must stay last: it leaves opQueue permanently blocked for this module instance.
+  test("stops the dashboard even while a queued op blocks opQueue", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+    spawnImpl = (cmd) =>
+      cmd[0] === "agent-browser"
+        ? { pid: -1, exitCode: 0, exited: Promise.resolve(0), kill: mock(() => {}) }
+        : { pid: -1, exitCode: null, exited: new Promise<number>(() => {}), stdout: new ReadableStream(), stderr: null, kill: mock(() => {}) };
+    try {
+      const { ensure, stopAll } = await import("../chrome-supervisor");
+      void ensure("headless-0").catch(() => {});
+      await Bun.sleep(20);
+      let queuedDone = false;
+      void stopAll().then(() => { queuedDone = true; });
+      await Bun.sleep(50);
+      expect(queuedDone).toBe(false);
+      expect(dashboardStops()).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

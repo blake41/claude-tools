@@ -647,10 +647,12 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
  * Teardown all supervised Chrome instances. Call on daemon shutdown.
  */
 export async function stopAll(): Promise<void> {
+  // Needs no queue and is idempotent: stop it first so an in-flight launch or
+  // heal ahead of us in opQueue cannot keep the detached server alive.
+  await stopDashboard();
   return opQueue.enqueue(() =>
     withOpId(newOpId(), async () => {
       log.info("Stopping all Chrome instances");
-      await stopDashboard();
       await Promise.all(ALL_TARGETS.map((target) => doKill(target)));
     }),
   ) as Promise<void>;
