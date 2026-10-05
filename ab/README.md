@@ -85,6 +85,8 @@ ab status               # daemon health + Chrome state
 
 Agents authenticate via a **Clerk Agent Task** — `ab` mints it directly against the development Clerk instance (`CLERK_SECRET_KEY` from the `ab` CLI env, `sk_test_` only, never `terra.clay.com`) and opens the one-time URL for a real session. No Google OAuth, no cookie stealing. Production uses `ab import`.
 
+`ab open <url>` logs in for you when the URL is a dev app origin (`http://localhost:5173`, `*.terra.localhost`, the staging and development onrender hosts) and the shard has no Clerk session cookie. It checks the cookie first and leaves an existing session alone, so only `ab reauth` forces a re-login as another user. It never runs for `terra.clay.com` or any other site. If `CLERK_SECRET_KEY` is not set in the `ab` CLI env, it prints one hint and opens the URL anyway; a login failure prints one warning and `ab open` continues. Concurrent logins for the same shard and origin share one Agent Task.
+
 See **[docs/agent-tasks-auth.md](docs/agent-tasks-auth.md)** for the full flow, configuration, and troubleshooting.
 
 ## Daemon Management
