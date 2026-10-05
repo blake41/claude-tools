@@ -319,6 +319,20 @@ async function spawnDaemon(opts?: {
 
       reapOrphanChromes(chromes);
 
+      // The daemon may be SIGKILLed before its own stopAll runs; stop this
+      // daemon's dashboard against its own socket dir, never the default one.
+      try {
+        const stop = Bun.spawn(["agent-browser", "dashboard", "stop"], {
+          stdout: "ignore",
+          stderr: "ignore",
+          env: { ...process.env, HOME: homeDir, AGENT_BROWSER_SOCKET_DIR: abDir },
+        });
+        await Promise.race([stop.exited, Bun.sleep(3_000)]);
+        if (stop.exitCode === null) stop.kill(9);
+      } catch {
+        // best effort
+      }
+
       // Remove temp directory
       try {
         fs.rmSync(homeDir, { recursive: true, force: true });
