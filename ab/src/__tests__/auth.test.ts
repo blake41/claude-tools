@@ -135,6 +135,12 @@ function scriptBrowser(urls: string[], cookies: Array<Record<string, string>> = 
   return calls;
 }
 
+const STATUS_OPTS = { port: 9333, sessionId: "test" };
+
+function authStatusOf(s: AuthStatusResponse) {
+  return { authenticated: s.authenticated, user: s.user, lastLogin: s.lastLogin };
+}
+
 function allLogs(): string {
   return JSON.stringify(getRecentLogs());
 }
@@ -303,7 +309,8 @@ describe("auth contract", () => {
     expect(result.error!.endsWith("ticket=[redacted] END-OF-STDERR")).toBe(true);
     expect(result.error!.length).toBeLessThanOrEqual("Auth exchange failed: ".length + 400);
     expect(result.error).not.toContain("TICKETSECRET");
-    expect(getAuthStatus().authenticated).toBe(false);
+    // authState was not recorded (status.authenticated follows the cookie jar, which these scripts fill).
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
   });
 
   test("Clerk user-not-found (404 / *_not_found) maps to the friendly 'no Clerk account' error", async () => {
@@ -364,7 +371,8 @@ describe("auth contract", () => {
     assertLoginFailure(result);
     expect(result.error).toContain("timed out");
     expect(Date.now() - started).toBeLessThan(1_000);
-    expect(getAuthStatus().authenticated).toBe(false);
+    // authState was not recorded (status.authenticated follows the cookie jar, which these scripts fill).
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
   });
 
   test("a hung `open` is cut off at the deadline: timeout failure, authState untouched", async () => {
@@ -401,7 +409,7 @@ describe("auth contract", () => {
     expect(elapsed).toBeLessThan(1_500);
     expect(killed).toBe(1);
     expect(calls.filter((a) => a[0] === "open")).toHaveLength(1);
-    expect(getAuthStatus()).toEqual({ ok: true, authenticated: false, user: null, lastLogin: null });
+    expect(authStatusOf(await getAuthStatus(STATUS_OPTS))).toEqual({ authenticated: false, user: null, lastLogin: null });
   });
 
   test("a session confirmed only after the deadline does not set authState", async () => {
@@ -429,7 +437,8 @@ describe("auth contract", () => {
       expect(calls.some((a) => a[0] === "cookies")).toBe(true);
       assertLoginFailure(result);
       expect(result.error).toContain("Auth exchange timed out");
-      expect(getAuthStatus().authenticated).toBe(false);
+      // authState was not recorded (status.authenticated follows the cookie jar, which these scripts fill).
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
     } finally {
       nowSpy.mockRestore();
     }
@@ -448,7 +457,8 @@ describe("auth contract", () => {
     expect(result.error).toContain("session");
     expect(result.error).toContain("CLERK_SECRET_KEY");
     expect(calls.some((a) => a[0] === "cookies")).toBe(true);
-    expect(getAuthStatus().authenticated).toBe(false);
+    // authState was not recorded (status.authenticated follows the cookie jar, which these scripts fill).
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
   });
 
   test("a __session cookie on another host does not count", async () => {
@@ -461,7 +471,8 @@ describe("auth contract", () => {
     );
 
     assertLoginFailure(result);
-    expect(getAuthStatus().authenticated).toBe(false);
+    // authState was not recorded (status.authenticated follows the cookie jar, which these scripts fill).
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
   });
 
   test("__client_uat other than 0 on a parent domain counts as a session; 0 does not", async () => {
@@ -492,39 +503,71 @@ describe("auth contract", () => {
     expect(factory).not.toHaveBeenCalled();
   });
 
-  test("getAuthStatus returns correct shape when not authenticated", () => {
-    const status = getAuthStatus();
+  test("getAuthStatus returns correct shape when not authenticated", async () => {
+    scriptBrowser([], []);
+    const status = await getAuthStatus(STATUS_OPTS);
     assertAuthStatusShape(status);
     expect(status.authenticated).toBe(false);
     expect(status.user).toBeNull();
     expect(status.lastLogin).toBeNull();
+    expect(status.port).toBe(9333);
+    expect(status.checkedVia).toBe("cookie");
   });
 
-  test("resetAuthState clears authenticated state", async () => {
-    // First authenticate
+  test("getAuthStatus is authenticated when the cookie jar holds a Clerk session cookie for the app host", async () => {
+    const calls = scriptBrowser(["about:blank"], [SESSION_COOKIE]);
+    const status = await getAuthStatus({ port: 9335, sessionId: "s1", appBaseUrl: "http://localhost:5173" });
+    expect(status.authenticated).toBe(true);
+    expect(status.port).toBe(9335);
+    expect(calls).toEqual([["cookies", "get", "--json"]]);
+  });
+
+  test("getAuthStatus is not authenticated when the only cookie is for another host", async () => {
+    scriptBrowser(["about:blank"], [{ name: "__session", value: "jwt", domain: "example.com" }]);
+    // authState was not recorded (status.authenticated follows the cookie jar, which these scripts fill).
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
+  });
+
+  test("survives a simulated crash: resetAuthState does not flip authenticated while the cookie persists", async () => {
+    scriptBrowser(["http://localhost:5173/"], [SESSION_COOKIE]);
+    const login = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
+    assertLoginSuccess(login);
+
+    resetAuthState(); // stands in for the supervisor crash path
+
+    const status = await getAuthStatus(STATUS_OPTS);
+    expect(status.authenticated).toBe(true);
+    expect(status.user).toBeNull();
+    expect(status.lastLogin).toBeNull();
+  });
+
+  test("a cookie read failure reports unauthenticated and does not throw", async () => {
     spawnMock.mockImplementation(() => ({
       pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("http://localhost:5173/")); c.close(); },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
+      exitCode: 1,
+      exited: Promise.resolve(1),
+      stdout: new ReadableStream({ start(c) { c.close(); } }),
+      stderr: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("cdp connect failed")); c.close(); } }),
       kill: () => {},
     }));
+    const status = await getAuthStatus(STATUS_OPTS);
+    expect(status.ok).toBe(true);
+    expect(status.authenticated).toBe(false);
+  });
 
+  test("resetAuthState clears user and lastLogin; authenticated follows the cookie", async () => {
+    scriptBrowser(["http://localhost:5173/"], [SESSION_COOKIE]);
     await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
-
-    const before = getAuthStatus();
+    // Already-authenticated short-circuit keeps user null; set lastLogin via timestamp.
+    const before = await getAuthStatus(STATUS_OPTS);
     expect(before.authenticated).toBe(true);
+    expect(before.lastLogin).not.toBeNull();
 
     resetAuthState();
 
-    const after = getAuthStatus();
+    const after = await getAuthStatus(STATUS_OPTS);
     assertAuthStatusShape(after);
-    expect(after.authenticated).toBe(false);
+    expect(after.authenticated).toBe(true);
     expect(after.user).toBeNull();
     expect(after.lastLogin).toBeNull();
   });

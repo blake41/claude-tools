@@ -16,8 +16,8 @@ import * as os from "os";
 import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
-import { authenticate, getAuthStatus } from "./auth";
-import { AUTH_LOGIN_TIMEOUT_MS, authLoginDeadline } from "./config";
+import { authenticate, getAuthStatus, DEFAULT_AUTH_APP_BASE } from "./auth";
+import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, authLoginDeadline } from "./config";
 import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
 import type {
@@ -27,6 +27,7 @@ import type {
   ChromeEnsureResponse,
   HealResponse,
   ChromeState,
+  AuthStatusResponse,
 } from "./types";
 import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS, headlessTarget } from "./types";
 
@@ -261,8 +262,25 @@ async function handleAuthLogin(req: Request): Promise<Response> {
   return json(result, result.ok ? 200 : 400);
 }
 
-function handleAuthStatus(): Response {
-  return json(getAuthStatus());
+const AuthStatusQuerySchema = z.object({
+  port: z.coerce.number().int().min(1).max(65535),
+  sessionId: z.string().min(1),
+  appBaseUrl: z.string().min(1),
+});
+
+async function handleAuthStatus(url: URL): Promise<Response> {
+  const q = url.searchParams;
+  const parsed = AuthStatusQuerySchema.safeParse({
+    port: q.get("port") ?? HEADLESS_BASE_PORT,
+    sessionId: q.get("sessionId") ?? "default",
+    appBaseUrl: q.get("appBaseUrl") ?? DEFAULT_AUTH_APP_BASE,
+  });
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
+    return json({ ok: false, error: `Validation failed: ${issues.join(", ")}` }, 400);
+  }
+  const status: AuthStatusResponse = await getAuthStatus(parsed.data);
+  return json(status);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +338,7 @@ async function handleRequest(req: Request): Promise<Response> {
       return json({ ok: true });
     }
     if (method === "GET" && pathname === "/auth/status") {
-      return handleAuthStatus();
+      return await withOpId(newOpId(), () => withTimeout(() => handleAuthStatus(url))) as Response;
     }
 
     return json({ error: "not_found", path: pathname }, 404);

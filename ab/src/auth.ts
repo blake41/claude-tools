@@ -432,11 +432,38 @@ export function resetAuthState(): void {
   authState = { authenticated: false, user: null, timestamp: null };
 }
 
-export function getAuthStatus(): AuthStatusResponse {
+/** Cap on the cookie probe so /auth/status cannot hang on a wedged agent-browser. */
+const STATUS_PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * Report whether the shard's Chrome profile holds a Clerk session cookie.
+ *
+ * The cookie, not in-memory state, is the truth: it persists in the profile
+ * across Chrome crashes and daemon restarts. `user` and `lastLogin` are
+ * best-effort metadata from memory and may be null after a restart.
+ *
+ * `cookies get` is context-wide, so any `sessionId` works. The call spawns or
+ * reuses an agent-browser helper process named `sessionId` that stays resident
+ * like any other session helper.
+ */
+export async function getAuthStatus(
+  opts: { port: number; sessionId: string; appBaseUrl?: string },
+): Promise<AuthStatusResponse> {
+  const authenticated = await confirmClerkSession(
+    opts.sessionId,
+    opts.port,
+    opts.appBaseUrl || DEFAULT_APP_BASE,
+    STATUS_PROBE_TIMEOUT_MS,
+  ).catch(() => false);
   return {
     ok: true,
-    authenticated: authState.authenticated,
+    authenticated,
     user: authState.user,
     lastLogin: authState.timestamp ? new Date(authState.timestamp).toISOString() : null,
+    port: opts.port,
+    checkedVia: "cookie",
   };
 }
+
+/** Default app base used when a caller omits appBaseUrl. */
+export const DEFAULT_AUTH_APP_BASE = DEFAULT_APP_BASE;

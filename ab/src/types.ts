@@ -199,4 +199,8 @@ export interface AuthStatusResponse {
   authenticated: boolean;
   user: { email: string } | null;
   lastLogin: string | null;
+  /** CDP port whose cookie jar was checked. */
+  port: number;
+  /** What `authenticated` was derived from. */
+  checkedVia: "cookie";
 }
