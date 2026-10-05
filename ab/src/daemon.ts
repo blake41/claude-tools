@@ -13,10 +13,10 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { SOCKET_PATH, startServer, type AbServer } from "./server";
+import { startServer, type AbServer } from "./server";
 import * as supervisor from "./chrome-supervisor";
 import { Logger, getRecentLogs } from "./logger";
-import { CONFIG_ERROR } from "./config";
+import { CONFIG_ERROR, SOCKET_PATH } from "./config";
 
 const log = new Logger({ component: "daemon" });
 
