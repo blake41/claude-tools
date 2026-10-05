@@ -266,11 +266,11 @@ async function parseAuthLoginBody(
 export function handleAuthLogin(req: Request, budgetMs: number = AUTH_LOGIN_TIMEOUT_MS): Promise<Response> {
   let appBaseUrl: string | undefined;
   return withTimeout(
-    async (signal) => {
+    async (signal, deadline) => {
       const parsed = await parseAuthLoginBody(req);
       if ("error" in parsed) return json({ ok: false, error: parsed.error }, 400);
       appBaseUrl = parsed.appBaseUrl;
-      const result = await authenticateJoined(parsed, signal);
+      const result = await authenticateJoined(parsed, { signal, deadline });
       return json(result, result.ok ? 200 : 400);
     },
     budgetMs,
@@ -304,15 +304,17 @@ async function handleAuthStatus(url: URL): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 /**
- * Runs `handler` with a signal that aborts when the route budget expires. At
- * expiry the route answers `onTimeout()` if given, else rejects (a 500).
+ * Runs `handler` with the route budget: a signal that aborts when it expires
+ * and its `deadline` (epoch ms), both from one start time. At expiry the
+ * route answers `onTimeout()` if given, else rejects (a 500).
  */
 async function withTimeout(
-  handler: (signal: AbortSignal) => Response | Promise<Response>,
+  handler: (signal: AbortSignal, deadline: number) => Response | Promise<Response>,
   timeoutMs: number = HANDLER_TIMEOUT_MS,
   onTimeout?: () => Response,
 ): Promise<Response> {
   const controller = new AbortController();
+  const deadline = Date.now() + timeoutMs;
   let timerId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<Response>((resolve, reject) => {
     timerId = setTimeout(() => {
@@ -326,7 +328,7 @@ async function withTimeout(
     }
   });
   try {
-    return await Promise.race([Promise.resolve(handler(controller.signal)), timeoutPromise]);
+    return await Promise.race([Promise.resolve(handler(controller.signal, deadline)), timeoutPromise]);
   } finally {
     if (timerId !== null) clearTimeout(timerId);
   }

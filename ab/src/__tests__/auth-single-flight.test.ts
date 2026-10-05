@@ -1,11 +1,11 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { __resetAuthStateForTest, authenticateJoined } from "../auth";
-import type { AgentTaskClient } from "../auth";
+import type { AgentTaskClient, LoginBudget } from "../auth";
 
 const originalSpawn = Bun.spawn;
 
-/** A signal that is never aborted. */
-const live = (): AbortSignal => new AbortController().signal;
+/** A login budget whose signal is never aborted. */
+const budget = (deadline = Date.now() + 60_000): LoginBudget => ({ signal: new AbortController().signal, deadline });
 
 beforeEach(() => {
   __resetAuthStateForTest();
@@ -57,8 +57,8 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req({ sessionId: "s1" }), live(), deps);
-    const b = authenticateJoined(req({ sessionId: "s2" }), live(), deps);
+    const a = authenticateJoined(req({ sessionId: "s1" }), budget(), deps);
+    const b = authenticateJoined(req({ sessionId: "s2" }), budget(), deps);
     await new Promise((r) => setTimeout(r, 20));
     c.release();
     const [ra, rb] = await Promise.all([a, b]);
@@ -73,8 +73,8 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req(), live(), deps);
-    const b = authenticateJoined(req({ appBaseUrl: "https://wt.terra.localhost" }), live(), deps);
+    const a = authenticateJoined(req(), budget(), deps);
+    const b = authenticateJoined(req({ appBaseUrl: "https://wt.terra.localhost" }), budget(), deps);
     await new Promise((r) => setTimeout(r, 20));
     c.release();
     await Promise.all([a, b]);
@@ -86,8 +86,8 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req(), live(), deps);
-    const b = authenticateJoined(req({ port: 9334 }), live(), deps);
+    const a = authenticateJoined(req(), budget(), deps);
+    const b = authenticateJoined(req({ port: 9334 }), budget(), deps);
     await new Promise((r) => setTimeout(r, 20));
     c.release();
     await Promise.all([a, b]);
@@ -95,13 +95,33 @@ describe("authenticateJoined", () => {
     expect(c.mints()).toBe(2);
   });
 
+  test("after the first caller aborts mid-mint, a retry starts a fresh flight and the first answers the timeout", async () => {
+    const c = countingClerk();
+    const deps = { createClerkClient: () => c.client };
+    const first = new AbortController();
+
+    const a = authenticateJoined(req({ sessionId: "s1" }), { signal: first.signal, deadline: Date.now() + 60_000 }, deps);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(c.mints()).toBe(1);
+    first.abort();
+    const b = authenticateJoined(req({ sessionId: "s2" }), budget(), deps);
+
+    const ra = await a;
+    expect(ra.ok).toBe(false);
+    expect(ra.error).toContain("Auth exchange timed out");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(c.mints()).toBe(2);
+    c.release();
+    expect((await b).error).toContain("mint refused");
+  });
+
   test("a login started after the first settled mints again", async () => {
     const c = countingClerk();
     c.release();
     const deps = { createClerkClient: () => c.client };
 
-    await authenticateJoined(req(), live(), deps);
-    await authenticateJoined(req(), live(), deps);
+    await authenticateJoined(req(), budget(), deps);
+    await authenticateJoined(req(), budget(), deps);
 
     expect(c.mints()).toBe(2);
   });
@@ -115,10 +135,10 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req({ sessionId: "s1" }), live(), deps);
-    const b = authenticateJoined(req({ sessionId: "s2" }), live(), deps);
+    const a = authenticateJoined(req({ sessionId: "s1" }), budget(), deps);
+    const b = authenticateJoined(req({ sessionId: "s2" }), budget(), deps);
     const settled = await Promise.allSettled([a, b]);
-    const after = await Promise.allSettled([authenticateJoined(req(), live(), deps)]);
+    const after = await Promise.allSettled([authenticateJoined(req(), budget(), deps)]);
 
     expect(settled.map((x) => x.status)).toEqual(["rejected", "rejected"]);
     expect(after[0].status).toBe("rejected");
