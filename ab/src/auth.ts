@@ -36,6 +36,15 @@ let authState: AuthState = {
 /** Default app base used when a caller omits appBaseUrl. */
 export const DEFAULT_AUTH_APP_BASE = "http://localhost:5173";
 
+/** Origin of `url`, or "" when it is not a URL. */
+function originOfUrl(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
 function originOf(appBaseUrl: string | undefined): string {
   const base = appBaseUrl || DEFAULT_AUTH_APP_BASE;
   try {
@@ -307,15 +316,9 @@ export async function authenticate(
   const urlResult = await step((ms) => runAgentBrowser(sessionId, port, ["get", "url"], ms));
   if (urlResult === null) return timedOut();
   if (urlResult.ok && isAuthenticatedUrl(urlResult.stdout)) {
-    let browserOrigin: string;
-    try {
-      browserOrigin = new URL(urlResult.stdout).origin;
-    } catch {
-      browserOrigin = "";
-    }
+    const browserOrigin = originOfUrl(urlResult.stdout);
 
     if (browserOrigin === appOrigin) {
-      if (expired()) return timedOut();
       log.info("Browser already on authenticated page for same origin — skipping login", {
         url: urlResult.stdout,
         targetOrigin: appOrigin,
@@ -391,7 +394,6 @@ export async function authenticate(
   const navResult = await step((ms) => runAgentBrowser(sessionId, port, ["open", taskUrl], ms));
   if (navResult === null) return timedOut();
   if (!navResult.ok) {
-    if (expired()) return timedOut();
     const stderr = redactSecrets(navResult.stderr, secrets);
     log.error("Navigation failed", { stderr });
     return { ok: false, error: `Auth exchange failed: ${tail(stderr, NAV_STDERR_TAIL_CHARS) || "browser navigation error"}` };
@@ -412,10 +414,7 @@ export async function authenticate(
       log.warn("Could not read browser URL during poll");
       continue;
     }
-    let origin = "";
-    try {
-      origin = new URL(verifyResult.stdout).origin;
-    } catch { /* not a URL yet */ }
+    const origin = originOfUrl(verifyResult.stdout);
     if (origin === appOrigin && !verifyResult.stdout.includes("/sign-in")) {
       const hasSession = await step((ms) => confirmClerkSession(sessionId, port, appOrigin, ms));
       if (hasSession === null) break;
@@ -439,7 +438,7 @@ export async function authenticate(
     };
   }
 
-  if (!landed || expired()) return timedOut();
+  if (!landed) return timedOut();
 
   // -----------------------------------------------------------------------
   // Step 5: Update in-memory auth state
