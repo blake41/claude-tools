@@ -23,6 +23,7 @@
  */
 
 import { pickTabWs, SessionTabError, TARGET_ID_ENV, type CdpTab } from "./cdp-target";
+import { HEADLESS_BASE_PORT } from "./src/config";
 
 const LEVELS_BY_SEVERITY: Record<string, Set<string>> = {
   verbose: new Set(["log", "debug", "info", "warning", "error"]),
@@ -311,7 +312,7 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 
-let port = 9333;
+let port = HEADLESS_BASE_PORT;
 if (positionals.length > 0) {
   const last = Number(positionals[positionals.length - 1]);
   if (!isNaN(last)) {

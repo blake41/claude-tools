@@ -22,7 +22,6 @@ import {
   resolveReauthBaseUrls,
   resolveTeardownShard,
   sessionFilePath,
-  shardForPort,
 } from "../cli";
 import type { SessionEntry } from "../cli";
 
@@ -404,20 +403,6 @@ describe("pickLeastLoadedShard", () => {
     const first = pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-b");
     const second = pickLeastLoadedShard([0, 0, 0], "abtest-tiebreak-b");
     expect(second).toBe(first);
-  });
-});
-
-describe("shardForPort (chrome-pool-plan Fix 2)", () => {
-  test("maps a pool port back to its shard index", () => {
-    expect(shardForPort(9333, 3)).toBe(0);
-    expect(shardForPort(9334, 3)).toBe(1);
-    expect(shardForPort(9335, 3)).toBe(2);
-  });
-
-  test("a port outside the pool's range resolves to shard 0 (legacy single Chrome)", () => {
-    expect(shardForPort(9333, 3)).toBe(0);
-    expect(shardForPort(9999, 3)).toBe(0);
-    expect(shardForPort(1, 3)).toBe(0);
   });
 });
 

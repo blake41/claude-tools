@@ -2,9 +2,11 @@
  * Port and pool configuration shared by the ab-server daemon and the ab CLI.
  *
  * They are separate processes, so each resolves this module from its own env
- * at load time. A bad value throws at module load with the same message in
- * both processes. Must not import ./types, ./server, ./cli or
- * ./chrome-supervisor (types.ts re-exports HEADLESS_POOL_SIZE from here).
+ * at load time. Loading never throws: a bad value is reported in CONFIG_ERROR
+ * and the constants fall back to the defaults. The daemon refuses to start
+ * while CONFIG_ERROR is set; the CLI only warns, because it takes its ports
+ * from the daemon. Must not import ./types, ./server, ./cli or
+ * ./chrome-supervisor.
  */
 
 type Env = Record<string, string | undefined>;
@@ -87,7 +89,22 @@ export function resolveConfig(env: Env = process.env): AbConfig {
   return { headlessBasePort: base, headedPort: headed, dashboardPort: dashboard, headlessPoolSize: poolSize };
 }
 
-const config = resolveConfig(process.env);
+function loadConfig(env: Env): { config: AbConfig; error: string | null } {
+  try {
+    return { config: resolveConfig(env), error: null };
+  } catch (err) {
+    return {
+      config: resolveConfig({ AB_HEADLESS_POOL_SIZE: env.AB_HEADLESS_POOL_SIZE }),
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+const loaded = loadConfig(process.env);
+const config = loaded.config;
+
+/** Why this process's AB_* env is invalid, or null. When set, the constants below are the defaults. */
+export const CONFIG_ERROR: string | null = loaded.error;
 
 /** Base CDP port for the headless pool (AB_BASE_PORT, default 9333). */
 export const HEADLESS_BASE_PORT: number = config.headlessBasePort;

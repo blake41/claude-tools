@@ -19,16 +19,12 @@ import * as rpc from "./rpc";
 import { isAuthenticatedUrl } from "./auth";
 import type { AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
-import { DASHBOARD_PORT, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
+import { CONFIG_ERROR, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-// Headless shard 0 / headed ports come from ./config (AB_BASE_PORT,
-// AB_HEADED_PORT). The daemon resolves the same module from its own env.
-const CDP_PORT_HEADLESS = HEADLESS_BASE_PORT;
-const CDP_PORT_HEADED = HEADED_PORT;
 const CDP_PORT_USER = 9222;
 
 // Default user for `reauth`. The Agent Task is minted by email.
@@ -562,19 +558,25 @@ function maybePrintFreshProfileHint(profileFresh: boolean): void {
 }
 
 /**
- * Derive the headless shard that actually served a request from the port
- * the daemon reported. The daemon's response port is the source of truth —
- * a pre-pool daemon ignores the `shard` field on the request entirely and
- * always serves its single Chrome on the base port regardless of what was
- * requested (chrome-pool-plan Fix 2). Ports map back via `AB_BASE_PORT + i`;
- * anything outside the current pool's port range (legacy daemon, single
- * Chrome) resolves to shard 0 — that Chrome IS where every tab lives
- * pre-pool.
+ * The daemon's CDP port for every headless shard, from its /status pool.
+ * Never from the CLI's own AB_* env: the launchd daemon does not see the
+ * shell env. An up shard reports its port; a down shard's port is inferred
+ * from any up shard (the daemon lays shard i on base + i). null when no shard
+ * is up to anchor on.
  */
-export function shardForPort(port: number, poolSize: number): number {
-  const i = port - CDP_PORT_HEADLESS;
-  if (i < 0 || i >= poolSize) return 0;
-  return i;
+export function headlessPortsFromPool(pool: ChromeState[] | undefined): Array<number | null> {
+  if (!pool) return [];
+  const anchor = pool.findIndex((s) => s.phase === "chrome_up");
+  if (anchor === -1) return pool.map(() => null);
+  const anchorState = pool[anchor] as Extract<ChromeState, { phase: "chrome_up" }>;
+  const base = anchorState.port - anchor;
+  return pool.map((s, i) => (s.phase === "chrome_up" ? s.port : base + i));
+}
+
+/** The headless shard the daemon serves on `port`, or null if its pool does not say. */
+export function shardForPort(port: number, pool: ChromeState[] | undefined): number | null {
+  const i = headlessPortsFromPool(pool).indexOf(port);
+  return i === -1 ? null : i;
 }
 
 /**
@@ -599,12 +601,13 @@ export function poolSizeFromStatus(status: { headlessPool?: unknown[] }): number
  * Fix 2).
  */
 async function resolveSessionCdpPort(pid: string): Promise<number> {
-  const poolSize = poolSizeFromStatus(await rpc.status());
+  const status = await rpc.status();
+  const poolSize = poolSizeFromStatus(status);
   const requestedShard = resolveOrAssignShard(pid, poolSize);
   const result = await rpc.ensureChrome({ shard: requestedShard });
   maybePrintFreshProfileHint(result.profileFresh);
-  const servedShard = shardForPort(result.port, poolSize);
-  if (servedShard !== requestedShard) {
+  const servedShard = shardForPort(result.port, status.headlessPool);
+  if (servedShard !== null && servedShard !== requestedShard) {
     writeShardAssignment(pid, servedShard);
   }
   return result.port;
@@ -705,6 +708,14 @@ function formatHHMMZ(iso: string): string {
   return match ? `${match[1]}Z` : iso;
 }
 
+function upPort(state: ChromeState): number | null {
+  return state.phase === "chrome_up" ? state.port : null;
+}
+
+function withPort(name: string, port: number | null): string {
+  return port === null ? name : `${name}, ${port}`;
+}
+
 /**
  * Build the human-readable detail string for one headless shard's doctor
  * line. On-demand shards (i>=1) that are idle with crash evidence
@@ -738,13 +749,14 @@ export function buildHeadlessDoctorChecks(
   },
 ): DoctorCheck[] {
   if (status.headlessPool && status.headlessPool.length > 0) {
+    const ports = headlessPortsFromPool(status.headlessPool);
     return status.headlessPool.map((state, i) => {
       const alwaysOn = i === 0;
       const ok = alwaysOn ? state.phase === "chrome_up" : state.phase !== "chrome_crashed";
       const diag = status.diagnostics?.headlessPool?.[i];
       const detail = buildHeadlessDoctorDetail(alwaysOn, state.phase, diag);
       return {
-        label: `Chrome (headless-${i}, ${CDP_PORT_HEADLESS + i})`,
+        label: `Chrome (${withPort(`headless-${i}`, ports[i])})`,
         ok,
         detail,
         fix: ok ? undefined : "ab ensure   # or: ab heal",
@@ -754,7 +766,7 @@ export function buildHeadlessDoctorChecks(
   const headlessOk = status.headless.phase === "chrome_up";
   return [
     {
-      label: `Chrome (headless, ${CDP_PORT_HEADLESS})`,
+      label: `Chrome (${withPort("headless", upPort(status.headless))})`,
       ok: headlessOk,
       detail: status.headless.phase,
       fix: headlessOk ? undefined : "ab ensure   # or: ab heal",
@@ -821,9 +833,12 @@ export async function fetchTabCounts(
  * on-demand shards — an idle shard has no pages by definition, and "we
  * couldn't ask" is not evidence of a problem either.
  */
-export function buildTabCountChecks(tabCounts: Array<number | null>): DoctorCheck[] {
+export function buildTabCountChecks(
+  tabCounts: Array<number | null>,
+  ports: Array<number | null> = [],
+): DoctorCheck[] {
   return tabCounts.map((count, i) => {
-    const label = `Chrome tabs (headless-${i}, ${CDP_PORT_HEADLESS + i})`;
+    const label = `Chrome tabs (${withPort(`headless-${i}`, ports[i] ?? null)})`;
     if (count === null) {
       return { label, ok: true, detail: "unreachable/idle" };
     }
@@ -892,6 +907,15 @@ async function cmdDoctor(headed = false): Promise<number> {
     });
   }
 
+  if (CONFIG_ERROR) {
+    checks.push({
+      label: "CLI AB_* port env",
+      ok: false,
+      detail: `${CONFIG_ERROR} (ignored: the CLI takes ports from the daemon)`,
+      fix: "fix or unset it in your shell; the daemon reads its own env from the launchd plist",
+    });
+  }
+
   if (status) {
     checks.push(...buildHeadlessDoctorChecks(status));
 
@@ -899,12 +923,13 @@ async function cmdDoctor(headed = false): Promise<number> {
     // after the headless-liveness checks so a tab-level leak can never
     // again hide behind a healthy session/Chrome-liveness picture.
     const tabCounts = await fetchTabCounts(status.headlessPool, status.headless);
-    checks.push(...buildTabCountChecks(tabCounts));
+    const tabPorts = status.headlessPool ? headlessPortsFromPool(status.headlessPool) : [upPort(status.headless)];
+    checks.push(...buildTabCountChecks(tabCounts, tabPorts));
 
     // Headed is on-demand — not running is normal, only flag if crashed.
     const headedCrashed = status.headed.phase === "chrome_crashed";
     checks.push({
-      label: `Chrome (headed, ${CDP_PORT_HEADED})`,
+      label: `Chrome (${withPort("headed", upPort(status.headed))})`,
       ok: !headedCrashed,
       detail: buildHeadlessDoctorDetail(false, status.headed.phase, status.diagnostics?.headed),
       fix: headedCrashed ? "ab heal" : undefined,
@@ -2341,9 +2366,13 @@ async function main(): Promise<number> {
   if (flags.userChrome) {
     cdpPort = CDP_PORT_USER;
   } else if (flags.headed) {
-    cdpPort = CDP_PORT_HEADED;
+    cdpPort = HEADED_PORT;
   } else {
-    cdpPort = CDP_PORT_HEADLESS;
+    cdpPort = HEADLESS_BASE_PORT;
+  }
+
+  if (CONFIG_ERROR) {
+    stderr(`warning: ${CONFIG_ERROR} — ignored by the CLI, which takes its ports from the daemon`);
   }
 
   // Session identity display (gray on stderr)
@@ -2546,7 +2575,7 @@ function printUsage(): void {
   stderr("  click-xy <x> <y>    Compositor-level pixel click (cross-origin iframes, shadow DOM)");
   stderr("");
   stderr("Flags:");
-  stderr(`  --headed            Use headed Chrome (port ${CDP_PORT_HEADED})`);
+  stderr("  --headed            Use headed Chrome (the daemon's headed port)");
   stderr("  --user-chrome       Use personal Chrome (port 9222), allows eval");
   stderr("");
   stderr("Environment:");
@@ -2559,10 +2588,10 @@ function printUsage(): void {
   stderr("  AB_VIEWPORT_H       Viewport height applied by 'ab open' (default 900)");
   stderr("  AB_VIEWPORT_SCALE   Viewport DPR applied by 'ab open' (default 2)");
   stderr("  AB_VIEWPORT=skip    Skip auto-viewport on 'ab open' (use Chrome native size)");
-  stderr(`  AB_BASE_PORT        Headless shard 0 CDP port; shard i uses base+i (default 9333, now ${CDP_PORT_HEADLESS})`);
-  stderr(`  AB_HEADED_PORT      Headed Chrome CDP port (default 9444, now ${CDP_PORT_HEADED})`);
-  stderr(`  AB_DASHBOARD_PORT   agent-browser dashboard port (default 4848, now ${DASHBOARD_PORT})`);
-  stderr("                      Set these identically for the daemon and the CLI.");
+  stderr("  AB_BASE_PORT        Daemon: headless shard 0 CDP port; shard i uses base+i (default 9333)");
+  stderr("  AB_HEADED_PORT      Daemon: headed Chrome CDP port (default 9444)");
+  stderr("  AB_DASHBOARD_PORT   Daemon: agent-browser dashboard port (default 4848)");
+  stderr("                      Read by the ab-server daemon; the CLI takes ports from the daemon.");
 }
 
 // ---------------------------------------------------------------------------
