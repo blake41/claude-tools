@@ -5,7 +5,7 @@
  * hits each route, and verifies the response shapes that
  * cli.ts and rpc.ts depend on.
  */
-import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
+import { test, expect, describe, beforeAll, afterAll, beforeEach, afterEach, mock } from "bun:test";
 import { resetAll, markUp, getAllStates } from "../state";
 import type {
   StatusResponse,
@@ -439,5 +439,107 @@ describe("server RPC contract", () => {
     expect(data.lastLogin === null || typeof data.lastLogin === "string").toBe(true);
     expect(typeof data.port).toBe("number");
     expect(data.checkedVia).toBe("cookie");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/status through the real handler (src/server.ts handleRequest)
+// ---------------------------------------------------------------------------
+
+describe("real GET /auth/status handler", () => {
+  const originalSpawn = Bun.spawn;
+  let spawnCalls: string[][];
+  let cookiesStdout: string;
+  let cookiesExit: number;
+
+  beforeEach(() => {
+    spawnCalls = [];
+    cookiesStdout = JSON.stringify({ data: { cookies: [] } });
+    cookiesExit = 0;
+    // @ts-expect-error — test mock, narrower than Bun.spawn's overload set
+    Bun.spawn = mock((cmd: string[]) => {
+      spawnCalls.push(cmd);
+      return {
+        exited: Promise.resolve(cookiesExit),
+        exitCode: cookiesExit,
+        stdout: new Response(cookiesStdout).body,
+        stderr: new Response("").body,
+        kill: () => {},
+      };
+    });
+  });
+
+  afterEach(() => {
+    Bun.spawn = originalSpawn;
+  });
+
+  async function get(query: string): Promise<{ status: number; data: any }> {
+    const { handleRequest } = await import("../server");
+    const resp = await handleRequest(new Request(`http://localhost/auth/status${query}`));
+    return { status: resp.status, data: await resp.json() };
+  }
+
+  const clerkCookie = (domain: string) => ({ name: "__session", value: "jwt", domain });
+
+  test("passes port and sessionId through to the agent-browser cookie read", async () => {
+    const { status, data } = await get("?port=9400&sessionId=shard-2");
+
+    expect(status).toBe(200);
+    expect(data.port).toBe(9400);
+    expect(data.checkedVia).toBe("cookie");
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]).toEqual([
+      "agent-browser", "--session", "shard-2", "--cdp", "9400", "cookies", "get", "--json",
+    ]);
+  });
+
+  test("defaults to the headless base port and session 'default' when params are missing", async () => {
+    const { HEADLESS_BASE_PORT } = await import("../config");
+    const { status, data } = await get("");
+
+    expect(status).toBe(200);
+    expect(data.port).toBe(HEADLESS_BASE_PORT);
+    expect(spawnCalls[0]!.slice(0, 5)).toEqual([
+      "agent-browser", "--session", "default", "--cdp", String(HEADLESS_BASE_PORT),
+    ]);
+  });
+
+  test("default appBaseUrl matches a localhost Clerk cookie but not a terra.clay.com one", async () => {
+    cookiesStdout = JSON.stringify({ data: { cookies: [clerkCookie("localhost")] } });
+    expect((await get("")).data.authenticated).toBe(true);
+
+    cookiesStdout = JSON.stringify({ data: { cookies: [clerkCookie("terra.clay.com")] } });
+    expect((await get("")).data.authenticated).toBe(false);
+  });
+
+  test("appBaseUrl selects which app host's cookie counts", async () => {
+    cookiesStdout = JSON.stringify({ data: { cookies: [clerkCookie("terra.clay.com")] } });
+    const { data } = await get(`?appBaseUrl=${encodeURIComponent("https://terra.clay.com")}`);
+
+    expect(data.authenticated).toBe(true);
+  });
+
+  test("reports authenticated=false when the cookie read fails", async () => {
+    cookiesExit = 1;
+    const { status, data } = await get("?port=9400");
+
+    expect(status).toBe(200);
+    expect(data.authenticated).toBe(false);
+  });
+
+  test.each([
+    ["port=0", "port"],
+    ["port=70000", "port"],
+    ["port=abc", "port"],
+    ["port=1.5", "port"],
+    ["sessionId=", "sessionId"],
+    ["appBaseUrl=", "appBaseUrl"],
+  ])("rejects %s with 400 naming the field", async (query, field) => {
+    const { status, data } = await get(`?${query}`);
+
+    expect(status).toBe(400);
+    expect(data.ok).toBe(false);
+    expect(data.error).toContain(`Validation failed: ${field}`);
+    expect(spawnCalls).toHaveLength(0);
   });
 });

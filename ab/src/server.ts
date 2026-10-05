@@ -307,7 +307,7 @@ async function withTimeout(
   }
 }
 
-async function handleRequest(req: Request): Promise<Response> {
+export async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url, "http://localhost");
   const method = req.method;
   const pathname = url.pathname;

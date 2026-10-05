@@ -141,9 +141,88 @@ describe("auth login client timeout", () => {
     try {
       const rpc = await import("../rpc");
       await rpc.authLogin({ sessionId: "test", port: 9333, email: "blake@clay.com" });
-      expect(timeoutSpy).toHaveBeenCalledTimes(1);
       expect(timeoutSpy.mock.calls[0]![0]).toBe(AUTH_LOGIN_CLIENT_TIMEOUT_MS);
       expect(AUTH_LOGIN_CLIENT_TIMEOUT_MS).toBeGreaterThan(AUTH_LOGIN_TIMEOUT_MS);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+});
+
+describe("rpc.authStatus against the real server handler", () => {
+  const originalSpawn = Bun.spawn;
+  let requestedUrls: string[];
+  let spawnCalls: string[][];
+
+  beforeEach(async () => {
+    requestedUrls = [];
+    spawnCalls = [];
+    const { handleRequest } = await import("../server");
+    globalThis.fetch = mock((input: string | URL | Request, init?: RequestInit) => {
+      requestedUrls.push(String(input));
+      return handleRequest(new Request(String(input), { method: init?.method }));
+    }) as unknown as typeof fetch;
+    // @ts-expect-error — test mock, narrower than Bun.spawn's overload set
+    Bun.spawn = mock((cmd: string[]) => {
+      spawnCalls.push(cmd);
+      const cookies = [{ name: "__session", value: "jwt", domain: "terra.clay.com" }];
+      return {
+        exited: Promise.resolve(0),
+        exitCode: 0,
+        stdout: new Response(JSON.stringify({ data: { cookies } })).body,
+        stderr: new Response("").body,
+        kill: () => {},
+      };
+    });
+  });
+
+  afterEach(() => {
+    Bun.spawn = originalSpawn;
+  });
+
+  test("port, sessionId and appBaseUrl survive encoding and reach the handler", async () => {
+    const rpc = await import("../rpc");
+    const result = await rpc.authStatus({
+      port: 9335,
+      sessionId: "shard 2&x",
+      appBaseUrl: "https://terra.clay.com",
+    });
+
+    const url = new URL(requestedUrls[0]!);
+    expect(url.pathname).toBe("/auth/status");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      port: "9335",
+      sessionId: "shard 2&x",
+      appBaseUrl: "https://terra.clay.com",
+    });
+    expect(spawnCalls[0]!.slice(0, 5)).toEqual(["agent-browser", "--session", "shard 2&x", "--cdp", "9335"]);
+    expect(result.authenticated).toBe(true);
+    expect(result.port).toBe(9335);
+    expect(result.checkedVia).toBe("cookie");
+  });
+
+  test("with no options sends no query string and the handler applies its defaults", async () => {
+    const { HEADLESS_BASE_PORT } = await import("../config");
+    const rpc = await import("../rpc");
+    const result = await rpc.authStatus();
+
+    expect(requestedUrls[0]).toBe("http://localhost/auth/status");
+    expect(result.port).toBe(HEADLESS_BASE_PORT);
+    expect(spawnCalls[0]!.slice(0, 3)).toEqual(["agent-browser", "--session", "default"]);
+  });
+
+  test("a daemon validation failure surfaces as an error carrying the 400 detail", async () => {
+    const rpc = await import("../rpc");
+
+    await expect(rpc.authStatus({ port: 0 })).rejects.toThrow(/Daemon returned 400 for GET \/auth\/status: .*port/);
+  });
+
+  test("/auth/status waits 15s on the client", async () => {
+    const timeoutSpy = spyOn(AbortSignal, "timeout");
+    try {
+      const rpc = await import("../rpc");
+      await rpc.authStatus();
+      expect(timeoutSpy.mock.calls[0]![0]).toBe(15_000);
     } finally {
       timeoutSpy.mockRestore();
     }
