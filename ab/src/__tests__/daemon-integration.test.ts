@@ -76,11 +76,28 @@ function assertNotLivePorts(env: Record<string, string | undefined>): void {
   }
 }
 
-/** Env for a spawned daemon: isolated ports first, so a test can still override. */
+/**
+ * Throw unless the spawned daemon's profile root is inside its own temp HOME.
+ * chrome-supervisor reads AB_PROFILE_ROOT before HOME, so one exported in the
+ * shell would otherwise point the test daemon at live profiles.
+ */
+function assertProfileRootIsolated(env: Record<string, string | undefined>): void {
+  const home = env.HOME ?? "";
+  const root = env.AB_PROFILE_ROOT ?? "";
+  const realHome = os.homedir();
+  if (!home || path.resolve(home) === path.resolve(realHome) || !path.resolve(root).startsWith(path.resolve(home) + path.sep)) {
+    throw new Error(
+      `daemon-integration refuses to run: AB_PROFILE_ROOT "${root}" is not inside the temp HOME "${home}" (real HOME ${realHome}).`,
+    );
+  }
+}
+
+/** Env for a spawned daemon: isolated ports and profile root first, so a test can still override. */
 function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<string, string | undefined> {
   const env = {
     ...process.env,
     HOME: homeDir,
+    AB_PROFILE_ROOT: path.join(homeDir, ".agent-browser"),
     // Suppress pino pretty-printing if any
     NODE_ENV: "test",
     AB_BASE_PORT: String(TEST_BASE_PORT),
@@ -89,12 +106,13 @@ function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<stri
     ...(extra ?? {}),
   };
   assertNotLivePorts(env);
+  assertProfileRootIsolated(env);
   return env;
 }
 
 beforeAll(() => {
-  // The file must be unable to run on live ports.
-  assertNotLivePorts(daemonEnv(os.tmpdir()));
+  // The file must be unable to run on live ports or live profiles.
+  daemonEnv(os.tmpdir());
 });
 
 // ---------------------------------------------------------------------------
