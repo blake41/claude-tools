@@ -206,7 +206,12 @@ function install(): void {
   log("Daemon loaded and started");
 
   // 4. Backup old ab if it's a bash script (not already our CLI)
-  if (fs.existsSync(AB_BIN) && isBashScript(AB_BIN) && !isBunScript(AB_BIN)) {
+  if (
+    fs.existsSync(AB_BIN) &&
+    isBashScript(AB_BIN) &&
+    !isBunScript(AB_BIN) &&
+    !fs.readFileSync(AB_BIN, "utf-8").includes(CLI_SRC)
+  ) {
     fs.copyFileSync(AB_BIN, AB_BACKUP);
     log(`Backed up old ab to ${AB_BACKUP}`);
   }
@@ -214,8 +219,8 @@ function install(): void {
   // 5. Install CLI — make executable and symlink to ~/.local/bin/ab
   log("Installing CLI...");
   fs.chmodSync(CLI_SRC, 0o755);
-  // Write a thin bun shim so the path resolves correctly
-  const shimContent = `#!/usr/bin/env bun\nawait import("${CLI_SRC}");\n`;
+  // cli.ts only runs main() under import.meta.main, so the shim must exec it, not import it
+  const shimContent = `#!/usr/bin/env bash\nexec bun ${CLI_SRC} "$@"\n`;
   fs.writeFileSync(AB_BIN, shimContent, { mode: 0o755 });
   log(`Installed ${AB_BIN} (shim -> ${CLI_SRC})`);
 
