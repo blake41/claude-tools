@@ -11,7 +11,6 @@
 
 import type { ClerkClient } from "@clerk/backend";
 import { Logger } from "./logger";
-import { AUTH_LOGIN_TIMEOUT_MS } from "./config";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "./types";
 
 const log = new Logger({ component: "auth" });
@@ -60,12 +59,17 @@ export type AgentTaskClient = Pick<ClerkClient, "agentTasks">;
 
 export interface AuthenticateDeps {
   createClerkClient: (secretKey: string) => AgentTaskClient | Promise<AgentTaskClient>;
-  /**
-   * Absolute epoch-ms cutoff that per-step timeouts are capped at. Defaults to
-   * the daemon's login budget measured from the call.
-   */
-  deadline?: number;
   pollIntervalMs?: number;
+}
+
+/**
+ * The route budget a login runs inside: `signal` aborts when it expires and
+ * `deadline` (epoch ms) is that same expiry, which per-step timeouts are
+ * capped at. Both come from one clock in the server's withTimeout.
+ */
+export interface LoginBudget {
+  signal: AbortSignal;
+  deadline: number;
 }
 
 const defaultDeps: AuthenticateDeps = {
@@ -107,6 +111,27 @@ function redactSecrets(text: string, secrets: Array<string | undefined>): string
 const NAV_STDERR_TAIL_CHARS = 400;
 /** Per-call agent-browser cap; every browser step in the login flow is also capped at the time left. */
 const STEP_TIMEOUT_MS = 15_000;
+
+const ABORTED = Symbol("aborted");
+
+/** `work`'s result, or ABORTED once `signal` aborts. A losing `work` keeps running and its result is dropped. */
+function unlessAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T | typeof ABORTED> {
+  if (signal.aborted) return Promise.resolve(ABORTED);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(ABORTED);
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
 
 function tail(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : text.slice(-maxChars);
@@ -240,10 +265,10 @@ export function isAuthenticatedUrl(url: string): boolean {
 
 export async function authenticate(
   req: AuthLoginRequest,
-  signal: AbortSignal,
+  { signal, deadline }: LoginBudget,
   deps: Partial<AuthenticateDeps> = {},
 ): Promise<AuthLoginResponse> {
-  const { createClerkClient, deadline = Date.now() + AUTH_LOGIN_TIMEOUT_MS, pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
+  const { createClerkClient, pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
   const { sessionId, port } = req;
   const appBaseUrl = req.appBaseUrl || DEFAULT_AUTH_APP_BASE;
   const email = req.email;
@@ -318,16 +343,20 @@ export async function authenticate(
 
   let taskUrl = "";
   try {
-    const clerk = await createClerkClient(secretKey!);
-    log.info("Minting Agent Task", { email, appBaseUrl });
-    const task = await clerk.agentTasks.create({
-      onBehalfOf: { identifier: email },
-      permissions: "*",
-      agentName: "ab",
-      taskDescription: "ab reauth",
-      redirectUrl: `${appBaseUrl}/`,
-      sessionMaxDurationInSeconds: AGENT_TASK_SESSION_SECONDS,
-    });
+    const mint = async () => {
+      const clerk = await createClerkClient(secretKey!);
+      log.info("Minting Agent Task", { email, appBaseUrl });
+      return clerk.agentTasks.create({
+        onBehalfOf: { identifier: email },
+        permissions: "*",
+        agentName: "ab",
+        taskDescription: "ab reauth",
+        redirectUrl: `${appBaseUrl}/`,
+        sessionMaxDurationInSeconds: AGENT_TASK_SESSION_SECONDS,
+      });
+    };
+    const task = await unlessAborted(mint(), signal);
+    if (task === ABORTED) return timedOut();
     if (typeof task?.url !== "string" || !task.url) {
       return { ok: false, error: "Agent Task mint returned invalid response: missing url" };
     }
@@ -424,21 +453,24 @@ const loginFlights = new Map<string, Promise<AuthLoginResponse>>();
  * authenticate() with concurrent logins joined into one: sessions share a
  * cookie jar per shard, so one Agent Task serves every waiting caller.
  * Requests are joined by port and app base URL only; the first caller's
- * email, session, key, deadline and abort signal decide the outcome for all
- * of them. A joiner's own signal is not watched.
+ * email, session, key and budget decide the outcome for all of them, and a
+ * joiner's own signal is not watched. When the first caller's signal aborts,
+ * the entry is dropped at once, so the next caller starts a fresh login.
  */
 export function authenticateJoined(
   req: AuthLoginRequest,
-  signal: AbortSignal,
+  budget: LoginBudget,
   deps: Partial<AuthenticateDeps> = {},
 ): Promise<AuthLoginResponse> {
   const key = `${req.port}|${req.appBaseUrl || DEFAULT_AUTH_APP_BASE}`;
   const existing = loginFlights.get(key);
   if (existing) return existing;
-  const flight = authenticate(req, signal, deps).finally(() => {
-    loginFlights.delete(key);
-  });
+  const forget = () => {
+    if (loginFlights.get(key) === flight) loginFlights.delete(key);
+  };
+  const flight = authenticate(req, budget, deps).finally(forget);
   loginFlights.set(key, flight);
+  budget.signal.addEventListener("abort", forget, { once: true });
   return flight;
 }
 
