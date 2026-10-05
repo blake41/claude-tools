@@ -194,7 +194,7 @@ interface TargetRuntime {
    * not spawn and refused to signal it. Cleared on the next successful
    * launch or adoption. Diagnostics only.
    */
-  lastPortConflict: { port: number; pid: number; reason: "occupant-not-ours" | "port-occupied-foreign"; at: number } | null;
+  lastPortConflict: { port: number; pid: number; reason: "port-occupied-foreign"; at: number } | null;
   healthTimer: ReturnType<typeof setInterval> | null;
   consecutiveFailures: number;
   backoffMs: number;
@@ -718,7 +718,6 @@ async function killOwnOccupantOrRefuse(
   target: ChromeTarget,
   pid: number,
   killReason: "crash-loop-recovery" | "port-occupied",
-  refuseReason: "occupant-not-ours" | "port-occupied-foreign",
 ): Promise<void> {
   const config = CONFIGS[target];
   const rt = runtime[target];
@@ -742,11 +741,11 @@ async function killOwnOccupantOrRefuse(
     return;
   }
 
-  rt.lastPortConflict = { port: config.port, pid, reason: refuseReason, at: Date.now() };
+  rt.lastPortConflict = { port: config.port, pid, reason: "port-occupied-foreign", at: Date.now() };
   rt.retryNotBefore = Date.now() + BACKOFF_MAX_MS;
   log.warn(
     `[${target}] port ${config.port} held by PID ${pid} (not spawned by this daemon) — fix: kill it yourself or set AB_BASE_PORT/AB_HEADED_PORT`,
-    { pid, port: config.port, reason: refuseReason },
+    { pid, port: config.port, reason: "port-occupied-foreign" },
   );
   markCrashed(target, -1);
   if (config.policy === "always-on") {
@@ -782,21 +781,18 @@ async function launchChrome(
 
   // --- Port conflict resolution ---
   // Check if something is already listening on our port before spawning.
+  // A responsive Chrome on our port is adopted, except our own Chrome while
+  // crash-looping: that one is cleared so the profile recovery below runs.
+  // A Chrome we did not spawn is adopted even at max backoff: we may not
+  // signal it, and adopting it lets the stable timer reset backoffMs.
   const inCrashLoop = rt.backoffMs >= BACKOFF_MAX_MS;
+  const shouldAdopt = (pid: number): boolean => !inCrashLoop || !spawnedPids.has(pid);
   const existingCdp = await checkCdp(config.port);
-  if (existingCdp && !inCrashLoop) {
-    // A responsive CDP is already on our port — adopt it instead of launching.
+  if (existingCdp) {
     const pid = await getListeningPid(config.port);
     if (pid) {
-      return adoptChrome(target, pid, profileFresh);
-    }
-  } else if (inCrashLoop && existingCdp) {
-    // In a crash loop — don't adopt. Clear the port so we go through the
-    // full recovery path (profile nuke below), but only if the occupant is
-    // a Chrome we spawned.
-    const stalePid = await getListeningPid(config.port);
-    if (stalePid) {
-      await killOwnOccupantOrRefuse(target, stalePid, "crash-loop-recovery", "occupant-not-ours");
+      if (shouldAdopt(pid)) return adoptChrome(target, pid, profileFresh);
+      await killOwnOccupantOrRefuse(target, pid, "crash-loop-recovery");
     }
   } else {
     // Port might be bound by a process whose CDP is not answering yet.
@@ -805,17 +801,12 @@ async function launchChrome(
       // checkCdp is false while a Chrome is still booting — give it up to 5s
       // before calling it unresponsive.
       const cameUp = await waitForCdp(config.port, OCCUPANT_CDP_WAIT_MS);
-      if (cameUp && !inCrashLoop) {
+      if (cameUp && shouldAdopt(stalePid)) {
         return adoptChrome(target, stalePid, profileFresh);
       }
-      // Still unresponsive (or responsive but we're crash-looping and need
-      // the recovery path): clear the port only if the occupant is ours.
-      await killOwnOccupantOrRefuse(
-        target,
-        stalePid,
-        cameUp ? "crash-loop-recovery" : "port-occupied",
-        cameUp ? "occupant-not-ours" : "port-occupied-foreign",
-      );
+      // Still unresponsive, or our own Chrome while crash-looping: clear the
+      // port only if the occupant is ours.
+      await killOwnOccupantOrRefuse(target, stalePid, cameUp ? "crash-loop-recovery" : "port-occupied");
     }
   }
 
