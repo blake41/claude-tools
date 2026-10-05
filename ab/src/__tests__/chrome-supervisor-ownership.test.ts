@@ -80,6 +80,9 @@ let cdpUp: () => boolean = () => true;
 /** PID lsof reports as listening on the port, or null for "nothing bound". */
 let listeningPid: number | null = FOREIGN_PID;
 let chromeProc: { pid: number; kill: ReturnType<typeof mock>; exitCode: number | null } | null = null;
+/** What `pgrep -lf` prints ("<pid> <args>" lines). Empty: no command line is readable. */
+let pgrepOutput = "";
+let pgrepCalls = 0;
 
 function installMocks(): void {
   globalThis.fetch = mock((url: string | URL | Request) => {
@@ -95,6 +98,17 @@ function installMocks(): void {
 
   // @ts-expect-error — test mock, narrower than Bun.spawn's overload set
   Bun.spawn = mock((cmd: string[]) => {
+    if (cmd[0] === "/usr/bin/pgrep") {
+      pgrepCalls++;
+      return {
+        pid: -1,
+        exitCode: pgrepOutput ? 0 : 1,
+        exited: Promise.resolve(pgrepOutput ? 0 : 1),
+        stdout: new Response(pgrepOutput).body,
+        stderr: null,
+        kill: mock(() => {}),
+      };
+    }
     if (cmd[0] === "/usr/sbin/lsof") {
       // getListeningPid reads `new Response(proc.stdout).text()` — needs a real stream.
       const body = listeningPid === null ? "" : `${listeningPid}\n`;
@@ -182,6 +196,8 @@ beforeEach(() => {
   cdpUp = () => true;
   listeningPid = FOREIGN_PID;
   chromeProc = null;
+  pgrepOutput = "";
+  pgrepCalls = 0;
   installMocks();
 });
 
@@ -335,4 +351,97 @@ describe("port occupant whose CDP never answers", () => {
     expect(s.procPid).toBe(SPAWNED_PID);
     expect(s.lastSpawnedPid).toBe(SPAWNED_PID);
   }, 15_000);
+});
+
+describe("unresponsive port occupant we did not spawn: rule B (command line decides)", () => {
+  const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  const cmdline = (userDataDir: string) =>
+    `${FOREIGN_PID} ${CHROME} --remote-debugging-port=9333 --user-data-dir=${userDataDir} --headless=new --no-first-run\n`;
+
+  type ConflictSnap = Snap & {
+    lastPortConflict: { pid: number; reason: string; detail: string } | null;
+  };
+
+  test("its --user-data-dir is this target's own profile: SIGKILLed after the CDP wait, then we spawn", async () => {
+    const { ensure, __getProfilePathForTest } = await loadSupervisor();
+    cdpUp = () => false;
+    pgrepOutput = `999 ${CHROME} --user-data-dir=/elsewhere\n` + cmdline(__getProfilePathForTest(TARGET));
+    const before = Date.now();
+
+    const result = await ensure(TARGET);
+
+    expect(Date.now() - before).toBeGreaterThanOrEqual(5_000);
+    expect(realSignalsTo(FOREIGN_PID)).toEqual(["SIGKILL"]);
+    expect(realSignalsTo(999)).toEqual([]);
+    expect(result.pid).toBe(SPAWNED_PID);
+    expect((await snap()).procPid).toBe(SPAWNED_PID);
+  }, 15_000);
+
+  test("another profile path (even a sibling shard's): left alone and refused", async () => {
+    const { ensure, RetryAfterError, __getProfilePathForTest } = await loadSupervisor();
+    cdpUp = () => false;
+    const other = `${__getProfilePathForTest(TARGET)}-1`;
+    pgrepOutput = cmdline(other);
+
+    await expect(ensure(TARGET)).rejects.toBeInstanceOf(RetryAfterError);
+
+    expect(realSignalsTo(FOREIGN_PID)).toEqual([]);
+    expect(chromeProc).toBeNull();
+    const s = (await snap()) as ConflictSnap;
+    expect(s.lastPortConflict).toMatchObject({ pid: FOREIGN_PID, reason: "port-occupied-foreign" });
+    expect(s.lastPortConflict?.detail).toContain(other);
+  }, 15_000);
+
+  test("unreadable command line: left alone and refused", async () => {
+    const { ensure, RetryAfterError } = await loadSupervisor();
+    cdpUp = () => false;
+    pgrepOutput = "";
+
+    await expect(ensure(TARGET)).rejects.toBeInstanceOf(RetryAfterError);
+
+    expect(realSignalsTo(FOREIGN_PID)).toEqual([]);
+    expect(chromeProc).toBeNull();
+    const s = (await snap()) as ConflictSnap;
+    expect(s.lastPortConflict).toMatchObject({ pid: FOREIGN_PID, reason: "port-occupied-foreign" });
+    expect(s.lastPortConflict?.detail).toContain("command line unreadable");
+  }, 15_000);
+
+  test("the refusal shows in /status diagnostics", async () => {
+    const { ensure, getHealthDiagnostics } = await loadSupervisor();
+    cdpUp = () => false;
+    await ensure(TARGET).catch(() => {});
+
+    expect(getHealthDiagnostics()[TARGET].lastPortConflict).toMatchObject({
+      pid: FOREIGN_PID,
+      reason: "port-occupied-foreign",
+      detail: expect.stringContaining("command line unreadable"),
+    });
+  }, 15_000);
+
+  test("retrying against the same refused pid does not wait for CDP again (no 5s hold on the op queue)", async () => {
+    const { ensure, RetryAfterError, __expireRetryWindowForTest } = await loadSupervisor();
+    cdpUp = () => false;
+    await expect(ensure(TARGET)).rejects.toBeInstanceOf(RetryAfterError);
+    __expireRetryWindowForTest(TARGET);
+
+    const before = Date.now();
+    await expect(ensure(TARGET)).rejects.toBeInstanceOf(RetryAfterError);
+
+    expect(Date.now() - before).toBeLessThan(1_000);
+    expect(realSignalsTo(FOREIGN_PID)).toEqual([]);
+  }, 15_000);
+});
+
+describe("commandLineUsesProfile", () => {
+  test("matches the exact --user-data-dir token, not a longer path that starts with it", async () => {
+    const { commandLineUsesProfile } = await loadSupervisor();
+    const p = "/Users/x/.agent-browser/profile";
+    expect(commandLineUsesProfile(`Chrome --user-data-dir=${p} --headless=new`, p)).toBe(true);
+    expect(commandLineUsesProfile(`Chrome --user-data-dir=${p}`, p)).toBe(true);
+    expect(commandLineUsesProfile(`Chrome --user-data-dir=${p}-1 --headless=new`, p)).toBe(false);
+    expect(commandLineUsesProfile(`Chrome --user-data-dir=${p}/sub`, p)).toBe(false);
+    expect(commandLineUsesProfile("Chrome --headless=new", p)).toBe(false);
+    const spaced = "/Users/x/Application Support/ab/profile";
+    expect(commandLineUsesProfile(`Chrome --user-data-dir=${spaced} --x`, spaced)).toBe(true);
+  });
 });
