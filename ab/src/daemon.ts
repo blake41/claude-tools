@@ -16,6 +16,7 @@ import * as path from "path";
 import { SOCKET_PATH, startServer, type AbServer } from "./server";
 import * as supervisor from "./chrome-supervisor";
 import { Logger, getRecentLogs } from "./logger";
+import { CONFIG_ERROR } from "./config";
 
 const log = new Logger({ component: "daemon" });
 
@@ -314,6 +315,11 @@ function startEventLoopMonitor(): void {
 async function main(): Promise<void> {
   daemonStartedAt = Date.now();
   log.info("ab-server daemon starting", { pid: process.pid });
+
+  if (CONFIG_ERROR) {
+    log.error("Invalid AB_* port config — refusing to start", { error: CONFIG_ERROR });
+    process.exit(1);
+  }
 
   // Clean up old crash dumps (best effort)
   cleanOldCrashDumps();

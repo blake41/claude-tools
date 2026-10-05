@@ -127,3 +127,33 @@ describe("auth login budgets", () => {
     expect(AUTH_LOGIN_CLIENT_TIMEOUT_MS).toBeGreaterThan(AUTH_LOGIN_TIMEOUT_MS);
   });
 });
+
+describe("loading config with an invalid AB_* port", () => {
+  test("does not throw: CONFIG_ERROR names the variable and the constants are the defaults", async () => {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined && !k.startsWith("AB_")) env[k] = v;
+    }
+    env.AB_BASE_PORT = "abc";
+    const script =
+      'const c = await import("./src/config.ts"); console.log(JSON.stringify({ e: c.CONFIG_ERROR, b: c.HEADLESS_BASE_PORT, h: c.HEADED_PORT }));';
+    const proc = Bun.spawn(["bun", "-e", script], {
+      cwd: `${import.meta.dir}/../..`,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({
+      e: 'AB_BASE_PORT must be an integer port between 1024 and 65535 (got "abc")',
+      b: 9333,
+      h: 9444,
+    });
+  });
+
+  test("CONFIG_ERROR is null for this test process's valid env", async () => {
+    const { CONFIG_ERROR } = await import("../config");
+    expect(CONFIG_ERROR).toBeNull();
+  });
+});

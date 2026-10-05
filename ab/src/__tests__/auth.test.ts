@@ -916,11 +916,10 @@ describe("reauth is shard-aware (chrome-pool-plan Unit 3)", () => {
 // chrome-pool-plan Fix 2 — persist the shard the daemon actually served.
 //
 // resolveOrAssignShard writes `shard=<requested>` to the marker BEFORE
-// rpc.ensureChrome({shard}) resolves. A pre-pool daemon ignores the `shard`
-// field entirely and always serves its single Chrome on port 9333, so the
-// marker would keep lying about where the tab actually lives unless it gets
-// corrected from the ensure response's *port* (the daemon's actual source of
-// truth) once that response arrives.
+// rpc.ensureChrome({shard}) resolves. If the daemon serves a different shard
+// than requested, the marker is corrected from the ensure response's *port*,
+// mapped to a shard through the daemon's own /status pool ports (never the
+// CLI's env base port).
 // ---------------------------------------------------------------------------
 
 describe("sticky shard correction from the ensure response's served port (Fix 2)", () => {
@@ -942,7 +941,11 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
     else process.env.CCO_SESSION_ID = originalCco;
   });
 
-  function mockEnsurePort(port: number, poolSize = 3): Array<{ path: string; body: unknown }> {
+  function mockEnsurePort(
+    port: number,
+    poolSize = 3,
+    pool: unknown[] = Array.from({ length: poolSize }, () => ({})),
+  ): Array<{ path: string; body: unknown }> {
     const calls: Array<{ path: string; body: unknown }> = [];
     fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
       const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : (url as Request).url;
@@ -950,7 +953,7 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
       calls.push({ path: pathname, body: init?.body ? JSON.parse(String(init.body)) : undefined });
       if (pathname === "/status") {
         return new Response(
-          JSON.stringify({ ok: true, headlessPool: Array.from({ length: poolSize }, () => ({})) }),
+          JSON.stringify({ ok: true, headlessPool: pool }),
           { status: 200 },
         );
       }
@@ -973,9 +976,10 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
     expect(readShardAssignment(testPid)).toBe(0);
   });
 
-  test("a pre-pool daemon that always serves 9333 rewrites a shard=2 marker down to shard 0", async () => {
+  test("a daemon that serves shard 0's port for a shard=2 request rewrites the marker to shard 0", async () => {
     fs.writeFileSync(markerPath, `${testPid}\nshard=2\n`);
-    mockEnsurePort(9333); // daemon ignored the requested shard, served its one Chrome
+    // The daemon ignored the requested shard and served shard 0's Chrome.
+    mockEnsurePort(9333, 3, [{ phase: "chrome_up", pid: 100, port: 9333 }, { phase: "idle" }, { phase: "idle" }]);
 
     const { ensureChromePort, readShardAssignment } = await import("../cli");
     const cdpPort = await ensureChromePort(false);
