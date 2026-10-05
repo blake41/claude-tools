@@ -19,7 +19,6 @@ import {
   markIdle,
 } from "./state";
 import { Logger, withOpId, newOpId } from "./logger";
-import { resetAuthState } from "./auth";
 
 const log = new Logger({ component: "chrome" });
 
@@ -1606,7 +1605,6 @@ function handleExit(target: ChromeTarget, exitCode: number | null, exitSignal: s
   rt.owned = false;
   clearTimers(target);
   markCrashed(target, exitCode ?? -1);
-  resetAuthState();
 
   if (CONFIGS[target].policy === "always-on") {
     scheduleRestart(target);
@@ -1648,7 +1646,6 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
 
   clearTimers(target);
   markCrashed(target, -1);
-  resetAuthState();
 
   if (CONFIGS[target].policy === "always-on") {
     scheduleRestart(target);
