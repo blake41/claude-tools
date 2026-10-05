@@ -21,21 +21,23 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import type { CdpPage, CmdOpenDeps, OpenTabDeps, TeardownDeps } from "../cli";
+import type { CmdOpenDeps, OpenTabDeps, TeardownDeps } from "../cli";
+import type { CdpPage } from "../cdp-http";
 import {
-  MAX_RECORDED_TARGETS,
   assignShard,
-  closeCdpTarget,
   cmdOpen,
   formatTeardownWarning,
-  listCdpPages,
   openTabAndRecordTarget,
+  teardownSession,
+} from "../cli";
+import { closeCdpTarget, listCdpPages } from "../cdp-http";
+import {
+  MAX_RECORDED_TARGETS,
   readSessionTargets,
   readShardAssignment,
   recordSessionTarget,
   sessionFilePath,
-  teardownSession,
-} from "../cli";
+} from "../session";
 import { HEADLESS_POOL_SIZE } from "../config";
 
 // ---------------------------------------------------------------------------

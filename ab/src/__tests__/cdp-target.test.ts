@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "fs";
 import * as path from "path";
 import { pickTabWs } from "../../cdp-target";
-import { recordSessionTarget, sessionFilePath, sessionTargetEnv } from "../cli";
+import { sessionTargetEnv } from "../cli";
+import { recordSessionTarget, sessionFilePath } from "../session";
 
 const AB_DIR = path.resolve(import.meta.dir, "../..");
 const tabs = [

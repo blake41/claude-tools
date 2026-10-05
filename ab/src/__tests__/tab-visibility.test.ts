@@ -22,12 +22,9 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
 import * as path from "path";
-import {
-  buildTabCountChecks,
-  fetchTabCounts,
-  TAB_WARN_THRESHOLD,
-} from "../cli";
-import type { CdpPage } from "../cli";
+import { buildTabCountChecks, TAB_WARN_THRESHOLD } from "../cli";
+import { fetchTabCounts } from "../cdp-http";
+import type { CdpPage } from "../cdp-http";
 import type { ChromeState } from "../types";
 
 const AB = path.resolve(import.meta.dir, "../../ab");

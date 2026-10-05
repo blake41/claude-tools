@@ -22,16 +22,16 @@ import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import type { CdpPage, SessionEntry, ShardSessionEvidence, SweepDeps } from "../cli";
+import type { SessionEntry, ShardSessionEvidence, SweepDeps } from "../cli";
+import type { CdpPage } from "../cdp-http";
 import type { ChromeState } from "../types";
 import {
   makeGcSweepEvidenceProvider,
   partitionOrphanTargets,
-  recordSessionTarget,
-  sessionFilePath,
   sweepOrphanTabs,
   sweepShards,
 } from "../cli";
+import { recordSessionTarget, sessionFilePath } from "../session";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
 const AGENT_BROWSER_HOME = path.join(os.homedir(), ".agent-browser");
