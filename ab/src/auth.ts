@@ -37,6 +37,20 @@ let authState: AuthState = {
 /** Default app base used when a caller omits appBaseUrl. */
 export const DEFAULT_AUTH_APP_BASE = "http://localhost:5173";
 
+function originOf(appBaseUrl: string | undefined): string {
+  const base = appBaseUrl || DEFAULT_AUTH_APP_BASE;
+  try {
+    return new URL(base).origin;
+  } catch {
+    return base;
+  }
+}
+
+/** The login-timeout error the CLI shows, whether authenticate() or the route budget ran out first. */
+export function loginTimedOutError(appBaseUrl: string | undefined): string {
+  return `Auth exchange timed out: browser did not land on ${originOf(appBaseUrl)}. The Agent Task URL is one-time, so retry the reauth.`;
+}
+
 // ---------------------------------------------------------------------------
 // Clerk client seam
 // ---------------------------------------------------------------------------
@@ -237,12 +251,7 @@ export async function authenticate(
   // Never log the secret key.
   log.info("Starting auth flow", { sessionId, port, appBaseUrl, email });
 
-  let appOrigin: string;
-  try {
-    appOrigin = new URL(appBaseUrl).origin;
-  } catch {
-    appOrigin = appBaseUrl;
-  }
+  const appOrigin = originOf(appBaseUrl);
   const timeLeft = () => deadline - Date.now();
   // Once the signal aborts, the route has already answered the CLI: no state write may follow.
   const expired = () => signal.aborted || timeLeft() <= 0;
@@ -251,10 +260,7 @@ export async function authenticate(
     expired() ? Promise.resolve(null) : run(Math.min(STEP_TIMEOUT_MS, timeLeft()));
   const timedOut = (): AuthLoginResponse => {
     log.error("Browser did not land on the app origin before the deadline", { appOrigin });
-    return {
-      ok: false,
-      error: `Auth exchange timed out: browser did not land on ${appOrigin}. The Agent Task URL is one-time, so retry the reauth.`,
-    };
+    return { ok: false, error: loginTimedOutError(appBaseUrl) };
   };
 
   // -----------------------------------------------------------------------

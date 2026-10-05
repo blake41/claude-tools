@@ -16,7 +16,7 @@ import * as os from "os";
 import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
-import { authenticateJoined, getAuthStatus, DEFAULT_AUTH_APP_BASE } from "./auth";
+import { authenticateJoined, getAuthStatus, loginTimedOutError, DEFAULT_AUTH_APP_BASE } from "./auth";
 import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE } from "./config";
 import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
@@ -240,22 +240,42 @@ export async function handleHeal(): Promise<Response> {
 // Auth route handlers
 // ---------------------------------------------------------------------------
 
-async function handleAuthLogin(req: Request, signal: AbortSignal): Promise<Response> {
+async function parseAuthLoginBody(
+  req: Request,
+): Promise<z.infer<typeof AuthLoginRequestSchema> | { error: string }> {
   let rawBody: unknown;
   try {
     rawBody = await req.json();
   } catch {
-    return json({ ok: false, error: "Invalid JSON body" }, 400);
+    return { error: "Invalid JSON body" };
   }
 
   const parsed = AuthLoginRequestSchema.safeParse(rawBody);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
-    return json({ ok: false, error: `Validation failed: ${issues.join(", ")}` }, 400);
+    return { error: `Validation failed: ${issues.join(", ")}` };
   }
+  return parsed.data;
+}
 
-  const result = await authenticateJoined(parsed.data, signal);
-  return json(result, result.ok ? 200 : 400);
+/**
+ * POST /auth/login inside its route budget. When the budget runs out the CLI
+ * gets the same 400 login-timeout error authenticate() returns, not a 500.
+ * `budgetMs` is injectable for tests.
+ */
+export function handleAuthLogin(req: Request, budgetMs: number = AUTH_LOGIN_TIMEOUT_MS): Promise<Response> {
+  let appBaseUrl: string | undefined;
+  return withTimeout(
+    async (signal) => {
+      const parsed = await parseAuthLoginBody(req);
+      if ("error" in parsed) return json({ ok: false, error: parsed.error }, 400);
+      appBaseUrl = parsed.appBaseUrl;
+      const result = await authenticateJoined(parsed, signal);
+      return json(result, result.ok ? 200 : 400);
+    },
+    budgetMs,
+    () => json({ ok: false, error: loginTimedOutError(appBaseUrl) }, 400),
+  );
 }
 
 const AuthStatusQuerySchema = z.object({
@@ -283,18 +303,23 @@ async function handleAuthStatus(url: URL): Promise<Response> {
 // Request dispatch
 // ---------------------------------------------------------------------------
 
-/** Runs `handler` with a signal that aborts when the route budget expires. */
+/**
+ * Runs `handler` with a signal that aborts when the route budget expires. At
+ * expiry the route answers `onTimeout()` if given, else rejects (a 500).
+ */
 async function withTimeout(
   handler: (signal: AbortSignal) => Response | Promise<Response>,
   timeoutMs: number = HANDLER_TIMEOUT_MS,
+  onTimeout?: () => Response,
 ): Promise<Response> {
   const controller = new AbortController();
   let timerId: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<Response>((_, reject) => {
+  const timeoutPromise = new Promise<Response>((resolve, reject) => {
     timerId = setTimeout(() => {
       const err = new Error(`Handler timeout after ${timeoutMs}ms`);
       controller.abort(err);
-      reject(err);
+      if (onTimeout) resolve(onTimeout());
+      else reject(err);
     }, timeoutMs);
     if (typeof timerId === "object" && "unref" in timerId) {
       (timerId as NodeJS.Timeout).unref();
@@ -331,7 +356,7 @@ export async function handleRequest(req: Request): Promise<Response> {
       return await withOpId(newOpId(), () => withTimeout(handleHeal)) as Response;
     }
     if (method === "POST" && pathname === "/auth/login") {
-      return await withOpId(newOpId(), () => withTimeout((signal) => handleAuthLogin(req, signal), AUTH_LOGIN_TIMEOUT_MS)) as Response;
+      return await withOpId(newOpId(), () => handleAuthLogin(req)) as Response;
     }
     if (method === "POST" && pathname === "/chrome/touch-headed") {
       supervisor.touchHeaded();
