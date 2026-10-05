@@ -30,6 +30,8 @@ const SLOW_ROUTES: Record<string, number> = {
   // Longer than the daemon's handler budget, so the CLI never gives up first.
   "/auth/login": AUTH_LOGIN_CLIENT_TIMEOUT_MS,
   "/heal": 30_000,
+  // One agent-browser round trip to read cookies.
+  "/auth/status": 15_000,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,6 +49,8 @@ interface RpcOptions {
   method: "GET" | "POST";
   path: string;
   body?: unknown;
+  /** Pre-encoded query string, without the leading `?`. */
+  query?: string;
   timeoutMs?: number;
 }
 
@@ -62,7 +66,7 @@ async function rpcFetch<T>(opts: RpcOptions): Promise<T> {
 
   let resp: Response;
   try {
-    resp = await fetch(`http://localhost${opts.path}`, {
+    resp = await fetch(`http://localhost${opts.path}${opts.query ? `?${opts.query}` : ""}`, {
       method: opts.method,
       headers,
       body: bodyStr,
@@ -139,8 +143,15 @@ export async function authLogin(
   return rpcFetch({ method: "POST", path: "/auth/login", body: req });
 }
 
-export async function authStatus(): Promise<AuthStatusResponse> {
-  return rpcFetch({ method: "GET", path: "/auth/status" });
+export async function authStatus(
+  opts: { port?: number; sessionId?: string; appBaseUrl?: string } = {},
+): Promise<AuthStatusResponse> {
+  const q = new URLSearchParams();
+  if (opts.port !== undefined) q.set("port", String(opts.port));
+  if (opts.sessionId !== undefined) q.set("sessionId", opts.sessionId);
+  if (opts.appBaseUrl !== undefined) q.set("appBaseUrl", opts.appBaseUrl);
+  const qs = q.toString();
+  return rpcFetch({ method: "GET", path: "/auth/status", query: qs || undefined });
 }
 
 export async function touchHeaded(): Promise<{ ok: boolean }> {

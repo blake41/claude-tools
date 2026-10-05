@@ -180,7 +180,7 @@ beforeAll(() => {
       }
 
       if (method === "GET" && pathname === "/auth/status") {
-        return json({ ok: true, authenticated: false, user: null, lastLogin: null });
+        return json({ ok: true, authenticated: false, user: null, lastLogin: null, port: 9333, checkedVia: "cookie" });
       }
 
       return json({ error: "not_found", path: pathname }, 404);
@@ -426,8 +426,10 @@ describe("server RPC contract", () => {
     expect(data.ok).toBe(true);
   });
 
-  test("GET /auth/status returns { ok, authenticated, user, lastLogin }", async () => {
-    const { status, data } = await rpc<{ ok: boolean; authenticated: boolean; user: null; lastLogin: null }>("GET", "/auth/status");
+  test("GET /auth/status returns { ok, authenticated, user, lastLogin, port, checkedVia }", async () => {
+    // NOTE: this file drives its own mock router, not the real handler; the
+    // real handler is covered through getAuthStatus in auth.test.ts.
+    const { status, data } = await rpc<{ ok: boolean; authenticated: boolean; user: null; lastLogin: null; port: number; checkedVia: string }>("GET", "/auth/status");
 
     expect(status).toBe(200);
     expect(data.ok).toBe(true);
@@ -435,5 +437,7 @@ describe("server RPC contract", () => {
     // user is object | null, lastLogin is string | null
     expect(data.user === null || typeof data.user === "object").toBe(true);
     expect(data.lastLogin === null || typeof data.lastLogin === "string").toBe(true);
+    expect(typeof data.port).toBe("number");
+    expect(data.checkedVia).toBe("cookie");
   });
 });
