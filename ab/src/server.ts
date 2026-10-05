@@ -17,7 +17,7 @@ import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
 import { authenticateJoined, getAuthStatus, DEFAULT_AUTH_APP_BASE } from "./auth";
-import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE, authLoginDeadline } from "./config";
+import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE } from "./config";
 import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
 import type {
@@ -240,11 +240,7 @@ export async function handleHeal(): Promise<Response> {
 // Auth route handlers
 // ---------------------------------------------------------------------------
 
-async function handleAuthLogin(req: Request): Promise<Response> {
-  // Fixed before any await. withTimeout(AUTH_LOGIN_TIMEOUT_MS) was armed just
-  // before this call, so this deadline falls AUTH_DEADLINE_GUARD_MS ahead of
-  // the handler timeout and authenticate() stops before it fires.
-  const deadline = authLoginDeadline(Date.now());
+async function handleAuthLogin(req: Request, signal: AbortSignal): Promise<Response> {
   let rawBody: unknown;
   try {
     rawBody = await req.json();
@@ -258,7 +254,7 @@ async function handleAuthLogin(req: Request): Promise<Response> {
     return json({ ok: false, error: `Validation failed: ${issues.join(", ")}` }, 400);
   }
 
-  const result = await authenticateJoined(parsed.data, { deadline });
+  const result = await authenticateJoined(parsed.data, signal);
   return json(result, result.ok ? 200 : 400);
 }
 
@@ -287,21 +283,25 @@ async function handleAuthStatus(url: URL): Promise<Response> {
 // Request dispatch
 // ---------------------------------------------------------------------------
 
+/** Runs `handler` with a signal that aborts when the route budget expires. */
 async function withTimeout(
-  handler: () => Response | Promise<Response>,
+  handler: (signal: AbortSignal) => Response | Promise<Response>,
   timeoutMs: number = HANDLER_TIMEOUT_MS,
 ): Promise<Response> {
+  const controller = new AbortController();
   let timerId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<Response>((_, reject) => {
     timerId = setTimeout(() => {
-      reject(new Error(`Handler timeout after ${timeoutMs}ms`));
+      const err = new Error(`Handler timeout after ${timeoutMs}ms`);
+      controller.abort(err);
+      reject(err);
     }, timeoutMs);
     if (typeof timerId === "object" && "unref" in timerId) {
       (timerId as NodeJS.Timeout).unref();
     }
   });
   try {
-    return await Promise.race([Promise.resolve(handler()), timeoutPromise]);
+    return await Promise.race([Promise.resolve(handler(controller.signal)), timeoutPromise]);
   } finally {
     if (timerId !== null) clearTimeout(timerId);
   }
@@ -331,7 +331,7 @@ export async function handleRequest(req: Request): Promise<Response> {
       return await withOpId(newOpId(), () => withTimeout(handleHeal)) as Response;
     }
     if (method === "POST" && pathname === "/auth/login") {
-      return await withOpId(newOpId(), () => withTimeout(() => handleAuthLogin(req), AUTH_LOGIN_TIMEOUT_MS)) as Response;
+      return await withOpId(newOpId(), () => withTimeout((signal) => handleAuthLogin(req, signal), AUTH_LOGIN_TIMEOUT_MS)) as Response;
     }
     if (method === "POST" && pathname === "/chrome/touch-headed") {
       supervisor.touchHeaded();

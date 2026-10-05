@@ -129,16 +129,5 @@ export function headlessPortForShard(shard: number): number {
 
 /** Daemon handler budget for POST /auth/login (withTimeout). */
 export const AUTH_LOGIN_TIMEOUT_MS = 60_000;
-/**
- * How far before the handler timeout authenticate() must stop. After its
- * deadline authenticate() returns a timeout failure and never sets authState,
- * so the guard keeps that cutoff strictly ahead of withTimeout's rejection.
- */
-export const AUTH_DEADLINE_GUARD_MS = 2_000;
 /** CLI RPC timeout for /auth/login; longer than the daemon's, so the CLI never gives up first. */
 export const AUTH_LOGIN_CLIENT_TIMEOUT_MS = AUTH_LOGIN_TIMEOUT_MS + 5_000;
-
-/** Absolute deadline (epoch ms) for authenticate() when the login handler started at `startedAt`. */
-export function authLoginDeadline(startedAt: number): number {
-  return startedAt + AUTH_LOGIN_TIMEOUT_MS - AUTH_DEADLINE_GUARD_MS;
-}
