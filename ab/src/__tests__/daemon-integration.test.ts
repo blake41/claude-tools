@@ -20,7 +20,37 @@ import * as os from "os";
 const CHROME_BIN =
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
-const CHROME_AVAILABLE = fs.existsSync(CHROME_BIN);
+/** Launches CHROME_BIN headless on an OS-assigned port (never 9333/9444); true if it reaches "DevTools listening". */
+async function probeHeadlessChrome(): Promise<boolean> {
+  if (!fs.existsSync(CHROME_BIN)) return false;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ab-chrome-probe-"));
+  const proc = Bun.spawn(
+    [CHROME_BIN, "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${dir}`, "--no-first-run", "about:blank"],
+    { stdout: "ignore", stderr: "pipe" },
+  );
+  const listening = (async () => {
+    const decoder = new TextDecoder();
+    let seen = "";
+    for await (const chunk of proc.stderr) {
+      seen += decoder.decode(chunk, { stream: true });
+      if (seen.includes("DevTools listening")) return true;
+    }
+    return false;
+  })();
+  const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000));
+  try {
+    return await Promise.race([listening, timeout]);
+  } finally {
+    proc.kill(9);
+    await proc.exited;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const CHROME_AVAILABLE = await probeHeadlessChrome().catch(() => false);
+if (!CHROME_AVAILABLE) {
+  console.log("SKIP: headless Chrome cannot launch here (sandbox?)");
+}
 
 // ---------------------------------------------------------------------------
 // Daemon project root (so we can spawn `bun run src/daemon.ts`)
@@ -92,12 +122,28 @@ function assertProfileRootIsolated(env: Record<string, string | undefined>): voi
   }
 }
 
+/**
+ * Throw unless the spawned daemon's agent-browser socket dir is inside its own
+ * temp HOME. `agent-browser dashboard stop` SIGTERMs the pid in
+ * <socket_dir>/dashboard.pid, so a shared dir would let a test daemon stop the live dashboard.
+ */
+function assertSocketDirIsolated(env: Record<string, string | undefined>): void {
+  const home = env.HOME ?? "";
+  const dir = env.AGENT_BROWSER_SOCKET_DIR ?? "";
+  if (!home || !dir || !path.resolve(dir).startsWith(path.resolve(home) + path.sep)) {
+    throw new Error(
+      `daemon-integration refuses to run: AGENT_BROWSER_SOCKET_DIR "${dir}" is not inside the temp HOME "${home}".`,
+    );
+  }
+}
+
 /** Env for a spawned daemon: isolated ports and profile root first, so a test can still override. */
 function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<string, string | undefined> {
   const env = {
     ...process.env,
     HOME: homeDir,
     AB_PROFILE_ROOT: path.join(homeDir, ".agent-browser"),
+    AGENT_BROWSER_SOCKET_DIR: path.join(homeDir, ".agent-browser"),
     // Suppress pino pretty-printing if any
     NODE_ENV: "test",
     AB_BASE_PORT: String(TEST_BASE_PORT),
@@ -107,6 +153,7 @@ function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<stri
   };
   assertNotLivePorts(env);
   assertProfileRootIsolated(env);
+  assertSocketDirIsolated(env);
   return env;
 }
 
