@@ -14,16 +14,23 @@ interface Harness {
   order: string[];
   statusCalls: Array<{ port?: number; sessionId?: string; appBaseUrl?: string }>;
   loginCalls: AuthLoginRequest[];
+  loginTimeouts: number[];
+  navCalls: Array<{ port: number; session: string | null; url: string }>;
 }
 
 function harness(opts: {
   env?: { CLERK_SECRET_KEY?: string };
   status?: () => Promise<AuthStatusResponse>;
   login?: () => Promise<AuthLoginResponse>;
+  navigate?: () => Promise<unknown>;
+  recordedId?: string | null;
 }): Harness {
-  const h: Harness = { order: [], statusCalls: [], loginCalls: [], deps: undefined as unknown as CmdOpenDeps };
+  const h: Harness = {
+    order: [], statusCalls: [], loginCalls: [], loginTimeouts: [], navCalls: [],
+    deps: undefined as unknown as CmdOpenDeps,
+  };
   h.deps = {
-    openTab: async () => { h.order.push("openTab"); return "TAB1"; },
+    openTab: async () => { h.order.push("openTab"); return opts.recordedId === undefined ? "TAB1" : opts.recordedId; },
     setViewport: async () => { h.order.push("viewport"); },
     autoAuth: {
       env: opts.env ?? {},
@@ -32,10 +39,16 @@ function harness(opts: {
         h.statusCalls.push(o);
         return (opts.status ?? (async () => status(false)))();
       },
-      authLogin: async (r) => {
+      authLogin: async (r, o) => {
         h.order.push("login");
         h.loginCalls.push(r);
+        h.loginTimeouts.push(o.timeoutMs);
         return (opts.login ?? (async () => ({ ok: true })))();
+      },
+      navigate: async (port, session, url) => {
+        h.order.push("navigate");
+        h.navCalls.push({ port, session, url });
+        return (opts.navigate ?? (async () => undefined))();
       },
     },
   };
@@ -67,18 +80,21 @@ describe("cmdOpen auto-auth", () => {
     }
   });
 
-  test("authenticated session: status checked, no login, tab opened", async () => {
+  test("authenticated session: status checked, no login, no re-navigation", async () => {
     const h = harness({ env: KEY, status: async () => status(true) });
     expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
-    expect(h.order).toEqual(["status", "openTab", "viewport"]);
+    expect(h.order).toEqual(["openTab", "viewport", "status"]);
+    expect(h.navCalls).toEqual([]);
     expect(h.loginCalls).toEqual([]);
     expect(h.statusCalls).toEqual([{ port: 9333, sessionId: "sess", appBaseUrl: "http://localhost:5173" }]);
   });
 
-  test("unauthenticated with key: one login with the key in the body, before the tab opens", async () => {
+  test("unauthenticated with key: tab first, then one login with the key in the body, then re-navigation", async () => {
     const h = harness({ env: KEY });
     expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
-    expect(h.order).toEqual(["status", "login", "openTab", "viewport"]);
+    expect(h.order).toEqual(["openTab", "viewport", "status", "login", "navigate"]);
+    expect(h.navCalls).toEqual([{ port: 9333, session: "sess", url: DEV_URL }]);
+    expect(h.loginTimeouts).toEqual([30_000]);
     expect(h.loginCalls).toHaveLength(1);
     expect(h.loginCalls[0]).toMatchObject({
       sessionId: "sess",
@@ -100,27 +116,27 @@ describe("cmdOpen auto-auth", () => {
     const h = harness({ env: {} });
     expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
     expect(h.loginCalls).toEqual([]);
-    expect(h.order).toEqual(["status", "openTab", "viewport"]);
+    expect(h.order).toEqual(["openTab", "viewport", "status"]);
     const hints = lines.filter((l) => l.includes("ab reauth") && l.includes("CLERK_SECRET_KEY"));
     expect(hints).toHaveLength(1);
     expect(lines).toHaveLength(1);
   });
 
-  test("login result ok:false: one warning, open proceeds", async () => {
+  test("login result ok:false: one warning, no re-navigation", async () => {
     const lines = captureStderr();
     const h = harness({ env: KEY, login: async () => ({ ok: false, error: "mint refused" }) });
     expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
-    expect(h.order).toEqual(["status", "login", "openTab", "viewport"]);
+    expect(h.order).toEqual(["openTab", "viewport", "status", "login"]);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("mint refused");
     expect(lines[0]).not.toContain("sk_test_abc");
   });
 
-  test("login RPC throws: one warning, open proceeds", async () => {
+  test("login RPC throws: one warning, no re-navigation", async () => {
     const lines = captureStderr();
     const h = harness({ env: KEY, login: async () => { throw new Error("ab-server not running"); } });
     expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
-    expect(h.order).toEqual(["status", "login", "openTab", "viewport"]);
+    expect(h.order).toEqual(["openTab", "viewport", "status", "login"]);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("ab-server not running");
   });
@@ -130,8 +146,32 @@ describe("cmdOpen auto-auth", () => {
     const h = harness({ env: KEY, status: async () => { throw new Error("timeout"); } });
     expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
     expect(h.loginCalls).toEqual([]);
-    expect(h.order).toEqual(["status", "openTab", "viewport"]);
+    expect(h.order).toEqual(["openTab", "viewport", "status"]);
     expect(lines).toHaveLength(1);
+  });
+
+  test("unrecorded tab on a dev origin: no RPC, one hint to run ab reauth", async () => {
+    const lines = captureStderr();
+    const h = harness({ env: KEY, recordedId: null });
+    expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
+    expect(h.order).toEqual(["openTab"]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("ab reauth");
+  });
+
+  test("unrecorded tab on a non-dev origin: silent", async () => {
+    const lines = captureStderr();
+    const h = harness({ env: KEY, recordedId: null });
+    await cmdOpen("https://google.com/", 9333, "sess", "p", h.deps);
+    expect(lines).toEqual([]);
+  });
+
+  test("re-navigation failure after a good login: one warning, exit 0", async () => {
+    const lines = captureStderr();
+    const h = harness({ env: KEY, navigate: async () => { throw new Error("nav boom"); } });
+    expect(await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps)).toBe(0);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("nav boom");
   });
 
   test("a thrown error that contains the key is redacted from the warning", async () => {
