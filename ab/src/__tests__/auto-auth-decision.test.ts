@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
-import { autoAuthOrigin, needsLogin } from "../cli";
+import { autoAuthOrigin } from "../app-origins";
+import { needsLogin } from "../auto-auth";
 
 const KEY = { CLERK_SECRET_KEY: "sk_test_abc" };
 

@@ -19,11 +19,11 @@ import {
   readShardAssignment,
   resolveOrAssignShard,
   resolvePid,
-  resolveReauthBaseUrls,
   resolveTeardownShard,
   sessionFilePath,
 } from "../cli";
 import type { SessionEntry } from "../cli";
+import { resolveReauthBaseUrls } from "../app-origins";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
 

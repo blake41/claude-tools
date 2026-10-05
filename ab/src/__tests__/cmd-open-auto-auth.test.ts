@@ -1,5 +1,6 @@
 import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
-import { autoAuthAfterOpen, cmdOpen } from "../cli";
+import { cmdOpen } from "../cli";
+import { autoAuthAfterOpen } from "../auto-auth";
 import type { CmdOpenDeps } from "../cli";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "../types";
 
