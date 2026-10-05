@@ -16,8 +16,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
-import { isAuthenticatedUrl } from "./auth";
-import type { AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
+import { isAuthenticatedUrl, redactSecrets } from "./auth";
+import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
 import { CONFIG_ERROR, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
 
@@ -1306,9 +1306,61 @@ export interface CmdOpenDeps {
     url: string,
   ) => Promise<string | null>;
   setViewport: (cdpPort: number, sessionName: string | null) => Promise<unknown>;
+  autoAuth?: AutoAuthDeps;
+}
+
+export interface AutoAuthDeps {
+  env: { CLERK_SECRET_KEY?: string };
+  authStatus: (opts: { port: number; sessionId: string; appBaseUrl: string }) => Promise<AuthStatusResponse>;
+  authLogin: (req: AuthLoginRequest) => Promise<AuthLoginResponse>;
+}
+
+const DEFAULT_AUTO_AUTH_DEPS: AutoAuthDeps = {
+  get env() {
+    return { CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY };
+  },
+  authStatus: (opts) => rpc.authStatus(opts),
+  authLogin: (req) => rpc.authLogin(req),
+};
+
+/** Logs in before the tab opens when a dev app origin has no Clerk session. Never throws. */
+async function autoAuthBeforeOpen(
+  url: string,
+  cdpPort: number,
+  sessionName: string | null,
+  deps: AutoAuthDeps,
+): Promise<void> {
+  const appBaseUrl = autoAuthOrigin(url);
+  if (!appBaseUrl) return;
+  const sessionId = sessionName ?? "default";
+  const secretKey = deps.env.CLERK_SECRET_KEY;
+  try {
+    const status = await deps.authStatus({ port: cdpPort, sessionId, appBaseUrl });
+    const decision = decideAutoAuth({ url, env: deps.env, status });
+    if (decision.kind === "skip") {
+      if (decision.reason === "no-key") {
+        stderr(`ab: not logged in to ${appBaseUrl}; run \`ab reauth\` from a directory whose env has CLERK_SECRET_KEY`);
+      }
+      return;
+    }
+    const result = await deps.authLogin({
+      sessionId,
+      port: cdpPort,
+      email: DEFAULT_AUTH_EMAIL,
+      appBaseUrl: decision.appBaseUrl,
+      clerkSecretKey: secretKey,
+    });
+    if (!result.ok) {
+      stderr(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(result.error ?? "unknown error", [secretKey])}); opening anyway`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    stderr(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(message, [secretKey])}); opening anyway`);
+  }
 }
 
 const DEFAULT_CMD_OPEN_DEPS: CmdOpenDeps = {
+  autoAuth: DEFAULT_AUTO_AUTH_DEPS,
   openTab: (sessionPid, cdpPort, sessionName, url) =>
     openTabAndRecordTarget(sessionPid, cdpPort, sessionName, url),
   setViewport: (cdpPort, sessionName) =>
@@ -1328,6 +1380,7 @@ export async function cmdOpen(
   sessionPid: string,
   deps: CmdOpenDeps = DEFAULT_CMD_OPEN_DEPS,
 ): Promise<number> {
+  if (deps.autoAuth) await autoAuthBeforeOpen(url, cdpPort, sessionName, deps.autoAuth);
   // Create a dedicated tab for this session so parallel sessions don't collide.
   // tab new sets the new tab as active, so subsequent commands target it.
   // The tab's CDP target id is captured here and persisted to the session
