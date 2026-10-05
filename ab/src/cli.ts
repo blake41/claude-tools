@@ -17,8 +17,8 @@ import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
 import { isAuthenticatedUrl } from "./auth";
-import { HEADLESS_POOL_SIZE } from "./types";
 import type { ChromeState, ShardDiagnostics } from "./types";
+import { TARGET_ID_ENV } from "../cdp-target";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -464,7 +464,7 @@ export function pickLeastLoadedShard(counts: number[], identity?: string): numbe
  */
 export function assignShard(
   pid: string,
-  poolSize: number = HEADLESS_POOL_SIZE,
+  poolSize: number,
   entries: SessionEntry[] = listSessionEntries(),
 ): number {
   const counts = new Array<number>(poolSize).fill(0);
@@ -499,7 +499,7 @@ function clampAndPersistShard(pid: string, shard: number, poolSize: number): num
  * the passthrough-command path, where booting a fresh shard for an
  * unassigned session is the correct behavior.
  */
-export function resolveOrAssignShard(pid: string, poolSize: number = HEADLESS_POOL_SIZE): number {
+export function resolveOrAssignShard(pid: string, poolSize: number): number {
   const raw = readShardAssignment(pid);
   if (raw === null) return assignShard(pid, poolSize);
   return clampAndPersistShard(pid, raw, poolSize);
@@ -512,7 +512,7 @@ export function resolveOrAssignShard(pid: string, poolSize: number = HEADLESS_PO
  * shard 0, matching where an unassigned session's tab landed before
  * sharding existed (shard 0 reuses the pre-pool profile/port).
  */
-export function resolveTeardownShard(pid: string, poolSize: number = HEADLESS_POOL_SIZE): number {
+export function resolveTeardownShard(pid: string, poolSize: number): number {
   const raw = readShardAssignment(pid);
   if (raw === null) return 0;
   return clampAndPersistShard(pid, raw, poolSize);
@@ -568,7 +568,7 @@ function maybePrintFreshProfileHint(profileFresh: boolean): void {
  * Chrome) resolves to shard 0 — that Chrome IS where every tab lives
  * pre-pool.
  */
-export function shardForPort(port: number, poolSize: number = HEADLESS_POOL_SIZE): number {
+export function shardForPort(port: number, poolSize: number): number {
   const i = port - CDP_PORT_HEADLESS;
   if (i < 0 || i >= poolSize) return 0;
   return i;
@@ -580,7 +580,7 @@ export function shardForPort(port: number, poolSize: number = HEADLESS_POOL_SIZE
  * daemon has no `headlessPool` and runs exactly one headless Chrome.
  */
 export function poolSizeFromStatus(status: { headlessPool?: unknown[] }): number {
-  return status.headlessPool?.length ?? 1;
+  return Math.max(1, status.headlessPool?.length ?? 1);
 }
 
 /**
@@ -1971,8 +1971,8 @@ export async function sweepOrphanTabs(opts: SweepOptions): Promise<SweepSummary>
  */
 export function makeGcSweepEvidenceProvider(
   reapedPids: Set<string>,
+  poolSize: number,
   listEntries: () => SessionEntry[] = listSessionEntries,
-  poolSize: number = HEADLESS_POOL_SIZE,
 ): (shard: SweepShard) => ShardSessionEvidence[] {
   return ({ port }) =>
     listEntries()
@@ -2085,7 +2085,7 @@ async function cmdGc(args: string[]): Promise<number> {
       // F1: evidenceFor re-scans listSessionEntries() fresh on every call
       // (see makeGcSweepEvidenceProvider) rather than reusing the stale
       // top-of-run `entries` snapshot taken above.
-      evidenceFor: makeGcSweepEvidenceProvider(reapedPids, listSessionEntries, poolSize ?? 1),
+      evidenceFor: makeGcSweepEvidenceProvider(reapedPids, poolSize ?? 1),
       dryRun,
       out: (line) => process.stdout.write(line + "\n"),
       warn: stderr,
@@ -2099,32 +2099,27 @@ async function cmdGc(args: string[]): Promise<number> {
  *  acts in another agent's tab on a shared shard. Empty when none is recorded. */
 export function sessionTargetEnv(pid: string, cdpPort: number): Record<string, string> {
   const targets = readSessionTargets(pid, cdpPort);
-  return { AB_TARGET_ID: targets[targets.length - 1] ?? "" };
+  const last = targets[targets.length - 1];
+  return last ? { [TARGET_ID_ENV]: last } : {};
 }
 
-async function cmdConsoleTail(args: string[], cdpPort: number, pid: string): Promise<number> {
-  const script = path.join(AB_DIR, "console-tail.ts");
-  const result = await execInherit("bun", ["run", script, ...args, String(cdpPort)], sessionTargetEnv(pid, cdpPort));
+async function runCdpScript(file: string, argv: string[], cdpPort: number, pid: string): Promise<number> {
+  const result = await execInherit(
+    "bun",
+    ["run", path.join(AB_DIR, file), ...argv],
+    sessionTargetEnv(pid, cdpPort),
+  );
   return result.exitCode;
 }
 
-async function cmdWatch(args: string[], cdpPort: number, pid: string): Promise<number> {
-  const script = path.join(AB_DIR, "console-tail.ts");
-  const result = await execInherit("bun", ["run", script, "--watch", ...args, String(cdpPort)], sessionTargetEnv(pid, cdpPort));
-  return result.exitCode;
-}
-
-async function cmdClickJs(args: string[], cdpPort: number, pid: string): Promise<number> {
-  const script = path.join(AB_DIR, "cdp-click.ts");
-  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args], sessionTargetEnv(pid, cdpPort));
-  return result.exitCode;
-}
-
-async function cmdClickXy(args: string[], cdpPort: number, pid: string): Promise<number> {
-  const script = path.join(AB_DIR, "cdp-click-xy.ts");
-  const result = await execInherit("bun", ["run", script, String(cdpPort), ...args], sessionTargetEnv(pid, cdpPort));
-  return result.exitCode;
-}
+const cmdConsoleTail = (args: string[], cdpPort: number, pid: string) =>
+  runCdpScript("console-tail.ts", [...args, String(cdpPort)], cdpPort, pid);
+const cmdWatch = (args: string[], cdpPort: number, pid: string) =>
+  runCdpScript("console-tail.ts", ["--watch", ...args, String(cdpPort)], cdpPort, pid);
+const cmdClickJs = (args: string[], cdpPort: number, pid: string) =>
+  runCdpScript("cdp-click.ts", [String(cdpPort), ...args], cdpPort, pid);
+const cmdClickXy = (args: string[], cdpPort: number, pid: string) =>
+  runCdpScript("cdp-click-xy.ts", [String(cdpPort), ...args], cdpPort, pid);
 
 async function cmdLocalStorage(
   subCmd: string,

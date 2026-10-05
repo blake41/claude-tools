@@ -38,8 +38,8 @@ describe("sessionTargetEnv", () => {
     expect(sessionTargetEnv(pid, 9333)).toEqual({ AB_TARGET_ID: "BBBB2222" });
   });
 
-  test("is empty when nothing is recorded", () => {
-    expect(sessionTargetEnv(pid, 9333)).toEqual({ AB_TARGET_ID: "" });
+  test("omits the key when nothing is recorded", () => {
+    expect(sessionTargetEnv(pid, 9333)).toEqual({});
   });
 });
 
@@ -62,4 +62,28 @@ describe("cdp-click script", () => {
       server.stop(true);
     }
   });
+});
+
+describe("console-tail script", () => {
+  test("exits instead of reconnecting forever when the session has no recorded tab", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json(tabs),
+    });
+    try {
+      const env: Record<string, string | undefined> = { ...process.env };
+      delete env.AB_TARGET_ID;
+      const proc = Bun.spawn(["bun", "run", path.join(AB_DIR, "console-tail.ts"), String(server.port)], {
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      expect(code).toBe(1);
+      expect(err).toMatch(/No tab recorded/);
+      expect(err).not.toMatch(/Reconnecting/);
+    } finally {
+      server.stop(true);
+    }
+  }, 10_000);
 });

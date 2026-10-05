@@ -179,7 +179,7 @@ describe("makeGcSweepEvidenceProvider", () => {
 
     // Provider built (mirrors cmdGc constructing the evidenceFor closure)
     // BEFORE the late session exists.
-    const provider = makeGcSweepEvidenceProvider(new Set(), listEntries);
+    const provider = makeGcSweepEvidenceProvider(new Set(), 3, listEntries);
 
     // The session opens its tab and records its identity strictly AFTER the
     // provider was constructed — the exact live-repro window from F1.
@@ -224,14 +224,14 @@ describe("makeGcSweepEvidenceProvider", () => {
         shard: 0,
       },
     ];
-    const provider = makeGcSweepEvidenceProvider(new Set(["reaped-1"]), () => liveEntries);
+    const provider = makeGcSweepEvidenceProvider(new Set(["reaped-1"]), 3, () => liveEntries);
     expect(provider({ shard: 0, port: 9333 })).toEqual([]);
   });
 
   test("defaults to the real listSessionEntries when no override is given", () => {
     // Just proves the default parameter wires to the real function without
     // throwing — the fixture-driven tests above cover actual behavior.
-    const provider = makeGcSweepEvidenceProvider(new Set());
+    const provider = makeGcSweepEvidenceProvider(new Set(), 3);
     expect(() => provider({ shard: 0, port: 9333 })).not.toThrow();
   });
 });
