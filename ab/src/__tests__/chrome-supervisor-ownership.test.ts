@@ -266,7 +266,8 @@ describe("crash detected on an adopted Chrome", () => {
     // Drives handleCrashDetected with the pid still alive: heartbeat closes
     // until the benign-close threshold, then both browser-WS probes fail
     // (FakeWebSocket never opens, probe times out) -> recycle.
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await loadSupervisor();
+    const { ensure } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
     await ensure(TARGET);
     await waitUntil(() => FakeWebSocket.instances.length > 0);
     for (let i = 0; i < HEARTBEAT_BENIGN_CLOSE_THRESHOLD; i++) {

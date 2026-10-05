@@ -408,7 +408,8 @@ async function driveToThreshold(_target: "headless-1", threshold: number): Promi
 describe("threshold -> probe wiring (headless target, probe-eligible)", () => {
   test("both probes fail -> recycle: handleCrashDetected fires with reason ws-probe-failed", async () => {
     installSpawnMock(71007);
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD, getHealthDiagnostics } = await loadSupervisor();
+    const { ensure, getHealthDiagnostics } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headless-1");
     await driveToThreshold("headless-1", HEARTBEAT_BENIGN_CLOSE_THRESHOLD);
@@ -428,7 +429,8 @@ describe("threshold -> probe wiring (headless target, probe-eligible)", () => {
 
   test("probe 1 succeeds (short-circuit) -> cooldown: Chrome is NOT recycled, cooldown timer armed", async () => {
     installSpawnMock(71008);
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD, getRuntimeSnapshot } = await loadSupervisor();
+    const { ensure, getRuntimeSnapshot } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headless-1");
     await driveToThreshold("headless-1", HEARTBEAT_BENIGN_CLOSE_THRESHOLD);
@@ -456,7 +458,8 @@ describe("threshold -> probe wiring (headless target, probe-eligible)", () => {
 
   test("stale probe result (teardown mid-probe bumps generation) is discarded silently", async () => {
     installSpawnMock(71009);
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD, kill, getRuntimeSnapshot } = await loadSupervisor();
+    const { ensure, kill, getRuntimeSnapshot } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headless-1");
     await driveToThreshold("headless-1", HEARTBEAT_BENIGN_CLOSE_THRESHOLD);
@@ -495,7 +498,8 @@ describe("threshold -> probe wiring (headless target, probe-eligible)", () => {
 describe("cooldown retry timer is gated by shouldRearmHeartbeat", () => {
   test("fires startHeartbeat and re-arms when nothing has changed (headed, direct cooldown)", async () => {
     installSpawnMock(71010);
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD, getRuntimeSnapshot } = await loadSupervisor();
+    const { ensure, getRuntimeSnapshot } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headed"); // headed always skips probing -> cooldown directly
     for (let i = 0; i < HEARTBEAT_BENIGN_CLOSE_THRESHOLD; i++) {
@@ -518,7 +522,8 @@ describe("cooldown retry timer is gated by shouldRearmHeartbeat", () => {
 
   test("kill() while in cooldown cancels the pending retry — clearTimers clears heartbeatCooldownTimer, no stray re-arm after teardown", async () => {
     installSpawnMock(71011);
-    const { ensure, kill, HEARTBEAT_BENIGN_CLOSE_THRESHOLD, getRuntimeSnapshot } = await loadSupervisor();
+    const { ensure, kill, getRuntimeSnapshot } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headed");
     for (let i = 0; i < HEARTBEAT_BENIGN_CLOSE_THRESHOLD; i++) {
@@ -554,7 +559,8 @@ describe("cooldown retry timer is gated by shouldRearmHeartbeat", () => {
 describe("cooldown retry setup failure re-arms a new cooldown timer (FIX 2 — never terminal)", () => {
   test("cooldown timer fires, mocked fetch fails -> mode stays cooldown AND a fresh cooldown timer is armed (not stuck)", async () => {
     installSpawnMock(71012);
-    const { ensure, HEARTBEAT_BENIGN_CLOSE_THRESHOLD, getRuntimeSnapshot } = await loadSupervisor();
+    const { ensure, getRuntimeSnapshot } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headed"); // headed always skips probing -> cooldown directly
     for (let i = 0; i < HEARTBEAT_BENIGN_CLOSE_THRESHOLD; i++) {

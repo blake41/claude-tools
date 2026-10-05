@@ -60,13 +60,13 @@ async function loadSupervisor() {
 
 describe("decideHeartbeatClose", () => {
   test("dead pid → crash, regardless of close history", async () => {
-    const { decideHeartbeatClose } = await loadSupervisor();
+    const { decideHeartbeatClose } = await import("../chrome-heartbeat");
     expect(decideHeartbeatClose(false, 0)).toEqual({ action: "crash" });
     expect(decideHeartbeatClose(false, 4)).toEqual({ action: "crash" });
   });
 
   test("alive pid, first benign close → rearm with count 1", async () => {
-    const { decideHeartbeatClose } = await loadSupervisor();
+    const { decideHeartbeatClose } = await import("../chrome-heartbeat");
     expect(decideHeartbeatClose(true, 0, 5)).toEqual({
       action: "rearm",
       nextConsecutiveBenignCloses: 1,
@@ -74,7 +74,7 @@ describe("decideHeartbeatClose", () => {
   });
 
   test("alive pid, below threshold → keeps re-arming", async () => {
-    const { decideHeartbeatClose } = await loadSupervisor();
+    const { decideHeartbeatClose } = await import("../chrome-heartbeat");
     // threshold=3: closes bringing the count to 1 and 2 both re-arm.
     expect(decideHeartbeatClose(true, 0, 3)).toEqual({
       action: "rearm",
@@ -87,7 +87,7 @@ describe("decideHeartbeatClose", () => {
   });
 
   test("alive pid, the Nth rapid close hits the threshold → threshold-reached (caller decides probe vs. cooldown)", async () => {
-    const { decideHeartbeatClose } = await loadSupervisor();
+    const { decideHeartbeatClose } = await import("../chrome-heartbeat");
     // threshold=3: the close that brings the count to 3 exhausts the budget.
     expect(decideHeartbeatClose(true, 2, 3)).toEqual({
       action: "threshold-reached",
@@ -96,7 +96,7 @@ describe("decideHeartbeatClose", () => {
   });
 
   test("uses the exported HEARTBEAT_BENIGN_CLOSE_THRESHOLD as its default", async () => {
-    const { decideHeartbeatClose, HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await loadSupervisor();
+    const { decideHeartbeatClose, HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
     const justBelow = decideHeartbeatClose(true, HEARTBEAT_BENIGN_CLOSE_THRESHOLD - 2);
     expect(justBelow.action).toBe("rearm");
     const atThreshold = decideHeartbeatClose(true, HEARTBEAT_BENIGN_CLOSE_THRESHOLD - 1);
@@ -104,7 +104,7 @@ describe("decideHeartbeatClose", () => {
   });
 
   test("never returns 'crash' for an alive pid regardless of close count", async () => {
-    const { decideHeartbeatClose } = await loadSupervisor();
+    const { decideHeartbeatClose } = await import("../chrome-heartbeat");
     for (const closes of [0, 1, 5, 100]) {
       expect(decideHeartbeatClose(true, closes).action).not.toBe("crash");
     }
@@ -113,57 +113,57 @@ describe("decideHeartbeatClose", () => {
 
 describe("decideThresholdPlan", () => {
   test("headless (always-on or on-demand) → probe", async () => {
-    const { decideThresholdPlan } = await loadSupervisor();
+    const { decideThresholdPlan } = await import("../chrome-heartbeat");
     expect(decideThresholdPlan("always-on")).toBe("probe");
     expect(decideThresholdPlan("on-demand")).toBe("probe");
   });
 
   test("headed → cooldown, never probe (headed is never killed by the supervisor)", async () => {
-    const { decideThresholdPlan } = await loadSupervisor();
+    const { decideThresholdPlan } = await import("../chrome-heartbeat");
     expect(decideThresholdPlan("headed")).toBe("cooldown");
   });
 });
 
 describe("decideProbeOutcome", () => {
   test("both probes fail → recycle", async () => {
-    const { decideProbeOutcome } = await loadSupervisor();
+    const { decideProbeOutcome } = await import("../chrome-heartbeat");
     expect(decideProbeOutcome(false, false)).toEqual({ action: "recycle" });
   });
 
   test("probe 1 succeeds alone → cooldown (short-circuit case)", async () => {
-    const { decideProbeOutcome } = await loadSupervisor();
+    const { decideProbeOutcome } = await import("../chrome-heartbeat");
     expect(decideProbeOutcome(true, false)).toEqual({ action: "cooldown" });
   });
 
   test("probe 2 succeeds alone (probe 1 failed) → cooldown", async () => {
-    const { decideProbeOutcome } = await loadSupervisor();
+    const { decideProbeOutcome } = await import("../chrome-heartbeat");
     expect(decideProbeOutcome(false, true)).toEqual({ action: "cooldown" });
   });
 
   test("both probes succeed → cooldown", async () => {
-    const { decideProbeOutcome } = await loadSupervisor();
+    const { decideProbeOutcome } = await import("../chrome-heartbeat");
     expect(decideProbeOutcome(true, true)).toEqual({ action: "cooldown" });
   });
 });
 
 describe("shouldRearmHeartbeat (staleness guards)", () => {
   test("re-arms when nothing has changed: same pid, no heartbeat WS yet, still chrome_up", async () => {
-    const { shouldRearmHeartbeat } = await loadSupervisor();
+    const { shouldRearmHeartbeat } = await import("../chrome-heartbeat");
     expect(shouldRearmHeartbeat(123, 123, null, "chrome_up")).toBe(true);
   });
 
   test("refuses when the pid changed (Chrome was relaunched during the delay)", async () => {
-    const { shouldRearmHeartbeat } = await loadSupervisor();
+    const { shouldRearmHeartbeat } = await import("../chrome-heartbeat");
     expect(shouldRearmHeartbeat(456, 123, null, "chrome_up")).toBe(false);
   });
 
   test("refuses when a new heartbeat WS was already established", async () => {
-    const { shouldRearmHeartbeat } = await loadSupervisor();
+    const { shouldRearmHeartbeat } = await import("../chrome-heartbeat");
     expect(shouldRearmHeartbeat(123, 123, {} /* a live WebSocket */, "chrome_up")).toBe(false);
   });
 
   test("refuses when the target's state moved on from chrome_up", async () => {
-    const { shouldRearmHeartbeat } = await loadSupervisor();
+    const { shouldRearmHeartbeat } = await import("../chrome-heartbeat");
     expect(shouldRearmHeartbeat(123, 123, null, "chrome_crashed")).toBe(false);
     expect(shouldRearmHeartbeat(123, 123, null, "idle")).toBe(false);
   });
@@ -462,7 +462,8 @@ describe("heartbeat re-arm wiring (real ensure() -> launchChrome() -> startHeart
 
   test("N rapid benign closes on headed hit threshold → cooldown directly, no probe, no kill, and stop re-arming", async () => {
     installSpawnMock(65002);
-    const { ensure, getRuntimeSnapshot, HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await loadSupervisor();
+    const { ensure, getRuntimeSnapshot } = await loadSupervisor();
+    const { HEARTBEAT_BENIGN_CLOSE_THRESHOLD } = await import("../chrome-heartbeat");
 
     await ensure("headed");
 
