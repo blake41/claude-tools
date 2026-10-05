@@ -51,7 +51,7 @@ cmux's `cmux-claude-wrapper` checks `--resume <id>` by expanding five deep globs
 
 `CCO_FASTWRAP_DISABLE=1` forces the stock path. `cco-claude-shim` starts its inner fish with `--no-config` and sources only `cco-permissions.fish`.
 
-Startup trace: `CCO_STARTUP_TRACE=1` appends `<epoch> <session-id> enter|exec|wrapper-done` lines to `/tmp/cco-startup-trace.log`. To also see claude's own boot, add a `SessionStart` hook and a `UserPromptSubmit` hook that each run `echo "$(perl -MTime::HiRes=time -e 'printf q(%.3f), time') $CCO_SESSION_ID session-start" >> /tmp/cco-startup-trace.log` (use `prompt-submit` for the second).
+Startup trace (on by default, `CCO_STARTUP_TRACE=0` turns it off): `<epoch> <session-id> <point> [detail]` lines in `~/.cmux/cco-startup-trace.log`. Points: `enter` (mode, load average, debug-file path), `ab-ensure-start`, `ab-ensure-done`, `exec`, `wrapper-done`, then `session-start` and `prompt-submit` from hooks in `~/.claude/settings.json` that run only when `CCO_SESSION_ID` is set. claude also gets `--debug-file /tmp/cco-startup-debug-<session>-<epoch>.log`.
 
 ## Sandbox expansion
 

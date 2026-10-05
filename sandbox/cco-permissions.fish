@@ -18,9 +18,9 @@
 # Env (optional):
 #   CCO_FASTWRAP_DISABLE=1  Launch through cmux's stock claude shim instead of
 #                           cco-cmux-claude.
-#   CCO_STARTUP_TRACE=1     Append startup timestamps to /tmp/cco-startup-trace.log
-#                           (see __cco_trace) and pass --debug-file
-#                           /tmp/cco-startup-debug-<session>-<epoch>.log to claude.
+#   CCO_STARTUP_TRACE=0     Turn off the startup trace. On by default: timestamps go to
+#                           ~/.cmux/cco-startup-trace.log (see __cco_trace) and claude gets
+#                           --debug-file /tmp/cco-startup-debug-<session>-<epoch>.log.
 
 function cco-permissions
     # Pull out our own flags before touching $argv further.
@@ -54,18 +54,23 @@ function cco-permissions
         set session_id (head -c 4 /dev/urandom | xxd -p)
     end
 
-    __cco_trace $session_id enter
     set -l trace_args
-    if test -n "$CCO_STARTUP_TRACE"
-        set trace_args --debug-file /tmp/cco-startup-debug-$session_id-(date +%s).log
+    if test "$CCO_STARTUP_TRACE" != 0
+        set -l debug_file /tmp/cco-startup-debug-$session_id-(date +%s).log
+        set trace_args --debug-file $debug_file
+        set -l mode sandboxed
+        $skip_sandbox; and set mode no-sandbox
+        __cco_trace $session_id enter "mode=$mode load="(sysctl -n vm.loadavg | string trim -c '{} ' | string replace -a ' ' ',')" debug=$debug_file"
     end
 
     # Ensure browser is ready before entering sandbox
     if command -q ab
+        __cco_trace $session_id ab-ensure-start
         if not ab ensure
             echo "Browser setup failed. Run 'ab heal' and try again." >&2
             return 1
         end
+        __cco_trace $session_id ab-ensure-done
     end
 
     set -gx CCO_SESSION_ID $session_id
@@ -200,12 +205,14 @@ function cco-permissions
     set -e CCO_SESSION_ID
 end
 
-# Opt-in startup trace (CCO_STARTUP_TRACE=1): "<epoch> <session-id> <point>" lines in
-# /tmp/cco-startup-trace.log. Points: enter, exec (just before claude launches),
-# wrapper-done (written by cco-cmux-claude when cmux's wrapper execs claude).
-function __cco_trace --argument-names session_id point
-    test -n "$CCO_STARTUP_TRACE"; or return 0
-    printf '%s %s %s\n' (/usr/bin/perl -MTime::HiRes=time -e 'printf q(%.3f), time') $session_id $point >>/tmp/cco-startup-trace.log 2>/dev/null
+# Startup trace, on unless CCO_STARTUP_TRACE=0: "<epoch> <session-id> <point> [detail]"
+# lines in ~/.cmux/cco-startup-trace.log. Points: enter (mode, load average, debug-file
+# path), ab-ensure-start, ab-ensure-done, exec (just before claude launches),
+# wrapper-done (cco-cmux-claude, when cmux's wrapper execs claude), session-start and
+# prompt-submit (hooks in ~/.claude/settings.json).
+function __cco_trace --argument-names session_id point detail
+    test "$CCO_STARTUP_TRACE" = 0; and return 0
+    printf '%s %s %s %s\n' (/usr/bin/perl -MTime::HiRes=time -e 'printf q(%.3f), time') $session_id $point "$detail" >>$HOME/.cmux/cco-startup-trace.log 2>/dev/null
 end
 
 # Intercept `claude --resume <id>` typed by cmux's autoResumeAgentSessions so
