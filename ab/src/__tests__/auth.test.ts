@@ -1031,7 +1031,8 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
     fs.writeFileSync(markerPath, `${testPid}\nshard=2\n`);
     const calls = mockEnsurePort(9333, 2); // daemon runs a 2-shard pool; CLI default is 3
 
-    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    const { ensureChromePort } = await import("../cli");
+    const { readShardAssignment } = await import("../session");
     await ensureChromePort(false);
     const ensure = calls.find((c) => c.path === "/chrome/ensure");
     expect(ensure?.body).toEqual({ shard: 0 });
@@ -1043,7 +1044,8 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
     // The daemon ignored the requested shard and served shard 0's Chrome.
     mockEnsurePort(9333, 3, [{ phase: "chrome_up", pid: 100, port: 9333 }, { phase: "idle" }, { phase: "idle" }]);
 
-    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    const { ensureChromePort } = await import("../cli");
+    const { readShardAssignment } = await import("../session");
     const cdpPort = await ensureChromePort(false);
     expect(cdpPort).toBe(9333);
     expect(readShardAssignment(testPid)).toBe(0);
@@ -1054,7 +1056,8 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
     const before = fs.statSync(markerPath).mtimeMs;
     mockEnsurePort(9334); // 9333 + shard 1 — matches what was requested
 
-    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    const { ensureChromePort } = await import("../cli");
+    const { readShardAssignment } = await import("../session");
     const cdpPort = await ensureChromePort(false);
     expect(cdpPort).toBe(9334);
     expect(readShardAssignment(testPid)).toBe(1);

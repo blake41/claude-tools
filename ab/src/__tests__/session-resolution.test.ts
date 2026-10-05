@@ -11,17 +11,14 @@ import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import {
-  RemovedFlagError,
   assignShard,
-  buildSessionName,
   parseFlags,
   pickLeastLoadedShard,
-  readShardAssignment,
+  RemovedFlagError,
   resolveOrAssignShard,
-  resolvePid,
   resolveTeardownShard,
-  sessionFilePath,
 } from "../cli";
+import { buildSessionName, readShardAssignment, resolvePid, sessionFilePath } from "../session";
 import type { SessionEntry } from "../cli";
 import { resolveReauthBaseUrls } from "../app-origins";
 

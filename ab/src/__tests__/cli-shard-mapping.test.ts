@@ -68,7 +68,8 @@ describe("ensureChromePort with a CLI env base port that differs from the daemon
       return new Response("{}", { status: 404 });
     }) as unknown as typeof fetch;
 
-    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    const { ensureChromePort } = await import("../cli");
+    const { readShardAssignment } = await import("../session");
     const { HEADLESS_BASE_PORT } = await import("../config");
     expect(HEADLESS_BASE_PORT).toBe(9500);
 
@@ -82,7 +83,7 @@ describe("ensureChromePort with a CLI env base port that differs from the daemon
 
 describe("shardForPort reads the daemon's pool, not the CLI env", () => {
   test("matches an up shard's port; shards that are down take base+i from an up shard", async () => {
-    const { shardForPort } = await import("../cli");
+    const { shardForPort } = await import("../shard-ports");
     const pool: ChromeState[] = [UP_POOL[0], { phase: "idle" }, { phase: "idle" }];
     expect(shardForPort(9333, pool)).toBe(0);
     expect(shardForPort(9334, pool)).toBe(1);
@@ -90,7 +91,7 @@ describe("shardForPort reads the daemon's pool, not the CLI env", () => {
   });
 
   test("a port outside the daemon's pool, or no up shard to anchor on, is unknown (null)", async () => {
-    const { shardForPort } = await import("../cli");
+    const { shardForPort } = await import("../shard-ports");
     expect(shardForPort(9500, UP_POOL)).toBeNull();
     expect(shardForPort(9334, [{ phase: "idle" }, { phase: "idle" }])).toBeNull();
     expect(shardForPort(9333, undefined)).toBeNull();
@@ -110,7 +111,8 @@ describe("doctor labels come from the daemon's ports", () => {
   });
 
   test("tab-count checks label shards with the daemon's ports", async () => {
-    const { buildTabCountChecks, headlessPortsFromPool } = await import("../cli");
+    const { buildTabCountChecks } = await import("../cli");
+    const { headlessPortsFromPool } = await import("../shard-ports");
     const labels = buildTabCountChecks([1, null, 2], headlessPortsFromPool(UP_POOL)).map((c) => c.label);
     expect(labels).toEqual([
       "Chrome tabs (headless-0, 9333)",

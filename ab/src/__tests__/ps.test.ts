@@ -40,10 +40,10 @@ import {
   buildHeadlessDoctorChecks,
   buildHeadlessDoctorDetail,
   listSessionEntries,
-  portForShard,
-  readShardAssignment,
   resolveTeardownShard,
 } from "../cli";
+import { readShardAssignment } from "../session";
+import { portForShard } from "../shard-ports";
 import type { ChromeState, ShardDiagnostics } from "../types";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
