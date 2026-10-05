@@ -1,0 +1,102 @@
+/**
+ * Shared port / pool config. The daemon and the CLI are separate processes
+ * that each resolve this from their own env, so the pure `resolveConfig(env)`
+ * is the contract both rely on.
+ */
+import { test, expect, describe } from "bun:test";
+import {
+  resolveConfig,
+  HEADLESS_BASE_PORT,
+  HEADED_PORT,
+  DASHBOARD_PORT,
+  HEADLESS_POOL_SIZE,
+  headlessPortForShard,
+} from "../config";
+import { HEADLESS_POOL_SIZE as TYPES_POOL_SIZE } from "../types";
+
+describe("module-level constants", () => {
+  test("are resolveConfig(process.env), and types.ts re-exports the same pool size", () => {
+    expect({
+      headlessBasePort: HEADLESS_BASE_PORT,
+      headedPort: HEADED_PORT,
+      dashboardPort: DASHBOARD_PORT,
+      headlessPoolSize: HEADLESS_POOL_SIZE,
+    }).toEqual(resolveConfig(process.env));
+    expect(TYPES_POOL_SIZE).toBe(HEADLESS_POOL_SIZE);
+  });
+
+  test("headlessPortForShard(i) is base + i", () => {
+    expect(headlessPortForShard(0)).toBe(HEADLESS_BASE_PORT);
+    expect(headlessPortForShard(2)).toBe(HEADLESS_BASE_PORT + 2);
+  });
+});
+
+describe("resolveConfig", () => {
+  test("defaults when no AB_* env is set", () => {
+    expect(resolveConfig({})).toEqual({
+      headlessBasePort: 9333,
+      headedPort: 9444,
+      dashboardPort: 4848,
+      headlessPoolSize: 3,
+    });
+  });
+
+  test("AB_BASE_PORT / AB_HEADED_PORT / AB_DASHBOARD_PORT overrides are parsed", () => {
+    expect(
+      resolveConfig({ AB_BASE_PORT: "29333", AB_HEADED_PORT: " 29444 ", AB_DASHBOARD_PORT: "24848" }),
+    ).toEqual({
+      headlessBasePort: 29333,
+      headedPort: 29444,
+      dashboardPort: 24848,
+      headlessPoolSize: 3,
+    });
+  });
+
+  test.each([
+    ["1", 1],
+    ["5", 5],
+    ["8", 8],
+    ["9", 8], // clamps to the 8-shard maximum
+    ["0", 1], // clamps to the 1-shard minimum
+    ["-3", 1],
+    ["", 3],
+    ["   ", 3],
+    ["lots", 3], // unparseable falls back to the default, never throws
+  ])("AB_HEADLESS_POOL_SIZE=%p resolves to %p shards", (raw, expected) => {
+    expect(resolveConfig({ AB_HEADLESS_POOL_SIZE: raw }).headlessPoolSize).toBe(expected);
+  });
+
+  test("headless range running past 65535 throws naming AB_BASE_PORT", () => {
+    expect(() => resolveConfig({ AB_BASE_PORT: "65534", AB_HEADLESS_POOL_SIZE: "3" })).toThrow(
+      "AB_BASE_PORT=65534 with 3 headless shards needs ports 65534-65536; the top exceeds 65535",
+    );
+  });
+
+  test.each([
+    ["AB_HEADED_PORT", { AB_BASE_PORT: "9443", AB_HEADED_PORT: "9444" }, 9444],
+    ["AB_DASHBOARD_PORT", { AB_BASE_PORT: "4847", AB_DASHBOARD_PORT: "4848" }, 4848],
+  ])("%s inside the headless shard range throws", (name, env, port) => {
+    expect(() => resolveConfig(env)).toThrow(
+      `${name}=${port} collides with a headless shard port (AB_BASE_PORT=${env.AB_BASE_PORT}, 3 shards)`,
+    );
+  });
+
+  test("headed and dashboard on the same port throws", () => {
+    expect(() => resolveConfig({ AB_HEADED_PORT: "5000", AB_DASHBOARD_PORT: "5000" })).toThrow(
+      "AB_HEADED_PORT and AB_DASHBOARD_PORT must differ (both 5000)",
+    );
+  });
+
+  test.each([
+    ["AB_BASE_PORT", "abc"],
+    ["AB_BASE_PORT", "9333abc"],
+    ["AB_HEADED_PORT", "1023"],
+    ["AB_HEADED_PORT", "65536"],
+    ["AB_DASHBOARD_PORT", "48.5"],
+    ["AB_DASHBOARD_PORT", "-4848"],
+  ])("%s=%s throws a message naming the variable", (name, value) => {
+    expect(() => resolveConfig({ [name]: value })).toThrow(
+      `${name} must be an integer port between 1024 and 65535 (got "${value}")`,
+    );
+  });
+});

@@ -8,7 +8,7 @@
  * These tests are slow (seconds each) because they manage real processes.
  * The socket-deletion test is especially slow (~35s) due to the watchdog interval.
  */
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, beforeAll } from "bun:test";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -29,6 +29,75 @@ const CHROME_AVAILABLE = fs.existsSync(CHROME_BIN);
 const PROJECT_ROOT = path.resolve(import.meta.dir, "..", "..");
 
 // ---------------------------------------------------------------------------
+// Isolated port block. Every spawned daemon gets these via AB_BASE_PORT /
+// AB_HEADED_PORT / AB_DASHBOARD_PORT so its Chromes never touch the live
+// daemon's 9333+ / 9444 / 4848. cleanup() only ever SIGKILLs a Chrome whose
+// port is inside this block.
+// ---------------------------------------------------------------------------
+
+const TEST_BASE_PORT = 29333;
+const TEST_HEADED_PORT = 29444;
+const TEST_DASHBOARD_PORT = 24848;
+/** config.ts clamps the pool to 8 shards, so the headless block is base..base+7. */
+const TEST_MAX_SHARDS = 8;
+
+const LIVE_HEADLESS_BASE_PORT = 9333;
+const LIVE_HEADED_PORT = 9444;
+const LIVE_DASHBOARD_PORT = 4848;
+const LIVE_PORTS = new Set<number>([
+  ...Array.from({ length: TEST_MAX_SHARDS }, (_, i) => LIVE_HEADLESS_BASE_PORT + i),
+  LIVE_HEADED_PORT,
+  LIVE_DASHBOARD_PORT,
+]);
+
+function isTestBlockPort(port: unknown): port is number {
+  return (
+    typeof port === "number" &&
+    ((port >= TEST_BASE_PORT && port < TEST_BASE_PORT + TEST_MAX_SHARDS) ||
+      port === TEST_HEADED_PORT)
+  );
+}
+
+/** Throw if any port a spawned daemon would bind lands on a live daemon port. */
+function assertNotLivePorts(env: Record<string, string | undefined>): void {
+  const base = Number(env.AB_BASE_PORT);
+  const used: Array<[string, number]> = [
+    ...Array.from({ length: TEST_MAX_SHARDS }, (_, i): [string, number] => [`AB_BASE_PORT+${i}`, base + i]),
+    ["AB_HEADED_PORT", Number(env.AB_HEADED_PORT)],
+    ["AB_DASHBOARD_PORT", Number(env.AB_DASHBOARD_PORT)],
+  ];
+  for (const [name, port] of used) {
+    if (!Number.isInteger(port) || LIVE_PORTS.has(port)) {
+      throw new Error(
+        `daemon-integration refuses to run: ${name} resolves to ${port}, which is a live ab daemon port (or unset). ` +
+          `Integration daemons must use the isolated block (${TEST_BASE_PORT}+ / ${TEST_HEADED_PORT} / ${TEST_DASHBOARD_PORT}).`,
+      );
+    }
+  }
+}
+
+/** Env for a spawned daemon: isolated ports first, so a test can still override. */
+function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<string, string | undefined> {
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    // Suppress pino pretty-printing if any
+    NODE_ENV: "test",
+    AB_BASE_PORT: String(TEST_BASE_PORT),
+    AB_HEADED_PORT: String(TEST_HEADED_PORT),
+    AB_DASHBOARD_PORT: String(TEST_DASHBOARD_PORT),
+    ...(extra ?? {}),
+  };
+  assertNotLivePorts(env);
+  return env;
+}
+
+beforeAll(() => {
+  // The file must be unable to run on live ports.
+  assertNotLivePorts(daemonEnv(os.tmpdir()));
+});
+
+// ---------------------------------------------------------------------------
 // RPC helper — Bun's fetch with unix socket support
 // ---------------------------------------------------------------------------
 
@@ -37,11 +106,12 @@ async function rpc(
   method: "GET" | "POST",
   pathname: string,
   body?: unknown,
+  timeoutMs = 30_000,
 ): Promise<{ status: number; data: any }> {
   const resp = await fetch(`http://localhost${pathname}`, {
     method,
     unix: socketPath,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(timeoutMs),
     ...(body !== undefined
       ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
       : {}),
@@ -154,13 +224,7 @@ async function spawnDaemon(opts?: {
     cwd: PROJECT_ROOT,
     stdout: "pipe",
     stderr: "pipe",
-    env: {
-      ...process.env,
-      HOME: homeDir,
-      // Suppress pino pretty-printing if any
-      NODE_ENV: "test",
-      ...(opts?.env ?? {}),
-    },
+    env: daemonEnv(homeDir, opts?.env),
   });
 
   const handle: DaemonHandle = {
@@ -170,6 +234,10 @@ async function spawnDaemon(opts?: {
     homeDir,
     abDir,
     cleanup: async () => {
+      // Snapshot this daemon's Chromes before signalling: the kill(9) path
+      // skips stopAll and would otherwise orphan them.
+      const chromes = proc.exitCode === null ? await collectChromePids(socketPath) : [];
+
       // Kill process if still alive
       try {
         if (proc.exitCode === null) {
@@ -183,6 +251,8 @@ async function spawnDaemon(opts?: {
       } catch {
         // already dead
       }
+
+      reapOrphanChromes(chromes);
 
       // Remove temp directory
       try {
@@ -212,6 +282,46 @@ async function spawnDaemon(opts?: {
   }
 
   return handle;
+}
+
+/**
+ * Chrome PIDs + ports a daemon reports in GET /status (pool, headed, and the
+ * legacy `headless` alias). Empty if the daemon does not answer.
+ */
+async function collectChromePids(socketPath: string): Promise<Array<{ pid: number; port: number }>> {
+  try {
+    const { data } = await rpc(socketPath, "GET", "/status", undefined, 2_000);
+    const states: unknown[] = [...(data?.headlessPool ?? []), data?.headed, data?.headless];
+    const seen = new Map<number, number>();
+    for (const s of states) {
+      const st = s as { pid?: unknown; port?: unknown } | undefined;
+      if (typeof st?.pid === "number" && typeof st?.port === "number") seen.set(st.pid, st.port);
+    }
+    return [...seen].map(([pid, port]) => ({ pid, port }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * SIGKILL Chromes the daemon left behind after it exited. Only a PID whose
+ * port is inside the isolated test block is ever signalled — a PID on any
+ * other port could be the live daemon's Chrome and is never touched.
+ */
+function reapOrphanChromes(chromes: Array<{ pid: number; port: number }>): void {
+  for (const { pid, port } of chromes) {
+    if (!isTestBlockPort(port)) continue;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      continue; // already gone
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // exited between the probe and the kill
+    }
+  }
 }
 
 /**
@@ -323,11 +433,7 @@ describe("daemon integration", () => {
           cwd: PROJECT_ROOT,
           stdout: "pipe",
           stderr: "pipe",
-          env: {
-            ...process.env,
-            HOME: daemon.homeDir,
-            NODE_ENV: "test",
-          },
+          env: daemonEnv(daemon.homeDir),
         });
 
         // Wait for it to exit — it should refuse and exit with code 1
@@ -578,7 +684,7 @@ describe("daemon integration", () => {
   );
 
   test(
-    "ensure {shard:1} boots a second Chrome on 9334 with its own profile dir, idempotently, and the daemon survives a shard-1 crash",
+    "ensure {shard:1} boots a second Chrome on base+1 with its own profile dir, idempotently, and the daemon survives a shard-1 crash",
     async () => {
       if (!CHROME_AVAILABLE) {
         console.log("SKIP: Chrome not available");
@@ -600,12 +706,12 @@ describe("daemon integration", () => {
       try {
         const shard0Before = await waitForShardUp(daemon.socketPath, 0);
         expect(shard0Before).not.toBeNull();
-        expect(shard0Before!.port).toBe(9333);
+        expect(shard0Before!.port).toBe(TEST_BASE_PORT);
 
         const first = await rpc(daemon.socketPath, "POST", "/chrome/ensure", { shard: 1 });
         expect(first.status).toBe(200);
         expect(first.data.ok).toBe(true);
-        expect(first.data.port).toBe(9334);
+        expect(first.data.port).toBe(TEST_BASE_PORT + 1);
         expect(first.data.alreadyRunning).toBe(false);
         // This daemon's HOME is a fresh temp dir (see spawnDaemon), so shard
         // 1's profile genuinely doesn't exist before this first ensure —
@@ -623,7 +729,7 @@ describe("daemon integration", () => {
         expect(second.status).toBe(200);
         expect(second.data.alreadyRunning).toBe(true);
         expect(second.data.pid).toBe(first.data.pid);
-        expect(second.data.port).toBe(9334);
+        expect(second.data.port).toBe(TEST_BASE_PORT + 1);
         expect(second.data.profileFresh).toBe(false);
 
         // --- Kill shard 1's Chrome directly ---
@@ -670,7 +776,7 @@ describe("daemon integration", () => {
       try {
         const shard0 = await waitForShardUp(daemon.socketPath, 0);
         expect(shard0).not.toBeNull();
-        expect(shard0!.port).toBe(9333);
+        expect(shard0!.port).toBe(TEST_BASE_PORT);
 
         const { data: status } = await rpc(daemon.socketPath, "GET", "/status");
         expect(status.headlessPool.length).toBe(1);

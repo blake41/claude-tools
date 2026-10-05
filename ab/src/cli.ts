@@ -19,13 +19,16 @@ import * as rpc from "./rpc";
 import { isAuthenticatedUrl } from "./auth";
 import type { ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
+import { DASHBOARD_PORT, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const CDP_PORT_HEADLESS = 9333;
-const CDP_PORT_HEADED = 9444;
+// Headless shard 0 / headed ports come from ./config (AB_BASE_PORT,
+// AB_HEADED_PORT). The daemon resolves the same module from its own env.
+const CDP_PORT_HEADLESS = HEADLESS_BASE_PORT;
+const CDP_PORT_HEADED = HEADED_PORT;
 const CDP_PORT_USER = 9222;
 
 // Default user for `reauth`. The Agent Task is minted by email.
@@ -562,8 +565,8 @@ function maybePrintFreshProfileHint(profileFresh: boolean): void {
  * Derive the headless shard that actually served a request from the port
  * the daemon reported. The daemon's response port is the source of truth —
  * a pre-pool daemon ignores the `shard` field on the request entirely and
- * always serves its single Chrome on port 9333 regardless of what was
- * requested (chrome-pool-plan Fix 2). Ports map back via `9333 + i`;
+ * always serves its single Chrome on the base port regardless of what was
+ * requested (chrome-pool-plan Fix 2). Ports map back via `AB_BASE_PORT + i`;
  * anything outside the current pool's port range (legacy daemon, single
  * Chrome) resolves to shard 0 — that Chrome IS where every tab lives
  * pre-pool.
@@ -587,7 +590,7 @@ export function poolSizeFromStatus(status: { headlessPool?: unknown[] }): number
  * Resolve the CDP port headless commands should use for this session:
  * resolve (or assign) its shard, then ensure that shard's Chrome is up via
  * the daemon. Returns the port the daemon reports rather than assuming the
- * `9333 + shard` formula — the daemon is the source of truth for the port.
+ * `AB_BASE_PORT + shard` formula — the daemon is the source of truth for the port.
  *
  * If the daemon served a different shard than the one requested (a
  * pre-pool daemon that ignores `shard` entirely, or a future mismatch),
@@ -751,7 +754,7 @@ export function buildHeadlessDoctorChecks(
   const headlessOk = status.headless.phase === "chrome_up";
   return [
     {
-      label: "Chrome (headless, 9333)",
+      label: `Chrome (headless, ${CDP_PORT_HEADLESS})`,
       ok: headlessOk,
       detail: status.headless.phase,
       fix: headlessOk ? undefined : "ab ensure   # or: ab heal",
@@ -869,7 +872,7 @@ async function cmdDoctor(): Promise<number> {
     // Headed is on-demand — not running is normal, only flag if crashed.
     const headedCrashed = status.headed.phase === "chrome_crashed";
     checks.push({
-      label: "Chrome (headed, 9444)",
+      label: `Chrome (headed, ${CDP_PORT_HEADED})`,
       ok: !headedCrashed,
       detail: buildHeadlessDoctorDetail(false, status.headed.phase, status.diagnostics?.headed),
       fix: headedCrashed ? "ab heal" : undefined,
@@ -2503,7 +2506,7 @@ function printUsage(): void {
   stderr("  click-xy <x> <y>    Compositor-level pixel click (cross-origin iframes, shadow DOM)");
   stderr("");
   stderr("Flags:");
-  stderr("  --headed            Use headed Chrome (port 9444)");
+  stderr(`  --headed            Use headed Chrome (port ${CDP_PORT_HEADED})`);
   stderr("  --user-chrome       Use personal Chrome (port 9222), allows eval");
   stderr("");
   stderr("Environment:");
@@ -2516,6 +2519,10 @@ function printUsage(): void {
   stderr("  AB_VIEWPORT_H       Viewport height applied by 'ab open' (default 900)");
   stderr("  AB_VIEWPORT_SCALE   Viewport DPR applied by 'ab open' (default 2)");
   stderr("  AB_VIEWPORT=skip    Skip auto-viewport on 'ab open' (use Chrome native size)");
+  stderr(`  AB_BASE_PORT        Headless shard 0 CDP port; shard i uses base+i (default 9333, now ${CDP_PORT_HEADLESS})`);
+  stderr(`  AB_HEADED_PORT      Headed Chrome CDP port (default 9444, now ${CDP_PORT_HEADED})`);
+  stderr(`  AB_DASHBOARD_PORT   agent-browser dashboard port (default 4848, now ${DASHBOARD_PORT})`);
+  stderr("                      Set these identically for the daemon and the CLI.");
 }
 
 // ---------------------------------------------------------------------------

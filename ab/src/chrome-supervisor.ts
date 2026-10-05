@@ -10,6 +10,7 @@ import * as path from "path";
 import { existsSync, unlinkSync, rmSync, mkdirSync, readdirSync } from "fs";
 import type { ChromeConfig, ChromePolicy, ChromeTarget, DetectionReason, HeartbeatMode, ShardDiagnostics } from "./types";
 import { ALL_TARGETS, HEADLESS_POOL_SIZE, headlessTarget } from "./types";
+import { DASHBOARD_PORT, HEADED_PORT, headlessPortForShard } from "./config";
 import {
   getState,
   markLaunching,
@@ -47,13 +48,6 @@ const SHARED_LAUNCH_ARGS: readonly string[] = [
 ];
 
 /**
- * Base CDP port for the headless pool. Shard i listens on HEADLESS_BASE_PORT + i.
- * Shard 0 reuses the pre-pool port (9333) and the pre-pool profile dir so
- * existing auth + zero-migration back-compat is preserved.
- */
-const HEADLESS_BASE_PORT = 9333;
-
-/**
  * Root directory for every Chrome profile dir. AB_PROFILE_ROOT is test-only —
  * read once at module load, matching the AB_* override pattern used elsewhere
  * in this file (AB_BACKOFF_INITIAL_MS etc.) — so a test can point every
@@ -69,18 +63,22 @@ function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
   const configs: Record<ChromeTarget, ChromeConfig> = {
     headed: {
       target: "headed",
-      port: 9444,
+      port: HEADED_PORT,
       profilePath: `${PROFILE_ROOT}/profile-headed`,
       launchArgs: [...SHARED_LAUNCH_ARGS],
       policy: "on-demand",
     },
   } as Record<ChromeTarget, ChromeConfig>;
 
+  // Ports come from ./config (AB_BASE_PORT / AB_HEADED_PORT, defaults
+  // 9333 / 9444): shard i listens on AB_BASE_PORT + i. Shard 0 keeps the
+  // pre-pool profile dir so existing auth + zero-migration back-compat is
+  // preserved.
   for (let i = 0; i < HEADLESS_POOL_SIZE; i++) {
     const target = headlessTarget(i);
     configs[target] = {
       target,
-      port: HEADLESS_BASE_PORT + i,
+      port: headlessPortForShard(i),
       profilePath:
         i === 0
           ? `${PROFILE_ROOT}/profile`
@@ -94,8 +92,6 @@ function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
 }
 
 const CONFIGS: Record<ChromeTarget, ChromeConfig> = buildConfigs();
-
-const DASHBOARD_PORT = 4848;
 
 let dashboardProc: ReturnType<typeof Bun.spawn> | null = null;
 
