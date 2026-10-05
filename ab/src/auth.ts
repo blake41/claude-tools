@@ -269,14 +269,6 @@ export async function authenticate(
   const urlResult = await step((ms) => runAgentBrowser(sessionId, port, ["get", "url"], ms));
   if (urlResult === null) return timedOut();
   if (urlResult.ok && isAuthenticatedUrl(urlResult.stdout)) {
-    // Determine target origin for the comparison.
-    let targetOrigin: string;
-    try {
-      targetOrigin = new URL(appBaseUrl).origin;
-    } catch {
-      targetOrigin = appBaseUrl;
-    }
-
     let browserOrigin: string;
     try {
       browserOrigin = new URL(urlResult.stdout).origin;
@@ -284,11 +276,11 @@ export async function authenticate(
       browserOrigin = "";
     }
 
-    if (browserOrigin === targetOrigin) {
+    if (browserOrigin === appOrigin) {
       if (expired()) return timedOut();
       log.info("Browser already on authenticated page for same origin — skipping login", {
         url: urlResult.stdout,
-        targetOrigin,
+        targetOrigin: appOrigin,
       });
       authState = {
         user: authState.user, // preserve existing user info
@@ -299,7 +291,7 @@ export async function authenticate(
 
     log.info("Browser is authenticated but on a different origin — proceeding with login", {
       browserOrigin,
-      targetOrigin,
+      targetOrigin: appOrigin,
     });
   }
 
@@ -471,12 +463,12 @@ const STATUS_PROBE_TIMEOUT_MS = 8_000;
  * like any other session helper.
  */
 export async function getAuthStatus(
-  opts: { port: number; sessionId: string; appBaseUrl?: string },
+  opts: { port: number; sessionId: string; appBaseUrl: string },
 ): Promise<AuthStatusResponse> {
   const authenticated = await confirmClerkSession(
     opts.sessionId,
     opts.port,
-    opts.appBaseUrl || DEFAULT_AUTH_APP_BASE,
+    opts.appBaseUrl,
     STATUS_PROBE_TIMEOUT_MS,
   ).catch(() => false);
   return {
