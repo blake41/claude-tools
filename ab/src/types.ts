@@ -20,30 +20,11 @@ export interface ChromeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Headless pool sizing
+// Headless pool sizing (resolved in ./config; re-exported for existing importers)
 // ---------------------------------------------------------------------------
 
-const MIN_HEADLESS_POOL_SIZE = 1;
-const MAX_HEADLESS_POOL_SIZE = 8;
-const DEFAULT_HEADLESS_POOL_SIZE = 3;
-
-function clampPoolSize(n: number): number {
-  return Math.min(MAX_HEADLESS_POOL_SIZE, Math.max(MIN_HEADLESS_POOL_SIZE, n));
-}
-
-function resolvePoolSize(): number {
-  const raw = process.env.AB_HEADLESS_POOL_SIZE;
-  if (raw === undefined || raw.trim() === "") return DEFAULT_HEADLESS_POOL_SIZE;
-  const parsed = parseInt(raw, 10);
-  if (Number.isNaN(parsed)) return DEFAULT_HEADLESS_POOL_SIZE;
-  return clampPoolSize(parsed);
-}
-
-/**
- * Number of headless Chrome shards this process supervises, resolved once
- * at module load from AB_HEADLESS_POOL_SIZE (default 3, clamped 1-8).
- */
-export const HEADLESS_POOL_SIZE: number = resolvePoolSize();
+import { HEADLESS_POOL_SIZE } from "./config";
+export { HEADLESS_POOL_SIZE };
 
 /** Build the ChromeTarget key for headless shard `shard` (0-indexed). */
 export function headlessTarget(shard: number): ChromeTarget {
