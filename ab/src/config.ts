@@ -1,5 +1,5 @@
 /**
- * Port and pool configuration shared by the ab-server daemon and the ab CLI.
+ * Socket, port and pool configuration shared by the ab-server daemon and the ab CLI.
  *
  * They are separate processes, so each resolves this module from its own env
  * at load time. Loading never throws: a bad value is reported in CONFIG_ERROR
@@ -8,6 +8,12 @@
  * from the daemon. Must not import ./types, ./server, ./cli or
  * ./chrome-supervisor.
  */
+
+import * as os from "os";
+import * as path from "path";
+
+/** Unix socket the daemon serves its RPC routes on and the CLI connects to. */
+export const SOCKET_PATH = path.join(os.homedir(), ".agent-browser", "ab-server.sock");
 
 type Env = Record<string, string | undefined>;
 

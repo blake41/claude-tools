@@ -12,12 +12,10 @@
  *   *    *                 → 404
  */
 
-import * as os from "os";
-import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
 import { authenticateJoined, getAuthStatus, loginTimedOutError, DEFAULT_AUTH_APP_BASE } from "./auth";
-import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE } from "./config";
+import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE, SOCKET_PATH } from "./config";
 import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
 import type {
@@ -32,16 +30,6 @@ import type {
 import { HEADLESS_TARGETS, headlessTarget } from "./types";
 
 const log = new Logger({ component: "daemon" });
-
-// ---------------------------------------------------------------------------
-// Socket path
-// ---------------------------------------------------------------------------
-
-export const SOCKET_PATH = path.join(
-  os.homedir(),
-  ".agent-browser",
-  "ab-server.sock",
-);
 
 // ---------------------------------------------------------------------------
 // Startup timestamp (set when server starts)

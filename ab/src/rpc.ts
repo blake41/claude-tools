@@ -5,8 +5,7 @@
  * Translates connection errors into actionable messages.
  */
 
-import { SOCKET_PATH } from "./server";
-import { AUTH_LOGIN_CLIENT_TIMEOUT_MS } from "./config";
+import { AUTH_LOGIN_CLIENT_TIMEOUT_MS, SOCKET_PATH } from "./config";
 import type {
   StatusResponse,
   HealthResponse,
