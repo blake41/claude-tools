@@ -117,10 +117,19 @@ bun run install.ts --uninstall  # Uninstall, restore old ab
 |------|---------|
 | `src/daemon.ts` | Daemon entry point |
 | `src/chrome-supervisor.ts` | Chrome lifecycle (launch, health, restart) |
+| `src/chrome-occupant.ts` | Who holds a CDP port (lsof / pgrep) and whether the daemon may signal it (`classifyOccupant`) |
 | `src/server.ts` | Unix socket HTTP server |
 | `src/auth.ts` | Agent Tasks auth flow |
+| `src/app-origins.ts` | App origin rules: reauth base URLs, env presets, worktree and auto-auth origins |
+| `src/auto-auth.ts` | Auto-auth after `ab open` on a dev app origin |
+| `src/login-request.ts` | The `/auth/login` request body the CLI sends |
 | `src/cli.ts` | CLI entry point (replaces old bash ab) |
+| `src/doctor.ts` | `ab doctor` checks and command |
+| `src/session.ts` | Session identity and its `/tmp/.ab-session-<pid>` marker (shard and tab lines) |
+| `src/cdp-http.ts` | Plain CDP HTTP: list and close page targets, per-shard tab counts |
+| `src/shard-ports.ts` | Headless shard ports from the daemon's `/status` pool |
 | `src/rpc.ts` | CLI → daemon RPC client |
+| `src/config.ts` | Socket path, ports and pool size, shared by the daemon and the CLI |
 | `src/state.ts` | Chrome state machine |
 | `src/types.ts` | Shared types |
 | `src/logger.ts` | Structured JSON logger |

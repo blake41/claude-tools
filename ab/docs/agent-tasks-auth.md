@@ -108,7 +108,11 @@ Skip the restart and the old daemon keeps running its old code. It strips the un
 
 | File | Purpose |
 |------|---------|
-| `src/auth.ts` | `authenticate()` flow, `checkAgentTaskGuards`, injectable Clerk client seam |
-| `src/cli.ts` | `cmdReauth` (forwards `CLERK_SECRET_KEY`), `cmdImport` (pins `appBaseUrl` to the browser origin), `resolveReauthBaseUrls` |
+| `src/auth.ts` | `authenticate()` flow (runs inside a `LoginBudget`: abort signal + deadline from the route), `authenticateJoined` (one shared login per port and app base), `checkAgentTaskGuards`, `loginTimedOutError`, injectable Clerk client seam |
+| `src/server.ts` | `POST /auth/login` (`handleAuthLogin`: 60 s budget; an expired budget answers 400 with the login-timeout error) and `GET /auth/status` |
+| `src/cli.ts` | `cmdReauth` (forwards `CLERK_SECRET_KEY`), `cmdImport` (pins `appBaseUrl` to the browser origin) |
+| `src/app-origins.ts` | `resolveReauthBaseUrls`, `REAUTH_ENV_PRESETS`, worktree and auto-auth origin rules |
+| `src/login-request.ts` | `loginRequest()`, the `AuthLoginRequest` body the CLI sends (default email, optional key) |
+| `src/auto-auth.ts` | `autoAuthAfterOpen`, the auto-auth step after `ab open` on a dev app origin |
 | `src/types.ts` | `AuthLoginRequest.clerkSecretKey` |
-| `src/__tests__/auth.test.ts`, `auth-guards.test.ts` | Tests (fake Clerk client, no network) |
+| `src/__tests__/auth.test.ts`, `auth-guards.test.ts`, `auth-single-flight.test.ts` | Tests (fake Clerk client, no network) |
