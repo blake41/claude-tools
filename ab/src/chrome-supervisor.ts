@@ -19,7 +19,7 @@ import {
   markIdle,
 } from "./state";
 import { Logger, withOpId, newOpId } from "./logger";
-import { commandLineUsesProfile, getListeningPid, readCommandLine } from "./chrome-occupant";
+import { classifyOccupant, getListeningPid, readCommandLine } from "./chrome-occupant";
 
 const log = new Logger({ component: "chrome" });
 
@@ -787,21 +787,20 @@ async function clearOccupantOrRefuse(
   const config = CONFIGS[target];
   const rt = runtime[target];
 
-  if (pid === rt.lastSpawnedPid) {
-    await killOccupant(target, pid, killReason, "our own Chrome");
-    return;
+  const cmdline = pid === rt.lastSpawnedPid ? null : await readCommandLine(pid);
+  const occupant = classifyOccupant({ pid, lastSpawnedPid: rt.lastSpawnedPid, cmdline, profilePath: config.profilePath });
+  switch (occupant.kind) {
+    case "ours":
+      await killOccupant(target, pid, killReason, "our own Chrome");
+      return;
+    case "own-profile":
+      await killOccupant(target, pid, "port-occupied-own-profile", `an unresponsive Chrome on this target's profile ${config.profilePath}`);
+      return;
+    case "foreign":
+      break;
   }
 
-  const cmdline = await readCommandLine(pid);
-  if (cmdline !== null && commandLineUsesProfile(cmdline, config.profilePath)) {
-    await killOccupant(target, pid, "port-occupied-own-profile", `an unresponsive Chrome on this target's profile ${config.profilePath}`);
-    return;
-  }
-
-  const userDataDir = cmdline === null ? null : (/--user-data-dir=(\S+)/.exec(cmdline)?.[1] ?? "none");
-  const detail = cmdline === null
-    ? "command line unreadable"
-    : `--user-data-dir ${userDataDir} is not this target's profile ${config.profilePath}`;
+  const { detail } = occupant;
   rt.lastPortConflict = { port: config.port, pid, reason: "port-occupied-foreign", detail, at: Date.now() };
   rt.retryNotBefore = Date.now() + BACKOFF_MAX_MS;
   log.warn(
