@@ -16,7 +16,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
-import { isAuthenticatedUrl, redactSecrets } from "./auth";
+import { DEFAULT_AUTH_APP_BASE, isAuthenticatedUrl, redactSecrets } from "./auth";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
 import { CONFIG_ERROR, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
@@ -30,6 +30,21 @@ const CDP_PORT_USER = 9222;
 // Default user for `reauth`. The Agent Task is minted by email.
 // Override with AB_AUTH_EMAIL.
 const DEFAULT_AUTH_EMAIL = process.env.AB_AUTH_EMAIL ?? "blake.johnson@clay.com";
+
+export function loginRequest(
+  cdpPort: number,
+  sessionName: string | null,
+  appBaseUrl: string | undefined,
+): AuthLoginRequest {
+  return {
+    sessionId: sessionName ?? "default",
+    port: cdpPort,
+    email: DEFAULT_AUTH_EMAIL,
+    appBaseUrl,
+    // Sent in the request body only; never written to disk or logged.
+    clerkSecretKey: process.env.CLERK_SECRET_KEY,
+  };
+}
 
 const AB_DIR = path.resolve(import.meta.dir, "..");
 
@@ -1066,8 +1081,6 @@ function detectWorktreeOrigin(browserUrl: string | undefined): string | undefine
   return undefined;
 }
 
-const AUTO_AUTH_LOCAL_ORIGIN = "http://localhost:5173";
-
 /** App origin that `ab open` may auto-authenticate against, or undefined for any other URL. */
 export function autoAuthOrigin(url: string): string | undefined {
   let parsed: URL;
@@ -1077,26 +1090,18 @@ export function autoAuthOrigin(url: string): string | undefined {
     return undefined;
   }
   const origin = parsed.origin;
-  if (origin === AUTO_AUTH_LOCAL_ORIGIN) return origin;
+  if (origin === DEFAULT_AUTH_APP_BASE) return origin;
   if (Object.values(REAUTH_ENV_PRESETS).includes(origin)) return origin;
   if (parsed.protocol === "https:") return detectWorktreeOrigin(url);
   return undefined;
 }
 
-export type AutoAuthDecision =
-  | { kind: "skip"; reason: "not-dev-origin" | "authenticated" | "no-key" }
-  | { kind: "login"; appBaseUrl: string };
-
-export function decideAutoAuth(input: {
-  url: string;
-  env: { CLERK_SECRET_KEY?: string };
-  status: { authenticated: boolean };
-}): AutoAuthDecision {
-  const appBaseUrl = autoAuthOrigin(input.url);
-  if (!appBaseUrl) return { kind: "skip", reason: "not-dev-origin" };
-  if (input.status.authenticated) return { kind: "skip", reason: "authenticated" };
-  if (!input.env.CLERK_SECRET_KEY) return { kind: "skip", reason: "no-key" };
-  return { kind: "login", appBaseUrl };
+export function needsLogin(
+  status: { authenticated: boolean },
+  env: { CLERK_SECRET_KEY?: string },
+): "login" | "no-key" | "skip" {
+  if (status.authenticated) return "skip";
+  return env.CLERK_SECRET_KEY ? "login" : "no-key";
 }
 
 export function resolveReauthBaseUrls(
@@ -1215,14 +1220,7 @@ export async function cmdReauth(
     stderr(urls.error);
     return 2;
   }
-  const result = await rpc.authLogin({
-    sessionId: sessionName ?? "default",
-    port: cdpPort,
-    email: DEFAULT_AUTH_EMAIL,
-    appBaseUrl: urls.appBaseUrl,
-    // Sent to the daemon in the request body only; never written to disk or logged.
-    clerkSecretKey: process.env.CLERK_SECRET_KEY,
-  });
+  const result = await rpc.authLogin(loginRequest(cdpPort, sessionName, urls.appBaseUrl));
   if (result.ok) {
     stderr("Reauth complete");
     if (result.user) {
@@ -1306,11 +1304,15 @@ export interface CmdOpenDeps {
     url: string,
   ) => Promise<string | null>;
   setViewport: (cdpPort: number, sessionName: string | null) => Promise<unknown>;
-  autoAuth?: AutoAuthDeps;
+  afterOpen: (
+    url: string,
+    recordedId: string | null,
+    cdpPort: number,
+    sessionName: string | null,
+  ) => Promise<void>;
 }
 
 export interface AutoAuthDeps {
-  env: { CLERK_SECRET_KEY?: string };
   authStatus: (opts: { port: number; sessionId: string; appBaseUrl: string }) => Promise<AuthStatusResponse>;
   authLogin: (req: AuthLoginRequest, opts: { timeoutMs: number }) => Promise<AuthLoginResponse>;
   navigate: (cdpPort: number, sessionName: string | null, url: string) => Promise<unknown>;
@@ -1320,11 +1322,8 @@ export interface AutoAuthDeps {
 export const AUTO_AUTH_LOGIN_TIMEOUT_MS = 30_000;
 
 const DEFAULT_AUTO_AUTH_DEPS: AutoAuthDeps = {
-  get env() {
-    return { CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY };
-  },
-  authStatus: (opts) => rpc.authStatus(opts),
-  authLogin: (req, opts) => rpc.authLogin(req, opts),
+  authStatus: rpc.authStatus,
+  authLogin: rpc.authLogin,
   navigate: (cdpPort, sessionName, url) => runAgentBrowser(cdpPort, sessionName, ["open", url]),
 };
 
@@ -1334,12 +1333,12 @@ const DEFAULT_AUTO_AUTH_DEPS: AutoAuthDeps = {
  * the login drives the browser's focused target, which is only provably this
  * session's tab when its creation was recorded. Never throws.
  */
-async function autoAuthAfterOpen(
+export async function autoAuthAfterOpen(
   url: string,
   recordedId: string | null,
   cdpPort: number,
   sessionName: string | null,
-  deps: AutoAuthDeps,
+  deps: AutoAuthDeps = DEFAULT_AUTO_AUTH_DEPS,
 ): Promise<void> {
   const appBaseUrl = autoAuthOrigin(url);
   if (!appBaseUrl) return;
@@ -1347,40 +1346,31 @@ async function autoAuthAfterOpen(
     stderr(`ab: could not confirm this session's tab, so skipped auto-login to ${appBaseUrl}; run \`ab reauth\` if you see a login screen`);
     return;
   }
-  const sessionId = sessionName ?? "default";
-  const secretKey = deps.env.CLERK_SECRET_KEY;
+  const request = loginRequest(cdpPort, sessionName, appBaseUrl);
   try {
-    const status = await deps.authStatus({ port: cdpPort, sessionId, appBaseUrl });
-    const decision = decideAutoAuth({ url, env: deps.env, status });
-    if (decision.kind === "skip") {
-      if (decision.reason === "no-key") {
-        stderr(`ab: not logged in to ${appBaseUrl}; run \`ab reauth\` from a directory whose env has CLERK_SECRET_KEY`);
-      }
+    const status = await deps.authStatus({ port: cdpPort, sessionId: request.sessionId, appBaseUrl });
+    const verdict = needsLogin(status, { CLERK_SECRET_KEY: request.clerkSecretKey });
+    if (verdict === "skip") return;
+    if (verdict === "no-key") {
+      stderr(`ab: not logged in to ${appBaseUrl}; run \`ab reauth\` from a directory whose env has CLERK_SECRET_KEY`);
       return;
     }
-    const result = await deps.authLogin(
-      {
-        sessionId,
-        port: cdpPort,
-        email: DEFAULT_AUTH_EMAIL,
-        appBaseUrl: decision.appBaseUrl,
-        clerkSecretKey: secretKey,
-      },
-      { timeoutMs: AUTO_AUTH_LOGIN_TIMEOUT_MS },
-    );
+    const result = await deps.authLogin(request, { timeoutMs: AUTO_AUTH_LOGIN_TIMEOUT_MS });
     if (!result.ok) {
-      stderr(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(result.error ?? "unknown error", [secretKey])})`);
+      stderr(`ab: auto-login to ${appBaseUrl} failed (${result.error ?? "unknown error"})`);
       return;
     }
     await deps.navigate(cdpPort, sessionName, url);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    stderr(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(message, [secretKey])})`);
+    // A transport error can echo the request body, which holds the key.
+    stderr(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(message, [request.clerkSecretKey])})`);
   }
 }
 
 const DEFAULT_CMD_OPEN_DEPS: CmdOpenDeps = {
-  autoAuth: DEFAULT_AUTO_AUTH_DEPS,
+  afterOpen: (url, recordedId, cdpPort, sessionName) =>
+    autoAuthAfterOpen(url, recordedId, cdpPort, sessionName),
   openTab: (sessionPid, cdpPort, sessionName, url) =>
     openTabAndRecordTarget(sessionPid, cdpPort, sessionName, url),
   setViewport: (cdpPort, sessionName) =>
@@ -1416,7 +1406,7 @@ export async function cmdOpen(
   if (recordedId !== null && process.env.AB_VIEWPORT !== "skip") {
     await deps.setViewport(cdpPort, sessionName);
   }
-  if (deps.autoAuth) await autoAuthAfterOpen(url, recordedId, cdpPort, sessionName, deps.autoAuth);
+  await deps.afterOpen(url, recordedId, cdpPort, sessionName);
   return 0;
 }
 
@@ -1468,10 +1458,8 @@ export async function cmdImport(overrides: Partial<ImportDeps> = {}): Promise<nu
   // Pinning appBaseUrl to the browser's own origin makes the daemon's
   // already-authenticated shortcut match, so import never mints.
   const authResult = await rpc.authLogin({
-    sessionId: "import",
-    port: result.port,
-    email: DEFAULT_AUTH_EMAIL,
-    appBaseUrl: new URL(browserUrl).origin,
+    ...loginRequest(result.port, "import", new URL(browserUrl).origin),
+    clerkSecretKey: undefined,
   });
 
   if (authResult.ok) {

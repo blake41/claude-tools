@@ -550,6 +550,7 @@ describe("cmdOpen viewport gating", () => {
     const deps: CmdOpenDeps = {
       openTab: async () => null, // simulates F2: tab-new failed / ambiguous
       setViewport: async (port) => { viewportCalls.push(port); },
+      afterOpen: async () => {},
     };
     const code = await cmdOpen("http://x/", 9333, "ab-pid-cmdopen-1", "pid-cmdopen-1", deps);
     expect(code).toBe(0);
@@ -562,6 +563,7 @@ describe("cmdOpen viewport gating", () => {
     const deps: CmdOpenDeps = {
       openTab: async () => "NEW001",
       setViewport: async (port) => { viewportCalls.push(port); },
+      afterOpen: async () => {},
     };
     const code = await cmdOpen("http://x/", 9333, "ab-pid-cmdopen-2", "pid-cmdopen-2", deps);
     expect(code).toBe(0);
@@ -574,6 +576,7 @@ describe("cmdOpen viewport gating", () => {
     const deps: CmdOpenDeps = {
       openTab: async () => "NEW001",
       setViewport: async (port) => { viewportCalls.push(port); },
+      afterOpen: async () => {},
     };
     const code = await cmdOpen("http://x/", 9333, "ab-pid-cmdopen-3", "pid-cmdopen-3", deps);
     expect(code).toBe(0);
