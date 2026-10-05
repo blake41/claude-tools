@@ -311,6 +311,10 @@ export async function authenticate(
   // must not skip auth for worktree-B. We compare the browser URL's origin
   // against the target appBaseUrl origin. When no appBaseUrl is provided, the
   // target is localhost:5173 (the DEFAULT_AUTH_APP_BASE), so we check that.
+  //
+  // The URL alone proves nothing: a fresh load of the app origin reads as
+  // authenticated until the app redirects to /sign-in. Only the Clerk session
+  // cookie skips the login.
   // -----------------------------------------------------------------------
 
   const urlResult = await step((ms) => runAgentBrowser(sessionId, port, ["get", "url"], ms));
@@ -319,21 +323,29 @@ export async function authenticate(
     const browserOrigin = originOfUrl(urlResult.stdout);
 
     if (browserOrigin === appOrigin) {
-      log.info("Browser already on authenticated page for same origin — skipping login", {
+      const hasSession = await step((ms) => confirmClerkSession(sessionId, port, appOrigin, ms));
+      if (hasSession === null) return timedOut();
+      if (hasSession) {
+        log.info("Browser already holds a Clerk session for the same origin — skipping login", {
+          url: urlResult.stdout,
+          targetOrigin: appOrigin,
+        });
+        authState = {
+          user: authState.user, // preserve existing user info
+          timestamp: Date.now(),
+        };
+        return { ok: true, user: authState.user ?? undefined };
+      }
+      log.info("Browser is on the app origin without a Clerk session — proceeding with login", {
         url: urlResult.stdout,
         targetOrigin: appOrigin,
       });
-      authState = {
-        user: authState.user, // preserve existing user info
-        timestamp: Date.now(),
-      };
-      return { ok: true, user: authState.user ?? undefined };
+    } else {
+      log.info("Browser is authenticated but on a different origin — proceeding with login", {
+        browserOrigin,
+        targetOrigin: appOrigin,
+      });
     }
-
-    log.info("Browser is authenticated but on a different origin — proceeding with login", {
-      browserOrigin,
-      targetOrigin: appOrigin,
-    });
   }
 
   // -----------------------------------------------------------------------
