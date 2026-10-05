@@ -109,6 +109,9 @@ function installMocks(): void {
         kill: mock(() => {}),
       };
     }
+    if (cmd[0] === "agent-browser") {
+      return { pid: -1, exitCode: 0, exited: Promise.resolve(0), stdout: null, stderr: null, kill: mock(() => {}) };
+    }
     if (cmd[0] === "/usr/sbin/lsof") {
       // getListeningPid reads `new Response(proc.stdout).text()` — needs a real stream.
       const body = listeningPid === null ? "" : `${listeningPid}\n`;
