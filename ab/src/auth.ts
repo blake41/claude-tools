@@ -11,6 +11,7 @@
 
 import type { ClerkClient } from "@clerk/backend";
 import { Logger } from "./logger";
+import { authLoginDeadline } from "./config";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "./types";
 
 const log = new Logger({ component: "auth" });
@@ -46,7 +47,12 @@ export type AgentTaskClient = Pick<ClerkClient, "agentTasks">;
 
 export interface AuthenticateDeps {
   createClerkClient: (secretKey: string) => AgentTaskClient | Promise<AgentTaskClient>;
-  pollTimeoutMs?: number;
+  /**
+   * Absolute epoch-ms cutoff for the whole flow. Past it, authenticate()
+   * returns a timeout failure and never sets authState. Defaults to the
+   * daemon's login budget measured from the call.
+   */
+  deadline?: number;
   pollIntervalMs?: number;
 }
 
@@ -86,11 +92,19 @@ function redactSecrets(text: string, secrets: Array<string | undefined>): string
 // Helpers
 // ---------------------------------------------------------------------------
 
+const NAV_STDERR_TAIL_CHARS = 400;
+/** Per-call agent-browser cap; every call in the login flow is also capped at the time left. */
+const STEP_TIMEOUT_MS = 15_000;
+
+function tail(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : text.slice(-maxChars);
+}
+
 async function runAgentBrowser(
   sessionId: string,
   port: number,
   args: string[],
-  timeoutMs = 15_000,
+  timeoutMs = STEP_TIMEOUT_MS,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   const proc = Bun.spawn(
     ["agent-browser", "--session", sessionId, "--cdp", String(port), ...args],
@@ -176,8 +190,13 @@ export function hasClerkSessionCookie(cookies: unknown, appHost: string): boolea
   });
 }
 
-async function confirmClerkSession(sessionId: string, port: number, appOrigin: string): Promise<boolean> {
-  const result = await runAgentBrowser(sessionId, port, ["cookies", "get", "--json"]);
+async function confirmClerkSession(
+  sessionId: string,
+  port: number,
+  appOrigin: string,
+  timeoutMs = STEP_TIMEOUT_MS,
+): Promise<boolean> {
+  const result = await runAgentBrowser(sessionId, port, ["cookies", "get", "--json"], timeoutMs);
   if (!result.ok) {
     log.warn("Could not read browser cookies to confirm the Clerk session");
     return false;
@@ -211,7 +230,7 @@ export async function authenticate(
   req: AuthLoginRequest,
   deps: Partial<AuthenticateDeps> = {},
 ): Promise<AuthLoginResponse> {
-  const { createClerkClient, pollTimeoutMs = 15_000, pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
+  const { createClerkClient, deadline = authLoginDeadline(Date.now()), pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
   const { sessionId, port } = req;
   const appBaseUrl = req.appBaseUrl || DEFAULT_APP_BASE;
   const email = req.email;
@@ -315,41 +334,42 @@ export async function authenticate(
   // Step 3: Open the one-time Clerk-hosted URL (never logged)
   // -----------------------------------------------------------------------
 
-  const secrets = [secretKey, taskUrl, ticketOf(taskUrl)];
-  const navResult = await runAgentBrowser(sessionId, port, ["open", taskUrl]);
-  if (!navResult.ok) {
-    log.error("Navigation failed", { stderr: redactSecrets(navResult.stderr, secrets) });
-    return { ok: false, error: "Auth exchange failed: browser navigation error" };
-  }
-
-  // -----------------------------------------------------------------------
-  // Step 4: Wait for network idle
-  // -----------------------------------------------------------------------
-
-  const waitResult = await runAgentBrowser(sessionId, port, ["wait", "--load", "networkidle"], 30_000);
-  if (!waitResult.ok) {
-    log.warn("Wait for networkidle returned non-zero", { stderr: redactSecrets(waitResult.stderr, secrets) });
-    // Continue anyway — the page may have loaded fine
-  }
-
-  // -----------------------------------------------------------------------
-  // Step 5: Poll until the browser lands on the app origin, has left
-  // Clerk-hosted / sign-in pages, and holds a Clerk session cookie
-  // -----------------------------------------------------------------------
-
   let appOrigin: string;
   try {
     appOrigin = new URL(appBaseUrl).origin;
   } catch {
     appOrigin = appBaseUrl;
   }
+  const timeLeft = () => deadline - Date.now();
+  const timedOut = (): AuthLoginResponse => {
+    log.error("Browser did not land on the app origin before the deadline", { appOrigin });
+    return {
+      ok: false,
+      error: `Auth exchange timed out: browser did not land on ${appOrigin}. The Agent Task URL is one-time, so retry the reauth.`,
+    };
+  };
 
-  const pollDeadline = Date.now() + pollTimeoutMs;
+  if (timeLeft() <= 0) return timedOut();
+  const secrets = [secretKey, taskUrl, ticketOf(taskUrl)];
+  const navResult = await runAgentBrowser(sessionId, port, ["open", taskUrl], Math.min(STEP_TIMEOUT_MS, timeLeft()));
+  if (!navResult.ok) {
+    if (timeLeft() <= 0) return timedOut();
+    const stderr = redactSecrets(navResult.stderr, secrets);
+    log.error("Navigation failed", { stderr });
+    return { ok: false, error: `Auth exchange failed: ${tail(stderr, NAV_STDERR_TAIL_CHARS) || "browser navigation error"}` };
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 4: Poll until the browser lands on the app origin, has left
+  // Clerk-hosted / sign-in pages, and holds a Clerk session cookie
+  // -----------------------------------------------------------------------
+
   let landed = false;
   let landedWithoutSession = false;
-  while (Date.now() < pollDeadline) {
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
-    const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, Math.min(pollIntervalMs, Math.max(0, timeLeft()))));
+    if (timeLeft() <= 0) break;
+    const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"], Math.min(STEP_TIMEOUT_MS, timeLeft()));
     if (!verifyResult.ok) {
       log.warn("Could not read browser URL during poll");
       continue;
@@ -359,7 +379,8 @@ export async function authenticate(
       origin = new URL(verifyResult.stdout).origin;
     } catch { /* not a URL yet */ }
     if (origin === appOrigin && !verifyResult.stdout.includes("/sign-in")) {
-      if (await confirmClerkSession(sessionId, port, appOrigin)) {
+      if (timeLeft() <= 0) break;
+      if (await confirmClerkSession(sessionId, port, appOrigin, Math.min(STEP_TIMEOUT_MS, timeLeft()))) {
         landed = true;
         landedWithoutSession = false;
         log.info("Auth exchange succeeded", { origin });
@@ -379,16 +400,14 @@ export async function authenticate(
     };
   }
 
-  if (!landed) {
-    log.error("Browser did not land on the app origin", { appOrigin, timeoutMs: pollTimeoutMs });
-    return {
-      ok: false,
-      error: `Auth exchange timed out: browser did not land on ${appOrigin}. The Agent Task URL is one-time, so retry the reauth.`,
-    };
-  }
+  if (!landed) return timedOut();
+
+  // The handler's withTimeout fires after `deadline`. A landing confirmed past
+  // it may already have been reported to the CLI as a failure: do not record it.
+  if (timeLeft() <= 0) return timedOut();
 
   // -----------------------------------------------------------------------
-  // Step 6: Update in-memory auth state
+  // Step 5: Update in-memory auth state
   // -----------------------------------------------------------------------
 
   const user = { email };

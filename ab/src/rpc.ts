@@ -6,6 +6,7 @@
  */
 
 import { SOCKET_PATH } from "./server";
+import { AUTH_LOGIN_CLIENT_TIMEOUT_MS } from "./config";
 import type {
   StatusResponse,
   HealthResponse,
@@ -26,7 +27,8 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 const SLOW_ROUTES: Record<string, number> = {
   "/chrome/ensure": 30_000,
   "/chrome/ensure-headed": 30_000,
-  "/auth/login": 30_000,
+  // Longer than the daemon's handler budget, so the CLI never gives up first.
+  "/auth/login": AUTH_LOGIN_CLIENT_TIMEOUT_MS,
   "/heal": 30_000,
 };
 
