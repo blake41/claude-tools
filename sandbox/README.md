@@ -19,6 +19,8 @@ Network is unrestricted. Claude runs as your user with full Keychain access.
 |------|----------|---------|
 | `claude-sandbox` | `~/.local/bin/claude-sandbox` (symlink) | Seatbelt/bwrap sandbox launcher |
 | `sandbox-request` | `~/.local/bin/sandbox-request` (symlink) | Request sandbox expansion from inside a session |
+| `cco-cmux-claude` | `~/.local/bin/cco-cmux-claude` (symlink) | cmux's claude wrapper with the `--resume` transcript lookup fixed |
+| `cco-claude-shim` | `~/.local/bin/cco-claude-shim` (symlink) | Routes cmux auto-resume into the fish `claude()` interceptor |
 | `dirs` | `tools/sandbox/dirs` (this directory) | Write allowlist |
 
 ## Dirs file format
@@ -42,6 +44,14 @@ Suffix `:ro` for read-only, `:rw` or no suffix for read-write. Lines starting wi
 4. Adding `~/.claude` and `~/.claude.json` as always-writable
 5. Calling `claude-sandbox -- claude --dangerously-skip-permissions`
 6. Expansion loop (see below)
+
+## Fast resume inside cmux
+
+cmux's `cmux-claude-wrapper` checks `--resume <id>` by expanding five deep globs over `~/.claude/projects` in one `for` list, so every resume walks the whole tree (1-4s). Inside cmux, `cco-permissions` launches `cco-cmux-claude` instead of `claude`. It patches that one loop in memory (~50ms), runs the patched text with `$0` set to the real wrapper, and falls back to cmux's stock shim if the wrapper changed. Nothing is written to disk and `/Applications/cmux.app` is not touched.
+
+`CCO_FASTWRAP_DISABLE=1` forces the stock path. `cco-claude-shim` starts its inner fish with `--no-config` and sources only `cco-permissions.fish`.
+
+Startup trace: `CCO_STARTUP_TRACE=1` appends `<epoch> <session-id> enter|exec|wrapper-done` lines to `/tmp/cco-startup-trace.log`. To also see claude's own boot, add a `SessionStart` hook and a `UserPromptSubmit` hook that each run `echo "$(perl -MTime::HiRes=time -e 'printf q(%.3f), time') $CCO_SESSION_ID session-start" >> /tmp/cco-startup-trace.log` (use `prompt-submit` for the second).
 
 ## Sandbox expansion
 

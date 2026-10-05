@@ -14,6 +14,12 @@
 #                   usual CCO_SESSION_ID / cmux auto-resume / browser preflight
 #                   still in place. Use when the sandbox is getting in the way
 #                   of an exploratory session.
+#
+# Env (optional):
+#   CCO_FASTWRAP_DISABLE=1  Launch through cmux's stock claude shim instead of
+#                           cco-cmux-claude.
+#   CCO_STARTUP_TRACE=1     Append startup timestamps to /tmp/cco-startup-trace.log
+#                           (see __cco_trace).
 
 function cco-permissions
     # Pull out our own flags before touching $argv further.
@@ -47,6 +53,8 @@ function cco-permissions
         set session_id (head -c 4 /dev/urandom | xxd -p)
     end
 
+    __cco_trace $session_id enter
+
     # Ensure browser is ready before entering sandbox
     if command -q ab
         if not ab ensure
@@ -72,6 +80,13 @@ function cco-permissions
         set -x PATH $HOME/.local/bin $PATH
     end
 
+    # Inside cmux, launch through cco-cmux-claude: cmux's claude wrapper with the
+    # --resume transcript lookup fixed. It falls back to the stock shim by itself.
+    set -l claude_cmd claude
+    if set -q CMUX_SURFACE_ID; and command -q cco-cmux-claude
+        set claude_cmd cco-cmux-claude
+    end
+
     # --no-sandbox: skip Seatbelt + the expansion loop entirely.
     # Everything else (CCO_SESSION_ID, auto-resume, --dangerously-skip-permissions)
     # stays in place.
@@ -84,7 +99,8 @@ function cco-permissions
         # `claude` would re-enter it (CMUX_SURFACE_ID + --resume) and recurse
         # through cco-permissions forever. The sandboxed path is immune only
         # because claude-sandbox execvp's the binary directly.
-        command claude --dangerously-skip-permissions $extra_args $argv
+        __cco_trace $session_id exec
+        command $claude_cmd --dangerously-skip-permissions $extra_args $argv
         set -e CCO_SESSION_ID
         set -e CCO_SANDBOX_OFF
         return
@@ -113,7 +129,8 @@ function cco-permissions
     set -l session_extra_args
 
     while true
-        claude-sandbox $sandbox_args $session_extra_args -- claude --dangerously-skip-permissions $extra_args $argv
+        __cco_trace $session_id exec
+        claude-sandbox $sandbox_args $session_extra_args -- $claude_cmd --dangerously-skip-permissions $extra_args $argv
 
         # Check for sandbox expansion requests
         set -l request_file /tmp/sandbox-expand-request-$session_id
@@ -176,6 +193,14 @@ function cco-permissions
     end
 
     set -e CCO_SESSION_ID
+end
+
+# Opt-in startup trace (CCO_STARTUP_TRACE=1): "<epoch> <session-id> <point>" lines in
+# /tmp/cco-startup-trace.log. Points: enter, exec (just before claude launches),
+# wrapper-done (written by cco-cmux-claude when cmux's wrapper execs claude).
+function __cco_trace --argument-names session_id point
+    test -n "$CCO_STARTUP_TRACE"; or return 0
+    printf '%s %s %s\n' (/usr/bin/perl -MTime::HiRes=time -e 'printf q(%.3f), time') $session_id $point >>/tmp/cco-startup-trace.log 2>/dev/null
 end
 
 # Intercept `claude --resume <id>` typed by cmux's autoResumeAgentSessions so
