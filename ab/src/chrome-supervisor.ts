@@ -19,7 +19,7 @@ import {
   markIdle,
 } from "./state";
 import { Logger, withOpId, newOpId } from "./logger";
-import { classifyOccupant, getListeningPid, readCommandLine } from "./chrome-occupant";
+import { classifyOccupant, getListeningPid, readCommandLine, type OccupantClass } from "./chrome-occupant";
 
 const log = new Logger({ component: "chrome" });
 
@@ -787,8 +787,9 @@ async function clearOccupantOrRefuse(
   const config = CONFIGS[target];
   const rt = runtime[target];
 
-  const cmdline = pid === rt.lastSpawnedPid ? null : await readCommandLine(pid);
-  const occupant = classifyOccupant({ pid, lastSpawnedPid: rt.lastSpawnedPid, cmdline, profilePath: config.profilePath });
+  const occupant: OccupantClass = pid === rt.lastSpawnedPid
+    ? { kind: "ours" }
+    : classifyOccupant({ cmdline: await readCommandLine(pid), profilePath: config.profilePath });
   switch (occupant.kind) {
     case "ours":
       await killOccupant(target, pid, killReason, "our own Chrome");

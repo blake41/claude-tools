@@ -68,15 +68,15 @@ export type OccupantClass =
   | { kind: "own-profile" }
   | { kind: "foreign"; detail: string };
 
-/** `cmdline` is null when it was not read or could not be read. */
+/**
+ * Classify a port holder this daemon did not spawn. `cmdline` is null only
+ * when it could not be read.
+ */
 export function classifyOccupant(input: {
-  pid: number;
-  lastSpawnedPid: number | null;
   cmdline: string | null;
   profilePath: string;
-}): OccupantClass {
-  const { pid, lastSpawnedPid, cmdline, profilePath } = input;
-  if (pid === lastSpawnedPid) return { kind: "ours" };
+}): Exclude<OccupantClass, { kind: "ours" }> {
+  const { cmdline, profilePath } = input;
   if (cmdline === null) return { kind: "foreign", detail: "command line unreadable" };
   if (commandLineUsesProfile(cmdline, profilePath)) return { kind: "own-profile" };
   const userDataDir = /--user-data-dir=(\S+)/.exec(cmdline)?.[1] ?? "none";

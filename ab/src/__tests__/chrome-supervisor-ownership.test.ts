@@ -452,14 +452,12 @@ describe("commandLineUsesProfile", () => {
 describe("classifyOccupant", () => {
   const profilePath = "/Users/x/.agent-browser/profile";
   test.each([
-    ["our last spawned pid, command line not read", { pid: 7, lastSpawnedPid: 7, cmdline: null }, { kind: "ours" }],
-    ["our last spawned pid wins even with a foreign command line", { pid: 7, lastSpawnedPid: 7, cmdline: "Chrome --user-data-dir=/elsewhere" }, { kind: "ours" }],
-    ["this target's own profile", { pid: 8, lastSpawnedPid: 7, cmdline: `Chrome --user-data-dir=${profilePath} --headless=new` }, { kind: "own-profile" }],
-    ["unreadable command line", { pid: 8, lastSpawnedPid: null, cmdline: null }, { kind: "foreign", detail: "command line unreadable" }],
-    ["another profile", { pid: 8, lastSpawnedPid: 7, cmdline: `Chrome --user-data-dir=${profilePath}-1` }, { kind: "foreign", detail: `--user-data-dir ${profilePath}-1 is not this target's profile ${profilePath}` }],
-    ["no --user-data-dir at all", { pid: 8, lastSpawnedPid: 7, cmdline: "Chrome --headless=new" }, { kind: "foreign", detail: `--user-data-dir none is not this target's profile ${profilePath}` }],
-  ] as const)("%s", async (_name, input, expected) => {
+    ["this target's own profile", `Chrome --user-data-dir=${profilePath} --headless=new`, { kind: "own-profile" }],
+    ["unreadable command line", null, { kind: "foreign", detail: "command line unreadable" }],
+    ["another profile", `Chrome --user-data-dir=${profilePath}-1`, { kind: "foreign", detail: `--user-data-dir ${profilePath}-1 is not this target's profile ${profilePath}` }],
+    ["no --user-data-dir at all", "Chrome --headless=new", { kind: "foreign", detail: `--user-data-dir none is not this target's profile ${profilePath}` }],
+  ] as const)("%s", async (_name, cmdline, expected) => {
     const { classifyOccupant } = await import("../chrome-occupant");
-    expect(classifyOccupant({ ...input, profilePath })).toEqual(expected);
+    expect(classifyOccupant({ cmdline, profilePath })).toEqual(expected);
   });
 });
