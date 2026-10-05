@@ -11,7 +11,6 @@ const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "ab-cdp-timeout-"));
 process.env.AB_PROFILE_ROOT = TMP_ROOT;
 process.env.AB_BACKOFF_INITIAL_MS = "5000";
 process.env.AB_BACKOFF_MAX_MS = "20000";
-process.env.AB_CDP_READY_TIMEOUT_MS = "50";
 
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { resetAll } from "../state";
@@ -20,6 +19,7 @@ const originalFetch = globalThis.fetch;
 const originalSpawn = Bun.spawn;
 
 beforeEach(() => {
+  process.env.AB_CDP_READY_TIMEOUT_MS = "50";
   resetAll();
   globalThis.fetch = mock(() => Promise.resolve(new Response("", { status: 404 }))) as unknown as typeof fetch;
   const proc = {
@@ -36,6 +36,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  delete process.env.AB_CDP_READY_TIMEOUT_MS;
   const { __resetRuntimeForTest } = await import("../chrome-supervisor");
   __resetRuntimeForTest();
   globalThis.fetch = originalFetch;
