@@ -17,7 +17,7 @@ import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
 import { authenticate, getAuthStatus, DEFAULT_AUTH_APP_BASE } from "./auth";
-import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, authLoginDeadline } from "./config";
+import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE, authLoginDeadline } from "./config";
 import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
 import type {
@@ -29,7 +29,7 @@ import type {
   ChromeState,
   AuthStatusResponse,
 } from "./types";
-import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS, headlessTarget } from "./types";
+import { HEADLESS_TARGETS, headlessTarget } from "./types";
 
 const log = new Logger({ component: "daemon" });
 

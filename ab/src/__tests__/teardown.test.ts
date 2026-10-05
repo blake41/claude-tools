@@ -36,7 +36,7 @@ import {
   sessionFilePath,
   teardownSession,
 } from "../cli";
-import { HEADLESS_POOL_SIZE } from "../types";
+import { HEADLESS_POOL_SIZE } from "../config";
 
 // ---------------------------------------------------------------------------
 // Local CDP fake — a real HTTP server on an ephemeral port, so the helpers'

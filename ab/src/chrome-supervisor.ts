@@ -9,8 +9,8 @@
 import * as path from "path";
 import { existsSync, unlinkSync, rmSync, mkdirSync, readdirSync } from "fs";
 import type { ChromeConfig, ChromePolicy, ChromeTarget, DetectionReason, HeartbeatMode, ShardDiagnostics } from "./types";
-import { ALL_TARGETS, HEADLESS_POOL_SIZE, headlessTarget } from "./types";
-import { DASHBOARD_PORT, HEADED_PORT, headlessPortForShard } from "./config";
+import { ALL_TARGETS, headlessTarget } from "./types";
+import { DASHBOARD_PORT, HEADED_PORT, HEADLESS_POOL_SIZE, headlessPortForShard } from "./config";
 import {
   getState,
   markLaunching,
@@ -177,18 +177,25 @@ const opQueue = new SerialQueue();
 // ---------------------------------------------------------------------------
 
 interface TargetRuntime {
-  proc: ReturnType<typeof Bun.spawn> | null;
-  /** PID of an adopted Chrome we don't own the process handle for */
-  adoptedPid: number | null;
   /**
-   * True only when THIS daemon spawned the current Chrome process (launchChrome's
-   * Bun.spawn). False for an adopted Chrome (another daemon's, or one left over
-   * from a previous run) and when no Chrome is tracked. Teardown and crash paths
-   * never signal a Chrome with owned === false — they only drop their state.
+   * Handle of the Chrome this daemon spawned for the target, or null. Only a
+   * Chrome with a handle is ever signalled by teardown and crash paths.
+   */
+  proc: ReturnType<typeof Bun.spawn> | null;
+  /**
+   * PID of an adopted Chrome (another daemon's, or one left over from a
+   * previous run). Never signalled: teardown and crash paths only drop it.
    * Without this rule a second daemon (e.g. a test daemon on the same ports)
    * adopted the live daemon's Chrome and SIGKILLed it on shutdown.
    */
-  owned: boolean;
+  adoptedPid: number | null;
+  /**
+   * PID of the last Chrome this daemon spawned for the target. Outlives `proc`
+   * (a lost handle, an exit that left the port bound) so launchChrome can
+   * still recognize that occupant as ours. Cleared once the port is
+   * confirmed free.
+   */
+  lastSpawnedPid: number | null;
   /**
    * The last time launchChrome found our port held by a PID this daemon did
    * not spawn and refused to signal it. Cleared on the next successful
@@ -286,19 +293,11 @@ function buildRuntime(): Record<ChromeTarget, TargetRuntime> {
 
 const runtime: Record<ChromeTarget, TargetRuntime> = buildRuntime();
 
-/**
- * Every Chrome PID this daemon process has spawned, for its whole lifetime.
- * launchChrome's port-occupant branches may SIGKILL a PID only if it is in
- * this set (e.g. our own Chrome we lost the handle to). A PID outside it
- * belongs to someone else and is never signalled.
- */
-const spawnedPids = new Set<number>();
-
 function freshRuntime(): TargetRuntime {
   return {
     proc: null,
     adoptedPid: null,
-    owned: false,
+    lastSpawnedPid: null,
     lastPortConflict: null,
     healthTimer: null,
     consecutiveFailures: 0,
@@ -340,7 +339,7 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
       ...(state.phase === "chrome_crashed" ? { exitCode: state.exitCode } : {}),
       procPid: rt.proc?.pid ?? null,
       adoptedPid: rt.adoptedPid,
-      owned: rt.owned,
+      lastSpawnedPid: rt.lastSpawnedPid,
       lastPortConflict:
         rt.lastPortConflict !== null ? { ...rt.lastPortConflict, at: new Date(rt.lastPortConflict.at).toISOString() } : null,
       consecutiveFailures: rt.consecutiveFailures,
@@ -528,47 +527,49 @@ export async function kill(target: ChromeTarget): Promise<void> {
   ) as Promise<void>;
 }
 
+/**
+ * Drop our hold on an adopted Chrome without signalling it. Leaves its
+ * SingletonLock alone: the adopted Chrome may still be using that profile,
+ * and removing its lock invites a second Chrome onto the same profile.
+ */
+function releaseAdopted(target: ChromeTarget, reason: string): void {
+  const rt = runtime[target];
+  if (rt.adoptedPid) {
+    log.info(`[${target}] Releasing adopted Chrome (PID ${rt.adoptedPid}) — not spawned by this daemon, not signalling`, {
+      reason,
+    });
+  }
+  rt.adoptedPid = null;
+}
+
 async function doKill(target: ChromeTarget): Promise<void> {
   const rt = runtime[target];
   const config = CONFIGS[target];
   clearTimers(target);
 
-  if (!rt.owned) {
-    // Not spawned by this daemon (adopted, or nothing tracked): drop our
-    // state only. Never signal it, and leave its SingletonLock alone — the
-    // adopted Chrome may still be using that profile, and removing its lock
-    // invites a second Chrome onto the same profile.
-    if (rt.adoptedPid) {
-      log.info(`[${target}] Releasing adopted Chrome (PID ${rt.adoptedPid}) — not spawned by this daemon, not signalling`, {
-        reason: "kill() requested",
-      });
-    }
-    rt.adoptedPid = null;
-    rt.proc = null;
+  const proc = rt.proc; // Capture before await — handleExit may null rt.proc
+  if (!proc) {
+    releaseAdopted(target, "kill() requested");
     if (getState(target).phase !== "idle") {
       markIdle(target);
     }
     return;
   }
 
-  if (rt.proc) {
-    const proc = rt.proc; // Capture before await — handleExit may null rt.proc
-    log.info(`[${target}] Killing Chrome (PID ${proc.pid})`, { killedBy: "supervisor", reason: "kill() requested" });
-    proc.kill();
-    // Wait for process exit (up to 5s)
-    await Promise.race([proc.exited, sleep(5_000)]);
-    // If Chrome didn't exit gracefully, escalate to SIGKILL
-    if (proc.exitCode === null) {
-      log.warn(`[${target}] Chrome did not exit gracefully — sending SIGKILL`, {
-        killedBy: "supervisor",
-        reason: "graceful-exit-timeout",
-      });
-      proc.kill(9); // SIGKILL
-      await Promise.race([proc.exited, sleep(2_000)]);
-    }
-    rt.proc = null;
+  log.info(`[${target}] Killing Chrome (PID ${proc.pid})`, { killedBy: "supervisor", reason: "kill() requested" });
+  proc.kill();
+  // Wait for process exit (up to 5s)
+  await Promise.race([proc.exited, sleep(5_000)]);
+  // If Chrome didn't exit gracefully, escalate to SIGKILL
+  if (proc.exitCode === null) {
+    log.warn(`[${target}] Chrome did not exit gracefully — sending SIGKILL`, {
+      killedBy: "supervisor",
+      reason: "graceful-exit-timeout",
+    });
+    proc.kill(9); // SIGKILL
+    await Promise.race([proc.exited, sleep(2_000)]);
   }
-  rt.owned = false;
+  rt.proc = null;
 
   // Clean up SingletonLock so next launch doesn't hit SIGTRAP
   const lockPath = path.join(config.profilePath, "SingletonLock");
@@ -680,8 +681,8 @@ const OCCUPANT_CDP_WAIT_MS = 5_000;
 
 /**
  * Adopt the Chrome already listening on `target`'s port. It was not spawned
- * by this daemon, so `owned` is false: teardown and crash handling will
- * release it, never signal it.
+ * by this daemon, so there is no process handle: teardown and crash handling
+ * will release it, never signal it.
  */
 function adoptChrome(
   target: ChromeTarget,
@@ -690,10 +691,9 @@ function adoptChrome(
 ): { pid: number; port: number; profileFresh: boolean } {
   const config = CONFIGS[target];
   const rt = runtime[target];
-  log.info(`[${target}] Adopting existing Chrome on port ${config.port}`, { pid, owned: false });
+  log.info(`[${target}] Adopting existing Chrome on port ${config.port}`, { pid });
   rt.proc = null; // We don't own the process handle
   rt.adoptedPid = pid;
-  rt.owned = false;
   rt.lastPortConflict = null;
   markUp(target, pid, config.port);
   startHealthCheck(target);
@@ -705,7 +705,7 @@ function adoptChrome(
 
 /**
  * Clear `target`'s port of `pid` so launchChrome can spawn — but only if
- * `pid` is a Chrome this daemon spawned (spawnedPids). Any other PID is
+ * `pid` is the Chrome this daemon last spawned for the target. Any other PID is
  * never signalled: record the conflict, arm a retry window, mark the launch
  * failed, and throw RetryAfterError. A hung occupant we did not spawn
  * therefore keeps the shard down until its owner (or the user) stops it.
@@ -722,7 +722,7 @@ async function killOwnOccupantOrRefuse(
   const config = CONFIGS[target];
   const rt = runtime[target];
 
-  if (spawnedPids.has(pid)) {
+  if (pid === rt.lastSpawnedPid) {
     log.warn(`[${target}] Port ${config.port} occupied by our own Chrome (PID ${pid}) — killing`, {
       killedBy: "supervisor",
       reason: killReason,
@@ -735,7 +735,10 @@ async function killOwnOccupantOrRefuse(
     // Wait up to 3s for the port to free up
     const deadline = Date.now() + 3_000;
     while (Date.now() < deadline) {
-      if (!(await getListeningPid(config.port))) break;
+      if (!(await getListeningPid(config.port))) {
+        rt.lastSpawnedPid = null;
+        break;
+      }
       await sleep(200);
     }
     return;
@@ -786,7 +789,7 @@ async function launchChrome(
   // A Chrome we did not spawn is adopted even at max backoff: we may not
   // signal it, and adopting it lets the stable timer reset backoffMs.
   const inCrashLoop = rt.backoffMs >= BACKOFF_MAX_MS;
-  const shouldAdopt = (pid: number): boolean => !inCrashLoop || !spawnedPids.has(pid);
+  const shouldAdopt = (pid: number): boolean => !inCrashLoop || pid !== rt.lastSpawnedPid;
   const existingCdp = await checkCdp(config.port);
   if (existingCdp) {
     const pid = await getListeningPid(config.port);
@@ -886,8 +889,7 @@ async function launchChrome(
 
   rt.proc = proc;
   rt.adoptedPid = null; // No longer adopted — we own the process
-  rt.owned = true;
-  spawnedPids.add(proc.pid);
+  rt.lastSpawnedPid = proc.pid;
 
   // Watch for unexpected exit
   proc.exited.then(() => {
@@ -923,7 +925,6 @@ async function launchChrome(
     });
     proc.kill();
     rt.proc = null;
-    rt.owned = false;
     bumpBackoffAndRetry(rt);
     markCrashed(target, -1);
     if (CONFIGS[target].policy === "always-on") {
@@ -1593,7 +1594,6 @@ function handleExit(target: ChromeTarget, exitCode: number | null, exitSignal: s
   }
   log.warn(`[${target}] Chrome exited`, diag);
   rt.proc = null;
-  rt.owned = false;
   clearTimers(target);
   markCrashed(target, exitCode ?? -1);
 
@@ -1611,19 +1611,7 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
   rt.lastDetection = { reason, at: Date.now() };
   bumpBackoffAndRetry(rt);
 
-  if (!rt.owned) {
-    // Not spawned by this daemon — drop our state, never signal it. The
-    // restart below (always-on) or the next ensure() relaunches; if the
-    // adopted Chrome is still holding the port, launchChrome's occupant
-    // branch decides what to do.
-    if (rt.adoptedPid) {
-      log.info(`[${target}] Releasing adopted Chrome (PID ${rt.adoptedPid}) — not spawned by this daemon, not signalling`, {
-        reason,
-      });
-    }
-    rt.adoptedPid = null;
-    rt.proc = null;
-  } else if (rt.proc) {
+  if (rt.proc) {
     // Force-kill the unresponsive process we spawned
     const pid = rt.proc.pid;
     rt.proc.kill();
@@ -1632,8 +1620,12 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
       killedBy: "supervisor",
       reason,
     });
+  } else {
+    // The restart below (always-on) or the next ensure() relaunches; if the
+    // adopted Chrome still holds the port, launchChrome's occupant branch
+    // decides what to do.
+    releaseAdopted(target, reason);
   }
-  rt.owned = false;
 
   clearTimers(target);
   markCrashed(target, -1);
@@ -1804,7 +1796,6 @@ export function __resetRuntimeForTest(): void {
     clearTimers(target);
     runtime[target] = freshRuntime();
   }
-  spawnedPids.clear();
 }
 
 /**

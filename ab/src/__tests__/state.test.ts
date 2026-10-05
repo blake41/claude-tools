@@ -16,7 +16,8 @@ import {
   resetAll,
 } from "../state";
 import type { ChromeState } from "../types";
-import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS } from "../types";
+import { HEADLESS_POOL_SIZE } from "../config";
+import { HEADLESS_TARGETS } from "../types";
 
 // Reset before each test to avoid cross-contamination
 beforeEach(() => {
