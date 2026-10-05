@@ -425,10 +425,10 @@ export async function authenticate(
 // ---------------------------------------------------------------------------
 
 /**
- * Reset auth state to defaults. Call when Chrome crashes/restarts
- * so the next agent command triggers a fresh login.
+ * Reset the cached user/lastLogin to defaults. Test-only: `authenticated` is
+ * derived from the cookie jar, so production never needs to reset on crash.
  */
-export function resetAuthState(): void {
+export function __resetAuthStateForTest(): void {
   authState = { authenticated: false, user: null, timestamp: null };
 }
 

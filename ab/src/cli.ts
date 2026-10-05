@@ -17,7 +17,7 @@ import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
 import { isAuthenticatedUrl } from "./auth";
-import type { ChromeState, ShardDiagnostics } from "./types";
+import type { AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
 import { DASHBOARD_PORT, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
 
@@ -837,7 +837,39 @@ export function buildTabCountChecks(tabCounts: Array<number | null>): DoctorChec
   });
 }
 
-async function cmdDoctor(): Promise<number> {
+/**
+ * Build the doctor "terra auth" check from a cookie-backed /auth/status
+ * response. `auth` is null when the target Chrome is not up (nothing to
+ * probe): reported ok-but-unverifiable rather than failed. Tolerates a daemon
+ * that predates the cookie-backed shape (no `port` / `checkedVia`) by
+ * building the detail from optional fields.
+ */
+export function buildAuthCheck(
+  auth: (Pick<AuthStatusResponse, "authenticated"> & Partial<AuthStatusResponse>) | null,
+  probedPort: number | null,
+  targetLabel = "headless-0",
+): DoctorCheck {
+  const label = "terra auth";
+  if (!auth) {
+    return { label, ok: true, detail: `not verifiable — ${targetLabel} Chrome is not up` };
+  }
+  const port = auth.port ?? probedPort;
+  if (!auth.authenticated) {
+    return {
+      label,
+      ok: false,
+      detail: port !== null ? `no Clerk session cookie on port ${port}` : "not authenticated",
+      fix: "ab reauth",
+    };
+  }
+  const who = auth.user?.email || "unknown";
+  const detail = auth.checkedVia === "cookie" && port !== null
+    ? `${who} — Clerk session cookie present on port ${port}`
+    : `${who} — authenticated (last login ${auth.lastLogin ?? "?"}; daemon reports no cookie detail)`;
+  return { label, ok: true, detail, fix: undefined };
+}
+
+async function cmdDoctor(headed = false): Promise<number> {
   const checks: Array<{ label: string; ok: boolean; detail?: string; fix?: string }> = [];
 
   let daemonUp = false;
@@ -881,15 +913,23 @@ async function cmdDoctor(): Promise<number> {
 
   if (daemonUp) {
     try {
-      const auth = await rpc.authStatus();
-      checks.push({
-        label: "terra auth",
-        ok: auth.authenticated,
-        detail: auth.authenticated
-          ? `${auth.user?.email || "unknown"} (last login ${auth.lastLogin ?? "?"})`
-          : "not authenticated",
-        fix: auth.authenticated ? undefined : "ab reauth",
-      });
+      // Doctor is read-only: read the marker's shard (never assign/clamp one),
+      // default shard 0, and probe the port the daemon actually reports up.
+      const shard = headed ? 0 : (readShardAssignment(resolvePid()) ?? 0);
+      const targetLabel = headed ? "headed" : `headless-${shard}`;
+      const port = headed
+        ? (status?.headed.phase === "chrome_up" ? status.headed.port : null)
+        : portForShard(status?.headlessPool, shard, status?.headless);
+      if (port === null) {
+        checks.push(buildAuthCheck(null, null, targetLabel));
+      } else {
+        const auth = await rpc.authStatus({
+          port,
+          sessionId: buildSessionName(),
+          appBaseUrl: process.env.AB_APP_BASE_URL,
+        });
+        checks.push(buildAuthCheck(auth, port, targetLabel));
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       checks.push({ label: "terra auth", ok: false, detail: msg, fix: "ab reauth" });
@@ -2337,7 +2377,7 @@ async function main(): Promise<number> {
 
     // -- Daemon lifecycle --
     if (command === "status") return await cmdStatus();
-    if (command === "doctor") return await cmdDoctor();
+    if (command === "doctor") return await cmdDoctor(flags.headed);
     if (command === "ensure") return await cmdEnsure(flags.headed);
     if (command === "heal") return await cmdHeal();
     if (command === "reauth") return await cmdReauth(rest, cdpPort, sessionName);

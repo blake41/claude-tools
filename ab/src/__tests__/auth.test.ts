@@ -6,7 +6,7 @@
  */
 import { test, expect, describe, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fs from "fs";
-import { resetAuthState, getAuthStatus, authenticate, isAuthenticatedUrl } from "../auth";
+import { __resetAuthStateForTest, getAuthStatus, authenticate, isAuthenticatedUrl } from "../auth";
 import type { AgentTaskClient } from "../auth";
 import { getRecentLogs } from "../logger";
 import type { AuthLoginResponse, AuthStatusResponse } from "../types";
@@ -25,7 +25,7 @@ let fetchMock: ReturnType<typeof mock>;
 let spawnMock: ReturnType<typeof mock>;
 
 beforeEach(() => {
-  resetAuthState();
+  __resetAuthStateForTest();
   fetchMock = mock(() => Promise.resolve(new Response("{}", { status: 200 })));
   globalThis.fetch = fetchMock as unknown as typeof fetch;
 
@@ -48,7 +48,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   Bun.spawn = originalSpawn;
-  resetAuthState();
+  __resetAuthStateForTest();
 });
 
 // ---------------------------------------------------------------------------
@@ -483,7 +483,7 @@ describe("auth contract", () => {
     );
     assertLoginSuccess(ok);
 
-    resetAuthState();
+    __resetAuthStateForTest();
     scriptBrowser(["about:blank", "https://app.terra.localhost/"], [{ name: "__client_uat", value: "0", domain: ".terra.localhost" }]);
     const signedOut = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://app.terra.localhost", clerkSecretKey: TEST_KEY },
@@ -528,12 +528,12 @@ describe("auth contract", () => {
     expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
   });
 
-  test("survives a simulated crash: resetAuthState does not flip authenticated while the cookie persists", async () => {
+  test("survives a simulated crash: __resetAuthStateForTest does not flip authenticated while the cookie persists", async () => {
     scriptBrowser(["http://localhost:5173/"], [SESSION_COOKIE]);
     const login = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
     assertLoginSuccess(login);
 
-    resetAuthState(); // stands in for the supervisor crash path
+    __resetAuthStateForTest(); // stands in for the supervisor crash path
 
     const status = await getAuthStatus(STATUS_OPTS);
     expect(status.authenticated).toBe(true);
@@ -555,7 +555,7 @@ describe("auth contract", () => {
     expect(status.authenticated).toBe(false);
   });
 
-  test("resetAuthState clears user and lastLogin; authenticated follows the cookie", async () => {
+  test("__resetAuthStateForTest clears user and lastLogin; authenticated follows the cookie", async () => {
     scriptBrowser(["http://localhost:5173/"], [SESSION_COOKIE]);
     await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
     // Already-authenticated short-circuit keeps user null; set lastLogin via timestamp.
@@ -563,7 +563,7 @@ describe("auth contract", () => {
     expect(before.authenticated).toBe(true);
     expect(before.lastLogin).not.toBeNull();
 
-    resetAuthState();
+    __resetAuthStateForTest();
 
     const after = await getAuthStatus(STATUS_OPTS);
     assertAuthStatusShape(after);

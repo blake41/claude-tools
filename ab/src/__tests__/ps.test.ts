@@ -36,6 +36,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
+  buildAuthCheck,
   buildHeadlessDoctorChecks,
   buildHeadlessDoctorDetail,
   listSessionEntries,
@@ -738,5 +739,32 @@ describe("ab gc (subprocess) — orphan-wrapper sweep", () => {
     expect(r.code).toBe(0);
     expect(fs.existsSync(orphanWrapper)).toBe(false);
     expect(fs.existsSync(guardedSidecar)).toBe(true);
+  });
+});
+
+describe("buildAuthCheck", () => {
+  test("authenticated: names the user and the probed port", () => {
+    const c = buildAuthCheck({ authenticated: true, user: { email: "blake@clay.com" }, lastLogin: null, port: 9333, checkedVia: "cookie" }, 9333);
+    expect(c).toEqual({ label: "terra auth", ok: true, detail: "blake@clay.com — Clerk session cookie present on port 9333", fix: undefined });
+  });
+
+  test("unauthenticated: not-ok with reauth fix and port", () => {
+    const c = buildAuthCheck({ authenticated: false, user: null, lastLogin: null, port: 9334, checkedVia: "cookie" }, 9334);
+    expect(c.ok).toBe(false);
+    expect(c.detail).toBe("no Clerk session cookie on port 9334");
+    expect(c.fix).toBe("ab reauth");
+  });
+
+  test("old daemon shape (no port/checkedVia): falls back to probed port, no throw", () => {
+    const c = buildAuthCheck({ authenticated: true, user: null, lastLogin: "2026-10-01" } as never, 9335);
+    expect(c.ok).toBe(true);
+    expect(c.detail).toBe("unknown — authenticated (last login 2026-10-01; daemon reports no cookie detail)");
+  });
+
+  test("null auth (shard Chrome down): not verifiable, ok, no fix", () => {
+    const c = buildAuthCheck(null, null, "headless-2");
+    expect(c.ok).toBe(true);
+    expect(c.detail).toBe("not verifiable — headless-2 Chrome is not up");
+    expect(c.fix).toBeUndefined();
   });
 });
