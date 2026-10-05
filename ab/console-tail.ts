@@ -22,7 +22,7 @@
  * Reconnects automatically on tab close/crash.
  */
 
-import { pickTabWs, TARGET_ID_ENV, type CdpTab } from "./cdp-target";
+import { pickTabWs, SessionTabError, TARGET_ID_ENV, type CdpTab } from "./cdp-target";
 
 const LEVELS_BY_SEVERITY: Record<string, Set<string>> = {
   verbose: new Set(["log", "debug", "info", "warning", "error"]),
@@ -282,6 +282,10 @@ async function tailWithReconnect(
       await tail(wsUrl, prefix, levels, watch, port);
     } catch (e: any) {
       if (e.name === "AbortError") throw e;
+      if (e instanceof SessionTabError) {
+        console.error(e.message);
+        process.exit(1);
+      }
       console.error(`Disconnected: ${e.message}. Reconnecting in 2s...`);
       await Bun.sleep(2000);
     }
