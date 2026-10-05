@@ -92,7 +92,7 @@ function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
 
 const CONFIGS: Record<ChromeTarget, ChromeConfig> = buildConfigs();
 
-let dashboardProc: ReturnType<typeof Bun.spawn> | null = null;
+const DASHBOARD_STOP_TIMEOUT_MS = 3_000;
 
 // Health check tuning. AB_HEALTH_INTERVAL_MS is test-only — overridden to a
 // tiny value so health-summary.test.ts can observe a real tick (lastHealthOkAt
@@ -636,7 +636,7 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
           }
         }
       }
-      startDashboard();
+      await startDashboard();
       log.info("Chrome supervision active");
       return { skippedBackoff };
     }),
@@ -650,11 +650,7 @@ export async function stopAll(): Promise<void> {
   return opQueue.enqueue(() =>
     withOpId(newOpId(), async () => {
       log.info("Stopping all Chrome instances");
-      if (dashboardProc && dashboardProc.exitCode === null) {
-        log.info("Killing dashboard process");
-        dashboardProc.kill();
-        dashboardProc = null;
-      }
+      await stopDashboard();
       await Promise.all(ALL_TARGETS.map((target) => doKill(target)));
     }),
   ) as Promise<void>;
@@ -1768,18 +1764,38 @@ export function touchHeaded(): void {
 // Dashboard
 // ---------------------------------------------------------------------------
 
-function startDashboard(): void {
-  log.info("Starting dashboard", { port: DASHBOARD_PORT });
-
-  // Kill existing dashboard process if still alive
-  if (dashboardProc && dashboardProc.exitCode === null) {
-    log.info("Killing existing dashboard process");
-    dashboardProc.kill();
-    dashboardProc = null;
+/**
+ * `agent-browser dashboard start` setsid()s a detached server and its launcher
+ * exits, so no process handle can stop it. `dashboard stop` SIGTERMs the pid
+ * recorded in <socket_dir>/dashboard.pid.
+ */
+async function stopDashboard(): Promise<void> {
+  try {
+    const proc = Bun.spawn(["agent-browser", "dashboard", "stop"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), DASHBOARD_STOP_TIMEOUT_MS);
+    });
+    const result = await Promise.race([proc.exited, timedOut]);
+    clearTimeout(timer);
+    if (result === "timeout") {
+      log.debug("Dashboard stop timed out");
+      proc.kill();
+    }
+  } catch (err) {
+    log.debug("Dashboard stop failed", { err: String(err) });
   }
+}
+
+async function startDashboard(): Promise<void> {
+  log.info("Starting dashboard", { port: DASHBOARD_PORT });
+  await stopDashboard();
 
   try {
-    dashboardProc = Bun.spawn(
+    Bun.spawn(
       ["agent-browser", "dashboard", "start", "--port", String(DASHBOARD_PORT)],
       { stdout: "ignore", stderr: "ignore" },
     );
