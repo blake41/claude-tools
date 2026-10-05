@@ -1066,6 +1066,39 @@ function detectWorktreeOrigin(browserUrl: string | undefined): string | undefine
   return undefined;
 }
 
+const AUTO_AUTH_LOCAL_ORIGIN = "http://localhost:5173";
+
+/** App origin that `ab open` may auto-authenticate against, or undefined for any other URL. */
+export function autoAuthOrigin(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+  const origin = parsed.origin;
+  if (origin === AUTO_AUTH_LOCAL_ORIGIN) return origin;
+  if (Object.values(REAUTH_ENV_PRESETS).includes(origin)) return origin;
+  if (parsed.protocol === "https:") return detectWorktreeOrigin(url);
+  return undefined;
+}
+
+export type AutoAuthDecision =
+  | { kind: "skip"; reason: "not-dev-origin" | "authenticated" | "no-key" }
+  | { kind: "login"; appBaseUrl: string };
+
+export function decideAutoAuth(input: {
+  url: string;
+  env: { CLERK_SECRET_KEY?: string };
+  status: { authenticated: boolean };
+}): AutoAuthDecision {
+  const appBaseUrl = autoAuthOrigin(input.url);
+  if (!appBaseUrl) return { kind: "skip", reason: "not-dev-origin" };
+  if (input.status.authenticated) return { kind: "skip", reason: "authenticated" };
+  if (!input.env.CLERK_SECRET_KEY) return { kind: "skip", reason: "no-key" };
+  return { kind: "login", appBaseUrl };
+}
+
 export function resolveReauthBaseUrls(
   args: string[],
   env: { AB_APP_BASE_URL?: string },
