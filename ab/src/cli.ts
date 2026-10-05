@@ -18,7 +18,8 @@ import * as path from "path";
 import * as rpc from "./rpc";
 import { isAuthenticatedUrl } from "./auth";
 import { resolveReauthBaseUrls } from "./app-origins";
-import { autoAuthAfterOpen, loginRequest } from "./auto-auth";
+import { autoAuthAfterOpen } from "./auto-auth";
+import { loginRequest } from "./login-request";
 import type { AutoAuthDeps } from "./auto-auth";
 import type { AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
@@ -1070,7 +1071,9 @@ export async function cmdReauth(
     stderr(urls.error);
     return 2;
   }
-  const result = await rpc.authLogin(loginRequest(cdpPort, sessionName, urls.appBaseUrl));
+  const result = await rpc.authLogin(
+    loginRequest(cdpPort, sessionName, urls.appBaseUrl, process.env.CLERK_SECRET_KEY),
+  );
   if (result.ok) {
     stderr("Reauth complete");
     if (result.user) {
@@ -1257,10 +1260,7 @@ export async function cmdImport(overrides: Partial<ImportDeps> = {}): Promise<nu
 
   // Pinning appBaseUrl to the browser's own origin makes the daemon's
   // already-authenticated shortcut match, so import never mints.
-  const authResult = await rpc.authLogin({
-    ...loginRequest(result.port, "import", new URL(browserUrl).origin),
-    clerkSecretKey: undefined,
-  });
+  const authResult = await rpc.authLogin(loginRequest(result.port, "import", new URL(browserUrl).origin));
 
   if (authResult.ok) {
     stderr("Import complete. Auth established.");

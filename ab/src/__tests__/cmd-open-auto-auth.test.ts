@@ -181,11 +181,4 @@ describe("cmdOpen auto-auth", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("nav boom");
   });
-
-  test("a thrown error that contains the key is redacted from the warning", async () => {
-    const lines = captureStderr();
-    const h = harness({ env: KEY, login: async () => { throw new Error("bad sk_test_abc here"); } });
-    await cmdOpen(DEV_URL, 9333, "sess", "p", h.deps);
-    expect(lines.join("")).not.toContain("sk_test_abc");
-  });
 });

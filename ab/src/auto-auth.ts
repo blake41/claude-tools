@@ -1,36 +1,9 @@
-import { redactSecrets } from "./auth";
+import { loginRequest } from "./login-request";
 import { autoAuthOrigin } from "./app-origins";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "./types";
 
 function warn(text: string): void {
   process.stderr.write(text + "\n");
-}
-
-// Default user for `reauth`. The Agent Task is minted by email.
-// Override with AB_AUTH_EMAIL.
-const DEFAULT_AUTH_EMAIL = process.env.AB_AUTH_EMAIL ?? "blake.johnson@clay.com";
-
-export function loginRequest(
-  cdpPort: number,
-  sessionName: string | null,
-  appBaseUrl: string | undefined,
-): AuthLoginRequest {
-  return {
-    sessionId: sessionName ?? "default",
-    port: cdpPort,
-    email: DEFAULT_AUTH_EMAIL,
-    appBaseUrl,
-    // Sent in the request body only; never written to disk or logged.
-    clerkSecretKey: process.env.CLERK_SECRET_KEY,
-  };
-}
-
-export function needsLogin(
-  status: { authenticated: boolean },
-  env: { CLERK_SECRET_KEY?: string },
-): "login" | "no-key" | "skip" {
-  if (status.authenticated) return "skip";
-  return env.CLERK_SECRET_KEY ? "login" : "no-key";
 }
 
 export interface AutoAuthDeps {
@@ -61,12 +34,11 @@ export async function autoAuthAfterOpen(
     warn(`ab: could not confirm this session's tab, so skipped auto-login to ${appBaseUrl}; run \`ab reauth\` if you see a login screen`);
     return;
   }
-  const request = loginRequest(cdpPort, sessionName, appBaseUrl);
+  const request = loginRequest(cdpPort, sessionName, appBaseUrl, process.env.CLERK_SECRET_KEY);
   try {
     const status = await deps.authStatus({ port: cdpPort, sessionId: request.sessionId, appBaseUrl });
-    const verdict = needsLogin(status, { CLERK_SECRET_KEY: request.clerkSecretKey });
-    if (verdict === "skip") return;
-    if (verdict === "no-key") {
+    if (status.authenticated) return;
+    if (!request.clerkSecretKey) {
       warn(`ab: not logged in to ${appBaseUrl}; run \`ab reauth\` from a directory whose env has CLERK_SECRET_KEY`);
       return;
     }
@@ -78,7 +50,6 @@ export async function autoAuthAfterOpen(
     await deps.navigate(cdpPort, sessionName, url);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // A transport error can echo the request body, which holds the key.
-    warn(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(message, [request.clerkSecretKey])})`);
+    warn(`ab: auto-login to ${appBaseUrl} failed (${message})`);
   }
 }

@@ -1,8 +1,5 @@
 import { test, expect, describe } from "bun:test";
 import { autoAuthOrigin } from "../app-origins";
-import { needsLogin } from "../auto-auth";
-
-const KEY = { CLERK_SECRET_KEY: "sk_test_abc" };
 
 describe("autoAuthOrigin", () => {
   const cases: Array<[string, string | undefined]> = [
@@ -29,26 +26,4 @@ describe("autoAuthOrigin", () => {
       expect(autoAuthOrigin(url)).toBe(expected);
     });
   }
-});
-
-describe("needsLogin", () => {
-  test("authenticated skips even with a key", () => {
-    expect(needsLogin({ authenticated: true }, KEY)).toBe("skip");
-  });
-
-  test("authenticated skips without a key", () => {
-    expect(needsLogin({ authenticated: true }, {})).toBe("skip");
-  });
-
-  test("unauthenticated without key is no-key", () => {
-    expect(needsLogin({ authenticated: false }, {})).toBe("no-key");
-  });
-
-  test("empty key counts as absent", () => {
-    expect(needsLogin({ authenticated: false }, { CLERK_SECRET_KEY: "" })).toBe("no-key");
-  });
-
-  test("unauthenticated with key needs login", () => {
-    expect(needsLogin({ authenticated: false }, KEY)).toBe("login");
-  });
 });

@@ -1091,14 +1091,22 @@ describe("cmdImport pins appBaseUrl to the browser's origin", () => {
     return calls;
   }
 
-  test("sends the browser's origin (staging) and no clerkSecretKey", async () => {
+  test("sends the browser's origin (staging) and no clerkSecretKey even when the env has one", async () => {
     const calls = routeDaemon();
     const { cmdImport } = await import("../cli");
-    const code = await cmdImport({
-      openUrl: async () => {},
-      waitForEnter: async () => {},
-      getBrowserUrl: async () => "https://slack-feedback-staging.onrender.com/accounts?x=1",
-    });
+    const originalKey = process.env.CLERK_SECRET_KEY;
+    process.env.CLERK_SECRET_KEY = "sk_test_IMPORTMUSTNOTSEND";
+    let code: number;
+    try {
+      code = await cmdImport({
+        openUrl: async () => {},
+        waitForEnter: async () => {},
+        getBrowserUrl: async () => "https://slack-feedback-staging.onrender.com/accounts?x=1",
+      });
+    } finally {
+      if (originalKey === undefined) delete process.env.CLERK_SECRET_KEY;
+      else process.env.CLERK_SECRET_KEY = originalKey;
+    }
     expect(code).toBe(0);
     const login = calls.find((c) => c.path === "/auth/login");
     expect(login?.body?.appBaseUrl).toBe("https://slack-feedback-staging.onrender.com");
