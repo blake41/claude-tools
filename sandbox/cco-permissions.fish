@@ -19,7 +19,8 @@
 #   CCO_FASTWRAP_DISABLE=1  Launch through cmux's stock claude shim instead of
 #                           cco-cmux-claude.
 #   CCO_STARTUP_TRACE=1     Append startup timestamps to /tmp/cco-startup-trace.log
-#                           (see __cco_trace).
+#                           (see __cco_trace) and pass --debug-file
+#                           /tmp/cco-startup-debug-<session>-<epoch>.log to claude.
 
 function cco-permissions
     # Pull out our own flags before touching $argv further.
@@ -54,6 +55,10 @@ function cco-permissions
     end
 
     __cco_trace $session_id enter
+    set -l trace_args
+    if test -n "$CCO_STARTUP_TRACE"
+        set trace_args --debug-file /tmp/cco-startup-debug-$session_id-(date +%s).log
+    end
 
     # Ensure browser is ready before entering sandbox
     if command -q ab
@@ -100,7 +105,7 @@ function cco-permissions
         # through cco-permissions forever. The sandboxed path is immune only
         # because claude-sandbox execvp's the binary directly.
         __cco_trace $session_id exec
-        command $claude_cmd --dangerously-skip-permissions $extra_args $argv
+        command $claude_cmd --dangerously-skip-permissions $trace_args $extra_args $argv
         set -e CCO_SESSION_ID
         set -e CCO_SANDBOX_OFF
         return
@@ -130,7 +135,7 @@ function cco-permissions
 
     while true
         __cco_trace $session_id exec
-        claude-sandbox $sandbox_args $session_extra_args -- $claude_cmd --dangerously-skip-permissions $extra_args $argv
+        claude-sandbox $sandbox_args $session_extra_args -- $claude_cmd --dangerously-skip-permissions $trace_args $extra_args $argv
 
         # Check for sandbox expansion requests
         set -l request_file /tmp/sandbox-expand-request-$session_id
