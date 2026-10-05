@@ -81,7 +81,7 @@ function ticketOf(url: string): string | undefined {
   }
 }
 
-export function redactSecrets(text: string, secrets: Array<string | undefined>): string {
+function redactSecrets(text: string, secrets: Array<string | undefined>): string {
   let out = text;
   for (const s of secrets) if (s) out = out.split(s).join("[redacted]");
   return out;
