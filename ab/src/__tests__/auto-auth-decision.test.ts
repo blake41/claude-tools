@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { autoAuthOrigin, decideAutoAuth } from "../cli";
+import { autoAuthOrigin, needsLogin } from "../cli";
 
 const KEY = { CLERK_SECRET_KEY: "sk_test_abc" };
 
@@ -30,40 +30,24 @@ describe("autoAuthOrigin", () => {
   }
 });
 
-describe("decideAutoAuth", () => {
-  test("non-dev origin skips even when unauthenticated with a key", () => {
-    expect(
-      decideAutoAuth({ url: "https://terra.clay.com/", env: KEY, status: { authenticated: false } }),
-    ).toEqual({ kind: "skip", reason: "not-dev-origin" });
+describe("needsLogin", () => {
+  test("authenticated skips even with a key", () => {
+    expect(needsLogin({ authenticated: true }, KEY)).toBe("skip");
   });
 
-  test("malformed URL skips", () => {
-    expect(
-      decideAutoAuth({ url: "nope", env: KEY, status: { authenticated: false } }),
-    ).toEqual({ kind: "skip", reason: "not-dev-origin" });
+  test("authenticated skips without a key", () => {
+    expect(needsLogin({ authenticated: true }, {})).toBe("skip");
   });
 
-  test("authenticated skips", () => {
-    expect(
-      decideAutoAuth({ url: "http://localhost:5173/", env: KEY, status: { authenticated: true } }),
-    ).toEqual({ kind: "skip", reason: "authenticated" });
-  });
-
-  test("unauthenticated without key skips with no-key", () => {
-    expect(
-      decideAutoAuth({ url: "http://localhost:5173/", env: {}, status: { authenticated: false } }),
-    ).toEqual({ kind: "skip", reason: "no-key" });
+  test("unauthenticated without key is no-key", () => {
+    expect(needsLogin({ authenticated: false }, {})).toBe("no-key");
   });
 
   test("empty key counts as absent", () => {
-    expect(
-      decideAutoAuth({ url: "http://localhost:5173/", env: { CLERK_SECRET_KEY: "" }, status: { authenticated: false } }),
-    ).toEqual({ kind: "skip", reason: "no-key" });
+    expect(needsLogin({ authenticated: false }, { CLERK_SECRET_KEY: "" })).toBe("no-key");
   });
 
-  test("unauthenticated with key logs in against the origin", () => {
-    expect(
-      decideAutoAuth({ url: "https://wt.terra.localhost/a/b", env: KEY, status: { authenticated: false } }),
-    ).toEqual({ kind: "login", appBaseUrl: "https://wt.terra.localhost" });
+  test("unauthenticated with key needs login", () => {
+    expect(needsLogin({ authenticated: false }, KEY)).toBe("login");
   });
 });

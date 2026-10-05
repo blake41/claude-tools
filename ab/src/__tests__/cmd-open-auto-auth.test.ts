@@ -1,5 +1,5 @@
-import { test, expect, describe, afterEach, spyOn } from "bun:test";
-import { cmdOpen } from "../cli";
+import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
+import { autoAuthAfterOpen, cmdOpen } from "../cli";
 import type { CmdOpenDeps } from "../cli";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "../types";
 
@@ -25,6 +25,8 @@ function harness(opts: {
   navigate?: () => Promise<unknown>;
   recordedId?: string | null;
 }): Harness {
+  if (opts.env?.CLERK_SECRET_KEY) process.env.CLERK_SECRET_KEY = opts.env.CLERK_SECRET_KEY;
+  else delete process.env.CLERK_SECRET_KEY;
   const h: Harness = {
     order: [], statusCalls: [], loginCalls: [], loginTimeouts: [], navCalls: [],
     deps: undefined as unknown as CmdOpenDeps,
@@ -32,8 +34,7 @@ function harness(opts: {
   h.deps = {
     openTab: async () => { h.order.push("openTab"); return opts.recordedId === undefined ? "TAB1" : opts.recordedId; },
     setViewport: async () => { h.order.push("viewport"); },
-    autoAuth: {
-      env: opts.env ?? {},
+    afterOpen: (url, recordedId, port, session) => autoAuthAfterOpen(url, recordedId, port, session, {
       authStatus: async (o) => {
         h.order.push("status");
         h.statusCalls.push(o);
@@ -50,7 +51,7 @@ function harness(opts: {
         h.navCalls.push({ port, session, url });
         return (opts.navigate ?? (async () => undefined))();
       },
-    },
+    }),
   };
   return h;
 }
@@ -64,7 +65,13 @@ function captureStderr(): string[] {
   }) as never);
   return lines;
 }
+const prevKey = process.env.CLERK_SECRET_KEY;
+beforeEach(() => {
+  delete process.env.CLERK_SECRET_KEY;
+});
 afterEach(() => {
+  if (prevKey === undefined) delete process.env.CLERK_SECRET_KEY;
+  else process.env.CLERK_SECRET_KEY = prevKey;
   stderrSpy?.mockRestore();
   stderrSpy = undefined;
 });
