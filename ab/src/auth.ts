@@ -280,9 +280,16 @@ export async function authenticate(
   const timeLeft = () => deadline - Date.now();
   // Once the signal aborts, the route has already answered the CLI: no state write may follow.
   const expired = () => signal.aborted || timeLeft() <= 0;
-  /** One browser step capped at the time left, or null once the budget is spent. */
-  const step = <T>(run: (timeoutMs: number) => Promise<T>): Promise<T | null> =>
-    expired() ? Promise.resolve(null) : run(Math.min(STEP_TIMEOUT_MS, timeLeft()));
+  /**
+   * One browser step capped at the time left, or null when the budget is
+   * spent before it starts or by the time it ends. A step cut off at the
+   * deadline must report the login timeout, not whatever the next step finds.
+   */
+  const step = async <T>(run: (timeoutMs: number) => Promise<T>): Promise<T | null> => {
+    if (expired()) return null;
+    const result = await run(Math.min(STEP_TIMEOUT_MS, timeLeft()));
+    return expired() ? null : result;
+  };
   const timedOut = (): AuthLoginResponse => {
     log.error("Browser did not land on the app origin before the deadline", { appOrigin });
     return { ok: false, error: loginTimedOutError(appBaseUrl) };
