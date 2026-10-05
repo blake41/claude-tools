@@ -22,7 +22,7 @@ import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import type { SessionEntry, ShardSessionEvidence, SweepDeps } from "../cli";
+import type { SessionEntry, ShardSessionEvidence, SweepDeps } from "../session-gc";
 import type { CdpPage } from "../cdp-http";
 import type { ChromeState } from "../types";
 import {
@@ -30,7 +30,7 @@ import {
   partitionOrphanTargets,
   sweepOrphanTabs,
   sweepShards,
-} from "../cli";
+} from "../session-gc";
 import { recordSessionTarget, sessionFilePath } from "../session";
 
 const AB = path.resolve(import.meta.dir, "../../ab");
