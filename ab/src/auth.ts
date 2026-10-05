@@ -11,7 +11,7 @@
 
 import type { ClerkClient } from "@clerk/backend";
 import { Logger } from "./logger";
-import { authLoginDeadline } from "./config";
+import { AUTH_LOGIN_TIMEOUT_MS } from "./config";
 import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse } from "./types";
 
 const log = new Logger({ component: "auth" });
@@ -47,9 +47,8 @@ export type AgentTaskClient = Pick<ClerkClient, "agentTasks">;
 export interface AuthenticateDeps {
   createClerkClient: (secretKey: string) => AgentTaskClient | Promise<AgentTaskClient>;
   /**
-   * Absolute epoch-ms cutoff for the whole flow. Past it, authenticate()
-   * returns a timeout failure and never sets authState. Defaults to the
-   * daemon's login budget measured from the call.
+   * Absolute epoch-ms cutoff that per-step timeouts are capped at. Defaults to
+   * the daemon's login budget measured from the call.
    */
   deadline?: number;
   pollIntervalMs?: number;
@@ -92,7 +91,7 @@ function redactSecrets(text: string, secrets: Array<string | undefined>): string
 // ---------------------------------------------------------------------------
 
 const NAV_STDERR_TAIL_CHARS = 400;
-/** Per-call agent-browser cap; every call in the login flow is also capped at the time left. */
+/** Per-call agent-browser cap; every browser step in the login flow is also capped at the time left. */
 const STEP_TIMEOUT_MS = 15_000;
 
 function tail(text: string, maxChars: number): string {
@@ -227,15 +226,36 @@ export function isAuthenticatedUrl(url: string): boolean {
 
 export async function authenticate(
   req: AuthLoginRequest,
+  signal: AbortSignal,
   deps: Partial<AuthenticateDeps> = {},
 ): Promise<AuthLoginResponse> {
-  const { createClerkClient, deadline = authLoginDeadline(Date.now()), pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
+  const { createClerkClient, deadline = Date.now() + AUTH_LOGIN_TIMEOUT_MS, pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
   const { sessionId, port } = req;
   const appBaseUrl = req.appBaseUrl || DEFAULT_AUTH_APP_BASE;
   const email = req.email;
 
   // Never log the secret key.
   log.info("Starting auth flow", { sessionId, port, appBaseUrl, email });
+
+  let appOrigin: string;
+  try {
+    appOrigin = new URL(appBaseUrl).origin;
+  } catch {
+    appOrigin = appBaseUrl;
+  }
+  const timeLeft = () => deadline - Date.now();
+  // Once the signal aborts, the route has already answered the CLI: no state write may follow.
+  const expired = () => signal.aborted || timeLeft() <= 0;
+  /** One browser step capped at the time left, or null once the budget is spent. */
+  const step = <T>(run: (timeoutMs: number) => Promise<T>): Promise<T | null> =>
+    expired() ? Promise.resolve(null) : run(Math.min(STEP_TIMEOUT_MS, timeLeft()));
+  const timedOut = (): AuthLoginResponse => {
+    log.error("Browser did not land on the app origin before the deadline", { appOrigin });
+    return {
+      ok: false,
+      error: `Auth exchange timed out: browser did not land on ${appOrigin}. The Agent Task URL is one-time, so retry the reauth.`,
+    };
+  };
 
   // -----------------------------------------------------------------------
   // Step 1: Check if already authenticated
@@ -246,7 +266,8 @@ export async function authenticate(
   // target is localhost:5173 (the DEFAULT_AUTH_APP_BASE), so we check that.
   // -----------------------------------------------------------------------
 
-  const urlResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
+  const urlResult = await step((ms) => runAgentBrowser(sessionId, port, ["get", "url"], ms));
+  if (urlResult === null) return timedOut();
   if (urlResult.ok && isAuthenticatedUrl(urlResult.stdout)) {
     // Determine target origin for the comparison.
     let targetOrigin: string;
@@ -264,6 +285,7 @@ export async function authenticate(
     }
 
     if (browserOrigin === targetOrigin) {
+      if (expired()) return timedOut();
       log.info("Browser already on authenticated page for same origin — skipping login", {
         url: urlResult.stdout,
         targetOrigin,
@@ -331,26 +353,11 @@ export async function authenticate(
   // Step 3: Open the one-time Clerk-hosted URL (never logged)
   // -----------------------------------------------------------------------
 
-  let appOrigin: string;
-  try {
-    appOrigin = new URL(appBaseUrl).origin;
-  } catch {
-    appOrigin = appBaseUrl;
-  }
-  const timeLeft = () => deadline - Date.now();
-  const timedOut = (): AuthLoginResponse => {
-    log.error("Browser did not land on the app origin before the deadline", { appOrigin });
-    return {
-      ok: false,
-      error: `Auth exchange timed out: browser did not land on ${appOrigin}. The Agent Task URL is one-time, so retry the reauth.`,
-    };
-  };
-
-  if (timeLeft() <= 0) return timedOut();
   const secrets = [secretKey, taskUrl, ticketOf(taskUrl)];
-  const navResult = await runAgentBrowser(sessionId, port, ["open", taskUrl], Math.min(STEP_TIMEOUT_MS, timeLeft()));
+  const navResult = await step((ms) => runAgentBrowser(sessionId, port, ["open", taskUrl], ms));
+  if (navResult === null) return timedOut();
   if (!navResult.ok) {
-    if (timeLeft() <= 0) return timedOut();
+    if (expired()) return timedOut();
     const stderr = redactSecrets(navResult.stderr, secrets);
     log.error("Navigation failed", { stderr });
     return { ok: false, error: `Auth exchange failed: ${tail(stderr, NAV_STDERR_TAIL_CHARS) || "browser navigation error"}` };
@@ -363,10 +370,10 @@ export async function authenticate(
 
   let landed = false;
   let landedWithoutSession = false;
-  while (Date.now() < deadline) {
+  while (!expired()) {
     await new Promise((r) => setTimeout(r, Math.min(pollIntervalMs, Math.max(0, timeLeft()))));
-    if (timeLeft() <= 0) break;
-    const verifyResult = await runAgentBrowser(sessionId, port, ["get", "url"], Math.min(STEP_TIMEOUT_MS, timeLeft()));
+    const verifyResult = await step((ms) => runAgentBrowser(sessionId, port, ["get", "url"], ms));
+    if (verifyResult === null) break;
     if (!verifyResult.ok) {
       log.warn("Could not read browser URL during poll");
       continue;
@@ -376,8 +383,9 @@ export async function authenticate(
       origin = new URL(verifyResult.stdout).origin;
     } catch { /* not a URL yet */ }
     if (origin === appOrigin && !verifyResult.stdout.includes("/sign-in")) {
-      if (timeLeft() <= 0) break;
-      if (await confirmClerkSession(sessionId, port, appOrigin, Math.min(STEP_TIMEOUT_MS, timeLeft()))) {
+      const hasSession = await step((ms) => confirmClerkSession(sessionId, port, appOrigin, ms));
+      if (hasSession === null) break;
+      if (hasSession) {
         landed = true;
         landedWithoutSession = false;
         log.info("Auth exchange succeeded", { origin });
@@ -397,11 +405,7 @@ export async function authenticate(
     };
   }
 
-  if (!landed) return timedOut();
-
-  // The handler's withTimeout fires after `deadline`. A landing confirmed past
-  // it may already have been reported to the CLI as a failure: do not record it.
-  if (timeLeft() <= 0) return timedOut();
+  if (!landed || expired()) return timedOut();
 
   // -----------------------------------------------------------------------
   // Step 5: Update in-memory auth state
@@ -422,16 +426,18 @@ const loginFlights = new Map<string, Promise<AuthLoginResponse>>();
  * authenticate() with concurrent logins joined into one: sessions share a
  * cookie jar per shard, so one Agent Task serves every waiting caller.
  * Requests are joined by port and app base URL only; the first caller's
- * email, session, key and deadline decide the outcome for all of them.
+ * email, session, key, deadline and abort signal decide the outcome for all
+ * of them. A joiner's own signal is not watched.
  */
 export function authenticateJoined(
   req: AuthLoginRequest,
+  signal: AbortSignal,
   deps: Partial<AuthenticateDeps> = {},
 ): Promise<AuthLoginResponse> {
   const key = `${req.port}|${req.appBaseUrl || DEFAULT_AUTH_APP_BASE}`;
   const existing = loginFlights.get(key);
   if (existing) return existing;
-  const flight = authenticate(req, deps).finally(() => {
+  const flight = authenticate(req, signal, deps).finally(() => {
     loginFlights.delete(key);
   });
   loginFlights.set(key, flight);

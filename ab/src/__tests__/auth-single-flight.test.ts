@@ -4,6 +4,9 @@ import type { AgentTaskClient } from "../auth";
 
 const originalSpawn = Bun.spawn;
 
+/** A signal that is never aborted. */
+const live = (): AbortSignal => new AbortController().signal;
+
 beforeEach(() => {
   __resetAuthStateForTest();
   Bun.spawn = (() => ({
@@ -54,8 +57,8 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req({ sessionId: "s1" }), deps);
-    const b = authenticateJoined(req({ sessionId: "s2" }), deps);
+    const a = authenticateJoined(req({ sessionId: "s1" }), live(), deps);
+    const b = authenticateJoined(req({ sessionId: "s2" }), live(), deps);
     await new Promise((r) => setTimeout(r, 20));
     c.release();
     const [ra, rb] = await Promise.all([a, b]);
@@ -70,8 +73,8 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req(), deps);
-    const b = authenticateJoined(req({ appBaseUrl: "https://wt.terra.localhost" }), deps);
+    const a = authenticateJoined(req(), live(), deps);
+    const b = authenticateJoined(req({ appBaseUrl: "https://wt.terra.localhost" }), live(), deps);
     await new Promise((r) => setTimeout(r, 20));
     c.release();
     await Promise.all([a, b]);
@@ -83,8 +86,8 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req(), deps);
-    const b = authenticateJoined(req({ port: 9334 }), deps);
+    const a = authenticateJoined(req(), live(), deps);
+    const b = authenticateJoined(req({ port: 9334 }), live(), deps);
     await new Promise((r) => setTimeout(r, 20));
     c.release();
     await Promise.all([a, b]);
@@ -97,8 +100,8 @@ describe("authenticateJoined", () => {
     c.release();
     const deps = { createClerkClient: () => c.client };
 
-    await authenticateJoined(req(), deps);
-    await authenticateJoined(req(), deps);
+    await authenticateJoined(req(), live(), deps);
+    await authenticateJoined(req(), live(), deps);
 
     expect(c.mints()).toBe(2);
   });
@@ -112,10 +115,10 @@ describe("authenticateJoined", () => {
     const c = countingClerk();
     const deps = { createClerkClient: () => c.client };
 
-    const a = authenticateJoined(req({ sessionId: "s1" }), deps);
-    const b = authenticateJoined(req({ sessionId: "s2" }), deps);
+    const a = authenticateJoined(req({ sessionId: "s1" }), live(), deps);
+    const b = authenticateJoined(req({ sessionId: "s2" }), live(), deps);
     const settled = await Promise.allSettled([a, b]);
-    const after = await Promise.allSettled([authenticateJoined(req(), deps)]);
+    const after = await Promise.allSettled([authenticateJoined(req(), live(), deps)]);
 
     expect(settled.map((x) => x.status)).toEqual(["rejected", "rejected"]);
     expect(after[0].status).toBe("rejected");

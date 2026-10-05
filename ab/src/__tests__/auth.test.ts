@@ -137,6 +137,9 @@ function scriptBrowser(urls: string[], cookies: Array<Record<string, string>> = 
 
 const STATUS_OPTS = { port: 9333, sessionId: "test" };
 
+/** A signal that is never aborted. */
+const live = (): AbortSignal => new AbortController().signal;
+
 function authStatusOf(s: AuthStatusResponse) {
   return { authenticated: s.authenticated, user: s.user, lastLogin: s.lastLogin };
 }
@@ -150,7 +153,7 @@ describe("auth contract", () => {
     scriptBrowser(["about:blank"]);
     const { factory } = fakeClerk();
 
-    const result = await authenticate({ sessionId: "test", port: 9333, clerkSecretKey: TEST_KEY }, { createClerkClient: factory });
+    const result = await authenticate({ sessionId: "test", port: 9333, clerkSecretKey: TEST_KEY }, live(), { createClerkClient: factory });
 
     assertLoginFailure(result);
     expect(result.error).toContain("email");
@@ -163,6 +166,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: "sk_live_LIVESECRET" },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -179,6 +183,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://terra.clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -194,7 +199,7 @@ describe("auth contract", () => {
     try {
       const calls = scriptBrowser(["about:blank", "http://localhost:5173/"]);
       const { factory } = fakeClerk();
-      const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, { createClerkClient: factory });
+      const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, live(), { createClerkClient: factory });
       assertLoginFailure(result);
       expect(result.error).toContain("CLERK_SECRET_KEY");
       expect(factory).not.toHaveBeenCalled();
@@ -212,6 +217,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -240,6 +246,7 @@ describe("auth contract", () => {
 
     await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -256,6 +263,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -278,6 +286,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -301,6 +310,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: fakeClerk().factory },
     );
 
@@ -323,6 +333,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "nobody@clay.com", appBaseUrl: "http://localhost:5173", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -337,6 +348,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -351,6 +363,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -365,6 +378,7 @@ describe("auth contract", () => {
     const started = Date.now();
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory, deadline: started + 150, pollIntervalMs: 5 },
     );
 
@@ -398,6 +412,7 @@ describe("auth contract", () => {
     const started = Date.now();
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: fakeClerk().factory, deadline: started + 300, pollIntervalMs: 5 },
     );
     const elapsed = Date.now() - started;
@@ -431,6 +446,7 @@ describe("auth contract", () => {
 
       const result = await authenticate(
         { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+        live(),
         { createClerkClient: fakeClerk().factory, deadline, pollIntervalMs: 5 },
       );
 
@@ -444,12 +460,54 @@ describe("auth contract", () => {
     }
   });
 
+  test("a signal aborted while the session is confirmed does not set authState", async () => {
+    const controller = new AbortController();
+    const calls = scriptBrowser(["about:blank", "http://localhost:5173/"]);
+    const inner = spawnMock.getMockImplementation()!;
+    spawnMock.mockImplementation((cmd: string[]) => {
+      if (cmd[5] === "cookies") controller.abort();
+      return inner(cmd);
+    });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      controller.signal,
+      { createClerkClient: fakeClerk().factory, pollIntervalMs: 5 },
+    );
+
+    expect(calls.some((a) => a[0] === "cookies")).toBe(true);
+    assertLoginFailure(result);
+    expect(result.error).toContain("Auth exchange timed out");
+    expect(authStatusOf(await getAuthStatus(STATUS_OPTS))).toEqual({ authenticated: true, user: null, lastLogin: null });
+  });
+
+  test("a signal aborted during the already-authenticated check does not set authState", async () => {
+    const controller = new AbortController();
+    scriptBrowser(["http://localhost:5173/home"]);
+    const inner = spawnMock.getMockImplementation()!;
+    spawnMock.mockImplementation((cmd: string[]) => {
+      if (cmd[5] === "get") controller.abort();
+      return inner(cmd);
+    });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com" },
+      controller.signal,
+      { createClerkClient: fakeClerk().factory },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("Auth exchange timed out");
+    expect((await getAuthStatus(STATUS_OPTS)).lastLogin).toBeNull();
+  });
+
   test("fails when the browser lands on the app origin but no Clerk session cookie exists (wrong Clerk instance)", async () => {
     const calls = scriptBrowser(["about:blank", "http://localhost:5173/"], [{ name: "unrelated", value: "x", domain: "localhost" }]);
     const { factory } = fakeClerk();
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory, deadline: Date.now() + 50, pollIntervalMs: 5 },
     );
 
@@ -467,6 +525,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: factory, deadline: Date.now() + 50, pollIntervalMs: 5 },
     );
 
@@ -479,6 +538,7 @@ describe("auth contract", () => {
     scriptBrowser(["about:blank", "https://app.terra.localhost/"], [{ name: "__client_uat", value: "1759600000", domain: ".terra.localhost" }]);
     const ok = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://app.terra.localhost", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: fakeClerk().factory },
     );
     assertLoginSuccess(ok);
@@ -487,6 +547,7 @@ describe("auth contract", () => {
     scriptBrowser(["about:blank", "https://app.terra.localhost/"], [{ name: "__client_uat", value: "0", domain: ".terra.localhost" }]);
     const signedOut = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://app.terra.localhost", clerkSecretKey: TEST_KEY },
+      live(),
       { createClerkClient: fakeClerk().factory, deadline: Date.now() + 50, pollIntervalMs: 5 },
     );
     assertLoginFailure(signedOut);
@@ -496,7 +557,7 @@ describe("auth contract", () => {
     scriptBrowser(["http://localhost:5173/"]);
     const { factory } = fakeClerk();
 
-    const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, { createClerkClient: factory });
+    const result = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, live(), { createClerkClient: factory });
 
     expect(result.ok).toBe(true);
     // No key, no Clerk client needed when already authenticated on the same origin.
@@ -530,7 +591,7 @@ describe("auth contract", () => {
 
   test("survives a simulated crash: __resetAuthStateForTest does not flip authenticated while the cookie persists", async () => {
     scriptBrowser(["http://localhost:5173/"], [SESSION_COOKIE]);
-    const login = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
+    const login = await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, live());
     assertLoginSuccess(login);
 
     __resetAuthStateForTest(); // stands in for the supervisor crash path
@@ -557,7 +618,7 @@ describe("auth contract", () => {
 
   test("__resetAuthStateForTest clears user and lastLogin; authenticated follows the cookie", async () => {
     scriptBrowser(["http://localhost:5173/"], [SESSION_COOKIE]);
-    await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" });
+    await authenticate({ sessionId: "test", port: 9333, email: "blake@clay.com" }, live());
     // Already-authenticated short-circuit keeps user null; set lastLogin via timestamp.
     const before = await getAuthStatus(STATUS_OPTS);
     expect(before.authenticated).toBe(true);
@@ -637,6 +698,7 @@ describe("origin-aware short-circuit", () => {
         appBaseUrl: "https://worktree-b.terra.localhost",
         clerkSecretKey: TEST_KEY,
       },
+      live(),
       { createClerkClient: factory },
     );
 
@@ -669,7 +731,7 @@ describe("origin-aware short-circuit", () => {
       port: 9333,
       email: "blake@clay.com",
       appBaseUrl: "https://worktree-a.terra.localhost",
-    });
+    }, live());
 
     // same origin: skip is valid, no minting
     expect(spawnMock.mock.calls.some((c) => (c[0] as string[]).includes("open"))).toBe(false);
@@ -699,7 +761,7 @@ describe("origin-aware short-circuit", () => {
       port: 9333,
       email: "blake@clay.com",
       // no appBaseUrl → defaults to localhost:5173
-    });
+    }, live());
 
     expect(spawnMock.mock.calls.some((c) => (c[0] as string[]).includes("open"))).toBe(false);
     assertLoginSuccess(result);
