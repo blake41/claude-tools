@@ -144,15 +144,13 @@ export async function authLogin(
   return rpcFetch({ method: "POST", path: "/auth/login", body: req, timeoutMs: opts.timeoutMs });
 }
 
+/** `appBaseUrl` omitted: the daemon applies its default app base. */
 export async function authStatus(
-  opts: { port?: number; sessionId?: string; appBaseUrl?: string } = {},
+  opts: { port: number; sessionId: string; appBaseUrl?: string },
 ): Promise<AuthStatusResponse> {
-  const q = new URLSearchParams();
-  if (opts.port !== undefined) q.set("port", String(opts.port));
-  if (opts.sessionId !== undefined) q.set("sessionId", opts.sessionId);
+  const q = new URLSearchParams({ port: String(opts.port), sessionId: opts.sessionId });
   if (opts.appBaseUrl !== undefined) q.set("appBaseUrl", opts.appBaseUrl);
-  const qs = q.toString();
-  return rpcFetch({ method: "GET", path: "/auth/status", query: qs || undefined });
+  return rpcFetch({ method: "GET", path: "/auth/status", query: q.toString() });
 }
 
 export async function touchHeaded(): Promise<{ ok: boolean }> {

@@ -135,7 +135,7 @@ function scriptBrowser(urls: string[], cookies: Array<Record<string, string>> = 
   return calls;
 }
 
-const STATUS_OPTS = { port: 9333, sessionId: "test" };
+const STATUS_OPTS = { port: 9333, sessionId: "test", appBaseUrl: "http://localhost:5173" };
 
 /** A signal that is never aborted. */
 const live = (): AbortSignal => new AbortController().signal;

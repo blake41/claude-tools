@@ -201,27 +201,26 @@ describe("rpc.authStatus against the real server handler", () => {
     expect(result.checkedVia).toBe("cookie");
   });
 
-  test("with no options sends no query string and the handler applies its defaults", async () => {
-    const { HEADLESS_BASE_PORT } = await import("../config");
+  test("without appBaseUrl sends only port and sessionId and the handler applies its app-base default", async () => {
     const rpc = await import("../rpc");
-    const result = await rpc.authStatus();
+    const result = await rpc.authStatus({ port: 9333, sessionId: "default" });
 
-    expect(requestedUrls[0]).toBe("http://localhost/auth/status");
-    expect(result.port).toBe(HEADLESS_BASE_PORT);
-    expect(spawnCalls[0]!.slice(0, 3)).toEqual(["agent-browser", "--session", "default"]);
+    expect(requestedUrls[0]).toBe("http://localhost/auth/status?port=9333&sessionId=default");
+    // The mocked cookie is for terra.clay.com; the default app base is localhost.
+    expect(result.authenticated).toBe(false);
   });
 
   test("a daemon validation failure surfaces as an error carrying the 400 detail", async () => {
     const rpc = await import("../rpc");
 
-    await expect(rpc.authStatus({ port: 0 })).rejects.toThrow(/Daemon returned 400 for GET \/auth\/status: .*port/);
+    await expect(rpc.authStatus({ port: 0, sessionId: "default" })).rejects.toThrow(/Daemon returned 400 for GET \/auth\/status: .*port/);
   });
 
   test("/auth/status waits 15s on the client", async () => {
     const timeoutSpy = spyOn(AbortSignal, "timeout");
     try {
       const rpc = await import("../rpc");
-      await rpc.authStatus();
+      await rpc.authStatus({ port: 9333, sessionId: "default" });
       expect(timeoutSpy.mock.calls[0]![0]).toBe(15_000);
     } finally {
       timeoutSpy.mockRestore();
