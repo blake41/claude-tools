@@ -259,22 +259,21 @@ async function parseAuthLoginBody(
 }
 
 /**
- * POST /auth/login inside its route budget. When the budget runs out the CLI
- * gets the same 400 login-timeout error authenticate() returns, not a 500.
- * `budgetMs` is injectable for tests.
+ * POST /auth/login. The body is validated first; the login then runs inside
+ * its route budget, and when that runs out the CLI gets the same 400
+ * login-timeout error authenticate() returns, not a 500. `budgetMs` is
+ * injectable for tests.
  */
-export function handleAuthLogin(req: Request, budgetMs: number = AUTH_LOGIN_TIMEOUT_MS): Promise<Response> {
-  let appBaseUrl: string | undefined;
+export async function handleAuthLogin(req: Request, budgetMs: number = AUTH_LOGIN_TIMEOUT_MS): Promise<Response> {
+  const parsed = await parseAuthLoginBody(req);
+  if ("error" in parsed) return json({ ok: false, error: parsed.error }, 400);
   return withTimeout(
     async (signal, deadline) => {
-      const parsed = await parseAuthLoginBody(req);
-      if ("error" in parsed) return json({ ok: false, error: parsed.error }, 400);
-      appBaseUrl = parsed.appBaseUrl;
       const result = await authenticateJoined(parsed, { signal, deadline });
       return json(result, result.ok ? 200 : 400);
     },
     budgetMs,
-    () => json({ ok: false, error: loginTimedOutError(appBaseUrl) }, 400),
+    () => json({ ok: false, error: loginTimedOutError(parsed.appBaseUrl) }, 400),
   );
 }
 
