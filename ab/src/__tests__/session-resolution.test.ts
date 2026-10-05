@@ -19,7 +19,7 @@ import {
   resolveTeardownShard,
 } from "../cli";
 import { buildSessionName, readShardAssignment, resolvePid, sessionFilePath } from "../session";
-import type { SessionEntry } from "../cli";
+import type { SessionEntry } from "../session-gc";
 import { resolveReauthBaseUrls } from "../app-origins";
 
 const AB = path.resolve(import.meta.dir, "../../ab");

@@ -117,6 +117,7 @@ bun run install.ts --uninstall  # Uninstall, restore old ab
 |------|---------|
 | `src/daemon.ts` | Daemon entry point |
 | `src/chrome-supervisor.ts` | Chrome lifecycle (launch, health, restart) |
+| `src/chrome-heartbeat.ts` | Chrome WebSocket heartbeat: close decisions, re-arm, threshold probe, cooldown (`startHeartbeat`) |
 | `src/chrome-occupant.ts` | Who holds a CDP port (lsof / pgrep) and whether the daemon may signal it (`classifyOccupant`) |
 | `src/server.ts` | Unix socket HTTP server |
 | `src/auth.ts` | Agent Tasks auth flow |
@@ -124,6 +125,8 @@ bun run install.ts --uninstall  # Uninstall, restore old ab
 | `src/auto-auth.ts` | Auto-auth after `ab open` on a dev app origin |
 | `src/login-request.ts` | The `/auth/login` request body the CLI sends |
 | `src/cli.ts` | CLI entry point (replaces old bash ab) |
+| `src/session-gc.ts` | Session listing, verified tab teardown, session-file reaping and the `ab gc` orphan-tab sweep |
+| `src/exec.ts` | `stderr` and agent-browser spawn helpers shared by the CLI and session-gc |
 | `src/doctor.ts` | `ab doctor` checks and command |
 | `src/session.ts` | Session identity and its `/tmp/.ab-session-<pid>` marker (shard and tab lines) |
 | `src/cdp-http.ts` | Plain CDP HTTP: list and close page targets, per-shard tab counts |
