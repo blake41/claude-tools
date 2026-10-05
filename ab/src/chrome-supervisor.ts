@@ -123,9 +123,10 @@ const BACKOFF_MAX_MS = Number(process.env.AB_BACKOFF_MAX_MS) || 30_000;
 // doesn't reset backoff; only surviving this stable window does" without a
 // real 60s wait.
 const BACKOFF_STABLE_RESET_MS = Number(process.env.AB_BACKOFF_STABLE_RESET_MS) || 60_000;
-// Test-only, same pattern: lets a test exercise the "CDP never answered"
-// launch failure without a real 15s wait.
-const CDP_READY_TIMEOUT_MS = Number(process.env.AB_CDP_READY_TIMEOUT_MS) || 15_000;
+// Test-only: lets a test exercise the "CDP never answered" launch failure
+// without a real 15s wait. Read per launch, not at import, because bun runs
+// every test file in one process and the module may already be cached.
+const cdpReadyTimeoutMs = (): number => Number(process.env.AB_CDP_READY_TIMEOUT_MS) || 15_000;
 
 // Heartbeat re-arm tuning — a benign WS close (Chrome pid still alive) must
 // re-arm the heartbeat, not leave the shard heartbeat-less (2026-08-04
@@ -830,9 +831,10 @@ async function launchChrome(
   });
 
   // Wait for CDP to respond (up to 15s)
-  const ready = await waitForCdp(config.port, CDP_READY_TIMEOUT_MS);
+  const readyTimeoutMs = cdpReadyTimeoutMs();
+  const ready = await waitForCdp(config.port, readyTimeoutMs);
   if (!ready) {
-    log.error(`[${target}] Chrome did not respond within ${CDP_READY_TIMEOUT_MS}ms`, {
+    log.error(`[${target}] Chrome did not respond within ${readyTimeoutMs}ms`, {
       port: config.port,
     });
     proc.kill();

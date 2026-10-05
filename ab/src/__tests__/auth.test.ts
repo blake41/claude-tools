@@ -691,6 +691,9 @@ describe("reauth is shard-aware (chrome-pool-plan Unit 3)", () => {
       }
       calls.push({ path: pathname, body });
 
+      if (pathname === "/status") {
+        return new Response(JSON.stringify({ ok: true, headlessPool: [{}, {}, {}] }), { status: 200 });
+      }
       if (pathname === "/chrome/ensure") {
         const shard = (body as { shard?: number } | undefined)?.shard ?? 0;
         return new Response(
@@ -800,14 +803,36 @@ describe("sticky shard correction from the ensure response's served port (Fix 2)
     else process.env.CCO_SESSION_ID = originalCco;
   });
 
-  function mockEnsurePort(port: number): void {
-    fetchMock.mockImplementation(async () =>
-      new Response(
+  function mockEnsurePort(port: number, poolSize = 3): Array<{ path: string; body: unknown }> {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : (url as Request).url;
+      const pathname = new URL(urlStr, "http://localhost").pathname;
+      calls.push({ path: pathname, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (pathname === "/status") {
+        return new Response(
+          JSON.stringify({ ok: true, headlessPool: Array.from({ length: poolSize }, () => ({})) }),
+          { status: 200 },
+        );
+      }
+      return new Response(
         JSON.stringify({ ok: true, pid: 100, port, alreadyRunning: true, profileFresh: false }),
         { status: 200 },
-      ),
-    );
+      );
+    });
+    return calls;
   }
+
+  test("pool size comes from the daemon's /status, not the CLI's own env", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=2\n`);
+    const calls = mockEnsurePort(9333, 2); // daemon runs a 2-shard pool; CLI default is 3
+
+    const { ensureChromePort, readShardAssignment } = await import("../cli");
+    await ensureChromePort(false);
+    const ensure = calls.find((c) => c.path === "/chrome/ensure");
+    expect(ensure?.body).toEqual({ shard: 0 });
+    expect(readShardAssignment(testPid)).toBe(0);
+  });
 
   test("a pre-pool daemon that always serves 9333 rewrites a shard=2 marker down to shard 0", async () => {
     fs.writeFileSync(markerPath, `${testPid}\nshard=2\n`);
