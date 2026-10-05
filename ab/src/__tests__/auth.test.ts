@@ -460,6 +460,28 @@ describe("auth contract", () => {
     }
   });
 
+  test("a browser step that ends past the deadline reports the login timeout, not the next step's error", async () => {
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    try {
+      const deadline = Date.now() + 5_000;
+      scriptBrowser(["about:blank"]);
+      const inner = spawnMock.getMockImplementation()!;
+      spawnMock.mockImplementation((cmd: string[]) => {
+        if (cmd[5] === "get") skew += deadline - Date.now() + 1;
+        return inner(cmd);
+      });
+
+      const result = await authenticate({ sessionId: "test", port: 9333 }, budget(deadline), { createClerkClient: fakeClerk().factory });
+
+      assertLoginFailure(result);
+      expect(result.error).toContain("Auth exchange timed out");
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   test("a signal aborted while the session is confirmed does not set authState", async () => {
     const controller = new AbortController();
     const calls = scriptBrowser(["about:blank", "http://localhost:5173/"]);
