@@ -92,8 +92,6 @@ function buildConfigs(): Record<ChromeTarget, ChromeConfig> {
 
 const CONFIGS: Record<ChromeTarget, ChromeConfig> = buildConfigs();
 
-const DASHBOARD_STOP_TIMEOUT_MS = 3_000;
-
 // Health check tuning. AB_HEALTH_INTERVAL_MS is test-only — overridden to a
 // tiny value so health-summary.test.ts can observe a real tick (lastHealthOkAt
 // getting set) without waiting multiple real seconds.
@@ -618,7 +616,7 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
           // An always-on target's launch must never throw uncaught here — a
           // crash-looping shard (RetryAfterError from launchChrome's
           // ensure-gate) would otherwise abort this loop before later
-          // always-on targets get a chance AND before startDashboard() runs
+          // always-on targets get a chance AND before restartDashboard() runs
           // below. Scenario: `ab heal` on a crash-looping always-on shard —
           // without this catch, the shard stays down with no relaunch timer
           // and the dashboard never restarts either.
@@ -636,7 +634,7 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
           }
         }
       }
-      await startDashboard();
+      await restartDashboard();
       log.info("Chrome supervision active");
       return { skippedBackoff };
     }),
@@ -1777,22 +1775,14 @@ async function stopDashboard(): Promise<void> {
       stdout: "ignore",
       stderr: "ignore",
     });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), DASHBOARD_STOP_TIMEOUT_MS);
-    });
-    const result = await Promise.race([proc.exited, timedOut]);
-    clearTimeout(timer);
-    if (result === "timeout") {
-      log.debug("Dashboard stop timed out");
-      proc.kill();
-    }
+    await Promise.race([proc.exited, sleep(3_000)]);
+    if (proc.exitCode === null) proc.kill();
   } catch (err) {
     log.debug("Dashboard stop failed", { err: String(err) });
   }
 }
 
-async function startDashboard(): Promise<void> {
+async function restartDashboard(): Promise<void> {
   log.info("Starting dashboard", { port: DASHBOARD_PORT });
   await stopDashboard();
 
