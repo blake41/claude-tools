@@ -586,6 +586,20 @@ describe("auth contract", () => {
     expect(factory).not.toHaveBeenCalled();
   });
 
+  test("authenticate on the app origin without a Clerk cookie still logs in", async () => {
+    scriptBrowser(["https://terra.localhost/", "https://terra.localhost/"], [{ name: "__client_uat", value: "0", domain: ".terra.localhost" }]);
+    const { factory } = fakeClerk();
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://terra.localhost", clerkSecretKey: TEST_KEY },
+      budget(Date.now() + 50),
+      { createClerkClient: factory, pollIntervalMs: 5 },
+    );
+
+    expect(factory).toHaveBeenCalled();
+    assertLoginFailure(result);
+  });
+
   test("getAuthStatus returns correct shape when not authenticated", async () => {
     scriptBrowser([], []);
     const status = await getAuthStatus(STATUS_OPTS);
@@ -731,22 +745,10 @@ describe("origin-aware short-circuit", () => {
   });
 
   test("DOES skip login when browser origin matches appBaseUrl (worktree-A to worktree-A)", async () => {
-    // Browser is authenticated on worktree-A, targeting worktree-A
-    spawnMock.mockImplementation(() => ({
-      pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) {
-          c.enqueue(new TextEncoder().encode("https://worktree-a.terra.localhost/home"));
-          c.close();
-        },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
-      kill: () => {},
-    }));
+    const calls = scriptBrowser(
+      ["https://worktree-a.terra.localhost/home"],
+      [{ name: "__session", value: "jwt.header.sig", domain: ".terra.localhost" }],
+    );
 
     const result = await authenticate({
       sessionId: "test",
@@ -755,28 +757,13 @@ describe("origin-aware short-circuit", () => {
       appBaseUrl: "https://worktree-a.terra.localhost",
     }, budget());
 
-    // same origin: skip is valid, no minting
-    expect(spawnMock.mock.calls.some((c) => (c[0] as string[]).includes("open"))).toBe(false);
+    // same origin and a session cookie: skip is valid, no minting
+    expect(calls.some((c) => c[0] === "open")).toBe(false);
     assertLoginSuccess(result);
   });
 
   test("DOES skip login when browser is on default localhost:5173 and no appBaseUrl given", async () => {
-    // Existing behavior preserved: browser on localhost:5173, targeting localhost default
-    spawnMock.mockImplementation(() => ({
-      pid: 1,
-      exitCode: 0,
-      exited: Promise.resolve(0),
-      stdout: new ReadableStream({
-        start(c) {
-          c.enqueue(new TextEncoder().encode("http://localhost:5173/home"));
-          c.close();
-        },
-      }),
-      stderr: new ReadableStream({
-        start(c) { c.enqueue(new TextEncoder().encode("")); c.close(); },
-      }),
-      kill: () => {},
-    }));
+    const calls = scriptBrowser(["http://localhost:5173/home"]);
 
     const result = await authenticate({
       sessionId: "test",
@@ -785,7 +772,7 @@ describe("origin-aware short-circuit", () => {
       // no appBaseUrl → defaults to localhost:5173
     }, budget());
 
-    expect(spawnMock.mock.calls.some((c) => (c[0] as string[]).includes("open"))).toBe(false);
+    expect(calls.some((c) => c[0] === "open")).toBe(false);
     assertLoginSuccess(result);
   });
 });
