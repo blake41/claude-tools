@@ -718,21 +718,21 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
   test("auto-detect: *.terra.localhost browser URL → portless HTTPS (443) for both bases", async () => {
     // This is tested at the resolveReauthBaseUrls level in session-resolution.test.ts
     // Verify that the logic works via the exported function from cli.ts
-    const { resolveReauthBaseUrls } = await import("../cli");
+    const { resolveReauthBaseUrls } = await import("../app-origins");
     const r = resolveReauthBaseUrls([], {}, "https://worktree-foo.terra.localhost/some-page");
     expect(r.appBaseUrl).toBe("https://worktree-foo.terra.localhost");
     expect(r.error).toBeUndefined();
   });
 
   test("auto-detect: non-terra browser URL falls back to undefined (localhost defaults)", async () => {
-    const { resolveReauthBaseUrls } = await import("../cli");
+    const { resolveReauthBaseUrls } = await import("../app-origins");
     const r = resolveReauthBaseUrls([], {}, "https://example.com/page");
     expect(r.appBaseUrl).toBeUndefined();
     expect(r.error).toBeUndefined();
   });
 
   test("auto-detect: explicit --host flag overrides browser URL", async () => {
-    const { resolveReauthBaseUrls } = await import("../cli");
+    const { resolveReauthBaseUrls } = await import("../app-origins");
     const r = resolveReauthBaseUrls(
       ["--host", "worktree-bar.terra.localhost"],
       {},
@@ -743,7 +743,7 @@ describe("resolveReauthBaseUrls with browserUrl auto-detect", () => {
   });
 
   test("auto-detect: env var override wins over browser URL", async () => {
-    const { resolveReauthBaseUrls } = await import("../cli");
+    const { resolveReauthBaseUrls } = await import("../app-origins");
     const r = resolveReauthBaseUrls(
       [],
       { AB_APP_BASE_URL: "https://custom.example.com" },

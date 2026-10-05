@@ -16,8 +16,11 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as rpc from "./rpc";
-import { DEFAULT_AUTH_APP_BASE, isAuthenticatedUrl, redactSecrets } from "./auth";
-import type { AuthLoginRequest, AuthLoginResponse, AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
+import { isAuthenticatedUrl } from "./auth";
+import { resolveReauthBaseUrls } from "./app-origins";
+import { autoAuthAfterOpen, loginRequest } from "./auto-auth";
+import type { AutoAuthDeps } from "./auto-auth";
+import type { AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
 import { CONFIG_ERROR, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
 
@@ -26,25 +29,6 @@ import { CONFIG_ERROR, HEADED_PORT, HEADLESS_BASE_PORT } from "./config";
 // ---------------------------------------------------------------------------
 
 const CDP_PORT_USER = 9222;
-
-// Default user for `reauth`. The Agent Task is minted by email.
-// Override with AB_AUTH_EMAIL.
-const DEFAULT_AUTH_EMAIL = process.env.AB_AUTH_EMAIL ?? "blake.johnson@clay.com";
-
-export function loginRequest(
-  cdpPort: number,
-  sessionName: string | null,
-  appBaseUrl: string | undefined,
-): AuthLoginRequest {
-  return {
-    sessionId: sessionName ?? "default",
-    port: cdpPort,
-    email: DEFAULT_AUTH_EMAIL,
-    appBaseUrl,
-    // Sent in the request body only; never written to disk or logged.
-    clerkSecretKey: process.env.CLERK_SECRET_KEY,
-  };
-}
 
 const AB_DIR = path.resolve(import.meta.dir, "..");
 
@@ -1049,140 +1033,6 @@ async function cmdDoctor(headed = false): Promise<number> {
   return allOk ? 0 : 1;
 }
 
-// Environment presets for `ab reauth`. Terra-specific: reauth mints a Clerk
-// Agent Task against the development Clerk instance, so only non-production
-// app hosts are valid targets (production is refused; use `ab import`).
-const REAUTH_ENV_PRESETS: Record<string, string> = {
-  staging: "https://slack-feedback-staging.onrender.com",
-  dev: "https://slack-feedback-development.onrender.com",
-};
-
-/**
- * Detect whether a browser URL is a Terra worktree origin (*.terra.localhost
- * or terra.localhost itself) and return the portless HTTPS base URL if so.
- * Returns undefined for non-Terra URLs.
- */
-function detectWorktreeOrigin(browserUrl: string | undefined): string | undefined {
-  if (!browserUrl) return undefined;
-  let parsed: URL;
-  try {
-    parsed = new URL(browserUrl);
-  } catch {
-    return undefined;
-  }
-  const hostname = parsed.hostname;
-  // Match terra.localhost itself or any *.terra.localhost subdomain
-  if (hostname === "terra.localhost" || hostname.endsWith(".terra.localhost")) {
-    // Use the browser's actual origin verbatim — portless serves standard
-    // HTTPS (:443), so a bare https origin is correct and any non-standard
-    // port the browser used is preserved.
-    return parsed.origin;
-  }
-  return undefined;
-}
-
-/** App origin that `ab open` may auto-authenticate against, or undefined for any other URL. */
-export function autoAuthOrigin(url: string): string | undefined {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return undefined;
-  }
-  const origin = parsed.origin;
-  if (origin === DEFAULT_AUTH_APP_BASE) return origin;
-  if (Object.values(REAUTH_ENV_PRESETS).includes(origin)) return origin;
-  if (parsed.protocol === "https:") return detectWorktreeOrigin(url);
-  return undefined;
-}
-
-export function needsLogin(
-  status: { authenticated: boolean },
-  env: { CLERK_SECRET_KEY?: string },
-): "login" | "no-key" | "skip" {
-  if (status.authenticated) return "skip";
-  return env.CLERK_SECRET_KEY ? "login" : "no-key";
-}
-
-export function resolveReauthBaseUrls(
-  args: string[],
-  env: { AB_APP_BASE_URL?: string },
-  browserUrl?: string,
-): { appBaseUrl: string | undefined; error?: string } {
-  let preset: string | undefined;
-  let host: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("--")) continue;
-
-    // --host <value> or --host=<value>
-    if (arg === "--host" || arg.startsWith("--host=")) {
-      let hostValue: string | undefined;
-      if (arg === "--host") {
-        const next = args[i + 1];
-        if (next !== undefined && !next.startsWith("--")) {
-          hostValue = next;
-          i++;
-        }
-      } else {
-        hostValue = arg.slice("--host=".length);
-      }
-      if (!hostValue) {
-        return { appBaseUrl: undefined, error: "--host requires a hostname" };
-      }
-      if (host && host !== hostValue) {
-        return { appBaseUrl: undefined, error: `Conflicting --host values: ${host} and ${hostValue}` };
-      }
-      host = hostValue;
-      continue;
-    }
-
-    const name = arg.slice(2);
-    if (name in REAUTH_ENV_PRESETS) {
-      if (preset && preset !== name) {
-        return { appBaseUrl: undefined, error: `Conflicting env flags: --${preset} and --${name}` };
-      }
-      preset = name;
-    } else if (name === "prod" || name === "production") {
-      return {
-          appBaseUrl: undefined,
-        error: "--prod is not supported: reauth only mints against the development Clerk instance. Production uses `ab import` (headed Google login).",
-      };
-    } else if (name === "local") {
-      // Explicit no-op: use defaults (localhost) from auth.ts.
-      preset = "local";
-    }
-  }
-  if (host && preset && preset !== "local") {
-    return {
-      appBaseUrl: undefined,
-      error: `Cannot combine --host with --${preset}`,
-    };
-  }
-  // --host wins over presets. For bare hostnames, pick the right scheme:
-  //   - `*.localhost` subdomains → portless serves standard HTTPS (:443);
-  //     :80 only redirects, so address https directly.
-  //   - bare `localhost` → plain HTTP on the default port (no portless).
-  const hostUrl = host
-    ? host.startsWith("http://") || host.startsWith("https://")
-      ? host
-      : host.endsWith(".localhost")
-        ? `https://${host}`
-        : `http://${host}`
-    : undefined;
-  const presetUrl = preset && preset !== "local" ? REAUTH_ENV_PRESETS[preset] : undefined;
-  // Auto-detect from browser URL when no explicit flag/preset was given.
-  // Explicit flags (--host, --staging, --dev, --local) always win over auto-detect.
-  const autoDetected = (hostUrl === undefined && presetUrl === undefined)
-    ? detectWorktreeOrigin(browserUrl)
-    : undefined;
-  const resolved = hostUrl ?? presetUrl ?? autoDetected;
-  // Env vars win over flags, flags win over auto-detect, auto-detect wins over undefined (→ auth.ts localhost defaults).
-  return {
-    appBaseUrl: env.AB_APP_BASE_URL ?? resolved,
-  };
-}
-
 /**
  * Query the browser's current URL via agent-browser, capturing stdout.
  * Returns undefined if the query fails or times out.
@@ -1312,65 +1162,15 @@ export interface CmdOpenDeps {
   ) => Promise<void>;
 }
 
-export interface AutoAuthDeps {
-  authStatus: (opts: { port: number; sessionId: string; appBaseUrl: string }) => Promise<AuthStatusResponse>;
-  authLogin: (req: AuthLoginRequest, opts: { timeoutMs: number }) => Promise<AuthLoginResponse>;
-  navigate: (cdpPort: number, sessionName: string | null, url: string) => Promise<unknown>;
-}
-
-/** Client cap for the auto-auth login so a hung login cannot hold `ab open` for the full 65s RPC budget. */
-export const AUTO_AUTH_LOGIN_TIMEOUT_MS = 30_000;
-
 const DEFAULT_AUTO_AUTH_DEPS: AutoAuthDeps = {
   authStatus: rpc.authStatus,
   authLogin: rpc.authLogin,
   navigate: (cdpPort, sessionName, url) => runAgentBrowser(cdpPort, sessionName, ["open", url]),
 };
 
-/**
- * Logs in after the session's own tab exists, when a dev app origin has no
- * Clerk session, then re-navigates that tab to `url`. Needs a recorded tab id:
- * the login drives the browser's focused target, which is only provably this
- * session's tab when its creation was recorded. Never throws.
- */
-export async function autoAuthAfterOpen(
-  url: string,
-  recordedId: string | null,
-  cdpPort: number,
-  sessionName: string | null,
-  deps: AutoAuthDeps = DEFAULT_AUTO_AUTH_DEPS,
-): Promise<void> {
-  const appBaseUrl = autoAuthOrigin(url);
-  if (!appBaseUrl) return;
-  if (recordedId === null) {
-    stderr(`ab: could not confirm this session's tab, so skipped auto-login to ${appBaseUrl}; run \`ab reauth\` if you see a login screen`);
-    return;
-  }
-  const request = loginRequest(cdpPort, sessionName, appBaseUrl);
-  try {
-    const status = await deps.authStatus({ port: cdpPort, sessionId: request.sessionId, appBaseUrl });
-    const verdict = needsLogin(status, { CLERK_SECRET_KEY: request.clerkSecretKey });
-    if (verdict === "skip") return;
-    if (verdict === "no-key") {
-      stderr(`ab: not logged in to ${appBaseUrl}; run \`ab reauth\` from a directory whose env has CLERK_SECRET_KEY`);
-      return;
-    }
-    const result = await deps.authLogin(request, { timeoutMs: AUTO_AUTH_LOGIN_TIMEOUT_MS });
-    if (!result.ok) {
-      stderr(`ab: auto-login to ${appBaseUrl} failed (${result.error ?? "unknown error"})`);
-      return;
-    }
-    await deps.navigate(cdpPort, sessionName, url);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    // A transport error can echo the request body, which holds the key.
-    stderr(`ab: auto-login to ${appBaseUrl} failed (${redactSecrets(message, [request.clerkSecretKey])})`);
-  }
-}
-
 const DEFAULT_CMD_OPEN_DEPS: CmdOpenDeps = {
   afterOpen: (url, recordedId, cdpPort, sessionName) =>
-    autoAuthAfterOpen(url, recordedId, cdpPort, sessionName),
+    autoAuthAfterOpen(url, recordedId, cdpPort, sessionName, DEFAULT_AUTO_AUTH_DEPS),
   openTab: (sessionPid, cdpPort, sessionName, url) =>
     openTabAndRecordTarget(sessionPid, cdpPort, sessionName, url),
   setViewport: (cdpPort, sessionName) =>
