@@ -544,3 +544,49 @@ describe("real GET /auth/status handler", () => {
     expect(spawnCalls).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /auth/login budget through the real handler (src/server.ts handleAuthLogin)
+// ---------------------------------------------------------------------------
+
+describe("real POST /auth/login budget", () => {
+  const originalSpawn = Bun.spawn;
+  let release: () => void = () => {};
+
+  beforeEach(() => {
+    // agent-browser `get url` hangs until released, so the login outlives its budget.
+    const hung = new Promise<number>((r) => { release = () => r(1); });
+    Bun.spawn = mock(() => ({
+      pid: 1,
+      exitCode: null,
+      exited: hung,
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+      kill: () => release(),
+    })) as unknown as typeof Bun.spawn;
+  });
+
+  afterEach(async () => {
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    Bun.spawn = originalSpawn;
+  });
+
+  test("an expired budget answers 400 with the one-time Agent Task retry message", async () => {
+    const { handleAuthLogin } = await import("../server");
+    const req = new Request("http://localhost/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ sessionId: "budget-test", port: 9399, appBaseUrl: "http://localhost:5173" }),
+    });
+
+    const started = Date.now();
+    const resp = await handleAuthLogin(req, 50);
+
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(resp.status).toBe(400);
+    expect(await resp.json()).toEqual({
+      ok: false,
+      error: "Auth exchange timed out: browser did not land on http://localhost:5173. The Agent Task URL is one-time, so retry the reauth.",
+    });
+  });
+});
