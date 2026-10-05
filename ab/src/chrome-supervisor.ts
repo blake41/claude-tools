@@ -340,6 +340,24 @@ function dropSpawned(rt: TargetRuntime): void {
   if (rt.chrome?.kind === "spawned") rt.chrome = null;
 }
 
+/** Whether `pid` is still the Chrome `rt` is attached to; false means a queued event for it is stale. */
+function isCurrentChrome(rt: TargetRuntime, pid: number | null): boolean {
+  return pidOf(rt) === pid;
+}
+
+/**
+ * SIGTERM the Chrome this daemon spawned for `rt` and forget its handle.
+ * Returns the signalled PID, or null when `rt` holds no spawned Chrome; an
+ * adopted Chrome is never signalled.
+ */
+function killSpawned(rt: TargetRuntime): number | null {
+  if (rt.chrome?.kind !== "spawned") return null;
+  const { proc } = rt.chrome;
+  proc.kill();
+  rt.chrome = null;
+  return proc.pid;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime snapshot — for crash dumps
 // ---------------------------------------------------------------------------
@@ -946,8 +964,7 @@ async function launchChrome(
     opQueue.enqueue(() =>
       withOpId(newOpId(), async () => {
         // If a different Chrome is now running, this exit is stale
-        const currentPid = pidOf(rt);
-        if (currentPid !== exitedPid && getState(target).phase !== "idle") {
+        if (!isCurrentChrome(rt, exitedPid) && getState(target).phase !== "idle") {
           log.info(`[${target}] Ignoring stale exit for PID ${exitedPid}`);
           return;
         }
@@ -963,8 +980,7 @@ async function launchChrome(
     log.error(`[${target}] Chrome did not respond within ${readyTimeoutMs}ms`, {
       port: config.port,
     });
-    proc.kill();
-    dropSpawned(rt);
+    killSpawned(rt);
     bumpBackoffAndRetry(rt);
     markCrashed(target, -1);
     if (CONFIGS[target].policy === "always-on") {
@@ -1016,16 +1032,14 @@ function startHealthCheck(target: ChromeTarget): void {
           process.kill(pid, 0);
         } catch {
           log.error(`[${target}] Chrome PID ${pid} gone — marking crashed`, {
-            hadProc: rt.chrome?.kind === "spawned",
-            wasAdopted: rt.chrome?.kind === "adopted",
+            chrome: rt.chrome?.kind ?? null,
           });
           if (rt.healthTimer) clearInterval(rt.healthTimer);
           rt.healthTimer = null;
           const crashedPid = pid;
           opQueue.enqueue(() =>
             withOpId(newOpId(), async () => {
-              const currentPid = pidOf(rt);
-              if (currentPid !== crashedPid) {
+              if (!isCurrentChrome(rt, crashedPid)) {
                 log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
                 return;
               }
@@ -1055,8 +1069,7 @@ function startHealthCheck(target: ChromeTarget): void {
         const crashedPid = pidOf(rt);
         opQueue.enqueue(() =>
           withOpId(newOpId(), async () => {
-            const currentPid = pidOf(rt);
-            if (currentPid !== crashedPid) {
+            if (!isCurrentChrome(rt, crashedPid)) {
               log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
               return;
             }
@@ -1326,16 +1339,15 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
     // startHeartbeat/teardown superseded us (generation), and the target is
     // still chrome_up. Any mismatch means we lost the race — close what we
     // just opened and abandon without touching rt.heartbeatWs.
-    const currentPid = pidOf(rt);
     if (
       rt.heartbeatGeneration !== myGeneration ||
-      currentPid !== capturedPid ||
+      !isCurrentChrome(rt, capturedPid) ||
       rt.heartbeatWs !== null ||
       getState(target).phase !== "chrome_up"
     ) {
       log.debug(`[${target}] Heartbeat setup stale after fetch — abandoning`, {
         capturedPid,
-        currentPid,
+        currentPid: pidOf(rt),
         isRearm,
       });
       try { ws.close(); } catch { /* ignore */ }
@@ -1373,8 +1385,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
       if (deadPid) {
         opQueue.enqueue(() =>
           withOpId(newOpId(), async () => {
-            const currentPid = pidOf(rt);
-            if (currentPid !== deadPid) return;
+            if (!isCurrentChrome(rt, deadPid)) return;
             let pidAlive = true;
             try {
               process.kill(deadPid, 0);
@@ -1431,8 +1442,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
             if (rt.heartbeatRearmTimer) clearTimeout(rt.heartbeatRearmTimer);
             rt.heartbeatRearmTimer = setTimeout(() => {
               rt.heartbeatRearmTimer = null;
-              const currentPidAtRearm = pidOf(rt);
-              if (!shouldRearmHeartbeat(currentPidAtRearm, deadPid, rt.heartbeatWs, getState(target).phase)) {
+              if (!shouldRearmHeartbeat(pidOf(rt), deadPid, rt.heartbeatWs, getState(target).phase)) {
                 return;
               }
               startHeartbeat(target, true);
@@ -1477,8 +1487,7 @@ function reenterCooldownIfStillUp(
   if (!isRearm || capturedPid === null) return;
   const rt = runtime[target];
   if (rt.heartbeatGeneration !== myGeneration) return;
-  const currentPid = pidOf(rt);
-  if (currentPid !== capturedPid) return;
+  if (!isCurrentChrome(rt, capturedPid)) return;
   if (getState(target).phase !== "chrome_up") return;
   log.warn(`[${target}] Cooldown retry setup failed — retrying in ${HEARTBEAT_COOLDOWN_MS / 1000}s`);
   enterCooldown(target, capturedPid);
@@ -1516,10 +1525,9 @@ async function runThresholdProbe(
   await opQueue.enqueue(() =>
     withOpId(newOpId(), async () => {
       const rt = runtime[target];
-      const currentPid = pidOf(rt);
       if (
         rt.heartbeatGeneration !== generation ||
-        currentPid !== deadPid ||
+        !isCurrentChrome(rt, deadPid) ||
         getState(target).phase !== "chrome_up"
       ) {
         log.debug(`[${target}] Stale probe result — discarding`, { deadPid, generation });
@@ -1560,8 +1568,7 @@ function enterCooldown(target: ChromeTarget, pid: number): void {
   if (rt.heartbeatCooldownTimer) clearTimeout(rt.heartbeatCooldownTimer);
   rt.heartbeatCooldownTimer = setTimeout(() => {
     rt.heartbeatCooldownTimer = null;
-    const currentPid = pidOf(rt);
-    if (!shouldRearmHeartbeat(currentPid, pid, rt.heartbeatWs, getState(target).phase)) {
+    if (!shouldRearmHeartbeat(pidOf(rt), pid, rt.heartbeatWs, getState(target).phase)) {
       return;
     }
     startHeartbeat(target, true);
@@ -1651,12 +1658,8 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
   rt.lastDetection = { reason, at: Date.now() };
   bumpBackoffAndRetry(rt);
 
-  const chrome = rt.chrome;
-  if (chrome?.kind === "spawned") {
-    // Force-kill the unresponsive process we spawned
-    const pid = chrome.proc.pid;
-    chrome.proc.kill();
-    rt.chrome = null;
+  const pid = killSpawned(rt);
+  if (pid !== null) {
     log.info(`[${target}] Killed unresponsive Chrome (PID ${pid})`, {
       killedBy: "supervisor",
       reason,
