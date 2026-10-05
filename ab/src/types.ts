@@ -117,6 +117,10 @@ export interface ShardDiagnostics {
   lastExit: { code: number | null; signal: string | null; at: string } | null;
   /** The last crash-detection event handleCrashDetected recorded, with why. */
   lastDetection: { reason: DetectionReason; at: string } | null;
+  /** PID of a Chrome the daemon adopted (did not spawn) and never signals, or null. */
+  adoptedPid?: number | null;
+  /** The last time the daemon refused to clear a port held by a PID it may not signal. */
+  lastPortConflict?: { port: number; pid: number; reason: "port-occupied-foreign"; detail: string; at: string } | null;
 }
 
 // ---------------------------------------------------------------------------

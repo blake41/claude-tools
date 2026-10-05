@@ -201,7 +201,7 @@ interface TargetRuntime {
    * not spawn and refused to signal it. Cleared on the next successful
    * launch or adoption. Diagnostics only.
    */
-  lastPortConflict: { port: number; pid: number; reason: "port-occupied-foreign"; at: number } | null;
+  lastPortConflict: { port: number; pid: number; reason: "port-occupied-foreign"; detail: string; at: number } | null;
   healthTimer: ReturnType<typeof setInterval> | null;
   consecutiveFailures: number;
   backoffMs: number;
@@ -383,6 +383,9 @@ export function getHealthDiagnostics(): Record<ChromeTarget, ShardDiagnostics> {
       heartbeatMode: rt.heartbeatMode,
       lastExit: rt.lastExit !== null ? { ...rt.lastExit, at: new Date(rt.lastExit.at).toISOString() } : null,
       lastDetection: rt.lastDetection !== null ? { ...rt.lastDetection, at: new Date(rt.lastDetection.at).toISOString() } : null,
+      adoptedPid: rt.adoptedPid,
+      lastPortConflict:
+        rt.lastPortConflict !== null ? { ...rt.lastPortConflict, at: new Date(rt.lastPortConflict.at).toISOString() } : null,
     };
   }
   return result;
@@ -703,18 +706,84 @@ function adoptChrome(
   return { pid, port: config.port, profileFresh };
 }
 
+/** `cmdline` passes exactly `--user-data-dir=<profilePath>` (not a longer path that starts with it). */
+export function commandLineUsesProfile(cmdline: string, profilePath: string): boolean {
+  const flag = `--user-data-dir=${profilePath}`;
+  let i = cmdline.indexOf(flag);
+  while (i !== -1) {
+    const before = i === 0 ? " " : cmdline[i - 1];
+    const after = cmdline[i + flag.length] ?? " ";
+    if (/\s/.test(before) && /\s/.test(after)) return true;
+    i = cmdline.indexOf(flag, i + 1);
+  }
+  return false;
+}
+
 /**
- * Clear `target`'s port of `pid` so launchChrome can spawn — but only if
- * `pid` is the Chrome this daemon last spawned for the target. Any other PID is
- * never signalled: record the conflict, arm a retry window, mark the launch
- * failed, and throw RetryAfterError. A hung occupant we did not spawn
- * therefore keeps the shard down until its owner (or the user) stops it.
+ * Command line of `pid` via `pgrep -lf` ("<pid> <args>" lines; the sandbox
+ * has no ps), or null if it cannot be read.
+ */
+async function readCommandLine(pid: number): Promise<string | null> {
+  const proc = Bun.spawn(["/usr/bin/pgrep", "-lf", "--", "--user-data-dir="], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  proc.exited.catch(() => {});
+  const timer = setTimeout(() => proc.kill(), 5_000);
+  try {
+    const raw = await new Response(proc.stdout).text();
+    const prefix = `${pid} `;
+    const line = raw.split("\n").find((l) => l.startsWith(prefix));
+    return line ? line.slice(prefix.length) : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function killOccupant(
+  target: ChromeTarget,
+  pid: number,
+  reason: "crash-loop-recovery" | "port-occupied" | "port-occupied-own-profile",
+  whose: string,
+): Promise<void> {
+  const config = CONFIGS[target];
+  const rt = runtime[target];
+  log.warn(`[${target}] Port ${config.port} occupied by ${whose} (PID ${pid}) — killing`, {
+    killedBy: "supervisor",
+    reason,
+  });
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Process may have already exited
+  }
+  // Wait up to 3s for the port to free up
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (!(await getListeningPid(config.port))) {
+      rt.lastSpawnedPid = null;
+      return;
+    }
+    await sleep(200);
+  }
+}
+
+/**
+ * Clear `target`'s port of `pid` so launchChrome can spawn. Kills `pid` only
+ * if it is the Chrome this daemon last spawned for the target, or a Chrome
+ * whose --user-data-dir is this target's own profile (it cannot be anyone
+ * else's, and it blocks every launch on that profile). Any other PID, or one
+ * whose command line cannot be read, is never signalled: record the
+ * conflict, arm a retry window, mark the launch failed, and throw
+ * RetryAfterError.
  *
  * The refusal arms retryNotBefore but deliberately does NOT escalate
  * backoffMs: backoffMs reaching BACKOFF_MAX_MS triggers the profile nuke in
  * launchChrome, and a foreign port holder says nothing about our profile.
  */
-async function killOwnOccupantOrRefuse(
+async function clearOccupantOrRefuse(
   target: ChromeTarget,
   pid: number,
   killReason: "crash-loop-recovery" | "port-occupied",
@@ -723,32 +792,25 @@ async function killOwnOccupantOrRefuse(
   const rt = runtime[target];
 
   if (pid === rt.lastSpawnedPid) {
-    log.warn(`[${target}] Port ${config.port} occupied by our own Chrome (PID ${pid}) — killing`, {
-      killedBy: "supervisor",
-      reason: killReason,
-    });
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Process may have already exited
-    }
-    // Wait up to 3s for the port to free up
-    const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      if (!(await getListeningPid(config.port))) {
-        rt.lastSpawnedPid = null;
-        break;
-      }
-      await sleep(200);
-    }
+    await killOccupant(target, pid, killReason, "our own Chrome");
     return;
   }
 
-  rt.lastPortConflict = { port: config.port, pid, reason: "port-occupied-foreign", at: Date.now() };
+  const cmdline = await readCommandLine(pid);
+  if (cmdline !== null && commandLineUsesProfile(cmdline, config.profilePath)) {
+    await killOccupant(target, pid, "port-occupied-own-profile", `an unresponsive Chrome on this target's profile ${config.profilePath}`);
+    return;
+  }
+
+  const userDataDir = cmdline === null ? null : (/--user-data-dir=(\S+)/.exec(cmdline)?.[1] ?? "none");
+  const detail = cmdline === null
+    ? "command line unreadable"
+    : `--user-data-dir ${userDataDir} is not this target's profile ${config.profilePath}`;
+  rt.lastPortConflict = { port: config.port, pid, reason: "port-occupied-foreign", detail, at: Date.now() };
   rt.retryNotBefore = Date.now() + BACKOFF_MAX_MS;
   log.warn(
-    `[${target}] port ${config.port} held by PID ${pid} (not spawned by this daemon) — fix: kill it yourself or set AB_BASE_PORT/AB_HEADED_PORT`,
-    { pid, port: config.port, reason: "port-occupied-foreign" },
+    `[${target}] port ${config.port} held by PID ${pid} (not spawned by this daemon: ${detail}) — fix: kill it yourself or set AB_BASE_PORT/AB_HEADED_PORT`,
+    { pid, port: config.port, reason: "port-occupied-foreign", detail },
   );
   markCrashed(target, -1);
   if (config.policy === "always-on") {
@@ -795,21 +857,22 @@ async function launchChrome(
     const pid = await getListeningPid(config.port);
     if (pid) {
       if (shouldAdopt(pid)) return adoptChrome(target, pid, profileFresh);
-      await killOwnOccupantOrRefuse(target, pid, "crash-loop-recovery");
+      await clearOccupantOrRefuse(target, pid, "crash-loop-recovery");
     }
   } else {
     // Port might be bound by a process whose CDP is not answering yet.
     const stalePid = await getListeningPid(config.port);
     if (stalePid) {
       // checkCdp is false while a Chrome is still booting — give it up to 5s
-      // before calling it unresponsive.
-      const cameUp = await waitForCdp(config.port, OCCUPANT_CDP_WAIT_MS);
+      // before calling it unresponsive. A pid we already refused is past
+      // booting: skip the wait, so a retry cycle does not hold the opQueue.
+      const refusedBefore = rt.lastPortConflict?.pid === stalePid;
+      const cameUp = refusedBefore ? false : await waitForCdp(config.port, OCCUPANT_CDP_WAIT_MS);
       if (cameUp && shouldAdopt(stalePid)) {
         return adoptChrome(target, stalePid, profileFresh);
       }
-      // Still unresponsive, or our own Chrome while crash-looping: clear the
-      // port only if the occupant is ours.
-      await killOwnOccupantOrRefuse(target, stalePid, cameUp ? "crash-loop-recovery" : "port-occupied");
+      // Still unresponsive, or our own Chrome while crash-looping.
+      await clearOccupantOrRefuse(target, stalePid, cameUp ? "crash-loop-recovery" : "port-occupied");
     }
   }
 
@@ -1796,6 +1859,11 @@ export function __resetRuntimeForTest(): void {
     clearTimers(target);
     runtime[target] = freshRuntime();
   }
+}
+
+/** Let the next ensure() past a refusal's retry window. Test-only. */
+export function __expireRetryWindowForTest(target: ChromeTarget): void {
+  runtime[target].retryNotBefore = 0;
 }
 
 /**

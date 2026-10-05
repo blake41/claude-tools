@@ -731,6 +731,13 @@ export function buildHeadlessDoctorDetail(
   phase: string,
   diag: ShardDiagnostics | undefined,
 ): string {
+  const conflict = diag?.lastPortConflict;
+  if (conflict && phase !== "chrome_up") {
+    return `${phase} — port ${conflict.port} held by PID ${conflict.pid}, not spawned by this daemon (${conflict.detail})`;
+  }
+  if (phase === "chrome_up" && diag?.adoptedPid) {
+    return `chrome_up (adopted PID ${diag.adoptedPid}, not spawned by this daemon; ab heal re-adopts it, it does not restart it)`;
+  }
   if (!alwaysOn && phase === "idle") {
     if (diag?.lastExit) {
       const { code, signal, at } = diag.lastExit;
@@ -739,6 +746,30 @@ export function buildHeadlessDoctorDetail(
     return "idle (on-demand)";
   }
   return phase;
+}
+
+/** Fix hint for a failing Chrome check: a refused port occupant needs a human, not ab heal. */
+function chromeFix(phase: string, diag: ShardDiagnostics | undefined, fallback: string): string {
+  const conflict = diag?.lastPortConflict;
+  if (conflict && phase !== "chrome_up") {
+    return `kill ${conflict.pid}   # only if that Chrome is yours; or set AB_BASE_PORT / AB_HEADED_PORT in the daemon's launchd env`;
+  }
+  return fallback;
+}
+
+export function buildHeadedDoctorCheck(status: {
+  headed: ChromeState;
+  diagnostics?: { headed?: ShardDiagnostics };
+}): DoctorCheck {
+  // Headed is on-demand — not running is normal, only flag if crashed.
+  const crashed = status.headed.phase === "chrome_crashed";
+  const diag = status.diagnostics?.headed;
+  return {
+    label: `Chrome (${withPort("headed", upPort(status.headed))})`,
+    ok: !crashed,
+    detail: buildHeadlessDoctorDetail(false, status.headed.phase, diag),
+    fix: crashed ? chromeFix(status.headed.phase, diag, "ab heal") : undefined,
+  };
 }
 
 export function buildHeadlessDoctorChecks(
@@ -759,7 +790,7 @@ export function buildHeadlessDoctorChecks(
         label: `Chrome (${withPort(`headless-${i}`, ports[i])})`,
         ok,
         detail,
-        fix: ok ? undefined : "ab ensure   # or: ab heal",
+        fix: ok ? undefined : chromeFix(state.phase, diag, "ab ensure   # or: ab heal"),
       };
     });
   }
@@ -926,14 +957,7 @@ async function cmdDoctor(headed = false): Promise<number> {
     const tabPorts = status.headlessPool ? headlessPortsFromPool(status.headlessPool) : [upPort(status.headless)];
     checks.push(...buildTabCountChecks(tabCounts, tabPorts));
 
-    // Headed is on-demand — not running is normal, only flag if crashed.
-    const headedCrashed = status.headed.phase === "chrome_crashed";
-    checks.push({
-      label: `Chrome (${withPort("headed", upPort(status.headed))})`,
-      ok: !headedCrashed,
-      detail: buildHeadlessDoctorDetail(false, status.headed.phase, status.diagnostics?.headed),
-      fix: headedCrashed ? "ab heal" : undefined,
-    });
+    checks.push(buildHeadedDoctorCheck(status));
   }
 
   if (daemonUp) {
@@ -2555,7 +2579,7 @@ function printUsage(): void {
   stderr("Auth & Lifecycle:");
   stderr("  reauth [--staging|--dev|--host <hostname>]  Re-authenticate via daemon (default: auto-detects *.terra.localhost from browser URL, falls back to localhost)");
   stderr("  import              Headed login (manual Google/Clerk auth)");
-  stderr("  heal                Kill all Chrome, restart fresh");
+  stderr("  heal                Restart the Chromes this daemon spawned (adopted ones are released and re-adopted, never killed)");
   stderr("  status              Show daemon status (JSON)");
   stderr("  doctor              Human-readable health check with fix commands");
   stderr("  ensure              Ensure Chrome is running");
