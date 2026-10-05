@@ -117,6 +117,8 @@ describe("getHealthDiagnostics", () => {
       heartbeatMode: "off",
       lastExit: null,
       lastDetection: null,
+      adoptedPid: null,
+      lastPortConflict: null,
     });
     expect(diag["headless-0"]).toEqual({
       lastHealthOkAt: null,
@@ -124,6 +126,8 @@ describe("getHealthDiagnostics", () => {
       heartbeatMode: "off",
       lastExit: null,
       lastDetection: null,
+      adoptedPid: null,
+      lastPortConflict: null,
     });
   });
 });
