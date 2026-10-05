@@ -16,17 +16,15 @@ import {
   AUTH_DEADLINE_GUARD_MS,
   authLoginDeadline,
 } from "../config";
-import { HEADLESS_POOL_SIZE as TYPES_POOL_SIZE } from "../types";
 
 describe("module-level constants", () => {
-  test("are resolveConfig(process.env), and types.ts re-exports the same pool size", () => {
+  test("are resolveConfig(process.env)", () => {
     expect({
       headlessBasePort: HEADLESS_BASE_PORT,
       headedPort: HEADED_PORT,
       dashboardPort: DASHBOARD_PORT,
       headlessPoolSize: HEADLESS_POOL_SIZE,
     }).toEqual(resolveConfig(process.env));
-    expect(TYPES_POOL_SIZE).toBe(HEADLESS_POOL_SIZE);
   });
 
   test("headlessPortForShard(i) is base + i", () => {

@@ -20,11 +20,10 @@ export interface ChromeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Headless pool sizing (resolved in ./config; re-exported for existing importers)
+// Headless pool targets (pool size is resolved in ./config)
 // ---------------------------------------------------------------------------
 
 import { HEADLESS_POOL_SIZE } from "./config";
-export { HEADLESS_POOL_SIZE };
 
 /** Build the ChromeTarget key for headless shard `shard` (0-indexed). */
 export function headlessTarget(shard: number): ChromeTarget {

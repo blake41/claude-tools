@@ -152,9 +152,9 @@ function realSignalsTo(pid: number): Array<string | number | undefined> {
 
 type Snap = {
   phase: string;
-  owned: boolean;
   adoptedPid: number | null;
   procPid: number | null;
+  lastSpawnedPid: number | null;
   retryNotBefore: number;
   restartScheduled: boolean;
   hasRestartTimer: boolean;
@@ -200,14 +200,14 @@ afterAll(() => {
 });
 
 describe("adopted Chrome (responsive CDP already on our port)", () => {
-  test("ensure adopts it as not-owned; stopAll leaves it idle and never signals the PID", async () => {
+  test("ensure adopts it without a process handle; stopAll leaves it idle and never signals the PID", async () => {
     const { ensure, stopAll } = await loadSupervisor();
 
     const result = await ensure(TARGET);
     expect(result.pid).toBe(FOREIGN_PID);
     expect(getState(TARGET).phase).toBe("chrome_up");
     const s = await snap();
-    expect(s.owned).toBe(false);
+    expect(s.procPid).toBeNull();
     expect(s.adoptedPid).toBe(FOREIGN_PID);
 
     await stopAll();
@@ -222,7 +222,7 @@ describe("crash detected on an adopted Chrome", () => {
   test("heartbeat close with the pid gone: no signal, crashed, backoff armed, restart scheduled", async () => {
     const { ensure } = await loadSupervisor();
     await ensure(TARGET);
-    expect((await snap()).owned).toBe(false);
+    expect((await snap()).procPid).toBeNull();
     await waitUntil(() => FakeWebSocket.instances.length > 0);
 
     // The adopted Chrome dies: liveness probe (signal 0) now throws ESRCH.
@@ -234,7 +234,7 @@ describe("crash detected on an adopted Chrome", () => {
     const s = await snap();
     expect(s.lastDetection?.reason).toBe("heartbeat-close-pid-dead");
     expect(s.adoptedPid).toBeNull();
-    expect(s.owned).toBe(false);
+    expect(s.procPid).toBeNull();
     expect(s.retryNotBefore).toBeGreaterThan(before);
     expect(s.restartScheduled).toBe(true);
     expect(s.hasRestartTimer).toBe(true);
@@ -268,7 +268,7 @@ describe("crash detected on an adopted Chrome", () => {
 });
 
 describe("port occupant that is still booting (CDP not answering yet)", () => {
-  test("waits for CDP, then adopts the occupant as not-owned and never signals it", async () => {
+  test("waits for CDP, then adopts the occupant without a process handle and never signals it", async () => {
     const { ensure } = await loadSupervisor();
     // CDP refuses for the first ~1s of the launch, then answers.
     const cdpUpAt = Date.now() + 1_000;
@@ -280,7 +280,7 @@ describe("port occupant that is still booting (CDP not answering yet)", () => {
     expect(result.pid).toBe(FOREIGN_PID);
     expect(getState(TARGET).phase).toBe("chrome_up");
     const s = await snap();
-    expect(s.owned).toBe(false);
+    expect(s.procPid).toBeNull();
     expect(s.adoptedPid).toBe(FOREIGN_PID);
     expect(chromeProc).toBeNull(); // no Chrome of our own was spawned
     expect(realSignalsTo(FOREIGN_PID)).toEqual([]);
@@ -316,9 +316,11 @@ describe("port occupant whose CDP never answers", () => {
     // First launch: port free, we spawn and own SPAWNED_PID.
     listeningPid = null;
     await ensure(TARGET);
-    expect((await snap()).owned).toBe(true);
+    expect((await snap()).procPid).toBe(SPAWNED_PID);
     await kill(TARGET);
     expect(chromeProc?.kill).toHaveBeenCalled();
+    // The handle is gone, but the pid is still remembered as ours.
+    expect(await snap()).toMatchObject({ procPid: null, lastSpawnedPid: SPAWNED_PID });
 
     // Our old PID is somehow still bound to the port and not answering CDP.
     listeningPid = SPAWNED_PID;
@@ -330,7 +332,7 @@ describe("port occupant whose CDP never answers", () => {
     expect(realSignalsTo(SPAWNED_PID)).toEqual(["SIGKILL"]);
     expect(result.pid).toBe(SPAWNED_PID); // the fresh spawn (mock reuses the pid)
     const s = await snap();
-    expect(s.owned).toBe(true);
     expect(s.procPid).toBe(SPAWNED_PID);
+    expect(s.lastSpawnedPid).toBe(SPAWNED_PID);
   }, 15_000);
 });

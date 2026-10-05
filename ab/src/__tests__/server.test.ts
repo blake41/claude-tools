@@ -14,7 +14,8 @@ import type {
   HealResponse,
   AuthLoginResponse,
 } from "../types";
-import { HEADLESS_POOL_SIZE, HEADLESS_TARGETS, headlessTarget } from "../types";
+import { HEADLESS_POOL_SIZE } from "../config";
+import { HEADLESS_TARGETS, headlessTarget } from "../types";
 
 // ---------------------------------------------------------------------------
 // Test socket path — isolated from the real daemon

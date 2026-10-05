@@ -21,13 +21,11 @@ const log = new Logger({ component: "auth" });
 // ---------------------------------------------------------------------------
 
 interface AuthState {
-  authenticated: boolean;
   user: { email: string } | null;
   timestamp: number | null;
 }
 
 let authState: AuthState = {
-  authenticated: false,
   user: null,
   timestamp: null,
 };
@@ -36,7 +34,8 @@ let authState: AuthState = {
 // Defaults
 // ---------------------------------------------------------------------------
 
-const DEFAULT_APP_BASE = "http://localhost:5173";
+/** Default app base used when a caller omits appBaseUrl. */
+export const DEFAULT_AUTH_APP_BASE = "http://localhost:5173";
 
 // ---------------------------------------------------------------------------
 // Clerk client seam
@@ -232,7 +231,7 @@ export async function authenticate(
 ): Promise<AuthLoginResponse> {
   const { createClerkClient, deadline = authLoginDeadline(Date.now()), pollIntervalMs = 1_000 } = { ...defaultDeps, ...deps };
   const { sessionId, port } = req;
-  const appBaseUrl = req.appBaseUrl || DEFAULT_APP_BASE;
+  const appBaseUrl = req.appBaseUrl || DEFAULT_AUTH_APP_BASE;
   const email = req.email;
 
   // Never log the secret key.
@@ -244,13 +243,13 @@ export async function authenticate(
   // The short-circuit is origin-aware: being authenticated on worktree-A
   // must not skip auth for worktree-B. We compare the browser URL's origin
   // against the target appBaseUrl origin. When no appBaseUrl is provided, the
-  // target is localhost:5173 (the DEFAULT_APP_BASE), so we check that.
+  // target is localhost:5173 (the DEFAULT_AUTH_APP_BASE), so we check that.
   // -----------------------------------------------------------------------
 
   const urlResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
   if (urlResult.ok && isAuthenticatedUrl(urlResult.stdout)) {
     // Determine target origin for the comparison.
-    const targetBase = appBaseUrl || DEFAULT_APP_BASE;
+    const targetBase = appBaseUrl || DEFAULT_AUTH_APP_BASE;
     let targetOrigin: string;
     try {
       targetOrigin = new URL(targetBase).origin;
@@ -271,7 +270,6 @@ export async function authenticate(
         targetOrigin,
       });
       authState = {
-        authenticated: true,
         user: authState.user, // preserve existing user info
         timestamp: Date.now(),
       };
@@ -412,7 +410,6 @@ export async function authenticate(
 
   const user = { email };
   authState = {
-    authenticated: true,
     user,
     timestamp: Date.now(),
   };
@@ -429,7 +426,7 @@ export async function authenticate(
  * derived from the cookie jar, so production never needs to reset on crash.
  */
 export function __resetAuthStateForTest(): void {
-  authState = { authenticated: false, user: null, timestamp: null };
+  authState = { user: null, timestamp: null };
 }
 
 /** Cap on the cookie probe so /auth/status cannot hang on a wedged agent-browser. */
@@ -452,7 +449,7 @@ export async function getAuthStatus(
   const authenticated = await confirmClerkSession(
     opts.sessionId,
     opts.port,
-    opts.appBaseUrl || DEFAULT_APP_BASE,
+    opts.appBaseUrl || DEFAULT_AUTH_APP_BASE,
     STATUS_PROBE_TIMEOUT_MS,
   ).catch(() => false);
   return {
@@ -464,6 +461,3 @@ export async function getAuthStatus(
     checkedVia: "cookie",
   };
 }
-
-/** Default app base used when a caller omits appBaseUrl. */
-export const DEFAULT_AUTH_APP_BASE = DEFAULT_APP_BASE;
