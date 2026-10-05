@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { __resetAuthStateForTest, authenticateJoined, createSingleFlight } from "../auth";
+import { __resetAuthStateForTest, authenticateJoined } from "../auth";
 import type { AgentTaskClient } from "../auth";
 
 const originalSpawn = Bun.spawn;
@@ -26,64 +26,6 @@ function gate() {
   const opened = new Promise<void>((r) => { release = r; });
   return { opened, release };
 }
-
-describe("createSingleFlight", () => {
-  test("concurrent callers with the same key share one run and one result", async () => {
-    const flight = createSingleFlight<{ n: number }>();
-    const g = gate();
-    let runs = 0;
-    const run = async () => { runs++; await g.opened; return { n: runs }; };
-
-    const a = flight("k", run);
-    const b = flight("k", run);
-    g.release();
-    const [ra, rb] = await Promise.all([a, b]);
-
-    expect(runs).toBe(1);
-    expect(ra).toBe(rb);
-  });
-
-  test("different keys run independently", async () => {
-    const flight = createSingleFlight<number>();
-    const g = gate();
-    let runs = 0;
-    const run = async () => { runs++; await g.opened; return runs; };
-
-    const a = flight("k1", run);
-    const b = flight("k2", run);
-    g.release();
-    await Promise.all([a, b]);
-
-    expect(runs).toBe(2);
-  });
-
-  test("entry is removed on success so a later call runs again", async () => {
-    const flight = createSingleFlight<number>();
-    let runs = 0;
-    const run = async () => ++runs;
-
-    await flight("k", run);
-    await flight("k", run);
-
-    expect(runs).toBe(2);
-  });
-
-  test("entry is removed on rejection and joined callers all see the rejection", async () => {
-    const flight = createSingleFlight<number>();
-    const g = gate();
-    let runs = 0;
-    const run = async () => { runs++; await g.opened; throw new Error("boom"); };
-
-    const a = flight("k", run);
-    const b = flight("k", run);
-    g.release();
-    const settled = await Promise.allSettled([a, b]);
-
-    expect(settled.map((s) => s.status)).toEqual(["rejected", "rejected"]);
-    expect(runs).toBe(1);
-    await expect(flight("k", async () => 7)).resolves.toBe(7);
-  });
-});
 
 describe("authenticateJoined", () => {
   const TEST_KEY = "sk_test_abcdef";
@@ -159,5 +101,24 @@ describe("authenticateJoined", () => {
     await authenticateJoined(req(), deps);
 
     expect(c.mints()).toBe(2);
+  });
+
+  test("a rejected login clears the entry: joined callers all reject, a later call runs fresh", async () => {
+    let spawns = 0;
+    Bun.spawn = (() => {
+      spawns++;
+      throw new Error("spawn exploded");
+    }) as unknown as typeof Bun.spawn;
+    const c = countingClerk();
+    const deps = { createClerkClient: () => c.client };
+
+    const a = authenticateJoined(req({ sessionId: "s1" }), deps);
+    const b = authenticateJoined(req({ sessionId: "s2" }), deps);
+    const settled = await Promise.allSettled([a, b]);
+    const after = await Promise.allSettled([authenticateJoined(req(), deps)]);
+
+    expect(settled.map((x) => x.status)).toEqual(["rejected", "rejected"]);
+    expect(after[0].status).toBe("rejected");
+    expect(spawns).toBe(2);
   });
 });
