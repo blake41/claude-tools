@@ -417,6 +417,35 @@ export async function authenticate(
   return { ok: true, user };
 }
 
+/** Runs `run` once per concurrent `key`; callers arriving while it is in flight join it. */
+export function createSingleFlight<T>(): (key: string, run: () => Promise<T>) => Promise<T> {
+  const inFlight = new Map<string, Promise<T>>();
+  return (key, run) => {
+    const existing = inFlight.get(key);
+    if (existing) return existing;
+    const flight = run().finally(() => {
+      inFlight.delete(key);
+    });
+    inFlight.set(key, flight);
+    return flight;
+  };
+}
+
+const loginFlights = createSingleFlight<AuthLoginResponse>();
+
+/**
+ * authenticate() with concurrent logins for the same shard and app origin
+ * joined into one: sessions share a cookie jar per shard, so one Agent Task
+ * serves every waiting caller.
+ */
+export function authenticateJoined(
+  req: AuthLoginRequest,
+  deps: Partial<AuthenticateDeps> = {},
+): Promise<AuthLoginResponse> {
+  const key = `${req.port}|${req.appBaseUrl || DEFAULT_AUTH_APP_BASE}`;
+  return loginFlights(key, () => authenticate(req, deps));
+}
+
 // ---------------------------------------------------------------------------
 // Auth status query
 // ---------------------------------------------------------------------------

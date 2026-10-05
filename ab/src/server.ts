@@ -16,7 +16,7 @@ import * as os from "os";
 import * as path from "path";
 import { getAllStates, resetAll } from "./state";
 import * as supervisor from "./chrome-supervisor";
-import { authenticate, getAuthStatus, DEFAULT_AUTH_APP_BASE } from "./auth";
+import { authenticateJoined, getAuthStatus, DEFAULT_AUTH_APP_BASE } from "./auth";
 import { AUTH_LOGIN_TIMEOUT_MS, HEADLESS_BASE_PORT, HEADLESS_POOL_SIZE, authLoginDeadline } from "./config";
 import { Logger, withOpId, newOpId } from "./logger";
 import { z } from "zod";
@@ -258,7 +258,7 @@ async function handleAuthLogin(req: Request): Promise<Response> {
     return json({ ok: false, error: `Validation failed: ${issues.join(", ")}` }, 400);
   }
 
-  const result = await authenticate(parsed.data, { deadline });
+  const result = await authenticateJoined(parsed.data, { deadline });
   return json(result, result.ok ? 200 : 400);
 }
 
