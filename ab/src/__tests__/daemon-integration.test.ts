@@ -107,32 +107,18 @@ function assertNotLivePorts(env: Record<string, string | undefined>): void {
 }
 
 /**
- * Throw unless the spawned daemon's profile root is inside its own temp HOME.
- * chrome-supervisor reads AB_PROFILE_ROOT before HOME, so one exported in the
- * shell would otherwise point the test daemon at live profiles.
+ * Throw unless env[key] is inside the daemon's own temp HOME (never the real one).
+ * chrome-supervisor reads AB_PROFILE_ROOT before HOME, and `agent-browser dashboard stop`
+ * SIGTERMs the pid in <AGENT_BROWSER_SOCKET_DIR>/dashboard.pid, so either pointing at a
+ * live dir would let a test daemon touch live profiles or the live dashboard.
  */
-function assertProfileRootIsolated(env: Record<string, string | undefined>): void {
+function assertInsideTempHome(env: Record<string, string | undefined>, key: string): void {
   const home = env.HOME ?? "";
-  const root = env.AB_PROFILE_ROOT ?? "";
+  const dir = env[key] ?? "";
   const realHome = os.homedir();
-  if (!home || path.resolve(home) === path.resolve(realHome) || !path.resolve(root).startsWith(path.resolve(home) + path.sep)) {
+  if (!home || !dir || path.resolve(home) === path.resolve(realHome) || !path.resolve(dir).startsWith(path.resolve(home) + path.sep)) {
     throw new Error(
-      `daemon-integration refuses to run: AB_PROFILE_ROOT "${root}" is not inside the temp HOME "${home}" (real HOME ${realHome}).`,
-    );
-  }
-}
-
-/**
- * Throw unless the spawned daemon's agent-browser socket dir is inside its own
- * temp HOME. `agent-browser dashboard stop` SIGTERMs the pid in
- * <socket_dir>/dashboard.pid, so a shared dir would let a test daemon stop the live dashboard.
- */
-function assertSocketDirIsolated(env: Record<string, string | undefined>): void {
-  const home = env.HOME ?? "";
-  const dir = env.AGENT_BROWSER_SOCKET_DIR ?? "";
-  if (!home || !dir || !path.resolve(dir).startsWith(path.resolve(home) + path.sep)) {
-    throw new Error(
-      `daemon-integration refuses to run: AGENT_BROWSER_SOCKET_DIR "${dir}" is not inside the temp HOME "${home}".`,
+      `daemon-integration refuses to run: ${key} "${dir}" is not inside the temp HOME "${home}" (real HOME ${realHome}).`,
     );
   }
 }
@@ -152,8 +138,8 @@ function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<stri
     ...(extra ?? {}),
   };
   assertNotLivePorts(env);
-  assertProfileRootIsolated(env);
-  assertSocketDirIsolated(env);
+  assertInsideTempHome(env, "AB_PROFILE_ROOT");
+  assertInsideTempHome(env, "AGENT_BROWSER_SOCKET_DIR");
   return env;
 }
 
@@ -285,12 +271,17 @@ async function spawnDaemon(opts?: {
   const socketPath = path.join(abDir, "ab-server.sock");
   const pidPath = path.join(abDir, "ab-server.pid");
 
+  const env = daemonEnv(homeDir, opts?.env);
   const proc = Bun.spawn(["bun", "run", "src/daemon.ts"], {
     cwd: PROJECT_ROOT,
     stdout: "pipe",
     stderr: "pipe",
-    env: daemonEnv(homeDir, opts?.env),
+    env,
   });
+  const reap = async (p: { exitCode: number | null; exited: Promise<unknown>; kill(sig?: number): void }, ms: number) => {
+    await Promise.race([p.exited, Bun.sleep(ms)]);
+    if (p.exitCode === null) p.kill(9);
+  };
 
   const handle: DaemonHandle = {
     proc,
@@ -307,11 +298,8 @@ async function spawnDaemon(opts?: {
       try {
         if (proc.exitCode === null) {
           proc.kill("SIGTERM");
-          await Promise.race([proc.exited, Bun.sleep(5_000)]);
-          if (proc.exitCode === null) {
-            proc.kill(9);
-            await Promise.race([proc.exited, Bun.sleep(2_000)]);
-          }
+          await reap(proc, 5_000);
+          await Promise.race([proc.exited, Bun.sleep(2_000)]);
         }
       } catch {
         // already dead
@@ -325,10 +313,9 @@ async function spawnDaemon(opts?: {
         const stop = Bun.spawn(["agent-browser", "dashboard", "stop"], {
           stdout: "ignore",
           stderr: "ignore",
-          env: { ...process.env, HOME: homeDir, AGENT_BROWSER_SOCKET_DIR: abDir },
+          env,
         });
-        await Promise.race([stop.exited, Bun.sleep(3_000)]);
-        if (stop.exitCode === null) stop.kill(9);
+        await reap(stop, 3_000);
       } catch {
         // best effort
       }

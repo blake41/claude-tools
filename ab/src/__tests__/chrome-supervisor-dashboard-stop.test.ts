@@ -62,25 +62,48 @@ describe("stopAll dashboard teardown", () => {
     await expect(stopAll()).resolves.toBeUndefined();
   });
 
-  // Must stay last: it leaves opQueue permanently blocked for this module instance.
   test("stops the dashboard even while a queued op blocks opQueue", async () => {
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let fetchStarted: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      fetchStarted = resolve;
+    });
+    globalThis.fetch = mock(() => {
+      fetchStarted();
+      return gate.then(
+        () => new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:1/devtools/browser/FAKE" })),
+      );
+    }) as unknown as typeof fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    // @ts-expect-error — inert stand-in so the adopted target's heartbeat opens no socket
+    globalThis.WebSocket = class {
+      close(): void {}
+    };
     spawnImpl = (cmd) =>
       cmd[0] === "agent-browser"
         ? { pid: -1, exitCode: 0, exited: Promise.resolve(0), kill: mock(() => {}) }
-        : { pid: -1, exitCode: null, exited: new Promise<number>(() => {}), stdout: new ReadableStream(), stderr: null, kill: mock(() => {}) };
+        : { pid: -1, exitCode: 0, exited: Promise.resolve(0), stdout: new Response("424242\n").body, stderr: null, kill: mock(() => {}) };
     try {
       const { ensure, stopAll } = await import("../chrome-supervisor");
-      void ensure("headless-0").catch(() => {});
-      await Bun.sleep(20);
+      const launching = ensure("headless-0").catch(() => {});
+      await blocked;
       let queuedDone = false;
-      void stopAll().then(() => { queuedDone = true; });
-      await Bun.sleep(50);
+      const stopping = stopAll().then(() => {
+        queuedDone = true;
+      });
       expect(queuedDone).toBe(false);
       expect(dashboardStops()).toHaveLength(1);
+      release();
+      await launching;
+      await stopping;
     } finally {
+      release();
       globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
     }
   });
 });
