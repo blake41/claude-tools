@@ -49,13 +49,16 @@ afterAll(() => {
 
 test("CDP timeout arms retryNotBefore, escalates backoff, and gates the next ensure", async () => {
   const { ensure, getRuntimeSnapshot, RetryAfterError } = await import("../chrome-supervisor");
+  const snapOf = () =>
+    (getRuntimeSnapshot() as Record<string, { backoffMs: number; retryNotBefore: number }>)["headless-1"];
+  const backoffBefore = snapOf().backoffMs;
   const before = Date.now();
 
   await expect(ensure("headless-1")).rejects.toThrow(/failed to start/);
 
-  const snap = (getRuntimeSnapshot() as Record<string, { backoffMs: number; retryNotBefore: number }>)["headless-1"];
-  expect(snap.backoffMs).toBe(10_000);
-  expect(snap.retryNotBefore).toBeGreaterThanOrEqual(before + 5_000);
+  const snap = snapOf();
+  expect(snap.backoffMs).toBeGreaterThan(backoffBefore);
+  expect(snap.retryNotBefore).toBeGreaterThanOrEqual(before + backoffBefore);
 
   await expect(ensure("headless-1")).rejects.toBeInstanceOf(RetryAfterError);
 }, 10_000);

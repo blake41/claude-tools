@@ -575,6 +575,15 @@ export function shardForPort(port: number, poolSize: number = HEADLESS_POOL_SIZE
 }
 
 /**
+ * The daemon owns the pool size (its own AB_HEADLESS_POOL_SIZE) and validates
+ * shards against it, so the CLI must never trust its own env copy. A pre-pool
+ * daemon has no `headlessPool` and runs exactly one headless Chrome.
+ */
+export function poolSizeFromStatus(status: { headlessPool?: unknown[] }): number {
+  return status.headlessPool?.length ?? 1;
+}
+
+/**
  * Resolve the CDP port headless commands should use for this session:
  * resolve (or assign) its shard, then ensure that shard's Chrome is up via
  * the daemon. Returns the port the daemon reports rather than assuming the
@@ -587,10 +596,11 @@ export function shardForPort(port: number, poolSize: number = HEADLESS_POOL_SIZE
  * Fix 2).
  */
 async function resolveSessionCdpPort(pid: string): Promise<number> {
-  const requestedShard = resolveOrAssignShard(pid);
+  const poolSize = poolSizeFromStatus(await rpc.status());
+  const requestedShard = resolveOrAssignShard(pid, poolSize);
   const result = await rpc.ensureChrome({ shard: requestedShard });
   maybePrintFreshProfileHint(result.profileFresh);
-  const servedShard = shardForPort(result.port);
+  const servedShard = shardForPort(result.port, poolSize);
   if (servedShard !== requestedShard) {
     writeShardAssignment(pid, servedShard);
   }
@@ -1962,6 +1972,7 @@ export async function sweepOrphanTabs(opts: SweepOptions): Promise<SweepSummary>
 export function makeGcSweepEvidenceProvider(
   reapedPids: Set<string>,
   listEntries: () => SessionEntry[] = listSessionEntries,
+  poolSize: number = HEADLESS_POOL_SIZE,
 ): (shard: SweepShard) => ShardSessionEvidence[] {
   return ({ port }) =>
     listEntries()
@@ -1971,7 +1982,7 @@ export function makeGcSweepEvidenceProvider(
         state: e.state,
         // Clamp exactly like resolveTeardownShard, but WITHOUT its marker
         // rewrite — the sweep must not mutate other agents' markers.
-        shard: e.shard === null ? null : e.shard % HEADLESS_POOL_SIZE,
+        shard: e.shard === null ? null : e.shard % poolSize,
         targets: readSessionTargets(e.pid, port),
       }));
 }
@@ -1995,10 +2006,12 @@ async function cmdGc(args: string[]): Promise<number> {
   // close attempt if THAT shard is up (decision 2/6: per-shard, not global).
   let headlessPool: ChromeState[] | undefined;
   let legacyHeadless: ChromeState | undefined;
+  let poolSize: number | null = null;
   try {
     const st = await rpc.status();
     headlessPool = st.headlessPool;
     legacyHeadless = st.headless;
+    poolSize = poolSizeFromStatus(st);
   } catch {
     headlessPool = undefined; // daemon down → nothing to close on any shard
     legacyHeadless = undefined;
@@ -2034,7 +2047,9 @@ async function cmdGc(args: string[]): Promise<number> {
       continue;
     }
 
-    const shard = resolveTeardownShard(e.pid);
+    // Daemon down: skip resolve — it would clamp against a guessed pool size
+    // and persist that into the marker.
+    const shard = poolSize === null ? 0 : resolveTeardownShard(e.pid, poolSize);
     const port = portForShard(headlessPool, shard, legacyHeadless);
     if (port !== null) {
       // tab-teardown-fix U1: teardown is now verified, and a failure is loud
@@ -2070,7 +2085,7 @@ async function cmdGc(args: string[]): Promise<number> {
       // F1: evidenceFor re-scans listSessionEntries() fresh on every call
       // (see makeGcSweepEvidenceProvider) rather than reusing the stale
       // top-of-run `entries` snapshot taken above.
-      evidenceFor: makeGcSweepEvidenceProvider(reapedPids),
+      evidenceFor: makeGcSweepEvidenceProvider(reapedPids, listSessionEntries, poolSize ?? 1),
       dryRun,
       out: (line) => process.stdout.write(line + "\n"),
       warn: stderr,
@@ -2382,7 +2397,7 @@ async function main(): Promise<number> {
           // Resolve this session's shard the same way teardown/gc does:
           // marker's recorded shard (missing/legacy → 0), never assigned or
           // booted here — `close` must stay a pure teardown.
-          closeShard = resolveTeardownShard(pid);
+          closeShard = resolveTeardownShard(pid, poolSizeFromStatus(st));
           closePort = portForShard(st.headlessPool, closeShard, st.headless);
         }
       } catch {
