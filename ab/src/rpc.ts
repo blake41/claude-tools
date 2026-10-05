@@ -139,8 +139,9 @@ export async function heal(): Promise<HealResponse> {
 
 export async function authLogin(
   req: AuthLoginRequest,
+  opts: { timeoutMs?: number } = {},
 ): Promise<AuthLoginResponse> {
-  return rpcFetch({ method: "POST", path: "/auth/login", body: req });
+  return rpcFetch({ method: "POST", path: "/auth/login", body: req, timeoutMs: opts.timeoutMs });
 }
 
 export async function authStatus(
