@@ -35,13 +35,8 @@ import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import {
-  buildAuthCheck,
-  buildHeadlessDoctorChecks,
-  buildHeadlessDoctorDetail,
-  listSessionEntries,
-  resolveTeardownShard,
-} from "../cli";
+import { listSessionEntries, resolveTeardownShard } from "../cli";
+import { buildAuthCheck, buildHeadlessDoctorChecks, buildHeadlessDoctorDetail } from "../doctor";
 import { readShardAssignment } from "../session";
 import { portForShard } from "../shard-ports";
 import type { ChromeState, ShardDiagnostics } from "../types";

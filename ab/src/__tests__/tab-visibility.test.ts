@@ -22,7 +22,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
 import * as path from "path";
-import { buildTabCountChecks, TAB_WARN_THRESHOLD } from "../cli";
+import { buildTabCountChecks, TAB_WARN_THRESHOLD } from "../doctor";
 import { fetchTabCounts } from "../cdp-http";
 import type { CdpPage } from "../cdp-http";
 import type { ChromeState } from "../types";
