@@ -185,6 +185,21 @@ interface TargetRuntime {
   proc: ReturnType<typeof Bun.spawn> | null;
   /** PID of an adopted Chrome we don't own the process handle for */
   adoptedPid: number | null;
+  /**
+   * True only when THIS daemon spawned the current Chrome process (launchChrome's
+   * Bun.spawn). False for an adopted Chrome (another daemon's, or one left over
+   * from a previous run) and when no Chrome is tracked. Teardown and crash paths
+   * never signal a Chrome with owned === false — they only drop their state.
+   * Without this rule a second daemon (e.g. a test daemon on the same ports)
+   * adopted the live daemon's Chrome and SIGKILLed it on shutdown.
+   */
+  owned: boolean;
+  /**
+   * The last time launchChrome found our port held by a PID this daemon did
+   * not spawn and refused to signal it. Cleared on the next successful
+   * launch or adoption. Diagnostics only.
+   */
+  lastPortConflict: { port: number; pid: number; reason: "occupant-not-ours" | "port-occupied-foreign"; at: number } | null;
   healthTimer: ReturnType<typeof setInterval> | null;
   consecutiveFailures: number;
   backoffMs: number;
@@ -276,10 +291,20 @@ function buildRuntime(): Record<ChromeTarget, TargetRuntime> {
 
 const runtime: Record<ChromeTarget, TargetRuntime> = buildRuntime();
 
+/**
+ * Every Chrome PID this daemon process has spawned, for its whole lifetime.
+ * launchChrome's port-occupant branches may SIGKILL a PID only if it is in
+ * this set (e.g. our own Chrome we lost the handle to). A PID outside it
+ * belongs to someone else and is never signalled.
+ */
+const spawnedPids = new Set<number>();
+
 function freshRuntime(): TargetRuntime {
   return {
     proc: null,
     adoptedPid: null,
+    owned: false,
+    lastPortConflict: null,
     healthTimer: null,
     consecutiveFailures: 0,
     backoffMs: BACKOFF_INITIAL_MS,
@@ -320,6 +345,9 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
       ...(state.phase === "chrome_crashed" ? { exitCode: state.exitCode } : {}),
       procPid: rt.proc?.pid ?? null,
       adoptedPid: rt.adoptedPid,
+      owned: rt.owned,
+      lastPortConflict:
+        rt.lastPortConflict !== null ? { ...rt.lastPortConflict, at: new Date(rt.lastPortConflict.at).toISOString() } : null,
       consecutiveFailures: rt.consecutiveFailures,
       backoffMs: rt.backoffMs,
       restartScheduled: rt.restartScheduled,
@@ -510,6 +538,24 @@ async function doKill(target: ChromeTarget): Promise<void> {
   const config = CONFIGS[target];
   clearTimers(target);
 
+  if (!rt.owned) {
+    // Not spawned by this daemon (adopted, or nothing tracked): drop our
+    // state only. Never signal it, and leave its SingletonLock alone — the
+    // adopted Chrome may still be using that profile, and removing its lock
+    // invites a second Chrome onto the same profile.
+    if (rt.adoptedPid) {
+      log.info(`[${target}] Releasing adopted Chrome (PID ${rt.adoptedPid}) — not spawned by this daemon, not signalling`, {
+        reason: "kill() requested",
+      });
+    }
+    rt.adoptedPid = null;
+    rt.proc = null;
+    if (getState(target).phase !== "idle") {
+      markIdle(target);
+    }
+    return;
+  }
+
   if (rt.proc) {
     const proc = rt.proc; // Capture before await — handleExit may null rt.proc
     log.info(`[${target}] Killing Chrome (PID ${proc.pid})`, { killedBy: "supervisor", reason: "kill() requested" });
@@ -526,17 +572,8 @@ async function doKill(target: ChromeTarget): Promise<void> {
       await Promise.race([proc.exited, sleep(2_000)]);
     }
     rt.proc = null;
-  } else if (rt.adoptedPid) {
-    // Kill adopted Chrome we don't have a proc handle for
-    log.info(`[${target}] Killing adopted Chrome (PID ${rt.adoptedPid})`, {
-      killedBy: "supervisor",
-      reason: "kill() requested",
-    });
-    try {
-      process.kill(rt.adoptedPid, "SIGKILL");
-    } catch { /* already dead */ }
-    rt.adoptedPid = null;
   }
+  rt.owned = false;
 
   // Clean up SingletonLock so next launch doesn't hit SIGTRAP
   const lockPath = path.join(config.profilePath, "SingletonLock");
@@ -643,6 +680,86 @@ export class RetryAfterError extends Error {
   }
 }
 
+/** How long launchChrome waits for a port occupant's CDP before calling it unresponsive. */
+const OCCUPANT_CDP_WAIT_MS = 5_000;
+
+/**
+ * Adopt the Chrome already listening on `target`'s port. It was not spawned
+ * by this daemon, so `owned` is false: teardown and crash handling will
+ * release it, never signal it.
+ */
+function adoptChrome(
+  target: ChromeTarget,
+  pid: number,
+  profileFresh: boolean,
+): { pid: number; port: number; profileFresh: boolean } {
+  const config = CONFIGS[target];
+  const rt = runtime[target];
+  log.info(`[${target}] Adopting existing Chrome on port ${config.port}`, { pid, owned: false });
+  rt.proc = null; // We don't own the process handle
+  rt.adoptedPid = pid;
+  rt.owned = false;
+  rt.lastPortConflict = null;
+  markUp(target, pid, config.port);
+  startHealthCheck(target);
+  startHeartbeat(target);
+  resetStableTimer(target);
+  if (target === "headed") resetIdleTimer(target);
+  return { pid, port: config.port, profileFresh };
+}
+
+/**
+ * Clear `target`'s port of `pid` so launchChrome can spawn — but only if
+ * `pid` is a Chrome this daemon spawned (spawnedPids). Any other PID is
+ * never signalled: record the conflict, arm a retry window, mark the launch
+ * failed, and throw RetryAfterError. A hung occupant we did not spawn
+ * therefore keeps the shard down until its owner (or the user) stops it.
+ *
+ * The refusal arms retryNotBefore but deliberately does NOT escalate
+ * backoffMs: backoffMs reaching BACKOFF_MAX_MS triggers the profile nuke in
+ * launchChrome, and a foreign port holder says nothing about our profile.
+ */
+async function killOwnOccupantOrRefuse(
+  target: ChromeTarget,
+  pid: number,
+  killReason: "crash-loop-recovery" | "port-occupied",
+  refuseReason: "occupant-not-ours" | "port-occupied-foreign",
+): Promise<void> {
+  const config = CONFIGS[target];
+  const rt = runtime[target];
+
+  if (spawnedPids.has(pid)) {
+    log.warn(`[${target}] Port ${config.port} occupied by our own Chrome (PID ${pid}) — killing`, {
+      killedBy: "supervisor",
+      reason: killReason,
+    });
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Process may have already exited
+    }
+    // Wait up to 3s for the port to free up
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      if (!(await getListeningPid(config.port))) break;
+      await sleep(200);
+    }
+    return;
+  }
+
+  rt.lastPortConflict = { port: config.port, pid, reason: refuseReason, at: Date.now() };
+  rt.retryNotBefore = Date.now() + BACKOFF_MAX_MS;
+  log.warn(
+    `[${target}] port ${config.port} held by PID ${pid} (not spawned by this daemon) — fix: kill it yourself or set AB_BASE_PORT/AB_HEADED_PORT`,
+    { pid, port: config.port, reason: refuseReason },
+  );
+  markCrashed(target, -1);
+  if (config.policy === "always-on") {
+    scheduleRestart(target);
+  }
+  throw new RetryAfterError(Math.max(0, rt.retryNotBefore - Date.now()));
+}
+
 async function launchChrome(
   target: ChromeTarget,
 ): Promise<{ pid: number; port: number; profileFresh: boolean }> {
@@ -676,55 +793,34 @@ async function launchChrome(
     // A responsive CDP is already on our port — adopt it instead of launching.
     const pid = await getListeningPid(config.port);
     if (pid) {
-      log.info(`[${target}] Adopting existing Chrome on port ${config.port}`, { pid });
-      rt.proc = null; // We don't own the process handle
-      rt.adoptedPid = pid;
-      markUp(target, pid, config.port);
-      startHealthCheck(target);
-      startHeartbeat(target);
-      resetStableTimer(target);
-      if (target === "headed") resetIdleTimer(target);
-      return { pid, port: config.port, profileFresh };
+      return adoptChrome(target, pid, profileFresh);
     }
   } else if (inCrashLoop && existingCdp) {
-    // In a crash loop — don't adopt, kill the occupant so we go through
-    // the full recovery path (profile nuke below).
+    // In a crash loop — don't adopt. Clear the port so we go through the
+    // full recovery path (profile nuke below), but only if the occupant is
+    // a Chrome we spawned.
     const stalePid = await getListeningPid(config.port);
     if (stalePid) {
-      log.warn(`[${target}] Crash loop — killing existing Chrome (PID ${stalePid}) instead of adopting`, {
-        killedBy: "supervisor",
-        reason: "crash-loop-recovery",
-      });
-      try {
-        process.kill(stalePid, "SIGKILL");
-      } catch {
-        // Process may have already exited
-      }
-      const deadline = Date.now() + 3_000;
-      while (Date.now() < deadline) {
-        if (!(await getListeningPid(config.port))) break;
-        await sleep(200);
-      }
+      await killOwnOccupantOrRefuse(target, stalePid, "crash-loop-recovery", "occupant-not-ours");
     }
   } else {
-    // Port might be bound by a non-responsive process — kill the occupant.
+    // Port might be bound by a process whose CDP is not answering yet.
     const stalePid = await getListeningPid(config.port);
     if (stalePid) {
-      log.warn(`[${target}] Port ${config.port} occupied by unresponsive PID ${stalePid} — killing`, {
-        killedBy: "supervisor",
-        reason: "port-occupied",
-      });
-      try {
-        process.kill(stalePid, "SIGKILL");
-      } catch {
-        // Process may have already exited
+      // checkCdp is false while a Chrome is still booting — give it up to 5s
+      // before calling it unresponsive.
+      const cameUp = await waitForCdp(config.port, OCCUPANT_CDP_WAIT_MS);
+      if (cameUp && !inCrashLoop) {
+        return adoptChrome(target, stalePid, profileFresh);
       }
-      // Wait up to 3s for the port to free up
-      const deadline = Date.now() + 3_000;
-      while (Date.now() < deadline) {
-        if (!(await getListeningPid(config.port))) break;
-        await sleep(200);
-      }
+      // Still unresponsive (or responsive but we're crash-looping and need
+      // the recovery path): clear the port only if the occupant is ours.
+      await killOwnOccupantOrRefuse(
+        target,
+        stalePid,
+        cameUp ? "crash-loop-recovery" : "port-occupied",
+        cameUp ? "occupant-not-ours" : "port-occupied-foreign",
+      );
     }
   }
 
@@ -804,6 +900,8 @@ async function launchChrome(
 
   rt.proc = proc;
   rt.adoptedPid = null; // No longer adopted — we own the process
+  rt.owned = true;
+  spawnedPids.add(proc.pid);
 
   // Watch for unexpected exit
   proc.exited.then(() => {
@@ -839,6 +937,7 @@ async function launchChrome(
     });
     proc.kill();
     rt.proc = null;
+    rt.owned = false;
     bumpBackoffAndRetry(rt);
     markCrashed(target, -1);
     if (CONFIGS[target].policy === "always-on") {
@@ -848,6 +947,7 @@ async function launchChrome(
   }
 
   markUp(target, proc.pid, config.port);
+  rt.lastPortConflict = null;
 
   // Start health checking
   startHealthCheck(target);
@@ -1507,6 +1607,7 @@ function handleExit(target: ChromeTarget, exitCode: number | null, exitSignal: s
   }
   log.warn(`[${target}] Chrome exited`, diag);
   rt.proc = null;
+  rt.owned = false;
   clearTimers(target);
   markCrashed(target, exitCode ?? -1);
   resetAuthState();
@@ -1525,8 +1626,20 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
   rt.lastDetection = { reason, at: Date.now() };
   bumpBackoffAndRetry(rt);
 
-  // Force-kill the unresponsive process
-  if (rt.proc) {
+  if (!rt.owned) {
+    // Not spawned by this daemon — drop our state, never signal it. The
+    // restart below (always-on) or the next ensure() relaunches; if the
+    // adopted Chrome is still holding the port, launchChrome's occupant
+    // branch decides what to do.
+    if (rt.adoptedPid) {
+      log.info(`[${target}] Releasing adopted Chrome (PID ${rt.adoptedPid}) — not spawned by this daemon, not signalling`, {
+        reason,
+      });
+    }
+    rt.adoptedPid = null;
+    rt.proc = null;
+  } else if (rt.proc) {
+    // Force-kill the unresponsive process we spawned
     const pid = rt.proc.pid;
     rt.proc.kill();
     rt.proc = null;
@@ -1534,17 +1647,8 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
       killedBy: "supervisor",
       reason,
     });
-  } else if (rt.adoptedPid) {
-    // Kill adopted Chrome we don't have a proc handle for
-    try {
-      process.kill(rt.adoptedPid, "SIGKILL");
-      log.info(`[${target}] Killed adopted Chrome (PID ${rt.adoptedPid})`, {
-        killedBy: "supervisor",
-        reason,
-      });
-    } catch { /* already dead */ }
-    rt.adoptedPid = null;
   }
+  rt.owned = false;
 
   clearTimers(target);
   markCrashed(target, -1);
@@ -1716,6 +1820,7 @@ export function __resetRuntimeForTest(): void {
     clearTimers(target);
     runtime[target] = freshRuntime();
   }
+  spawnedPids.clear();
 }
 
 /**
