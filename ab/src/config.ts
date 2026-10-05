@@ -123,6 +123,9 @@ export function headlessPortForShard(shard: number): number {
   return HEADLESS_BASE_PORT + shard;
 }
 
+/** The agent-browser binary, looked up on PATH. */
+export const AGENT_BROWSER = "agent-browser";
+
 // ---------------------------------------------------------------------------
 // Auth login budgets
 // ---------------------------------------------------------------------------

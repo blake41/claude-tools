@@ -100,7 +100,7 @@ describe("shardForPort reads the daemon's pool, not the CLI env", () => {
 
 describe("doctor labels come from the daemon's ports", () => {
   test("headless checks label shards with the daemon's ports, not CLI base 9500", async () => {
-    const { buildHeadlessDoctorChecks } = await import("../cli");
+    const { buildHeadlessDoctorChecks } = await import("../doctor");
     const pool: ChromeState[] = [UP_POOL[0], { phase: "chrome_crashed", exitCode: 1, lastCrash: new Date() }, { phase: "idle" }];
     const labels = buildHeadlessDoctorChecks({ headless: pool[0], headlessPool: pool }).map((c) => c.label);
     expect(labels).toEqual([
@@ -111,7 +111,7 @@ describe("doctor labels come from the daemon's ports", () => {
   });
 
   test("tab-count checks label shards with the daemon's ports", async () => {
-    const { buildTabCountChecks } = await import("../cli");
+    const { buildTabCountChecks } = await import("../doctor");
     const { headlessPortsFromPool } = await import("../shard-ports");
     const labels = buildTabCountChecks([1, null, 2], headlessPortsFromPool(UP_POOL)).map((c) => c.label);
     expect(labels).toEqual([

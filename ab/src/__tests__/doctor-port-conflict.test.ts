@@ -4,7 +4,7 @@
  * builders only; nothing here talks to a daemon or a CDP port.
  */
 import { describe, expect, test } from "bun:test";
-import { buildHeadedDoctorCheck, buildHeadlessDoctorChecks } from "../cli";
+import { buildHeadedDoctorCheck, buildHeadlessDoctorChecks } from "../doctor";
 import type { ChromeState, ShardDiagnostics } from "../types";
 
 const baseDiag: ShardDiagnostics = {
