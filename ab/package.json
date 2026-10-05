@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "test": "bun test --isolate"
+  },
   "dependencies": {
     "@clerk/backend": "3.2.8",
     "zod": "^4.3.6"
