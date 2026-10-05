@@ -437,7 +437,7 @@ describe("unresponsive port occupant we did not spawn: rule B (command line deci
 
 describe("commandLineUsesProfile", () => {
   test("matches the exact --user-data-dir token, not a longer path that starts with it", async () => {
-    const { commandLineUsesProfile } = await loadSupervisor();
+    const { commandLineUsesProfile } = await import("../chrome-occupant");
     const p = "/Users/x/.agent-browser/profile";
     expect(commandLineUsesProfile(`Chrome --user-data-dir=${p} --headless=new`, p)).toBe(true);
     expect(commandLineUsesProfile(`Chrome --user-data-dir=${p}`, p)).toBe(true);
