@@ -174,21 +174,22 @@ const opQueue = new SerialQueue();
 // Per-target runtime state (not persisted — lives in-process only)
 // ---------------------------------------------------------------------------
 
+/**
+ * The Chrome a target is currently attached to. Only a `spawned` Chrome has a
+ * process handle, so only it can be signalled by teardown and crash paths. An
+ * `adopted` Chrome (another daemon's, or one left over from a previous run)
+ * is only ever dropped: without this rule a second daemon (e.g. a test daemon
+ * on the same ports) adopted the live daemon's Chrome and SIGKILLed it on
+ * shutdown.
+ */
+type ChromeHandle =
+  | { kind: "spawned"; proc: ReturnType<typeof Bun.spawn> }
+  | { kind: "adopted"; pid: number };
+
 interface TargetRuntime {
+  chrome: ChromeHandle | null;
   /**
-   * Handle of the Chrome this daemon spawned for the target, or null. Only a
-   * Chrome with a handle is ever signalled by teardown and crash paths.
-   */
-  proc: ReturnType<typeof Bun.spawn> | null;
-  /**
-   * PID of an adopted Chrome (another daemon's, or one left over from a
-   * previous run). Never signalled: teardown and crash paths only drop it.
-   * Without this rule a second daemon (e.g. a test daemon on the same ports)
-   * adopted the live daemon's Chrome and SIGKILLed it on shutdown.
-   */
-  adoptedPid: number | null;
-  /**
-   * PID of the last Chrome this daemon spawned for the target. Outlives `proc`
+   * PID of the last Chrome this daemon spawned for the target. Outlives `chrome`
    * (a lost handle, an exit that left the port bound) so launchChrome can
    * still recognize that occupant as ours. Cleared once the port is
    * confirmed free.
@@ -293,8 +294,7 @@ const runtime: Record<ChromeTarget, TargetRuntime> = buildRuntime();
 
 function freshRuntime(): TargetRuntime {
   return {
-    proc: null,
-    adoptedPid: null,
+    chrome: null,
     lastSpawnedPid: null,
     lastPortConflict: null,
     healthTimer: null,
@@ -321,6 +321,24 @@ function freshRuntime(): TargetRuntime {
   };
 }
 
+function pidOf(rt: TargetRuntime): number | null {
+  if (rt.chrome === null) return null;
+  return rt.chrome.kind === "spawned" ? rt.chrome.proc.pid : rt.chrome.pid;
+}
+
+function spawnedPid(rt: TargetRuntime): number | null {
+  return rt.chrome?.kind === "spawned" ? rt.chrome.proc.pid : null;
+}
+
+function adoptedPid(rt: TargetRuntime): number | null {
+  return rt.chrome?.kind === "adopted" ? rt.chrome.pid : null;
+}
+
+/** Forget the spawned Chrome's handle. An adopted Chrome is left as it is. */
+function dropSpawned(rt: TargetRuntime): void {
+  if (rt.chrome?.kind === "spawned") rt.chrome = null;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime snapshot — for crash dumps
 // ---------------------------------------------------------------------------
@@ -335,8 +353,8 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
       phase: state.phase,
       ...(state.phase === "chrome_up" ? { pid: state.pid, port: state.port } : {}),
       ...(state.phase === "chrome_crashed" ? { exitCode: state.exitCode } : {}),
-      procPid: rt.proc?.pid ?? null,
-      adoptedPid: rt.adoptedPid,
+      procPid: spawnedPid(rt),
+      adoptedPid: adoptedPid(rt),
       lastSpawnedPid: rt.lastSpawnedPid,
       lastPortConflict:
         rt.lastPortConflict !== null ? { ...rt.lastPortConflict, at: new Date(rt.lastPortConflict.at).toISOString() } : null,
@@ -381,7 +399,7 @@ export function getHealthDiagnostics(): Record<ChromeTarget, ShardDiagnostics> {
       heartbeatMode: rt.heartbeatMode,
       lastExit: rt.lastExit !== null ? { ...rt.lastExit, at: new Date(rt.lastExit.at).toISOString() } : null,
       lastDetection: rt.lastDetection !== null ? { ...rt.lastDetection, at: new Date(rt.lastDetection.at).toISOString() } : null,
-      adoptedPid: rt.adoptedPid,
+      adoptedPid: adoptedPid(rt),
       lastPortConflict:
         rt.lastPortConflict !== null ? { ...rt.lastPortConflict, at: new Date(rt.lastPortConflict.at).toISOString() } : null,
     };
@@ -446,7 +464,7 @@ function logHealthSummary(target: ChromeTarget): void {
   const rt = runtime[target];
   const state = getState(target);
   if (state.phase === "idle") return;
-  const pid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+  const pid = pidOf(rt);
   const payload = buildHealthSummaryPayload(
     target,
     state.phase,
@@ -535,12 +553,11 @@ export async function kill(target: ChromeTarget): Promise<void> {
  */
 function releaseAdopted(target: ChromeTarget, reason: string): void {
   const rt = runtime[target];
-  if (rt.adoptedPid) {
-    log.info(`[${target}] Releasing adopted Chrome (PID ${rt.adoptedPid}) — not spawned by this daemon, not signalling`, {
-      reason,
-    });
-  }
-  rt.adoptedPid = null;
+  if (rt.chrome?.kind !== "adopted") return;
+  log.info(`[${target}] Releasing adopted Chrome (PID ${rt.chrome.pid}) — not spawned by this daemon, not signalling`, {
+    reason,
+  });
+  rt.chrome = null;
 }
 
 async function doKill(target: ChromeTarget): Promise<void> {
@@ -548,8 +565,8 @@ async function doKill(target: ChromeTarget): Promise<void> {
   const config = CONFIGS[target];
   clearTimers(target);
 
-  const proc = rt.proc; // Capture before await — handleExit may null rt.proc
-  if (!proc) {
+  const chrome = rt.chrome; // Capture before await — handleExit may null rt.chrome
+  if (chrome?.kind !== "spawned") {
     releaseAdopted(target, "kill() requested");
     if (getState(target).phase !== "idle") {
       markIdle(target);
@@ -557,6 +574,7 @@ async function doKill(target: ChromeTarget): Promise<void> {
     return;
   }
 
+  const proc = chrome.proc;
   log.info(`[${target}] Killing Chrome (PID ${proc.pid})`, { killedBy: "supervisor", reason: "kill() requested" });
   proc.kill();
   // Wait for process exit (up to 5s)
@@ -570,7 +588,7 @@ async function doKill(target: ChromeTarget): Promise<void> {
     proc.kill(9); // SIGKILL
     await Promise.race([proc.exited, sleep(2_000)]);
   }
-  rt.proc = null;
+  dropSpawned(rt);
 
   // Clean up SingletonLock so next launch doesn't hit SIGTRAP
   const lockPath = path.join(config.profilePath, "SingletonLock");
@@ -691,8 +709,7 @@ function adoptChrome(
   const config = CONFIGS[target];
   const rt = runtime[target];
   log.info(`[${target}] Adopting existing Chrome on port ${config.port}`, { pid });
-  rt.proc = null; // We don't own the process handle
-  rt.adoptedPid = pid;
+  rt.chrome = { kind: "adopted", pid };
   rt.lastPortConflict = null;
   markUp(target, pid, config.port);
   startHealthCheck(target);
@@ -946,8 +963,7 @@ async function launchChrome(
     })();
   }
 
-  rt.proc = proc;
-  rt.adoptedPid = null; // No longer adopted — we own the process
+  rt.chrome = { kind: "spawned", proc };
   rt.lastSpawnedPid = proc.pid;
 
   // Watch for unexpected exit
@@ -965,7 +981,7 @@ async function launchChrome(
     opQueue.enqueue(() =>
       withOpId(newOpId(), async () => {
         // If a different Chrome is now running, this exit is stale
-        const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+        const currentPid = pidOf(rt);
         if (currentPid !== exitedPid && getState(target).phase !== "idle") {
           log.info(`[${target}] Ignoring stale exit for PID ${exitedPid}`);
           return;
@@ -983,7 +999,7 @@ async function launchChrome(
       port: config.port,
     });
     proc.kill();
-    rt.proc = null;
+    dropSpawned(rt);
     bumpBackoffAndRetry(rt);
     markCrashed(target, -1);
     if (CONFIGS[target].policy === "always-on") {
@@ -1029,21 +1045,21 @@ function startHealthCheck(target: ChromeTarget): void {
     // Invariant 4: verify Chrome PID is still alive (catches OOM kills, adopted PIDs dying)
     const currentState = getState(target);
     if (currentState.phase === "chrome_up") {
-      const pid = rt.proc?.pid ?? rt.adoptedPid;
+      const pid = pidOf(rt);
       if (pid) {
         try {
           process.kill(pid, 0);
         } catch {
           log.error(`[${target}] Chrome PID ${pid} gone — marking crashed`, {
-            hadProc: !!rt.proc,
-            wasAdopted: !!rt.adoptedPid,
+            hadProc: rt.chrome?.kind === "spawned",
+            wasAdopted: rt.chrome?.kind === "adopted",
           });
           if (rt.healthTimer) clearInterval(rt.healthTimer);
           rt.healthTimer = null;
           const crashedPid = pid;
           opQueue.enqueue(() =>
             withOpId(newOpId(), async () => {
-              const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+              const currentPid = pidOf(rt);
               if (currentPid !== crashedPid) {
                 log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
                 return;
@@ -1071,10 +1087,10 @@ function startHealthCheck(target: ChromeTarget): void {
         log.error(`[${target}] Chrome unresponsive — marking crashed`);
         if (rt.healthTimer) clearInterval(rt.healthTimer);
         rt.healthTimer = null;
-        const crashedPid = rt.proc?.pid ?? rt.adoptedPid;
+        const crashedPid = pidOf(rt);
         opQueue.enqueue(() =>
           withOpId(newOpId(), async () => {
-            const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+            const currentPid = pidOf(rt);
             if (currentPid !== crashedPid) {
               log.info(`[${target}] Ignoring stale crash for PID ${crashedPid}`);
               return;
@@ -1325,7 +1341,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
   // execute `rt.heartbeatWs = ws` further down, either resurrecting a
   // heartbeat on a torn-down target or orphaning whichever WS loses the
   // race (2026-08-04 incident follow-up).
-  const capturedPid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+  const capturedPid = pidOf(rt);
   const myGeneration = ++rt.heartbeatGeneration;
 
   try {
@@ -1345,7 +1361,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
     // startHeartbeat/teardown superseded us (generation), and the target is
     // still chrome_up. Any mismatch means we lost the race — close what we
     // just opened and abandon without touching rt.heartbeatWs.
-    const currentPid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+    const currentPid = pidOf(rt);
     if (
       rt.heartbeatGeneration !== myGeneration ||
       currentPid !== capturedPid ||
@@ -1380,7 +1396,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
 
     ws.onclose = () => {
       if (rt.heartbeatWs !== ws) return; // Stale — we've moved on
-      const deadPid = rt.proc?.pid ?? rt.adoptedPid;
+      const deadPid = pidOf(rt);
       log.warn(`[${target}] Heartbeat WebSocket closed — Chrome may be dead`, { pid: deadPid });
       rt.heartbeatWs = null;
       rt.heartbeatArmedSince = null;
@@ -1392,7 +1408,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
       if (deadPid) {
         opQueue.enqueue(() =>
           withOpId(newOpId(), async () => {
-            const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+            const currentPid = pidOf(rt);
             if (currentPid !== deadPid) return;
             let pidAlive = true;
             try {
@@ -1450,7 +1466,7 @@ async function startHeartbeat(target: ChromeTarget, isRearm = false): Promise<vo
             if (rt.heartbeatRearmTimer) clearTimeout(rt.heartbeatRearmTimer);
             rt.heartbeatRearmTimer = setTimeout(() => {
               rt.heartbeatRearmTimer = null;
-              const currentPidAtRearm = rt.proc?.pid ?? rt.adoptedPid;
+              const currentPidAtRearm = pidOf(rt);
               if (!shouldRearmHeartbeat(currentPidAtRearm, deadPid, rt.heartbeatWs, getState(target).phase)) {
                 return;
               }
@@ -1496,7 +1512,7 @@ function reenterCooldownIfStillUp(
   if (!isRearm || capturedPid === null) return;
   const rt = runtime[target];
   if (rt.heartbeatGeneration !== myGeneration) return;
-  const currentPid = rt.proc?.pid ?? rt.adoptedPid ?? null;
+  const currentPid = pidOf(rt);
   if (currentPid !== capturedPid) return;
   if (getState(target).phase !== "chrome_up") return;
   log.warn(`[${target}] Cooldown retry setup failed — retrying in ${HEARTBEAT_COOLDOWN_MS / 1000}s`);
@@ -1535,7 +1551,7 @@ async function runThresholdProbe(
   await opQueue.enqueue(() =>
     withOpId(newOpId(), async () => {
       const rt = runtime[target];
-      const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+      const currentPid = pidOf(rt);
       if (
         rt.heartbeatGeneration !== generation ||
         currentPid !== deadPid ||
@@ -1579,7 +1595,7 @@ function enterCooldown(target: ChromeTarget, pid: number): void {
   if (rt.heartbeatCooldownTimer) clearTimeout(rt.heartbeatCooldownTimer);
   rt.heartbeatCooldownTimer = setTimeout(() => {
     rt.heartbeatCooldownTimer = null;
-    const currentPid = rt.proc?.pid ?? rt.adoptedPid;
+    const currentPid = pidOf(rt);
     if (!shouldRearmHeartbeat(currentPid, pid, rt.heartbeatWs, getState(target).phase)) {
       return;
     }
@@ -1599,7 +1615,7 @@ function enterCooldown(target: ChromeTarget, pid: number): void {
  * an on-demand shard's backoffMs never escalated and the corruption-recovery
  * gate in launchChrome (`rt.backoffMs >= BACKOFF_MAX_MS`) was unreachable
  * for it. handleExit and handleCrashDetected are mutually exclusive per
- * process generation (a crash-detected kill nulls rt.proc/marks non-idle
+ * process generation (a crash-detected kill nulls rt.chrome/marks non-idle
  * before its own proc.exited fires, so handleExit's idle/restartScheduled
  * guards above already no-op that call) — so this always runs exactly once
  * per death.
@@ -1652,7 +1668,7 @@ function handleExit(target: ChromeTarget, exitCode: number | null, exitSignal: s
     }
   }
   log.warn(`[${target}] Chrome exited`, diag);
-  rt.proc = null;
+  dropSpawned(rt);
   clearTimers(target);
   markCrashed(target, exitCode ?? -1);
 
@@ -1670,11 +1686,12 @@ function handleCrashDetected(target: ChromeTarget, reason: DetectionReason): voi
   rt.lastDetection = { reason, at: Date.now() };
   bumpBackoffAndRetry(rt);
 
-  if (rt.proc) {
+  const chrome = rt.chrome;
+  if (chrome?.kind === "spawned") {
     // Force-kill the unresponsive process we spawned
-    const pid = rt.proc.pid;
-    rt.proc.kill();
-    rt.proc = null;
+    const pid = chrome.proc.pid;
+    chrome.proc.kill();
+    rt.chrome = null;
     log.info(`[${target}] Killed unresponsive Chrome (PID ${pid})`, {
       killedBy: "supervisor",
       reason,
