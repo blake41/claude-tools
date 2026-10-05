@@ -249,12 +249,11 @@ export async function authenticate(
   const urlResult = await runAgentBrowser(sessionId, port, ["get", "url"]);
   if (urlResult.ok && isAuthenticatedUrl(urlResult.stdout)) {
     // Determine target origin for the comparison.
-    const targetBase = appBaseUrl || DEFAULT_AUTH_APP_BASE;
     let targetOrigin: string;
     try {
-      targetOrigin = new URL(targetBase).origin;
+      targetOrigin = new URL(appBaseUrl).origin;
     } catch {
-      targetOrigin = targetBase;
+      targetOrigin = appBaseUrl;
     }
 
     let browserOrigin: string;
@@ -417,33 +416,26 @@ export async function authenticate(
   return { ok: true, user };
 }
 
-/** Runs `run` once per concurrent `key`; callers arriving while it is in flight join it. */
-export function createSingleFlight<T>(): (key: string, run: () => Promise<T>) => Promise<T> {
-  const inFlight = new Map<string, Promise<T>>();
-  return (key, run) => {
-    const existing = inFlight.get(key);
-    if (existing) return existing;
-    const flight = run().finally(() => {
-      inFlight.delete(key);
-    });
-    inFlight.set(key, flight);
-    return flight;
-  };
-}
-
-const loginFlights = createSingleFlight<AuthLoginResponse>();
+const loginFlights = new Map<string, Promise<AuthLoginResponse>>();
 
 /**
- * authenticate() with concurrent logins for the same shard and app origin
- * joined into one: sessions share a cookie jar per shard, so one Agent Task
- * serves every waiting caller.
+ * authenticate() with concurrent logins joined into one: sessions share a
+ * cookie jar per shard, so one Agent Task serves every waiting caller.
+ * Requests are joined by port and app base URL only; the first caller's
+ * email, session, key and deadline decide the outcome for all of them.
  */
 export function authenticateJoined(
   req: AuthLoginRequest,
   deps: Partial<AuthenticateDeps> = {},
 ): Promise<AuthLoginResponse> {
   const key = `${req.port}|${req.appBaseUrl || DEFAULT_AUTH_APP_BASE}`;
-  return loginFlights(key, () => authenticate(req, deps));
+  const existing = loginFlights.get(key);
+  if (existing) return existing;
+  const flight = authenticate(req, deps).finally(() => {
+    loginFlights.delete(key);
+  });
+  loginFlights.set(key, flight);
+  return flight;
 }
 
 // ---------------------------------------------------------------------------
