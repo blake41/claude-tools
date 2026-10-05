@@ -11,6 +11,10 @@ import {
   DASHBOARD_PORT,
   HEADLESS_POOL_SIZE,
   headlessPortForShard,
+  AUTH_LOGIN_TIMEOUT_MS,
+  AUTH_LOGIN_CLIENT_TIMEOUT_MS,
+  AUTH_DEADLINE_GUARD_MS,
+  authLoginDeadline,
 } from "../config";
 import { HEADLESS_POOL_SIZE as TYPES_POOL_SIZE } from "../types";
 
@@ -98,5 +102,28 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ [name]: value })).toThrow(
       `${name} must be an integer port between 1024 and 65535 (got "${value}")`,
     );
+  });
+});
+
+// The daemon wraps /auth/login in withTimeout(AUTH_LOGIN_TIMEOUT_MS) and hands
+// authenticate() the deadline authLoginDeadline(startedAt). authenticate()
+// refuses to set authState once that deadline has passed, so it must fall
+// strictly before the handler's own timeout: otherwise withTimeout could
+// already have rejected (CLI sees failure) while the login still lands.
+describe("auth login budgets", () => {
+  test("the login handler budget is 60 s", () => {
+    expect(AUTH_LOGIN_TIMEOUT_MS).toBe(60_000);
+  });
+
+  test("authenticate's deadline falls strictly before the handler timeout fires", () => {
+    const t = 1_759_600_000_000;
+    expect(AUTH_DEADLINE_GUARD_MS).toBeGreaterThan(0);
+    expect(authLoginDeadline(t)).toBe(t + AUTH_LOGIN_TIMEOUT_MS - AUTH_DEADLINE_GUARD_MS);
+    expect(authLoginDeadline(t)).toBeLessThan(t + AUTH_LOGIN_TIMEOUT_MS);
+  });
+
+  test("the CLI waits longer than the daemon's handler budget", () => {
+    expect(AUTH_LOGIN_CLIENT_TIMEOUT_MS).toBe(AUTH_LOGIN_TIMEOUT_MS + 5_000);
+    expect(AUTH_LOGIN_CLIENT_TIMEOUT_MS).toBeGreaterThan(AUTH_LOGIN_TIMEOUT_MS);
   });
 });

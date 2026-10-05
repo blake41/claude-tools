@@ -6,7 +6,7 @@
  *
  * Does NOT start a real server — tests error paths only.
  */
-import { test, expect, describe, beforeEach, afterEach, mock } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
 // ---------------------------------------------------------------------------
 // We need to test rpc.ts behavior when daemon is not running.
@@ -127,6 +127,25 @@ describe("rpc client contract", () => {
       // Should NOT say "ab-server not running" — it's a timeout, not missing daemon
       expect(msg).not.toContain("ab-server not running");
       expect(msg).toContain("timed out");
+    }
+  });
+});
+
+describe("auth login client timeout", () => {
+  test("/auth/login waits AUTH_LOGIN_CLIENT_TIMEOUT_MS, longer than the daemon's handler budget", async () => {
+    const { AUTH_LOGIN_CLIENT_TIMEOUT_MS, AUTH_LOGIN_TIMEOUT_MS } = await import("../config");
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ ok: true, user: { email: "blake@clay.com" } }), { status: 200 })),
+    ) as unknown as typeof fetch;
+    const timeoutSpy = spyOn(AbortSignal, "timeout");
+    try {
+      const rpc = await import("../rpc");
+      await rpc.authLogin({ sessionId: "test", port: 9333, email: "blake@clay.com" });
+      expect(timeoutSpy).toHaveBeenCalledTimes(1);
+      expect(timeoutSpy.mock.calls[0]![0]).toBe(AUTH_LOGIN_CLIENT_TIMEOUT_MS);
+      expect(AUTH_LOGIN_CLIENT_TIMEOUT_MS).toBeGreaterThan(AUTH_LOGIN_TIMEOUT_MS);
+    } finally {
+      timeoutSpy.mockRestore();
     }
   });
 });

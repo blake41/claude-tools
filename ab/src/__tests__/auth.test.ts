@@ -4,7 +4,7 @@
  * Tests the authenticate() flow against an injected fake Clerk client and mocked agent-browser responses (no network).
  * Verifies the shapes that cli.ts reads: { ok, user: { email }, error }.
  */
-import { test, expect, describe, beforeEach, afterEach, mock } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fs from "fs";
 import { resetAuthState, getAuthStatus, authenticate, isAuthenticatedUrl } from "../auth";
 import type { AgentTaskClient } from "../auth";
@@ -223,7 +223,8 @@ describe("auth contract", () => {
     });
     const open = calls.find((a) => a[0] === "open");
     expect(open).toEqual(["open", MINTED_URL]);
-    expect(calls.some((a) => a[0] === "wait" && a.includes("networkidle"))).toBe(true);
+    // Step 5's poll checks the real landing condition; no networkidle wait eats the budget.
+    expect(calls.some((a) => a[0] === "wait" || a.includes("networkidle"))).toBe(false);
     expect(calls.filter((a) => a[0] === "get" && a[1] === "url").length).toBeGreaterThanOrEqual(3);
   });
 
@@ -275,10 +276,34 @@ describe("auth contract", () => {
     );
 
     assertLoginFailure(result);
+    // The 400 body carries the redacted stderr tail, not a generic message.
+    expect(result.error).toBe("Auth exchange failed: navigation to [redacted] failed ticket=[redacted] [redacted]");
     const blob = allLogs() + (result.error ?? "");
     expect(blob).not.toContain("UNITTESTSECRET");
     expect(blob).not.toContain("TICKETSECRET");
     expect(blob).not.toContain("clerk.accounts.dev");
+  });
+
+  test("navigation failure keeps only the last ~400 chars of stderr in the error", async () => {
+    spawnMock.mockImplementation((cmd: string[]) => {
+      const args = cmd.slice(5);
+      const failing = args[0] === "open";
+      const err = failing ? `${"x".repeat(1_000)} ticket=TICKETSECRET END-OF-STDERR` : "";
+      const stream = (t: string) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(t)); c.close(); } });
+      return { pid: 1, exitCode: failing ? 1 : 0, exited: Promise.resolve(failing ? 1 : 0), stdout: stream(failing ? "" : "about:blank"), stderr: stream(err), kill: () => {} };
+    });
+
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: fakeClerk().factory },
+    );
+
+    assertLoginFailure(result);
+    expect(result.error!.startsWith("Auth exchange failed: ")).toBe(true);
+    expect(result.error!.endsWith("ticket=[redacted] END-OF-STDERR")).toBe(true);
+    expect(result.error!.length).toBeLessThanOrEqual("Auth exchange failed: ".length + 400);
+    expect(result.error).not.toContain("TICKETSECRET");
+    expect(getAuthStatus().authenticated).toBe(false);
   });
 
   test("Clerk user-not-found (404 / *_not_found) maps to the friendly 'no Clerk account' error", async () => {
@@ -326,17 +351,88 @@ describe("auth contract", () => {
     expect(result.error).toContain("missing url");
   });
 
-  test("times out when the browser never lands on the app origin", async () => {
+  test("times out at the deadline when the browser never lands on the app origin", async () => {
     scriptBrowser(["about:blank", "https://fake-instance.clerk.accounts.dev/v1/tickets/accept"]);
     const { factory } = fakeClerk();
 
+    const started = Date.now();
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
-      { createClerkClient: factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+      { createClerkClient: factory, deadline: started + 150, pollIntervalMs: 5 },
     );
 
     assertLoginFailure(result);
     expect(result.error).toContain("timed out");
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(getAuthStatus().authenticated).toBe(false);
+  });
+
+  test("a hung `open` is cut off at the deadline: timeout failure, authState untouched", async () => {
+    const calls: string[][] = [];
+    let killed = 0;
+    spawnMock.mockImplementation((cmd: string[]) => {
+      const args = cmd.slice(5);
+      calls.push(args);
+      const hangs = args[0] === "open";
+      let resolveExit: (code: number) => void = () => {};
+      const exited = hangs ? new Promise<number>((r) => { resolveExit = r; }) : Promise.resolve(0);
+      const stream = (t: string) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(t)); c.close(); } });
+      return {
+        pid: 1,
+        exitCode: hangs ? null : 0,
+        exited,
+        stdout: stream(args[0] === "get" ? "about:blank" : ""),
+        stderr: stream(""),
+        kill: () => { killed++; resolveExit(143); },
+      };
+    });
+
+    const started = Date.now();
+    const result = await authenticate(
+      { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+      { createClerkClient: fakeClerk().factory, deadline: started + 300, pollIntervalMs: 5 },
+    );
+    const elapsed = Date.now() - started;
+
+    assertLoginFailure(result);
+    expect(result.error).toContain("Auth exchange timed out");
+    // open's own timeout was capped at the time left (~300 ms), not the 15 s default.
+    expect(elapsed).toBeGreaterThanOrEqual(250);
+    expect(elapsed).toBeLessThan(1_500);
+    expect(killed).toBe(1);
+    expect(calls.filter((a) => a[0] === "open")).toHaveLength(1);
+    expect(getAuthStatus()).toEqual({ ok: true, authenticated: false, user: null, lastLogin: null });
+  });
+
+  test("a session confirmed only after the deadline does not set authState", async () => {
+    // The cookie read "takes" until past the deadline: the clock jumps inside
+    // that call, then it reports a valid session. withTimeout may already have
+    // answered the CLI with a failure, so the login must not land.
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    try {
+      const started = Date.now();
+      const deadline = started + 5_000;
+      const calls = scriptBrowser(["about:blank", "http://localhost:5173/"]);
+      const inner = spawnMock.getMockImplementation()!;
+      spawnMock.mockImplementation((cmd: string[]) => {
+        if (cmd[5] === "cookies") skew += deadline - Date.now() + 1;
+        return inner(cmd);
+      });
+
+      const result = await authenticate(
+        { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
+        { createClerkClient: fakeClerk().factory, deadline, pollIntervalMs: 5 },
+      );
+
+      expect(calls.some((a) => a[0] === "cookies")).toBe(true);
+      assertLoginFailure(result);
+      expect(result.error).toContain("Auth exchange timed out");
+      expect(getAuthStatus().authenticated).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   test("fails when the browser lands on the app origin but no Clerk session cookie exists (wrong Clerk instance)", async () => {
@@ -345,7 +441,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
-      { createClerkClient: factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+      { createClerkClient: factory, deadline: Date.now() + 50, pollIntervalMs: 5 },
     );
 
     assertLoginFailure(result);
@@ -361,7 +457,7 @@ describe("auth contract", () => {
 
     const result = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", clerkSecretKey: TEST_KEY },
-      { createClerkClient: factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+      { createClerkClient: factory, deadline: Date.now() + 50, pollIntervalMs: 5 },
     );
 
     assertLoginFailure(result);
@@ -380,7 +476,7 @@ describe("auth contract", () => {
     scriptBrowser(["about:blank", "https://app.terra.localhost/"], [{ name: "__client_uat", value: "0", domain: ".terra.localhost" }]);
     const signedOut = await authenticate(
       { sessionId: "test", port: 9333, email: "blake@clay.com", appBaseUrl: "https://app.terra.localhost", clerkSecretKey: TEST_KEY },
-      { createClerkClient: fakeClerk().factory, pollTimeoutMs: 50, pollIntervalMs: 5 },
+      { createClerkClient: fakeClerk().factory, deadline: Date.now() + 50, pollIntervalMs: 5 },
     );
     assertLoginFailure(signedOut);
   });
