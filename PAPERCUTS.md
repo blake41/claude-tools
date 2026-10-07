@@ -39,3 +39,27 @@ ab click on a ref reports 'outside layout viewport' with a bogus viewport rect (
 2026-08-11T01:33:12.715Z - sonnet - blake johnson - [worktree: parser-migration]
 
 ab console-tail only streams NEW console messages from attach time forward — no buffer replay. If you 'open' a URL then start console-tail, you miss all logs from that page load. Must start console-tail (backgrounded) BEFORE navigating, then trigger navigation, then read its output file.
+
+2026-10-05T03:29:06.772Z - opus - blake johnson - [worktree: ab-daemon-hardening]
+
+ab tests: running several ab/src/__tests__ files in one 'bun test' call without --isolate gives 13 false failures, because chrome-supervisor reads AB_* env knobs at import and the first file's env wins. Use 'bun test --isolate' or a test script that sets it.
+
+2026-10-05T06:09:23.909Z - opus - blake johnson - [worktree: ab-daemon-hardening]
+
+ab tests (ps/tab-visibility/teardown/session-resolution) shell out to ab/ab, which hardcodes /Users/blake/Documents/Development/tools/ab/src/cli.ts, so in a worktree they exercise the main checkout, and several also hit the live daemon via ab gc/status/open; heartbeat-rearm, threshold-probe, health-summary, server-retry-gate and chrome-supervisor.test call ensure() without AB_PROFILE_ROOT.
+
+2026-10-05T06:12:38.451Z - opus-4.8 - blake johnson - [worktree: ab-daemon-hardening]
+
+daemon-integration.test.ts leaks agent-browser helper processes (cwd in the worktree, dashboard port 24848/24858) after a run; needs cleanup in the test's afterAll.
+
+2026-10-05T07:05:12.592Z - opus - blake johnson - [worktree: ab-refactor]
+
+ab: chrome-supervisor-adopt-flap.test.ts failed once (0 pass 1 fail) in a sequential --isolate run on an untouched tree, then passed 4/4 re-runs; timing-sensitive under load, worth a look.
+
+2026-10-05T07:30:16.022Z - sonnet - blake johnson - [worktree: ab-followups]
+
+worktree-add-cow in tools repo ran 'bun install' at root which has no package.json (ab/ has it) and reported ERROR even though the worktree was created.
+
+2026-10-05T13:15:04.498Z - fable - blake johnson
+
+Timing claude startup with a pty.fork() harness: the Bash tool moved the >300s command to background and the second pty.fork in the same python process hung forever (no claude child alive, no output). Running one pty session per python process with signal.alarm fixed it; macOS has no 'timeout' binary either.
