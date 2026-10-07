@@ -14,6 +14,7 @@
 # NOT handled here (each has its own installer):
 #   - ab / agent-browser  → ab/install.ts (builds a Rust binary; see shipyard DEPENDENCIES.md item 6)
 #   - session-explorer    → shipyard's scripts/install-recall.sh (launchd service)
+#   - cass                → cass/install.sh (pinned release download; see shipyard DEPENDENCIES.md item 15)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
