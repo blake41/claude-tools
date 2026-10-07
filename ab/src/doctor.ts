@@ -1,8 +1,8 @@
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as rpc from "./rpc";
-import type { AuthStatusResponse, ChromeState, ShardDiagnostics } from "./types";
-import { AGENT_BROWSER, CONFIG_ERROR } from "./config";
+import type { AuthStatusResponse, ChromeIdentityInfo, ChromeState, ShardDiagnostics } from "./types";
+import { AGENT_BROWSER, CONFIG_ERROR, FORBIDDEN_BUNDLE_ID } from "./config";
 import { buildSessionName, readShardAssignment, resolvePid, sessionFilePath } from "./session";
 import { fetchTabCounts } from "./cdp-http";
 import { headlessPortsFromPool, portForShard } from "./shard-ports";
@@ -214,6 +214,68 @@ export function buildAuthCheck(
   return { label, ok: true, detail, fix: undefined };
 }
 
+/** "Chrome binary" check: pass unless ab's Chrome app is missing or personal Chrome. */
+export function buildChromeBinaryCheck(chrome: ChromeIdentityInfo | undefined): DoctorCheck {
+  if (!chrome) {
+    return {
+      label: "Chrome binary",
+      ok: false,
+      detail: "daemon does not report its Chrome app (older daemon)",
+      fix: "launchctl kickstart -k gui/$(id -u)/com.clay.ab-server",
+    };
+  }
+  const ok = chrome.error === null && chrome.chromeBundleId !== FORBIDDEN_BUNDLE_ID;
+  return {
+    label: "Chrome binary",
+    ok,
+    detail: ok
+      ? `${chrome.chromeApp} (${chrome.chromeBundleId}, ${chrome.chromeVersion})`
+      : (chrome.error ?? `${chrome.chromeApp} is ${FORBIDDEN_BUNDLE_ID}`),
+    fix: ok ? undefined : "install Chrome Beta (google.com/chrome/beta), or set AB_CHROME_APP to Chrome Dev/Canary in the daemon's launchd env",
+  };
+}
+
+/** Pull the bundle id out of `lsappinfo info -only bundleID <pid>` output. */
+export function parseBundleId(lsappinfoOutput: string): string | null {
+  const m = /"CFBundleIdentifier"\s*=\s*"([^"]+)"/.exec(lsappinfoOutput);
+  return m ? m[1] : null;
+}
+
+/**
+ * "LaunchServices identity" check. Fails if any ab Chrome pid is registered as
+ * personal Chrome's bundle; an unregistered pid is only noted (headless Chromes
+ * may not check in yet).
+ */
+export function buildLaunchServicesChecks(pids: Array<{ pid: number; bundleId: string | null }>): DoctorCheck[] {
+  const label = "LaunchServices identity";
+  const stock = pids.filter((p) => p.bundleId === FORBIDDEN_BUNDLE_ID);
+  if (stock.length > 0) {
+    return [{
+      label,
+      ok: false,
+      detail: `ab Chrome pid ${stock.map((p) => p.pid).join(", ")} registered as ${FORBIDDEN_BUNDLE_ID} (collides with personal Chrome)`,
+      fix: "fix the Chrome binary check above, then ab heal (it replaces a stock Chrome on an ab profile). A stock Chrome on any other profile is not ab's: quit it yourself",
+    }];
+  }
+  const unregistered = pids.filter((p) => p.bundleId === null);
+  const detail =
+    pids.length === 0
+      ? "no ab Chrome running"
+      : unregistered.length > 0
+        ? `pid ${unregistered.map((p) => p.pid).join(", ")} not registered with LaunchServices (warning only)`
+        : `${pids.length} ab Chrome pid(s) not under ${FORBIDDEN_BUNDLE_ID}`;
+  return [{ label, ok: true, detail }];
+}
+
+function lsappinfoBundleId(pid: number): string | null {
+  const res = spawnSync("lsappinfo", ["info", "-only", "bundleID", String(pid)], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 3000,
+  });
+  return res.status === 0 ? parseBundleId(res.stdout) : null;
+}
+
 export async function cmdDoctor(headed = false): Promise<number> {
   const checks: Array<{ label: string; ok: boolean; detail?: string; fix?: string }> = [];
 
@@ -247,6 +309,11 @@ export async function cmdDoctor(headed = false): Promise<number> {
   }
 
   if (status) {
+    checks.push(buildChromeBinaryCheck(status.chrome));
+    const abPids = [status.headed, ...(status.headlessPool ?? [status.headless])].flatMap((st) =>
+      st.phase === "chrome_up" ? [st.pid] : [],
+    );
+    checks.push(...buildLaunchServicesChecks(abPids.map((pid) => ({ pid, bundleId: lsappinfoBundleId(pid) }))));
     checks.push(...buildHeadlessDoctorChecks(status));
 
     // tab-teardown-fix U3 (R5): per-shard open-page counts, appended right

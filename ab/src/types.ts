@@ -61,6 +61,12 @@ export interface StatusResponse {
   headlessPool: ChromeState[];
   uptime: number;
   /**
+   * Which Chrome app ab spawns. `error` is non-null when ab refuses to spawn
+   * (missing app, or personal Chrome's com.google.Chrome bundle). Optional: an
+   * older daemon does not report it.
+   */
+  chrome?: ChromeIdentityInfo;
+  /**
    * Per-target health diagnostics — additive, does not replace/rename
    * anything above. Added for the 2026-08-04 incident diagnosability gap
    * (a heartbeat closed at 16:28Z and nothing loggable existed until the
@@ -100,6 +106,14 @@ export type DetectionReason =
   | "heartbeat-close-pid-dead"
   | "ws-probe-failed";
 
+/** Identity of the Chrome app ab spawns — see StatusResponse.chrome. */
+export interface ChromeIdentityInfo {
+  chromeApp: string;
+  chromeBundleId: string | null;
+  chromeVersion: string | null;
+  error: string | null;
+}
+
 /** Per-target health diagnostics — see StatusResponse.diagnostics. */
 export interface ShardDiagnostics {
   /** ISO timestamp of the last successful health-check poll, or null if none yet. */
@@ -117,6 +131,10 @@ export interface ShardDiagnostics {
   lastExit: { code: number | null; signal: string | null; at: string } | null;
   /** The last crash-detection event handleCrashDetected recorded, with why. */
   lastDetection: { reason: DetectionReason; at: string } | null;
+  /** Chrome app, bundle id and version this target spawns (same app for every target). */
+  chromeApp?: string;
+  chromeBundleId?: string | null;
+  chromeVersion?: string | null;
   /** PID of a Chrome the daemon adopted (did not spawn) and never signals, or null. */
   adoptedPid?: number | null;
   /** The last time the daemon refused to clear a port held by a PID it may not signal. */

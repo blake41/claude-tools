@@ -86,6 +86,7 @@ function handleStatus(): Response {
     ok: true,
     version: VERSION,
     uptime: Math.floor((Date.now() - startedAt) / 1000),
+    chrome: supervisor.getChromeIdentityStatus(),
     headless: headlessPool[0],
     headed: states.headed,
     headlessPool,
@@ -146,6 +147,11 @@ export async function handleEnsure(target: ChromeTarget): Promise<Response> {
         },
         503,
       );
+    }
+    if (err instanceof supervisor.ChromeBinRejectedError) {
+      // Not a crash: no retry window, no backoff. Retrying cannot help until
+      // someone installs Beta (or fixes AB_CHROME_APP) and restarts the daemon.
+      return json({ ok: false, error: err.message }, 503);
     }
     throw err;
   }
@@ -208,7 +214,7 @@ export async function handleHeal(): Promise<Response> {
   actions.push("state reset");
 
   // Step 4: restart supervision (launches headless)
-  const { skippedBackoff } = await supervisor.startSupervision();
+  const { skippedBackoff, skippedRejected } = await supervisor.startSupervision();
   actions.push("supervisor.startSupervision()");
   // Surface any always-on target that was still inside crash-loop backoff
   // and got skipped this pass — heal must not silently leave it down with
@@ -218,6 +224,12 @@ export async function handleHeal(): Promise<Response> {
     actions.push(
       `${skip.target}: launch skipped — crash backoff, retry in ${Math.ceil(skip.retryAfterMs / 1000)}s`,
     );
+  }
+
+  // A refused binary is not a backoff and no retry will fix it: say so in the
+  // actions (same additive pattern; ok stays true like the backoff case).
+  for (const skip of skippedRejected) {
+    actions.push(`${skip.target}: launch refused — ${skip.reason}`);
   }
 
   const body: HealResponse = { ok: true, actions };

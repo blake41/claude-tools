@@ -111,7 +111,7 @@ describe("getHealthDiagnostics", () => {
     resetAll();
 
     const diag = getHealthDiagnostics();
-    expect(diag.headed).toEqual({
+    expect(diag.headed).toMatchObject({
       lastHealthOkAt: null,
       heartbeatArmedSince: null,
       heartbeatMode: "off",
@@ -120,7 +120,7 @@ describe("getHealthDiagnostics", () => {
       adoptedPid: null,
       lastPortConflict: null,
     });
-    expect(diag["headless-0"]).toEqual({
+    expect(diag["headless-0"]).toMatchObject({
       lastHealthOkAt: null,
       heartbeatArmedSince: null,
       heartbeatMode: "off",

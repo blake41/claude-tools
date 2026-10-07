@@ -358,7 +358,7 @@ describe("port occupant whose CDP never answers", () => {
 });
 
 describe("unresponsive port occupant we did not spawn: rule B (command line decides)", () => {
-  const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  const CHROME = "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta";
   const cmdline = (userDataDir: string) =>
     `${FOREIGN_PID} ${CHROME} --remote-debugging-port=9333 --user-data-dir=${userDataDir} --headless=new --no-first-run\n`;
 

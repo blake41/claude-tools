@@ -12,17 +12,24 @@ import { describe, test, expect, afterAll, beforeAll } from "bun:test";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { checkChromeApp } from "../chrome-identity";
+import { CHROME_APP_DEFAULT } from "../config";
 
 // ---------------------------------------------------------------------------
 // Chrome availability guard
 // ---------------------------------------------------------------------------
 
-const CHROME_BIN =
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+// Same app the daemon would spawn (never stock Chrome: a stock headless Chrome
+// during `bun test` recreates the LaunchServices collision with personal Chrome).
+// The preload (setup-chrome-app.ts) points AB_CHROME_APP at a fixture, so resolve the
+// real Beta explicitly (or AB_TEST_REAL_CHROME_APP) and hand it to spawned daemons.
+const REAL_CHROME_APP = process.env.AB_TEST_REAL_CHROME_APP || CHROME_APP_DEFAULT;
+const chromeApp = checkChromeApp(REAL_CHROME_APP);
+const CHROME_BIN = chromeApp.ok ? chromeApp.identity.bin : "";
 
 /** Launches CHROME_BIN headless on an OS-assigned port (never 9333/9444); true if it reaches "DevTools listening". */
 async function probeHeadlessChrome(): Promise<boolean> {
-  if (!fs.existsSync(CHROME_BIN)) return false;
+  if (!CHROME_BIN || !fs.existsSync(CHROME_BIN)) return false;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ab-chrome-probe-"));
   const proc = Bun.spawn(
     [CHROME_BIN, "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${dir}`, "--no-first-run", "about:blank"],
@@ -132,6 +139,7 @@ function daemonEnv(homeDir: string, extra?: Record<string, string>): Record<stri
     AGENT_BROWSER_SOCKET_DIR: path.join(homeDir, ".agent-browser"),
     // Suppress pino pretty-printing if any
     NODE_ENV: "test",
+    AB_CHROME_APP: REAL_CHROME_APP,
     AB_BASE_PORT: String(TEST_BASE_PORT),
     AB_HEADED_PORT: String(TEST_HEADED_PORT),
     AB_DASHBOARD_PORT: String(TEST_DASHBOARD_PORT),
