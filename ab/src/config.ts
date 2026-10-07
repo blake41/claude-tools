@@ -15,6 +15,13 @@ import * as path from "path";
 /** Unix socket the daemon serves its RPC routes on and the CLI connects to. */
 export const SOCKET_PATH = path.join(os.homedir(), ".agent-browser", "ab-server.sock");
 
+/** Default browser bundle for every ab-spawned Chrome: Chrome Beta, never stock Chrome. */
+export const CHROME_APP_DEFAULT = "/Applications/Google Chrome Beta.app";
+/** ab's browser bundle. Chrome Dev/Canary drop in via AB_CHROME_APP without code changes. */
+export const CHROME_APP = process.env.AB_CHROME_APP || CHROME_APP_DEFAULT;
+/** Blake's personal Chrome. ab never spawns a binary with this bundle ID, and there is no override. */
+export const FORBIDDEN_BUNDLE_ID = "com.google.Chrome";
+
 type Env = Record<string, string | undefined>;
 
 export interface AbConfig {

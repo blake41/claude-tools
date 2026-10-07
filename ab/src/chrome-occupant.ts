@@ -82,3 +82,13 @@ export function classifyOccupant(input: {
   const userDataDir = /--user-data-dir=(\S+)/.exec(cmdline)?.[1] ?? "none";
   return { kind: "foreign", detail: `--user-data-dir ${userDataDir} is not this target's profile ${profilePath}` };
 }
+
+/**
+ * The `.app` bundle a `pgrep -lf` command line runs from (the text before
+ * `/Contents/MacOS/`), or null when the command line is not a bundle binary.
+ * Handles spaces in the path ("/Applications/Google Chrome.app/...").
+ */
+export function appBundleOfCommandLine(cmdline: string): string | null {
+  const m = /^(\/.*?\.app)\/Contents\/MacOS\//.exec(cmdline);
+  return m ? m[1] : null;
+}

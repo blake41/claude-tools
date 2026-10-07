@@ -64,7 +64,7 @@ ab heal
 ab get url  # ✓ works
 
 # 2. Kill Chrome (simulating crash)
-kill -9 $(pgrep "Google Chrome" | head -1)
+kill -9 $(pgrep -f "user-data-dir=$HOME/.agent-browser" | head -1)
 
 # 3. Immediately try get url (before daemon detects the crash)
 agent-browser --session-name terra get url
@@ -296,7 +296,7 @@ agent-browser-heal --force >&2 || true
 ab status                              # Overall health check (shows auto-detected session name)
 ab ensure                              # Ensure browser is connected
 pgrep -la "agent-browser-d"           # List daemon processes
-pgrep -la "Google Chrome" | wc -l     # Count Chrome processes
+pgrep -f "user-data-dir=$HOME/.agent-browser" | wc -l     # Count ab Chrome processes (not personal Chrome)
 cat ~/.agent-browser/default.pid       # Daemon PID
 ls -la ~/.agent-browser/default.sock   # Socket exists?
 ab get url                             # Current page (with timeout)

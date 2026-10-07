@@ -20,17 +20,15 @@ import {
 } from "./state";
 import { Logger, withOpId, newOpId } from "./logger";
 import { startHeartbeat, type HeartbeatHost } from "./chrome-heartbeat";
-import { classifyOccupant, getListeningPid, readCommandLine, type OccupantClass } from "./chrome-occupant";
+import { CHROME_APP, FORBIDDEN_BUNDLE_ID } from "./config";
+import { checkChromeApp, profileIsNewerThan, readBundleInfo, type ChromeAppCheck } from "./chrome-identity";
+import { appBundleOfCommandLine, commandLineUsesProfile, classifyOccupant, getListeningPid, readCommandLine, type OccupantClass } from "./chrome-occupant";
 
 const log = new Logger({ component: "chrome" });
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/** macOS-only — ab-server does not support other platforms. */
-const CHROME_BIN =
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 /** Flags shared by both headless and headed Chrome. */
 const SHARED_LAUNCH_ARGS: readonly string[] = [
@@ -397,9 +395,13 @@ export function getRuntimeSnapshot(): Record<string, unknown> {
  */
 export function getHealthDiagnostics(): Record<ChromeTarget, ShardDiagnostics> {
   const result: Record<ChromeTarget, ShardDiagnostics> = {} as Record<ChromeTarget, ShardDiagnostics>;
+  const identity = getChromeIdentityStatus();
   for (const target of ALL_TARGETS) {
     const rt = runtime[target];
     result[target] = {
+      chromeApp: identity.chromeApp,
+      chromeBundleId: identity.chromeBundleId,
+      chromeVersion: identity.chromeVersion,
       lastHealthOkAt: rt.lastHealthOkAt !== null ? new Date(rt.lastHealthOkAt).toISOString() : null,
       heartbeatArmedSince: rt.heartbeatArmedSince !== null ? new Date(rt.heartbeatArmedSince).toISOString() : null,
       heartbeatMode: rt.heartbeatMode,
@@ -622,6 +624,8 @@ export interface StartSupervisionResult {
    * function. handleHeal surfaces these in its HealResponse.actions.
    */
   skippedBackoff: Array<{ target: ChromeTarget; retryAfterMs: number }>;
+  /** Always-on targets whose launch ChromeBinRejectedError refused (bad Chrome app or downgrade). */
+  skippedRejected: Array<{ target: ChromeTarget; reason: string }>;
 }
 
 export async function startSupervision(): Promise<StartSupervisionResult> {
@@ -632,7 +636,15 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
         throw new Error("Unsupported platform: " + process.platform);
       }
       log.info("Starting Chrome supervision");
+      const chromeStatus = getChromeIdentityStatus();
+      if (chromeStatus.error) {
+        // Stay up so `ab doctor` can report it; launchChrome refuses every spawn.
+        log.error("Chrome app unusable — no Chrome will be spawned", { ...chromeStatus });
+      } else {
+        log.info("Chrome app", { ...chromeStatus });
+      }
       const skippedBackoff: Array<{ target: ChromeTarget; retryAfterMs: number }> = [];
+      const skippedRejected: Array<{ target: ChromeTarget; reason: string }> = [];
       for (const target of ALL_TARGETS) {
         if (CONFIGS[target].policy !== "always-on") continue;
         const state = getState(target);
@@ -652,6 +664,9 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
                 retryAfterMs: err.retryAfterMs,
               });
               skippedBackoff.push({ target, retryAfterMs: err.retryAfterMs });
+            } else if (err instanceof ChromeBinRejectedError) {
+              log.error(`[${target}] startSupervision launch refused`, { err: err.message });
+              skippedRejected.push({ target, reason: err.message });
             } else {
               log.error(`[${target}] startSupervision launch failed`, { err: String(err) });
             }
@@ -660,7 +675,7 @@ export async function startSupervision(): Promise<StartSupervisionResult> {
       }
       await restartDashboard();
       log.info("Chrome supervision active");
-      return { skippedBackoff };
+      return { skippedBackoff, skippedRejected };
     }),
   ) as Promise<StartSupervisionResult>;
 }
@@ -683,6 +698,72 @@ export async function stopAll(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Chrome launch
 // ---------------------------------------------------------------------------
+
+/**
+ * Thrown by launchChrome when the configured Chrome app is unusable: missing,
+ * personal Chrome's bundle (com.google.Chrome), or older than the profile.
+ * It says nothing about the profile's health, so it must NEVER touch
+ * rt.backoffMs, consecutiveFailures or retryNotBefore: backoffMs reaching
+ * BACKOFF_MAX_MS deletes the profile (see the corruption-recovery block in
+ * launchChrome). launchChrome throws it before any state change.
+ */
+export class ChromeBinRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChromeBinRejectedError";
+  }
+}
+
+// Re-read on every use, never cached: Chrome Beta auto-updates on disk under a
+// running daemon, and Chrome rewrites a profile's `Last Version` on every start.
+// A stale cached version would call the next launch a "downgrade". The read is
+// two small file reads. Never falls back to stock Chrome.
+let chromeAppOverride: string | null = null;
+
+function getChromeCheck(): ChromeAppCheck {
+  return checkChromeApp(chromeAppOverride ?? CHROME_APP);
+}
+
+function rejectionMessage(check: Extract<ChromeAppCheck, { ok: false }>): string {
+  return check.reason === "personal-bundle"
+    ? `Chrome app ${check.appPath} is personal Chrome (com.google.Chrome); ab refuses to run it. Install Chrome Beta or set AB_CHROME_APP to Dev/Canary.`
+    : `Chrome app ${check.appPath} is missing or has no executable. Install Chrome Beta (/Applications/Google Chrome Beta.app) or set AB_CHROME_APP.`;
+}
+
+export interface ChromeIdentityStatus {
+  chromeApp: string;
+  chromeBundleId: string | null;
+  chromeVersion: string | null;
+  /** Why ab will not spawn Chrome, or null when the app is usable. */
+  error: string | null;
+}
+
+/** Identity of the Chrome app ab spawns, for /status and `ab doctor`. */
+export function getChromeIdentityStatus(): ChromeIdentityStatus {
+  const check = getChromeCheck();
+  if (check.ok) {
+    const { appPath, bundleId, version } = check.identity;
+    return { chromeApp: appPath, chromeBundleId: bundleId, chromeVersion: version, error: null };
+  }
+  // Report what a rejected-but-present app is, so doctor can say what it found.
+  const info = readBundleInfo(check.appPath);
+  return {
+    chromeApp: check.appPath,
+    chromeBundleId: info?.bundleId ?? null,
+    chromeVersion: info?.version ?? null,
+    error: rejectionMessage(check),
+  };
+}
+
+/** Test-only: point the guard at a fixture app (null restores CHROME_APP). */
+export function __setChromeAppForTest(appPath: string | null): void {
+  chromeAppOverride = appPath;
+}
+
+/** Test-only: arm the backoff-max gate without a crash cycle. */
+export function __setBackoffForTest(target: ChromeTarget, ms: number): void {
+  runtime[target].backoffMs = ms;
+}
 
 /**
  * Thrown by launchChrome's ensure-gate when a target is inside its
@@ -723,6 +804,29 @@ function adoptChrome(
   resetStableTimer(target);
   if (target === "headed") resetIdleTimer(target);
   return { pid, port: config.port, profileFresh };
+}
+
+/**
+ * If the responsive Chrome on our port is stock com.google.Chrome running on
+ * THIS target's own ab profile, kill it so launchChrome spawns Beta instead of
+ * adopting it (adopted Chromes are only released, never signalled, so a heal
+ * would re-adopt it forever). Returns true when evicted.
+ *
+ * Both conditions are required: the bundle id comes from the Info.plist of
+ * the app the command line runs from, and the --user-data-dir must be exactly
+ * this target's profile. Personal Chrome (stock bundle, ~/Library/Application
+ * Support/Google/Chrome) fails the second test and is never signalled.
+ */
+async function evictStockOccupant(target: ChromeTarget, pid: number): Promise<boolean> {
+  const config = CONFIGS[target];
+  if (pid === runtime[target].lastSpawnedPid) return false; // spawned by us, from the guarded binary
+  const cmdline = await readCommandLine(pid);
+  if (cmdline === null) return false;
+  const app = appBundleOfCommandLine(cmdline);
+  if (app === null || readBundleInfo(app)?.bundleId !== FORBIDDEN_BUNDLE_ID) return false;
+  if (!commandLineUsesProfile(cmdline, config.profilePath)) return false;
+  await killOccupant(target, pid, "port-occupied-own-profile", `a stock ${FORBIDDEN_BUNDLE_ID} Chrome on this target's profile ${config.profilePath}`);
+  return true;
 }
 
 async function killOccupant(
@@ -808,6 +912,19 @@ async function launchChrome(
   const config = CONFIGS[target];
   const rt = runtime[target];
 
+  // Binary guard: before ANY state change (no markLaunching, no backoff, no
+  // retry window), or a rejection could escalate into the profile nuke below.
+  const chrome = getChromeCheck();
+  if (!chrome.ok) {
+    log.error(`[${target}] Refusing to spawn Chrome`, { appPath: chrome.appPath, reason: chrome.reason });
+    throw new ChromeBinRejectedError(rejectionMessage(chrome));
+  }
+  if (profileIsNewerThan(config.profilePath, chrome.identity.version)) {
+    throw new ChromeBinRejectedError(
+      `Profile ${config.profilePath} was last opened by a newer Chrome than ${chrome.identity.appPath} (${chrome.identity.version}); refusing a downgrade. Update Chrome Beta or restore the pre-beta backup.`,
+    );
+  }
+
   // Ensure gate (item 7): fail fast rather than let a backoff-window ensure
   // block the shared opQueue for every other target.
   const now = Date.now();
@@ -839,8 +956,11 @@ async function launchChrome(
   if (existingCdp) {
     const pid = await getListeningPid(config.port);
     if (pid) {
-      if (shouldAdopt(pid)) return adoptChrome(target, pid, profileFresh);
-      await clearOccupantOrRefuse(target, pid, "crash-loop-recovery");
+      if (shouldAdopt(pid)) {
+        if (!(await evictStockOccupant(target, pid))) return adoptChrome(target, pid, profileFresh);
+      } else {
+        await clearOccupantOrRefuse(target, pid, "crash-loop-recovery");
+      }
     }
   } else {
     // Port might be bound by a process whose CDP is not answering yet.
@@ -852,10 +972,11 @@ async function launchChrome(
       const refusedBefore = rt.lastPortConflict?.pid === stalePid;
       const cameUp = refusedBefore ? false : await waitForCdp(config.port, OCCUPANT_CDP_WAIT_MS);
       if (cameUp && shouldAdopt(stalePid)) {
-        return adoptChrome(target, stalePid, profileFresh);
+        if (!(await evictStockOccupant(target, stalePid))) return adoptChrome(target, stalePid, profileFresh);
+      } else {
+        // Still unresponsive, or our own Chrome while crash-looping.
+        await clearOccupantOrRefuse(target, stalePid, cameUp ? "crash-loop-recovery" : "port-occupied");
       }
-      // Still unresponsive, or our own Chrome while crash-looping.
-      await clearOccupantOrRefuse(target, stalePid, cameUp ? "crash-loop-recovery" : "port-occupied");
     }
   }
 
@@ -906,7 +1027,7 @@ async function launchChrome(
 
   log.info(`[${target}] Spawning Chrome`, { port: config.port, args });
 
-  const proc = Bun.spawn([CHROME_BIN, ...args], {
+  const proc = Bun.spawn([chrome.identity.bin, ...args], {
     stdout: "ignore",
     stderr: "pipe",
   });

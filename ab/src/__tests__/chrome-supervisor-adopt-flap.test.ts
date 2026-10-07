@@ -69,6 +69,10 @@ function installMocks(): void {
 
   // @ts-expect-error — test mock, narrower than Bun.spawn's overload set
   Bun.spawn = mock((cmd: string[]) => {
+    if (cmd[0] === "/usr/bin/pgrep") {
+      // Occupant command line unreadable: the stock-Chrome check cannot match, so it is adopted.
+      return { pid: -1, exitCode: 1, exited: Promise.resolve(1), stdout: new Response("").body, stderr: null, kill: mock(() => {}) };
+    }
     if (cmd[0] !== "/usr/sbin/lsof") {
       chromeSpawned = true;
       throw new Error(`unexpected spawn: ${cmd[0]}`);
