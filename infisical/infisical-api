@@ -450,6 +450,101 @@ cmd_secrets_delete() {
     json_ok "$TOOL_NAME secrets delete" "$result" "$na"
 }
 
+cmd_secrets_batch_delete() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local file=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="$2"; shift 2 ;;
+            -e|--env) environment="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            --file) file="$2"; shift 2 ;;
+            *)
+                json_error "$TOOL_NAME secrets batch-delete" "Unknown option: $1" "INVALID_ARG" \
+                    "Usage: infisical-api secrets batch-delete --file <path|-> -p <project-id> [-e env] [--path /path]"
+                ;;
+        esac
+    done
+
+    if [[ -z "$project_id" || -z "$file" ]]; then
+        json_error "$TOOL_NAME secrets batch-delete" "Project ID and --file required" "MISSING_ARG" \
+            "Usage: infisical-api secrets batch-delete --file <path|-> -p <project-id> [-e env] [--path /path]"
+    fi
+
+    local raw_json
+    if [[ "$file" == "-" ]]; then
+        raw_json=$(cat)
+    else
+        [[ -f "$file" ]] || json_error "$TOOL_NAME secrets batch-delete" "File not found: $file" "MISSING_ARG" \
+            'Pass a JSON array file: ["FOO","BAR"] or [{"secretKey":"FOO"}]'
+        raw_json=$(cat "$file")
+    fi
+
+    # Accept bare key strings or {secretKey} objects; normalize to [{secretKey}].
+    local secrets_json
+    secrets_json=$(echo "$raw_json" | jq -ec \
+        'if type == "array" and length > 0 and all(.[]; (type == "string" and . != "") or (type == "object" and ((.secretKey? // "") | type == "string" and . != "")))
+         then map(if type == "string" then {secretKey: .} else {secretKey: .secretKey} end)
+         else error("bad input") end' 2>/dev/null) || \
+        json_error "$TOOL_NAME secrets batch-delete" "Input must be a non-empty JSON array of key strings or objects with a non-empty secretKey" "INVALID_ARG" \
+            'Example: ["FOO","BAR"] or [{"secretKey":"FOO"}]'
+
+    local dup
+    dup=$(echo "$secrets_json" | jq -r '[.[].secretKey] | group_by(.) | map(select(length > 1) | .[0]) | join(", ")')
+    if [[ -n "$dup" ]]; then
+        json_error "$TOOL_NAME secrets batch-delete" "Duplicate secretKey(s) in batch: $dup" "INVALID_ARG" \
+            "Each key can only appear once per batch"
+    fi
+
+    load_credentials || json_error "$TOOL_NAME secrets batch-delete" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local api_host token
+    api_host=$(load_api_host)
+    token=$(get_access_token) || json_error "$TOOL_NAME secrets batch-delete" "Failed to authenticate" "AUTH_FAILED" \
+        "Check your credentials"
+
+    local payload
+    payload=$(jq -n \
+        --arg pid "$project_id" \
+        --arg env "$environment" \
+        --arg path "$path" \
+        --argjson secrets "$secrets_json" \
+        '{projectId: $pid, environment: $env, secretPath: $path, secrets: $secrets}')
+
+    local tmpfile
+    tmpfile=$(mktemp) && chmod 600 "$tmpfile"
+    trap 'rm -f "$tmpfile"' EXIT
+    printf '%s' "$payload" > "$tmpfile"
+
+    # /v4/secrets/batch, not /v3: v3 fails with "blind index not found".
+    local body
+    body=$(safe_api_call "DELETE /v4/secrets/batch" "$api_host/api/v4/secrets/batch" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -X DELETE --data-binary "@$tmpfile")
+
+    rm -f "$tmpfile"
+    trap - EXIT
+
+    local key_count
+    key_count=$(echo "$secrets_json" | jq 'length')
+
+    local na
+    if echo "$body" | jq -e '.approval' >/dev/null 2>&1; then
+        na=$(next_actions \
+            "$(next_action "Review and approve in the Infisical UI" "Batch delete of $key_count keys is pending approval — not live yet")")
+    else
+        na=$(next_actions \
+            "$(next_action "infisical-api secrets list -p $project_id -e $environment" "List remaining secrets")")
+    fi
+    json_ok "$TOOL_NAME secrets batch-delete" "$body" "$na"
+}
+
 # ============================================================================
 # FOLDER COMMANDS
 # ============================================================================
@@ -916,9 +1011,10 @@ case "${1:-}" in
             create) shift 2; cmd_secrets_create "$@" ;;
             update) shift 2; cmd_secrets_update "$@" ;;
             batch-update) shift 2; cmd_secrets_batch_update "$@" ;;
+            batch-delete) shift 2; cmd_secrets_batch_delete "$@" ;;
             delete) shift 2; cmd_secrets_delete "$@" ;;
             export) shift 2; cmd_secrets_export "$@" ;;
-            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|create|update|batch-update|delete|export>" ;;
+            *) json_error "$TOOL_NAME secrets" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api secrets <list|get|create|update|batch-update|delete|batch-delete|export>" ;;
         esac
         ;;
     syncs)
@@ -971,6 +1067,7 @@ case "${1:-}" in
             {name: "secrets update", description: "Update a secret value", usage: "infisical-api secrets update <KEY> <NEW_VALUE> -p <project> [-e env] [--path /path]"},
             {name: "secrets batch-update", description: "Update multiple secrets in one change request/approval/sync", usage: "infisical-api secrets batch-update --file <path|-> -p <project> [-e env] [--path /path]"},
             {name: "secrets delete", description: "Delete a secret", usage: "infisical-api secrets delete <KEY> -p <project> [-e env] [--path /path]"},
+            {name: "secrets batch-delete", description: "Delete multiple secrets in one change request/approval/sync", usage: "infisical-api secrets batch-delete --file <path|-> -p <project> [-e env] [--path /path]"},
             {name: "secrets export", description: "Export secrets", usage: "infisical-api secrets export -p <project> [-f env|json]"},
             {name: "folders list", description: "List secret folders", usage: "infisical-api folders list -p <project> [-e env] [--path /path]"},
             {name: "environments list", description: "List project environments", usage: "infisical-api environments list <project-id>"},
