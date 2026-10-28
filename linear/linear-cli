@@ -615,16 +615,22 @@ cmd_create() {
   local label=""
   local assignee=""
   local project=""
+  local state=""
+  local created_at=""
+  local completed_at=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --state|-s) state="$2"; shift 2 ;;
+      --created-at) created_at="$2"; shift 2 ;;
+      --completed-at) completed_at="$2"; shift 2 ;;
       --description|-d) description="$2"; shift 2 ;;
       --priority|-p) priority="$2"; shift 2 ;;
       --parent) parent="$2"; shift 2 ;;
       --label|-l) label="$2"; shift 2 ;;
       --assignee|-a) assignee="$2"; shift 2 ;;
       --project) project="$2"; shift 2 ;;
-      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]" ;;
+      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601]" ;;
     esac
   done
 
@@ -650,8 +656,20 @@ cmd_create() {
     --arg assigneeId "$assignee_id" \
     '{teamId: $teamId, title: $title, assigneeId: $assigneeId}')
 
+  if [[ -n "$state" ]]; then
+    try_resolve todo_state_id resolve_state_id "$team_key" "$state"
+  fi
+
   if [[ -n "$todo_state_id" ]]; then
     input=$(echo "$input" | jq --arg stateId "$todo_state_id" '. + {stateId: $stateId}')
+  fi
+
+  if [[ -n "$created_at" ]]; then
+    input=$(echo "$input" | jq --arg v "$created_at" '. + {createdAt: $v}')
+  fi
+
+  if [[ -n "$completed_at" ]]; then
+    input=$(echo "$input" | jq --arg v "$completed_at" '. + {completedAt: $v}')
   fi
 
   if [[ -n "$description" ]]; then
@@ -680,7 +698,7 @@ cmd_create() {
     input=$(echo "$input" | jq --arg pid "$project_id" '. + {projectId: $pid}')
   fi
 
-  local query='mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url state { name } assignee { name } } } }'
+  local query='mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url state { name } assignee { name } parent { identifier } createdAt completedAt } } }'
   local payload
   payload=$(jq -n --arg q "$query" --argjson vars "{\"input\": $input}" '{query: $q, variables: $vars}')
 
@@ -798,7 +816,7 @@ if [[ $# -lt 1 ]]; then
         {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--parent ID] [--limit N|all]"},
         {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
         {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]"},
-        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]"},
+        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601]"},
         {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
         {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
         {name: "search",   description: "Search issues by text",                usage: "linear-cli search <query>"},
@@ -851,9 +869,13 @@ case "$CMD" in
     ;;
   issues) cmd_issues "$@" ;;
   create)
-    [[ $# -lt 2 ]] && json_error "$TOOL_NAME create" "Team key and title required" "MISSING_ARG" \
-      "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]"
-    cmd_create "$@"
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME create" "Title required" "MISSING_ARG" \
+      "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] (team defaults to GTMOPS)"
+    if [[ $# -ge 2 && "$1" =~ ^[A-Z][A-Z0-9]*$ && "$2" != --* ]]; then
+      cmd_create "$@"
+    else
+      cmd_create GTMOPS "$@"
+    fi
     ;;
   cancel)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME cancel" "Issue ID required" "MISSING_ARG" "Usage: linear-cli cancel <ID>"
