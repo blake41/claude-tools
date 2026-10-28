@@ -150,7 +150,7 @@ cmd_issue() {
   fi
 
   local result
-  result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } attachments { nodes { id title url metadata sourceType } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty')
+  result=$(graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } parent { identifier title } children { nodes { identifier title state { name } } } labels { nodes { name } } attachments { nodes { id title url metadata sourceType } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty')
 
   if [[ -z "$result" || "$result" == "null" ]]; then
     json_error "$TOOL_NAME issue" "Issue '$issue_id' not found" "NOT_FOUND" "Check the issue identifier"
