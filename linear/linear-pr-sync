@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# linear-pr-sync [--dry-run] <pr-url|number> [--repo OWNER/REPO]
+# Ensure a Done GTMOPS ticket exists for a PR. Idempotent: the PR URL in the
+# ticket description is the dedup key, alongside GTMOPS-N and bd-* references.
+set -euo pipefail
+
+DRY=0
+if [[ "${1:-}" == "--dry-run" ]]; then DRY=1; shift; fi
+PR="${1:?usage: linear-pr-sync [--dry-run] <pr-url|number> [--repo OWNER/REPO]}"; shift || true
+REPO_ARGS=()
+[[ "${1:-}" == "--repo" ]] && REPO_ARGS=(--repo "$2")
+
+KEY="${LINEAR_API_KEY:-$(cat "$HOME/.config/linear/api-key")}"
+gql() { curl -s -X POST -H "Content-Type: application/json" -H "Authorization: $KEY" --data "$1" https://api.linear.app/graphql; }
+
+pr_json=$(gh pr view "$PR" "${REPO_ARGS[@]}" --json number,title,body,headRefName,url,files)
+url=$(jq -r .url <<<"$pr_json")
+title=$(jq -r .title <<<"$pr_json")
+body=$(jq -r '.body // ""' <<<"$pr_json")
+branch=$(jq -r .headRefName <<<"$pr_json")
+haystack="$title $body $branch"
+
+mark_done() {
+  local id="$1" state
+  state=$(linear-cli issue "$id" | jq -r '.result.state.name')
+  if [[ "$state" != "Done" && "$state" != "Canceled" ]]; then
+    if (( DRY )); then echo "would mark $id Done (now $state)"; return; fi
+    linear-cli update "$id" --state Done >/dev/null
+    echo "marked $id Done"
+  else
+    echo "$id already $state"
+  fi
+}
+
+# 1. explicit ticket id in title, body, or branch
+if id=$(grep -oE 'GTMOPS-[0-9]+' <<<"$haystack" | head -1) && [[ -n "$id" ]]; then
+  mark_done "$id"; exit 0
+fi
+
+# 2. a ticket already carrying this PR URL
+q=$(jq -n --arg u "$url" '{query:"query($u:String!){ issues(first:1, filter:{description:{contains:$u}}){ nodes{ identifier } } }",variables:{u:$u}}')
+id=$(gql "$q" | jq -r '.data.issues.nodes[0].identifier // empty')
+if [[ -n "$id" ]]; then mark_done "$id"; exit 0; fi
+
+# 3. a ticket carrying the same bead id
+for bd in $({ grep -oiE 'bd-[a-z0-9]+(\.[0-9]+)*' <<<"$haystack" || true; } | sort -u); do
+  q=$(jq -n --arg b "$bd" '{query:"query($b:String!){ issues(first:1, filter:{team:{key:{eq:\"GTMOPS\"}}, title:{containsIgnoreCase:$b}}){ nodes{ identifier } } }",variables:{b:$b}}')
+  id=$(gql "$q" | jq -r '.data.issues.nodes[0].identifier // empty')
+  if [[ -n "$id" ]]; then mark_done "$id"; exit 0; fi
+done
+
+# 4. create
+files=$(jq -r '.files[].path' <<<"$pr_json")
+total=$(wc -l <<<"$files" | tr -d ' ')
+ux=$(grep -E "(^web/app-home/src/|\.tsx$|\.css$|/components/|/frontend/)" <<<"$files" | { grep -vE "__tests__|\.test\." || true; } | wc -l | tr -d " ") || ux=0
+project="Terra Infrastructure"
+(( total > 0 && ux * 2 >= total )) && project="Core Terra UI & UX"
+
+if (( DRY )); then echo "would create Done GTMOPS ticket \"$title\" in $project"; exit 0; fi
+
+desc=$(printf 'PR: %s\n\n%s' "$url" "${body:0:1500}")
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+out=$(linear-cli create GTMOPS "$title" --description "$desc" --project "$project" --state Done --created-at "$now" --completed-at "$now")
+echo "created $(jq -r .result.identifier <<<"$out") ($project) for $url"
