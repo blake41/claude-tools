@@ -720,6 +720,7 @@ cmd_issues() {
   local mine=""
   local project=""
   local status=""
+  local parent=""
   local limit=20
 
   while [[ $# -gt 0 ]]; do
@@ -727,8 +728,9 @@ cmd_issues() {
       --mine) mine="true"; shift ;;
       --project) project="$2"; shift 2 ;;
       --status) status="$2"; shift 2 ;;
+      --parent) parent="$2"; shift 2 ;;
       --limit) limit="$2"; shift 2 ;;
-      *) json_error "$TOOL_NAME issues" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]" ;;
+      *) json_error "$TOOL_NAME issues" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli issues [--mine] [--project NAME] [--status STATUS] [--parent ID] [--limit N|all]" ;;
     esac
   done
 
@@ -748,18 +750,33 @@ cmd_issues() {
     filters+=("project: { name: { eq: \\\"$project\\\" } }")
   fi
 
+  if [[ -n "$parent" ]]; then
+    local pnum="${parent##*-}" pteam="${parent%-*}"
+    filters+=("parent: { number: { eq: $pnum }, team: { key: { eq: \\\"$pteam\\\" } } }")
+  fi
+
   if [[ ${#filters[@]} -gt 0 ]]; then
     filter="filter: { $(IFS=', '; echo "${filters[*]}") }, "
   fi
 
-  local raw
-  raw=$(graphql "{ issues(${filter}first: $limit, orderBy: updatedAt) { nodes { id identifier title state { name } priority assignee { name } project { name } updatedAt } } }")
-  local issues
-  issues=$(echo "$raw" | jq '.data.issues.nodes')
+  # Page through results (Linear caps a page at 250). --limit all = no cap.
+  local want="$limit"
+  [[ "$want" == "all" ]] && want=100000
+  [[ "$want" =~ ^[0-9]+$ ]] || json_error "$TOOL_NAME issues" "--limit must be a number or 'all'" "INVALID_ARG" "Usage: linear-cli issues [--limit N|all]"
+  local issues="[]" after="" page_size raw has_next
+  while (( $(echo "$issues" | jq length) < want )); do
+    page_size=$(( want - $(echo "$issues" | jq length) ))
+    (( page_size > 250 )) && page_size=250
+    raw=$(graphql "{ issues(${filter}first: $page_size${after}, orderBy: updatedAt) { pageInfo { hasNextPage endCursor } nodes { id identifier title state { name } priority assignee { name } project { name } parent { identifier } updatedAt } } }")
+    issues=$(jq -n --argjson a "$issues" --argjson b "$(echo "$raw" | jq '.data.issues.nodes')" '$a + $b')
+    has_next=$(echo "$raw" | jq -r '.data.issues.pageInfo.hasNextPage')
+    [[ "$has_next" == "true" ]] || break
+    after=", after: \\\"$(echo "$raw" | jq -r '.data.issues.pageInfo.endCursor')\\\""
+  done
 
-  # Truncate at 50
+  # total/truncated now reflect --limit, not a hidden 50 cap
   local truncated
-  truncated=$(json_truncate "$issues" 50)
+  truncated=$(json_truncate "$issues" "$want")
 
   local first_id
   first_id=$(echo "$issues" | jq -r '.[0].identifier // empty')
@@ -778,7 +795,7 @@ cmd_issues() {
 # Main
 if [[ $# -lt 1 ]]; then
     cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
-        {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--limit N]"},
+        {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--parent ID] [--limit N|all]"},
         {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
         {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]"},
         {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME]"},
