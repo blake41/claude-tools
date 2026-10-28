@@ -401,6 +401,7 @@ cmd_update() {
   shift
 
   local state="" assignee="" priority="" label_add="" label_rm="" cycle="" parent="" project=""
+  local title="" description="" description_set=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -412,8 +413,19 @@ cmd_update() {
       --cycle) cycle="$2"; shift 2 ;;
       --parent) parent="$2"; shift 2 ;;
       --project) project="$2"; shift 2 ;;
+      --title|-t) title="$2"; shift 2 ;;
+      --description|-d) description="$2"; description_set=1; shift 2 ;;
+      --description-file)
+        if [[ "$2" == "-" ]]; then
+          description=$(cat)
+        elif [[ -f "$2" ]]; then
+          description=$(cat "$2")
+        else
+          json_error "$TOOL_NAME update" "File not found: $2" "INVALID_ARG" "Pass a readable file path, or - for stdin"
+        fi
+        description_set=1; shift 2 ;;
       *) json_error "$TOOL_NAME update" "Unknown option: $1" "INVALID_ARG" \
-           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME]" ;;
+           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]" ;;
     esac
   done
 
@@ -456,6 +468,15 @@ cmd_update() {
     local project_id
     try_resolve project_id resolve_project_id "$project"
     input=$(echo "$input" | jq --arg id "$project_id" '. + {projectId: $id}')
+  fi
+
+  if [[ -n "$title" ]]; then
+    input=$(echo "$input" | jq --arg t "$title" '. + {title: $t}')
+  fi
+
+  # Replaces the whole description (Linear has no partial edit).
+  if [[ -n "$description_set" ]]; then
+    input=$(echo "$input" | jq --arg d "$description" '. + {description: $d}')
   fi
 
   # Handle label mutations separately (add/remove use different mutations)
@@ -829,7 +850,7 @@ if [[ $# -lt 1 ]]; then
     cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
         {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--parent ID] [--limit N|all]"},
         {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
-        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME]"},
+        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"},
         {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601]"},
         {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
         {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
@@ -866,7 +887,7 @@ case "$CMD" in
     ;;
   update)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME update" "Issue ID required" "MISSING_ARG" \
-      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME]"
+      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
     cmd_update "$@"
     ;;
   comment)
