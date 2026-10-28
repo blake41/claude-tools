@@ -400,7 +400,7 @@ cmd_update() {
   local issue_id="$1"
   shift
 
-  local state="" assignee="" priority="" label_add="" label_rm="" cycle=""
+  local state="" assignee="" priority="" label_add="" label_rm="" cycle="" parent="" project=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -410,8 +410,10 @@ cmd_update() {
       --label) label_add="$2"; shift 2 ;;
       --remove-label) label_rm="$2"; shift 2 ;;
       --cycle) cycle="$2"; shift 2 ;;
+      --parent) parent="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
       *) json_error "$TOOL_NAME update" "Unknown option: $1" "INVALID_ARG" \
-           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]" ;;
+           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME]" ;;
     esac
   done
 
@@ -444,6 +446,18 @@ cmd_update() {
     input=$(echo "$input" | jq --arg id "$cycle_id" '. + {cycleId: $id}')
   fi
 
+  if [[ -n "$parent" ]]; then
+    local parent_uuid
+    try_resolve parent_uuid resolve_issue_uuid "$parent"
+    input=$(echo "$input" | jq --arg id "$parent_uuid" '. + {parentId: $id}')
+  fi
+
+  if [[ -n "$project" ]]; then
+    local project_id
+    try_resolve project_id resolve_project_id "$project"
+    input=$(echo "$input" | jq --arg id "$project_id" '. + {projectId: $id}')
+  fi
+
   # Handle label mutations separately (add/remove use different mutations)
   if [[ -n "$label_add" ]]; then
     local label_id
@@ -465,7 +479,7 @@ cmd_update() {
   if [[ "$input" != '{}' ]]; then
     local result
     result=$(graphql_mutation \
-      'mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier title state { name } priority assignee { name } labels { nodes { name } } } } }' \
+      'mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier title state { name } priority assignee { name } parent { identifier } createdAt completedAt labels { nodes { name } } } } }' \
       "$(jq -n --arg id "$issue_uuid" --argjson input "$input" '{id: $id, input: $input}')")
 
     local success
@@ -815,7 +829,7 @@ if [[ $# -lt 1 ]]; then
     cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
         {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--parent ID] [--limit N|all]"},
         {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
-        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current]"},
+        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME]"},
         {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601]"},
         {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
         {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
@@ -852,7 +866,7 @@ case "$CMD" in
     ;;
   update)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME update" "Issue ID required" "MISSING_ARG" \
-      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current]"
+      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME]"
     cmd_update "$@"
     ;;
   comment)
