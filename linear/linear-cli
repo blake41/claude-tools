@@ -74,7 +74,7 @@ cmd_teams() {
 
 cmd_projects() {
   local result
-  result=$(graphql "{ projects(first: 50) { nodes { id name description state { name } lead { name } targetDate } } }" | jq '.data.projects.nodes')
+  result=$(graphql "{ projects(first: 100) { nodes { id name description state lead { name } targetDate } } }" | jq '.data.projects.nodes')
   local na
   na=$(next_actions \
       "$(next_action "linear-cli issues --project \"<project-name>\"" "List issues in a project")")
@@ -382,7 +382,7 @@ resolve_project_id() {
   local project_name="$1"
 
   local result
-  result=$(graphql "{ projects(first: 50) { nodes { id name } } }")
+  result=$(graphql "{ projects(first: 250) { nodes { id name } } }")
 
   local project_id
   project_id=$(echo "$result" | jq -r --arg name "$project_name" \
