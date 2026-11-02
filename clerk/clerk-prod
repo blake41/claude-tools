@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# clerk-prod: run `clerk` against the Terra PRODUCTION Clerk instance.
+# Fetches sk_live_ from Infisical per call and passes it to the child via env
+# (never argv, so it stays out of `ps`). Nothing is stored on disk.
+# Why: the ambient CLERK_SECRET_KEY is sk_test_ (dev) and beats --instance/--app,
+# so `clerk api --instance prod` silently hits dev. See ~/.claude/skills/clerk-cli.
+set -euo pipefail
+
+TERRA_PROJECT=320dfa64-a77c-4a51-ba4f-6ccbc21208ef
+
+key=$(infisical-api secrets get CLERK_SECRET_KEY -p "$TERRA_PROJECT" -e production 2>/dev/null \
+  | jq -r '.result.secret.secretValue // empty')
+
+if [[ "$key" != sk_live_* ]]; then
+  echo "clerk-prod: no sk_live_ key from Infisical (got prefix '${key:0:8}')" >&2
+  exit 1
+fi
+
+CLERK_SECRET_KEY="$key" exec clerk "$@"

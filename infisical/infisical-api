@@ -989,6 +989,50 @@ cmd_api() {
     json_ok "$TOOL_NAME api" "$result"
 }
 
+cmd_share() {
+    local name="" expires_in="1d" max_views="3" access_type="anyone" password=""
+    local -a emails=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -n|--name) name="$2"; shift 2 ;;
+            --expires-in) expires_in="$2"; shift 2 ;;
+            --max-views) max_views="$2"; shift 2 ;;
+            --access) access_type="$2"; shift 2 ;;
+            --email) emails+=("$2"); shift 2 ;;
+            --password) password="$2"; shift 2 ;;
+            *) json_error "$TOOL_NAME share" "Unknown option: $1 (the value is read from stdin, never argv)" "INVALID_ARG" "Usage: printf %s \"\$VALUE\" | infisical-api share [-n name<=50] [--expires-in 1d] [--max-views 3] [--access anyone|organization] [--email addr]... [--password pw]" ;;
+        esac
+    done
+
+    if [[ -t 0 ]]; then
+        json_error "$TOOL_NAME share" "Secret value must be piped on stdin" "MISSING_ARG" "Usage: printf %s \"\$VALUE\" | infisical-api share -n \"label\""
+    fi
+
+    load_credentials || json_error "$TOOL_NAME share" "Infisical credentials not found" "AUTH_MISSING" "Set credentials in .env or ~/.config/infisical/credentials"
+
+    local emails_json
+    emails_json=$(printf '%s\n' "${emails[@]+"${emails[@]}"}" | jq -R . | jq -s 'map(select(length>0))')
+
+    # Payload goes to curl on stdin (-d @-) so the secret never lands in argv/ps.
+    local result
+    result=$(jq -Rs --arg n "$name" --arg e "$expires_in" --argjson v "$max_views" --arg a "$access_type" --arg p "$password" --argjson em "$emails_json" '
+        {secretValue: ., expiresIn: $e, maxViews: $v, accessType: $a}
+        + (if $n != "" then {name: $n} else {} end)
+        + (if $p != "" then {password: $p} else {} end)
+        + (if ($em | length) > 0 then {authorizedEmails: $em} else {} end)
+    ' | infisical_api "/v1/shared-secrets" -X POST -d @-) || \
+        json_error "$TOOL_NAME share" "Request failed" "API_ERROR" "Check credentials and network"
+
+    # Never echo the secret: keep only metadata + link. Surface API errors as-is.
+    local link
+    link=$(printf '%s' "$result" | jq -r '.sharedSecretLink // empty')
+    if [[ -z "$link" ]]; then
+        json_error "$TOOL_NAME share" "$(printf '%s' "$result" | jq -r '.message // "no sharedSecretLink in response"')" "API_ERROR" "Route is POST /api/v1/shared-secrets; machine identity must be allowed to create shares"
+    fi
+    json_ok "$TOOL_NAME share" "$(printf '%s' "$result" | jq '{sharedSecretLink, id, name, expiresAt, expiresAfterViews, accessType}')"
+}
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1053,6 +1097,9 @@ case "${1:-}" in
             *) json_error "$TOOL_NAME debug" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api debug <compare>" ;;
         esac
         ;;
+    share)
+        shift; cmd_share "$@"
+        ;;
     api)
         shift; cmd_api "$@"
         ;;
@@ -1078,6 +1125,7 @@ case "${1:-}" in
             {name: "syncs remove-secrets", description: "Remove stale secrets from Render", usage: "infisical-api syncs remove-secrets <sync-id> [--yes]"},
             {name: "integrations list", description: "List integrations", usage: "infisical-api integrations list <project-id>"},
             {name: "debug compare", description: "Compare Infisical vs Render secrets", usage: "infisical-api debug compare -p <project> -r <render-env-group>"},
+            {name: "share", description: "Create a one-time share link for a value piped on stdin (never argv)", usage: "printf %s \"$VALUE\" | infisical-api share -n <label<=50> [--expires-in 1d] [--max-views 3] [--access anyone|organization] [--email addr] [--password pw]"},
             {name: "api", description: "Raw API call", usage: "infisical-api api <endpoint> [-X METHOD] [-d data]"}
         ]')"
         ;;
