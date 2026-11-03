@@ -133,7 +133,7 @@ async function parkJob(
   const body = [
     `epic-runner parked **${label}** in epic \`${ctx.policy.epicId}\`: ${reason}.`,
     run ? `Session \`${run.sessionId}\` in herdr pane \`${run.pane}\` (session \`${ctx.policy.herdrSession}\`).` : '',
-    kind === 'blocked' ? 'The runner never types into a dialog. Answer it in the pane, then run `epic-runner resume <policy>`.' : 'Fix the cause, then run `epic-runner resume <policy>`.',
+    kind === 'blocked' ? 'The runner never types into a dialog. Answer it in the pane, then resume.' : 'Fix the cause, then resume.',
     paneText ? `\nPane:\n\n\`\`\`\n${paneText.trimEnd().slice(-3000)}\n\`\`\`` : '',
   ]
     .filter((l) => l !== '')

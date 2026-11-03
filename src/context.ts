@@ -19,6 +19,7 @@ export type RunnerDeps = {
   claudeProjectsDir: string
   nmConfigPath: string
   hookPath: string
+  resumeCommand: string
   notifier: Notifier
   quota: QuotaCheck
 }
@@ -94,6 +95,24 @@ export class Ctx {
     this.state.halted = { reason, at: this.now() }
     await this.save()
     await this.event('halted', { reason })
-    if (notice) await this.notify(notice)
+    const base = notice ?? {
+      key: `${this.policy.epicId}:halt:${this.state.halted.at}`,
+      subject: `epic-runner halted on ${this.policy.epicId}`,
+      body: reason,
+    }
+    await this.notify({ ...base, body: `${base.body}\n\n${this.resumeAction(reason)}` })
+  }
+
+  private resumeAction(reason: string): string {
+    const id = this.policy.epicId
+    return [
+      ':::action',
+      `Resume epic-runner on ${id}`,
+      reason,
+      '',
+      `Run: ${this.deps.resumeCommand}`,
+      `Stopped: epic ${id} is halted until it is resumed`,
+      ':::',
+    ].join('\n')
   }
 }

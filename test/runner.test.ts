@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { Ctx } from '../src/context.ts'
 import { Runner } from '../src/runner.ts'
 import { StateStore } from '../src/store.ts'
 import { realFs } from '../src/fs.ts'
@@ -364,5 +365,48 @@ describe('tick errors', () => {
     expect(r.mustState().halted?.reason).toMatch(/^tick failed twice: gh pr view 4242/)
     expect(events(w).filter((e) => e.type === 'tick_error')).toHaveLength(2)
     expect(w.notices.map((n) => n.subject)).toEqual(['epic-runner halted on bd-43aa7'])
+  })
+})
+
+describe('busy pane at agent start', () => {
+  it('retries agent start while the pane is not yet at a shell, then starts the worker', async () => {
+    const w = new FakeWorld()
+    w.startBusy = 2
+    const r = await startedBead(w)
+    expect(r.mustState().halted).toBeNull()
+    expect(r.mustState().beads['bd-43aa7.1']?.s).toBe('working')
+    expect(w.herdrCalls('agent start')).toHaveLength(3)
+  })
+
+  it('parks and halts once the retry budget is spent', async () => {
+    const w = new FakeWorld()
+    w.startBusy = 1000
+    const r = await startedBead(w)
+    expect(r.mustState().halted?.reason).toContain('agent_pane_busy')
+    expect(w.herdrCalls('agent start')).toHaveLength(20)
+  })
+})
+
+describe('halt notices', () => {
+  it('a halt with no notice still notifies, with a resolved resume action block', async () => {
+    const w = new FakeWorld()
+    const ctx = new Ctx(w.policy(), w.deps(), realFs)
+    ctx.state = gatingState(w, 'merge')
+    await ctx.halt('no-mistakes config: mismatch')
+    expect(w.notices).toHaveLength(1)
+    const n = w.notices[0]!
+    expect(n.subject).toBe('epic-runner halted on bd-43aa7')
+    expect(n.body).toContain(
+      ':::action\nResume epic-runner on bd-43aa7\nno-mistakes config: mismatch\n\nRun: bun run /opt/epic-runner/src/cli.ts resume /work/policy.json\nStopped: epic bd-43aa7 is halted until it is resumed\n:::',
+    )
+    expect(n.body).not.toContain('<policy>')
+  })
+
+  it('a halt with a notice keeps its body and appends the action block', async () => {
+    const w = new FakeWorld()
+    const ctx = new Ctx(w.policy(), w.deps(), realFs)
+    ctx.state = gatingState(w, 'merge')
+    await ctx.halt('boom', { key: 'k', subject: 's', body: 'details' })
+    expect(w.notices[0]?.body.startsWith('details\n\n:::action\n')).toBe(true)
   })
 })

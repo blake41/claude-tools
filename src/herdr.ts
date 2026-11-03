@@ -48,6 +48,9 @@ function herdrError(r: ExecResult): { code: string; message: string } {
   return { code: r.timedOut ? 'timeout' : `exit_${r.code}`, message: (r.stderr || r.stdout).trim().slice(0, 300) }
 }
 
+const BUSY_PANE_RETRY_MS = 3_000
+const BUSY_PANE_MAX_ATTEMPTS = 20
+
 export class Herdr {
   constructor(
     private readonly exec: Exec,
@@ -81,10 +84,12 @@ export class Herdr {
   }
 
   async startClaude(pane: string, sessionId: string, claudeArgs: string[]): Promise<StartResult> {
-    const r = await this.call(
-      ['agent', 'start', agentName(sessionId), '--kind', 'claude', '--pane', pane, '--timeout', '60000', '--', ...claudeArgs],
-      90_000,
-    )
+    const args = ['agent', 'start', agentName(sessionId), '--kind', 'claude', '--pane', pane, '--timeout', '60000', '--', ...claudeArgs]
+    let r = await this.call(args, 90_000)
+    for (let attempt = 1; r.code !== 0 && attempt < BUSY_PANE_MAX_ATTEMPTS && herdrError(r).code === 'agent_pane_busy'; attempt++) {
+      await this.sleep(BUSY_PANE_RETRY_MS)
+      r = await this.call(args, 90_000)
+    }
     if (r.code !== 0) return { ok: false, ...herdrError(r) }
     await this.sendKeys(pane, ['esc'])
     return { ok: true }

@@ -18,7 +18,8 @@ const ResponseSchema = z.object({
 const bin = process.env.PLANNOTATOR_BIN ?? '/Users/blake/.local/bin/plannotator'
 const payload = PayloadSchema.parse(JSON.parse(await Bun.stdin.text()))
 
-const proc = Bun.spawn([bin, 'inbox', 'mcp'], { cwd: payload.project_path, stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' })
+const { CLAUDE_CODE_SESSION_ID: _session, CLAUDECODE: _claude, ...env } = process.env
+const proc = Bun.spawn([bin, 'inbox', 'mcp'], { cwd: payload.project_path, env, stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' })
 const send = (msg: unknown) => {
   proc.stdin.write(`${JSON.stringify(msg)}\n`)
   proc.stdin.flush()

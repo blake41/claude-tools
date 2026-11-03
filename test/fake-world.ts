@@ -31,6 +31,7 @@ export class FakeWorld {
   panes = new Map<string, FakeAgent | null>()
   workspaces = 0
   promptStalls = 0
+  startBusy = 0
   onPrompt: ((text: string) => void) | null = null
   paneText = ''
   commits = new Set<string>()
@@ -77,6 +78,7 @@ export class FakeWorld {
       claudeProjectsDir: this.projectsDir,
       nmConfigPath: join(this.root, 'nm', 'config.yaml'),
       hookPath: '/opt/epic-runner/hooks/rotate.sh',
+      resumeCommand: 'bun run /opt/epic-runner/src/cli.ts resume /work/policy.json',
       notifier: { send: async (n) => void this.notices.push(n) },
       quota: async () => ({ ok: true }),
     }
@@ -150,6 +152,10 @@ export class FakeWorld {
       return ok(JSON.stringify({ id: 'cli:pane:get', result: { pane, type: 'pane_info' } }))
     }
     if (group === 'agent' && sub === 'start') {
+      if (this.startBusy > 0) {
+        this.startBusy--
+        return herdrErr('agent_pane_busy', `agent target pane ${target} is not an available shell`)
+      }
       const dash = a.indexOf('--')
       const args = a.slice(dash + 1)
       const sid = args[args.indexOf('--session-id') + 1] ?? args[args.indexOf('--resume') + 1] ?? ''

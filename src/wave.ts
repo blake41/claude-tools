@@ -72,7 +72,7 @@ export async function stepValidating(ctx: Ctx, wave: number): Promise<Step> {
       await ctx.halt(`no-mistakes needs a decision on wave ${wave + 1}`, {
         key: `${p.epicId}:nm-gate:${wave}:${nmRun}`,
         subject: `no-mistakes needs a decision on wave ${wave + 1}`,
-        body: `Run \`no-mistakes axi status\` in \`${p.worktree}\` and respond, then \`epic-runner resume <policy>\`.\n\n\`\`\`\n${out.text}\n\`\`\``,
+        body: `Run \`no-mistakes axi status\` in \`${p.worktree}\` and respond, then resume.\n\n\`\`\`\n${out.text}\n\`\`\``,
       })
       return 'progressed'
     case 'outcome': {

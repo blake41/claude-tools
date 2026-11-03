@@ -47,7 +47,7 @@ export class Runner {
         await this.ctx.halt(`tick failed twice: ${message}`, {
           key: `${this.ctx.policy.epicId}:tick-error:${this.ctx.now()}`,
           subject: `epic-runner halted on ${this.ctx.policy.epicId}`,
-          body: `Two ticks in a row failed. Last error:\n\n\`\`\`\n${message}\n\`\`\`\n\nFix the cause, then run \`epic-runner resume <policy>\`.`,
+          body: `Two ticks in a row failed. Last error:\n\n\`\`\`\n${message}\n\`\`\`\n\nFix the cause, then resume.`,
         })
       }
       return { progressed: false, summary: `error: ${message}` }
@@ -285,7 +285,7 @@ export class Runner {
         await ctx.halt(`${label} failed: ${end.reason}`, {
           key: `${ctx.policy.epicId}:failed:${jobKey(job)}:${run.sessionId}`,
           subject: `Parked ${label}: worker reported failure`,
-          body: `The worker for **${label}** in epic \`${ctx.policy.epicId}\` wrote \`failed: ${end.reason}\`. Later beads wait. Fix the cause, then run \`epic-runner resume <policy>\`.`,
+          body: `The worker for **${label}** in epic \`${ctx.policy.epicId}\` wrote \`failed: ${end.reason}\`. Later beads wait. Fix the cause, then resume.`,
         })
         return
       }

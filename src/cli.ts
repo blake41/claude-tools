@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { RunnerDeps } from './context.ts'
 import { dryRunExec, realExec, type ExecRequest, type ExecResult } from './exec.ts'
 import { dryRunFs, realFs } from './fs.ts'
@@ -46,7 +46,7 @@ function dryCanned(): (req: ExecRequest) => Partial<ExecResult> | undefined {
   }
 }
 
-function deps(policy: EpicPolicy, stateRoot: string, dry: boolean): RunnerDeps {
+function deps(policy: EpicPolicy, stateRoot: string, dry: boolean, policyPath: string): RunnerDeps {
   const print = (l: string) => console.log(l)
   const exec = dry ? dryRunExec(print, dryCanned()) : realExec
   const nmHome = process.env.NM_HOME ?? join(homedir(), '.no-mistakes')
@@ -60,6 +60,7 @@ function deps(policy: EpicPolicy, stateRoot: string, dry: boolean): RunnerDeps {
     claudeProjectsDir: join(homedir(), '.claude', 'projects'),
     nmConfigPath: join(nmHome, 'config.yaml'),
     hookPath: join(ROOT, 'hooks', 'rotate.sh'),
+    resumeCommand: `bun run ${join(ROOT, 'src', 'cli.ts')} resume ${policyPath}`,
     notifier: dry
       ? { send: async (n) => print(`# notify [${policy.epicId}/runner] ${n.subject} (key ${n.key})`) }
       : inboxNotifier(exec, { wrapperPath: join(ROOT, 'src', 'inbox-send.ts'), projectPath: policy.repo, thread: `${policy.epicId}/runner` }),
@@ -106,7 +107,7 @@ async function main(argv: string[]): Promise<number> {
     return 0
   }
   const policy = await loadPolicy(target)
-  const runner = new Runner(policy, deps(policy, stateRoot, dry))
+  const runner = new Runner(policy, deps(policy, stateRoot, dry, resolve(target)))
   switch (cmd) {
     case 'tick': {
       const steps = Number(flag(argv, '--steps') ?? '1')
