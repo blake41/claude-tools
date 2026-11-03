@@ -105,14 +105,11 @@ export class Ctx {
 
   private resumeAction(reason: string): string {
     const id = this.policy.epicId
-    return [
-      ':::action',
-      `Resume epic-runner on ${id}`,
-      reason,
-      '',
-      `Run: ${this.deps.resumeCommand}`,
-      `Stopped: epic ${id} is halted until it is resumed`,
-      ':::',
-    ].join('\n')
+    return actionBlock(`Resume epic-runner on ${id}`, reason, [`Run: ${this.deps.resumeCommand}`, `Stopped: epic ${id} is halted until it is resumed`])
   }
+}
+
+/** A Plannotator action item: the Inbox lists it as open under "Stopped on you". */
+export function actionBlock(title: string, why: string, details: string[]): string {
+  return [':::action', title, why, '', ...details, ':::'].join('\n')
 }

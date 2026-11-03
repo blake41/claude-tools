@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { fixBrief } from './brief.ts'
-import type { Ctx } from './context.ts'
+import { actionBlock, type Ctx } from './context.ts'
 import { mustRun } from './exec.ts'
 import { currentVerdicts, downgradeReason } from './gates.ts'
 import { ciState } from './gh.ts'
@@ -157,12 +157,18 @@ async function runReview(ctx: Ctx, wave: number, gate: ReviewGate, pr: number, h
   return { gate: 'review', head, pass, findings: out.findings, at: ctx.now() }
 }
 
-async function stopAtPr(ctx: Ctx, wave: number, pr: number, why: string): Promise<void> {
+async function stopAtPr(ctx: Ctx, wave: number, pr: number, why: string, url?: string): Promise<void> {
+  const id = ctx.policy.epicId
+  const last = wave + 1 >= ctx.state.waves.length
+  const action = actionBlock(`Review and merge PR #${pr} for wave ${wave + 1} of ${id}`, why, [
+    ...(url ? [`Where: ${url}`] : []),
+    `Stopped: ${last ? `epic ${id}` : `wave ${wave + 2} of ${id}`} waits until PR #${pr} is merged`,
+  ])
   await ctx.setWave(wave, { s: 'stopped_at_pr', pr, why })
   await ctx.notify({
     key: `${ctx.policy.epicId}:stopped:${wave}:${pr}:${why}`,
     subject: `PR #${pr} stopped at PR`,
-    body: `Wave ${wave + 1} of epic \`${ctx.policy.epicId}\` stopped at PR #${pr}: ${why}.\n\nMerge it yourself to continue; the runner picks up the next wave once it sees the PR merged.`,
+    body: `Wave ${wave + 1} of epic \`${ctx.policy.epicId}\` stopped at PR #${pr}: ${why}.\n\nMerge it yourself to continue; the runner picks up the next wave once it sees the PR merged.\n\n${action}`,
   })
 }
 
@@ -189,7 +195,12 @@ async function startFix(ctx: Ctx, wave: number, gate: ReviewGate, pr: number, ve
   w.fixRounds = round
   await ctx.save()
   await ctx.event('fix_round_started', { wave: wave + 1, round, pr, head: verdict.head })
-  await startWorker(ctx, job, { model: gate.fixLoop?.model ?? p.workerModel, launch: { k: 'fresh' }, restarts: 0 })
+  const started = await startWorker(ctx, job, { model: gate.fixLoop?.model ?? p.workerModel, launch: { k: 'fresh' }, restarts: 0 })
+  if ('k' in started) {
+    // The start parked: no round ran, so a resume retries this same round number.
+    w.fixRounds = round - 1
+    await ctx.save()
+  }
 }
 
 export async function stepGating(ctx: Ctx, wave: number): Promise<Step> {
@@ -201,7 +212,7 @@ export async function stepGating(ctx: Ctx, wave: number): Promise<Step> {
     return 'progressed'
   }
   if (st.s !== 'gating') return 'idle'
-  const view = await ctx.gh.view(String(st.pr), ['number', 'headRefOid', 'state', 'statusCheckRollup', 'additions', 'deletions'])
+  const view = await ctx.gh.view(String(st.pr), ['number', 'headRefOid', 'state', 'url', 'statusCheckRollup', 'additions', 'deletions'])
   if (view.state === 'MERGED') return markMerged(ctx, wave, st.pr, 'merged outside the runner')
   if (view.state === 'CLOSED') {
     await ctx.halt(`PR #${st.pr} was closed`)
@@ -234,7 +245,7 @@ export async function stepGating(ctx: Ctx, wave: number): Promise<Step> {
         return 'progressed'
       }
       const why = gate.kind === 'review' && fix ? `${gate.kind} failed and fix rounds are exhausted (${w.fixRounds}/${fix.maxRounds})` : `${gate.kind} failed at ${st.head}`
-      await stopAtPr(ctx, wave, st.pr, why)
+      await stopAtPr(ctx, wave, st.pr, why, view.url)
       return 'progressed'
     }
   }
@@ -249,11 +260,11 @@ export async function stepGating(ctx: Ctx, wave: number): Promise<Step> {
   })
   await ctx.event('gates_passed', { wave: wave + 1, pr: st.pr, head: st.head, downgrade, onPass: w.onPass })
   if (downgrade) {
-    await stopAtPr(ctx, wave, st.pr, `downgraded: ${downgrade}`)
+    await stopAtPr(ctx, wave, st.pr, `downgraded: ${downgrade}`, view.url)
     return 'progressed'
   }
   if (w.onPass === 'stop_at_pr') {
-    await stopAtPr(ctx, wave, st.pr, 'policy onPass is stop_at_pr')
+    await stopAtPr(ctx, wave, st.pr, 'policy onPass is stop_at_pr', view.url)
     return 'progressed'
   }
   await ctx.setWave(wave, { s: 'merge_ready', pr: st.pr, head: st.head })

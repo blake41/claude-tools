@@ -315,6 +315,20 @@ describe('merge gates', () => {
     expect(w.notices.map((n) => n.subject)).toEqual(['PR #4242 stopped at PR'])
   })
 
+  it('a stop-at-PR notice carries an action block so it lands as an open item', async () => {
+    const w = new FakeWorld()
+    w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/render-api.ts'], additions: 10, deletions: 2, checks: [greenCheck] }
+    const r = await gatingRunner(w, 'stop_at_pr', [{ kind: 'ci_green_at_head' }])
+    await ticks(r, 3)
+    expect(w.notices).toHaveLength(1)
+    const body = w.notices[0]!.body
+    expect(body).toContain(':::action')
+    expect(body).toContain('Review and merge PR #4242 for wave 1 of bd-43aa7')
+    expect(body).toContain('Where: https://github.com/clay-run/terra/pull/4242')
+    expect(body).toContain('Stopped: epic bd-43aa7 waits until PR #4242 is merged')
+    expect(body.trimEnd().endsWith(':::')).toBe(true)
+  })
+
   it('merges serially with --match-head-commit at the gated head, then rebases the epic branch', async () => {
     const w = new FakeWorld()
     w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/render-api.ts'], additions: 30, deletions: 20, checks: [greenCheck] }
@@ -349,6 +363,26 @@ describe('merge gates', () => {
     expect(st.worker).toBeNull()
     expect(st.waves[0]?.state).toEqual({ s: 'validating', nmRun: '' })
     expect(st.waves[0]?.fixRounds).toBe(1)
+  })
+})
+
+describe('fix round accounting', () => {
+  it('a fix start that parks does not spend a round; resume retries the same round', async () => {
+    const w = new FakeWorld()
+    w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/render-api.ts'], additions: 30, deletions: 20, checks: [greenCheck] }
+    w.reviewOutputs.push(reviewOut('major'))
+    w.startBusy = 1000
+    const r = await gatingRunner(w, 'merge', [{ kind: 'ci_green_at_head' }, review])
+    let st = await ticks(r, 2)
+    expect(st.halted?.reason).toContain('agent_pane_busy')
+    expect(st.waves[0]?.fixRounds).toBe(0)
+    w.startBusy = 0
+    await r.resume()
+    st = await ticks(r, 1)
+    expect(st.worker?.job).toEqual({ kind: 'fix', wave: 0, round: 1 })
+    expect(st.waves[0]?.fixRounds).toBe(1)
+    const rounds = events(w).filter((e) => e.type === 'fix_round_started').map((e) => e.round)
+    expect(rounds.at(-1)).toBe(1)
   })
 })
 
