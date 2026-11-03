@@ -31,6 +31,7 @@ export class FakeWorld {
   panes = new Map<string, FakeAgent | null>()
   workspaces = 0
   promptStalls = 0
+  onPrompt: ((text: string) => void) | null = null
   paneText = ''
   commits = new Set<string>()
   dirty: string[] = []
@@ -168,6 +169,7 @@ export class FakeWorld {
         return herdrErr('agent_prompt_stalled', 'no activity observed')
       }
       agent.status = 'working'
+      this.onPrompt?.(a[3] ?? '')
       return ok('{}')
     }
     return herdrErr('unsupported', a.join(' '))

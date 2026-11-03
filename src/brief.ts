@@ -8,6 +8,8 @@ export type BriefParams = {
   worktree: string
   statusFile: string
   inboxThread: string
+  beadText: string
+  epicText: string
 }
 
 function protocol(p: Pick<BriefParams, 'statusFile' | 'inboxThread' | 'repoRoot'>): string {
@@ -35,17 +37,26 @@ export function beadBrief(p: BriefParams): string {
 
 You work on the epic branch \`${p.branch}\` in the worktree \`${p.worktree}\`. One bead, start to finish.
 
-1. Run \`br show ${p.beadId}\`. Read the bead, the epic (\`br show ${p.epicId}\`), and any baton in \`.baton/\`.
+1. Read the bead and the epic below, and any baton in \`.baton/\`. The runner read them with \`br\`; do not run \`br\` yourself (the sandbox blocks its write lock in the main checkout).
 2. Implement with tests (implementer method: RED then GREEN where testable).
 3. Run the scope gates from CLAUDE.md for touched paths. Run \`bun run lint:suppressions:prune\` when a baselined site is fixed.
 4. Commit on \`${p.branch}\`. One bead = one commit (or a few).
 5. Write \`done sha=<sha>\`. End the turn.
 6. A question is allowed only for a one-way door. First classify it (reversible / default / needs-user, the \`open-question-resolver\` rules). Reversible or default: decide, and log it under \`REVIEW-THESE\` in the commit body. Needs-user: send it to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn.
 
-${protocol(p)}`
+${protocol(p)}
+
+## Bead ${p.beadId}
+
+${p.beadText.trim()}
+
+## Epic ${p.epicId}
+
+${p.epicText.trim()}
+`
 }
 
-export function fixBrief(p: BriefParams & { pr: number; round: number; findings: Finding[] }): string {
+export function fixBrief(p: Omit<BriefParams, 'beadText' | 'epicText'> & { pr: number; round: number; findings: Finding[] }): string {
   const list = p.findings.map((f) => `- [${f.severity}] ${f.file}:${f.line} ${f.summary}`).join('\n')
   return `# Review fixes for PR #${p.pr}, round ${p.round} (epic ${p.epicId})
 

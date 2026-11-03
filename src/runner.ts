@@ -112,7 +112,7 @@ export class Runner {
     const notes: string[] = []
     const run = ctx.state.worker
     for (const [id, bead] of Object.entries(ctx.state.beads)) {
-      if (bead.s !== 'parked') continue
+      if (bead.s !== 'parked' && bead.s !== 'failed') continue
       if (run && run.job.kind === 'bead' && run.job.beadId === id) {
         run.protocolNudged = false
         run.stallNudges = 0
@@ -192,6 +192,9 @@ export class Runner {
     const ctx = this.ctx
     const p = ctx.policy
     const job: WorkerJob = { kind: 'bead', beadId }
+    const show = (id: string) => mustRun(ctx.deps.exec, { cmd: 'br', args: ['show', id], cwd: p.repo, timeoutMs: 60_000 })
+    const beadText = await show(beadId)
+    const epicText = await show(p.epicId)
     await ctx.fs.writeAtomic(
       ctx.paths.brief(jobKey(job)),
       beadBrief({
@@ -202,6 +205,8 @@ export class Runner {
         worktree: p.worktree,
         statusFile: ctx.paths.status,
         inboxThread: `${p.epicId}/${beadId}`,
+        beadText,
+        epicText,
       }),
     )
   }

@@ -54,7 +54,7 @@ describe('bead lifecycle', () => {
     expect(settings.sandbox).toEqual({ enabled: true })
     expect(settings.hooks.PostToolUse[0].hooks[0].command).toContain('EPIC_RUNNER_ROTATE_AT=300000')
     const brief = readFileSync(join(w.worktree, '.epic-runner', 'brief-bd-43aa7.1.md'), 'utf8')
-    expect(brief).toContain('br show bd-43aa7.1')
+    expect(brief).toContain('## Bead bd-43aa7.1')
     expect(brief).toContain('thread: "bd-43aa7/bd-43aa7.1"')
     expect(brief).toContain(`project_path: "${w.repo}"`)
 
@@ -119,6 +119,26 @@ describe('bead lifecycle', () => {
     expect(st.halted?.reason).toContain('bd-43aa7.1')
     expect(w.notices).toHaveLength(1)
     expect(w.notices[0]?.body).toContain('Do you want to proceed?')
+  })
+
+  it('a status line written while the first prompt is in flight is not skipped', async () => {
+    const w = new FakeWorld()
+    w.onPrompt = (text) => {
+      if (text.includes('bead brief')) w.writeStatus('failed: br blocked by the sandbox')
+    }
+    const r = new Runner(w.policy(), w.deps())
+    const st = await ticks(r, 4)
+    expect(st.beads['bd-43aa7.1']).toEqual({ s: 'failed', reason: 'br blocked by the sandbox' })
+    expect(w.herdrCalls('agent prompt').some((c) => (c.args[5] ?? '').includes('without a status line'))).toBe(false)
+  })
+
+  it('the brief carries the bead and epic text so workers never run br', async () => {
+    const w = new FakeWorld()
+    await startedBead(w)
+    const brief = readFileSync(join(w.worktree, '.epic-runner', 'brief-bd-43aa7.1.md'), 'utf8')
+    expect(brief).toContain('## Bead bd-43aa7.1')
+    expect(brief).toContain('## Epic bd-43aa7')
+    expect(brief).toContain('do not run `br` yourself')
   })
 
   it('idle without a status line: one nudge, then park and notify', async () => {

@@ -88,6 +88,7 @@ export async function startWorker(
     return parkJob(ctx, job, null, why, text, started.code === 'agent_not_ready' ? 'blocked' : 'parked')
   }
   const briefPath = ctx.paths.brief(jobKey(job))
+  const statusCursor = statusLineCount(await ctx.fs.readText(ctx.paths.status))
   const prompted = await ctx.herdr.prompt(pane.pane, firstPrompt(job, opts.launch, briefPath, ctx.paths.status))
   if (!prompted.ok) {
     const text = await ctx.herdr.readPane(pane.pane, 'visible')
@@ -101,7 +102,7 @@ export async function startWorker(
     model: opts.model,
     startedAt: now,
     restarts: opts.restarts,
-    statusCursor: statusLineCount(await ctx.fs.readText(ctx.paths.status)),
+    statusCursor,
     lastPromptAt: now,
     protocolNudged: false,
     stallNudges: 0,
