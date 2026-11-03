@@ -104,6 +104,11 @@ describe("mintProdTicketUrl", () => {
 });
 
 describe("parseInfisicalSecret", () => {
+  test("reads result.secret.secretValue, the shape infisical-api secrets get prints", () => {
+    expect(
+      parseInfisicalSecret(JSON.stringify({ ok: true, result: { secret: { secretKey: "CLERK_SECRET_KEY", secretValue: "sk_live_z" } } })),
+    ).toBe("sk_live_z");
+  });
   test("reads result.secretValue", () => {
     expect(parseInfisicalSecret(JSON.stringify({ result: { secretValue: "sk_live_x" } }))).toBe("sk_live_x");
   });

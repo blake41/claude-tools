@@ -33,8 +33,12 @@ export function parseInfisicalSecret(stdout: string): string {
   } catch {
     throw new Error("infisical-api returned non-JSON output");
   }
-  const o = parsed as { result?: { secretValue?: unknown }; secret?: { secretValue?: unknown }; secretValue?: unknown };
-  const value = o?.result?.secretValue ?? o?.secret?.secretValue ?? o?.secretValue;
+  const o = parsed as {
+    result?: { secret?: { secretValue?: unknown }; secretValue?: unknown };
+    secret?: { secretValue?: unknown };
+    secretValue?: unknown;
+  };
+  const value = o?.result?.secret?.secretValue ?? o?.result?.secretValue ?? o?.secret?.secretValue ?? o?.secretValue;
   if (typeof value !== "string" || !value) throw new Error("infisical-api returned no secret value");
   return value;
 }
