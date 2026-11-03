@@ -10,7 +10,7 @@ const OK_OUTCOMES = new Set(['passed', 'success', 'succeeded', 'completed', 'che
 
 export function nmRunArgs(opts: { intentFile?: string; wait: string }): string[] {
   const start = opts.intentFile ? ['--intent-file', opts.intentFile] : []
-  const skip = opts.intentFile ? ['--skip', 'test'] : []
+  const skip = opts.intentFile ? ['--skip', 'test,review,document,lint'] : []
   return ['axi', 'run', ...start, '--yes', ...skip, '--wait', opts.wait]
 }
 

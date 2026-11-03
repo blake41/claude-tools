@@ -164,9 +164,10 @@ export class Runner {
       const has = await exec({ cmd: 'git', args: ['rev-parse', '--verify', '--quiet', `refs/heads/${p.branch}`], cwd: p.repo, timeoutMs: 30_000 })
       if (has.code === 0) {
         await mustRun(exec, { cmd: 'git', args: ['worktree', 'add', p.worktree, p.branch], cwd: p.repo, timeoutMs: 300_000 })
+        await mustRun(exec, { cmd: 'bun', args: ['install', '--frozen-lockfile'], cwd: p.worktree, timeoutMs: 600_000 })
       } else {
         await mustRun(exec, { cmd: 'git', args: ['fetch', 'origin', p.base], cwd: p.repo, timeoutMs: 300_000 })
-        await mustRun(exec, { cmd: 'git', args: ['worktree', 'add', '-b', p.branch, p.worktree, `origin/${p.base}`], cwd: p.repo, timeoutMs: 300_000 })
+        await mustRun(exec, { cmd: 'worktree-add-cow', args: [p.worktree, '-b', p.branch, `origin/${p.base}`], cwd: p.repo, timeoutMs: 600_000 })
       }
       await ctx.event('worktree_created', { worktree: p.worktree, branch: p.branch })
     }

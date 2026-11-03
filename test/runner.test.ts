@@ -71,7 +71,7 @@ describe('bead lifecycle', () => {
     const validated = await ticks(r, 2)
     const nm = w.callsTo('no-mistakes', 'axi', 'run')[0]
     expect(nm?.cwd).toBe(w.worktree)
-    expect(nm?.args).toEqual(['axi', 'run', '--intent-file', join(w.stateRoot, 'bd-43aa7', 'intent-wave-1.md'), '--yes', '--skip', 'test', '--wait', '8m'])
+    expect(nm?.args).toEqual(['axi', 'run', '--intent-file', join(w.stateRoot, 'bd-43aa7', 'intent-wave-1.md'), '--yes', '--skip', 'test,review,document,lint', '--wait', '8m'])
     expect(validated.waves[0]?.state).toEqual({ s: 'pr_open', pr: 4242, head: HEAD1 })
   })
 

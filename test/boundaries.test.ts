@@ -24,7 +24,7 @@ describe('claude worker flags', () => {
 describe('no-mistakes axi', () => {
   it('builds a new-run and a reattach invocation', () => {
     expect(nmRunArgs({ intentFile: '/s/intent-w1.md', wait: '8m' })).toEqual([
-      'axi', 'run', '--intent-file', '/s/intent-w1.md', '--yes', '--skip', 'test', '--wait', '8m',
+      'axi', 'run', '--intent-file', '/s/intent-w1.md', '--yes', '--skip', 'test,review,document,lint', '--wait', '8m',
     ])
     expect(nmRunArgs({ wait: '8m' })).toEqual(['axi', 'run', '--yes', '--wait', '8m'])
   })
