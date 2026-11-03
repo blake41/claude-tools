@@ -840,6 +840,8 @@ const PASSTHROUGH_COMMANDS = new Set([
   "set",
   "keyboard",
   "frame",
+  "console", // recent console messages (agent-browser `console [--clear]`)
+  "errors", // recent page errors (agent-browser `errors [--clear]`)
   "close", // tear down this session's tab — see the explicit handler; never boots Chrome
 ]);
 
@@ -1107,6 +1109,8 @@ function printUsage(): void {
   stderr("  record stop         Stop recording");
   stderr("");
   stderr("Debugging:");
+  stderr("  console [--clear]   Recent console messages");
+  stderr("  errors [--clear]    Recent page errors");
   stderr("  console-tail [pfx]  Stream console output via CDP");
   stderr("  watch               Errors + auto-screenshot");
   stderr("");

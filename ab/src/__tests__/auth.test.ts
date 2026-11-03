@@ -850,6 +850,12 @@ describe("NEEDS_CHROME membership (FINAL CONSENSUS SPEC item 13)", () => {
     expect(NEEDS_CHROME.has("click-xy")).toBe(true);
   });
 
+  test("console and errors are members, so they reach agent-browser and boot a down shard", async () => {
+    const { NEEDS_CHROME } = await import("../cli");
+    expect(NEEDS_CHROME.has("console")).toBe(true);
+    expect(NEEDS_CHROME.has("errors")).toBe(true);
+  });
+
   test("close stays excluded — it must tear down, never boot Chrome", async () => {
     const { NEEDS_CHROME } = await import("../cli");
     expect(NEEDS_CHROME.has("close")).toBe(false);
