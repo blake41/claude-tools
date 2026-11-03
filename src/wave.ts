@@ -5,8 +5,8 @@ import { mustRun } from './exec.ts'
 import { currentVerdicts, downgradeReason } from './gates.ts'
 import { ciState } from './gh.ts'
 import { nmRunArgs, parseAxiOutput } from './nomistakes.ts'
-import { buildReviewArgs, parseReviewOutput, reviewPasses } from './review.ts'
-import type { Gate, GateVerdict, ReviewGate } from './types.ts'
+import { buildReviewArgs, judgeVerify, parseReviewOutput, parseVerifyOutput, reviewPasses, VERIFY_JSON_SCHEMA } from './review.ts'
+import type { Finding, Gate, GateVerdict, ReviewGate } from './types.ts'
 import { jobKey, startWorker } from './worker.ts'
 
 type Step = 'progressed' | 'idle'
@@ -144,17 +144,46 @@ async function runGate(ctx: Ctx, wave: number, gate: Gate, pr: number, head: str
 
 async function runReview(ctx: Ctx, wave: number, gate: ReviewGate, pr: number, head: string): Promise<GateVerdict> {
   const w = ctx.wave(wave)
-  const prompt = [
-    `Review PR #${pr} at head ${head} in this worktree: the change is \`git diff origin/${ctx.policy.base}...${head}\`.`,
-    `It delivers beads ${w.beads.join(', ')} of epic ${ctx.policy.epicId} (\`br show <id>\` for the bead text).`,
-    'Report every finding with severity nit, minor, major or blocker, file and line.',
-  ].join(' ')
-  const args = buildReviewArgs({ skill: gate.skill, model: gate.model, prompt })
+  const prev = w.lastReview
+  const verify = prev !== undefined && prev.head !== head && (gate.fixLoop?.reReview ?? 'verify') === 'verify'
+  const base = `origin/${ctx.policy.base}`
+  const beadsLine = `It delivers beads ${w.beads.join(', ')} of epic ${ctx.policy.epicId} (\`br show <id>\` for the bead text).`
+  const prompt =
+    verify && prev
+      ? [
+          `Re-review PR #${pr} at head ${head} in this worktree. ${beadsLine}`,
+          `The previous review at ${prev.head} raised these findings:`,
+          ...prev.findings.map((f) => `- ${f.id} [${f.severity}] ${f.file}:${f.line} ${f.summary}`),
+          `The fix diff is \`git diff ${prev.head} ${head}\`. The branch may have been rebased onto a moved base: ignore changes that came in from ${base}.`,
+          '(1) For EACH previous finding, report its id with resolved true or false and a one-line note.',
+          '(2) Report NEW findings ONLY for problems introduced or exposed by lines changed in the fix diff, each with severity nit, minor, major or blocker, file and line.',
+          'Do not re-review untouched code.',
+        ].join('\n')
+      : [
+          `Review PR #${pr} at head ${head} in this worktree: the change is \`git diff ${base}...${head}\`.`,
+          beadsLine,
+          'Report every finding with severity nit, minor, major or blocker, file and line.',
+        ].join(' ')
+  const args = buildReviewArgs({ skill: gate.skill, model: gate.model, prompt, ...(verify ? { schema: VERIFY_JSON_SCHEMA } : {}) })
   const r = await mustRun(ctx.deps.exec, { cmd: 'claude', args, cwd: ctx.policy.worktree, timeoutMs: 30 * 60_000 })
-  const out = parseReviewOutput(r)
-  const pass = reviewPasses(out.findings, gate.passWhen.maxSeverity)
-  await ctx.event('review_verdict', { wave: wave + 1, pr, head, skill: gate.skill, model: gate.model, pass, findings: out.findings.length, tokens: out.tokens, costUsd: out.costUsd })
-  return { gate: 'review', head, pass, findings: out.findings, at: ctx.now() }
+  const common = { wave: wave + 1, pr, head, skill: gate.skill, model: gate.model }
+  let pass: boolean
+  let findings: Finding[]
+  if (verify && prev) {
+    const out = parseVerifyOutput(r)
+    const v = judgeVerify(prev.findings, out, gate.passWhen.maxSeverity)
+    pass = v.pass
+    findings = v.findings
+    await ctx.event('review_verdict', { ...common, mode: 'verify', pass, findings: findings.length, resolved: v.resolved, unresolved: v.unresolved, newFindings: v.newFindings, tokens: out.tokens, costUsd: out.costUsd })
+  } else {
+    const out = parseReviewOutput(r)
+    pass = reviewPasses(out.findings, gate.passWhen.maxSeverity)
+    findings = out.findings
+    await ctx.event('review_verdict', { ...common, mode: 'full', pass, findings: findings.length, tokens: out.tokens, costUsd: out.costUsd })
+  }
+  w.lastReview = pass ? undefined : { head, findings: findings.map((f, i) => ({ ...f, id: `F${i + 1}` })) }
+  await ctx.save()
+  return { gate: 'review', head, pass, findings, at: ctx.now() }
 }
 
 async function stopAtPr(ctx: Ctx, wave: number, pr: number, why: string, url?: string): Promise<void> {
@@ -282,7 +311,7 @@ async function markMerged(ctx: Ctx, wave: number, pr: number, how: string): Prom
     await ctx.halt(`rebase of ${p.branch} onto origin/${p.base} failed after merging PR #${pr}`)
     return 'progressed'
   }
-  await ctx.setWave(wave, { s: 'merged', pr, sha })
+  await ctx.setWave(wave, { s: 'merged', pr, sha }, { lastReview: undefined })
   await ctx.event('merged', { wave: wave + 1, pr, sha, how })
   await ctx.notify({
     key: `${p.epicId}:merged:${wave}:${pr}`,

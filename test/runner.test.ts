@@ -444,3 +444,120 @@ describe('halt notices', () => {
     expect(w.notices[0]?.body.startsWith('details\n\n:::action\n')).toBe(true)
   })
 })
+
+const verifyOut = (prior: Array<{ id: string; resolved: boolean }>, findings: Array<{ severity: string }> = []) =>
+  JSON.stringify({
+    type: 'result',
+    is_error: false,
+    total_cost_usd: 0.2,
+    usage: { input_tokens: 5, output_tokens: 100, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 },
+    structured_output: {
+      prior: prior.map((p) => ({ ...p, note: p.resolved ? 'fixed' : 'still broken' })),
+      findings: findings.map((f) => ({ severity: f.severity, file: 'src/new.ts', line: 3, summary: 'introduced by the fix' })),
+    },
+  })
+
+/** Fail the first review at HEAD1, then restart a runner as if the fix landed and the PR head moved to HEAD2. */
+async function failedThenNewHead(w: FakeWorld, gate: unknown = review, severities: string[] = ['major', 'minor']) {
+  w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/render-api.ts'], additions: 30, deletions: 20, checks: [greenCheck] }
+  w.reviewOutputs.push(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      structured_output: { findings: severities.map((severity, i) => ({ severity, file: 'src/a.ts', line: i + 1, summary: `finding ${i + 1}` })) },
+    }),
+  )
+  const r = await gatingRunner(w, 'merge', [{ kind: 'ci_green_at_head' }, gate])
+  await ticks(r, 2)
+  const store = new StateStore(realFs, w.stateRoot, 'bd-43aa7', () => w.clock)
+  const st = (await store.load())!
+  const afterFirst = structuredClone(st.waves[0]!.lastReview)
+  st.worker = null
+  st.waves[0]!.state = { s: 'pr_open', pr: 4242, head: HEAD2 }
+  await store.save(st)
+  w.pr.headRefOid = HEAD2
+  const policy = w.policy({ onPass: 'merge', gates: [{ kind: 'ci_green_at_head' }, gate] })
+  return { afterFirst, runner: new Runner(policy, w.deps()), store }
+}
+
+describe('convergent review gate', () => {
+  it('the second review is a verify review of the fix diff against the previous findings', async () => {
+    const w = new FakeWorld()
+    const { afterFirst, runner } = await failedThenNewHead(w)
+    expect(afterFirst?.head).toBe(HEAD1)
+    expect(afterFirst?.findings.map((f) => f.id)).toEqual(['F1', 'F2'])
+    w.reviewOutputs.push(verifyOut([{ id: 'F1', resolved: true }, { id: 'F2', resolved: true }]))
+    await ticks(runner, 3)
+    const revs = w.callsTo('claude', '-p')
+    expect(revs).toHaveLength(2)
+    const prompt = revs[1]!.args.at(-1)!
+    expect(prompt).toContain(HEAD1)
+    expect(prompt).toContain(`git diff ${HEAD1} ${HEAD2}`)
+    expect(prompt).toContain('F1 [major] src/a.ts:1 finding 1')
+    expect(prompt).toContain('F2 [minor] src/a.ts:2 finding 2')
+    const schema = JSON.parse(revs[1]!.args[revs[1]!.args.indexOf('--json-schema') + 1]!)
+    expect(Object.keys(schema.properties)).toEqual(['prior', 'findings'])
+    expect(events(w).filter((e) => e.type === 'review_verdict').map((e) => e.mode)).toEqual(['full', 'verify'])
+  })
+
+  it('passes when every above-threshold prior is resolved and new findings are only minor', async () => {
+    const w = new FakeWorld()
+    const { runner } = await failedThenNewHead(w)
+    w.reviewOutputs.push(verifyOut([{ id: 'F1', resolved: true }, { id: 'F2', resolved: false }], [{ severity: 'minor' }]))
+    const st = await ticks(runner, 4)
+    const v = events(w).filter((e) => e.type === 'review_verdict').at(-1)
+    expect(v).toMatchObject({ mode: 'verify', pass: true, resolved: 1, unresolved: 1, newFindings: 1, head: HEAD2 })
+    expect(st.waves[0]?.state).toMatchObject({ s: 'merged' })
+    expect(st.waves[0]?.lastReview).toBeUndefined()
+  })
+
+  it('fails when a major prior is unresolved: the fix brief lists it plus new findings, and lastReview moves to the new head', async () => {
+    const w = new FakeWorld()
+    const { runner } = await failedThenNewHead(w)
+    w.reviewOutputs.push(verifyOut([{ id: 'F1', resolved: false }, { id: 'F2', resolved: true }], [{ severity: 'minor' }]))
+    const st = await ticks(runner, 3)
+    expect(st.worker?.job).toEqual({ kind: 'fix', wave: 0, round: 2 })
+    const brief = readFileSync(join(w.worktree, '.epic-runner', 'brief-fix-w1-r2.md'), 'utf8')
+    expect(brief).toContain('[major] src/a.ts:1 finding 1')
+    expect(brief).toContain('[minor] src/new.ts:3 introduced by the fix')
+    expect(brief).not.toContain('finding 2')
+    expect(st.waves[0]?.lastReview).toEqual({
+      head: HEAD2,
+      findings: [
+        { id: 'F1', severity: 'major', file: 'src/a.ts', line: 1, summary: 'finding 1' },
+        { id: 'F2', severity: 'minor', file: 'src/new.ts', line: 3, summary: 'introduced by the fix' },
+      ],
+    })
+  })
+
+  it('a prior id missing from the verify output counts as unresolved', async () => {
+    const w = new FakeWorld()
+    const { runner } = await failedThenNewHead(w)
+    w.reviewOutputs.push(verifyOut([{ id: 'F2', resolved: true }]))
+    const st = await ticks(runner, 3)
+    expect(events(w).filter((e) => e.type === 'review_verdict').at(-1)).toMatchObject({ pass: false, unresolved: 1 })
+    expect(st.worker?.job).toEqual({ kind: 'fix', wave: 0, round: 2 })
+  })
+
+  it("reReview: 'full' keeps the full review on later rounds", async () => {
+    const w = new FakeWorld()
+    const full = { ...review, fixLoop: { model: 'sonnet', maxRounds: 3, reReview: 'full' } }
+    const { runner } = await failedThenNewHead(w, full)
+    w.reviewOutputs.push(reviewOut('nit'))
+    await ticks(runner, 3)
+    const revs = w.callsTo('claude', '-p')
+    const prompt = revs[1]!.args.at(-1)!
+    expect(prompt).toContain(`git diff origin/master...${HEAD2}`)
+    expect(prompt).not.toContain('F1')
+    expect(JSON.parse(revs[1]!.args[revs[1]!.args.indexOf('--json-schema') + 1]!).required).toEqual(['findings'])
+    expect(events(w).filter((e) => e.type === 'review_verdict').map((e) => e.mode)).toEqual(['full', 'full'])
+  })
+
+  it('a state.json written before lastReview existed still loads', async () => {
+    const w = new FakeWorld()
+    const store = new StateStore(realFs, w.stateRoot, 'bd-43aa7', () => w.clock)
+    await store.save(gatingState(w, 'merge'))
+    const loaded = await store.load()
+    expect(loaded?.waves[0]?.lastReview).toBeUndefined()
+  })
+})

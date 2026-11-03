@@ -19,7 +19,9 @@ export const GateSchema = z.discriminatedUnion('kind', [
     skill: z.string().min(1),
     model: z.enum(['opus', 'fable', 'sonnet']),
     passWhen: z.object({ maxSeverity: z.enum(['minor', 'major']) }),
-    fixLoop: z.object({ model: z.string().min(1), maxRounds: z.number().int().min(0) }).optional(),
+    fixLoop: z
+      .object({ model: z.string().min(1), maxRounds: z.number().int().min(0), reReview: z.enum(['verify', 'full']).optional() })
+      .optional(),
   }),
 ])
 export type Gate = z.infer<typeof GateSchema>
@@ -167,6 +169,12 @@ export const WorkerRunSchema = z.object({
 })
 export type WorkerRun = z.infer<typeof WorkerRunSchema>
 
+export const LastReviewSchema = z.object({
+  head: z.string(),
+  findings: z.array(FindingSchema.extend({ id: z.string() })),
+})
+export type LastReview = z.infer<typeof LastReviewSchema>
+
 export const WaveRecordSchema = z.object({
   beads: z.array(z.string()),
   onPass: OnPassSchema,
@@ -174,6 +182,7 @@ export const WaveRecordSchema = z.object({
   fixRounds: z.number().int(),
   gatingSince: z.number().nullable(),
   nmStarted: z.boolean(),
+  lastReview: LastReviewSchema.optional(),
 })
 export type WaveRecord = z.infer<typeof WaveRecordSchema>
 
