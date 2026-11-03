@@ -42,7 +42,7 @@ You work on the epic branch \`${p.branch}\` in the worktree \`${p.worktree}\`. O
 3. Run the scope gates from CLAUDE.md for touched paths. Run \`bun run lint:suppressions:prune\` when a baselined site is fixed.
 4. Commit on \`${p.branch}\`. One bead = one commit (or a few).
 5. Write \`done sha=<sha>\`. End the turn.
-6. A question is allowed only for a one-way door. First classify it (reversible / default / needs-user, the \`open-question-resolver\` rules). Reversible or default: decide, and log it under \`REVIEW-THESE\` in the commit body. Needs-user: send it to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn.
+6. Before any question, read \`${p.statusFile.replace(/status$/, 'decisions.md')}\` (owner decisions earlier beads of this epic already got; it may not exist yet). If a recorded decision covers your case, apply it, cite it in the commit body, and do not ask. A question is allowed only for a one-way door. First classify it (reversible / default / needs-user, the \`open-question-resolver\` rules). Reversible or default: decide, and log it under \`REVIEW-THESE\` in the commit body. Needs-user: send it to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn. When the owner's answer arrives, append one entry to that decisions file before you continue: the date, this bead, the question in one line, the answer, and the class of cases it covers (for example: "60 s memo of an outside API with no Prisma source: route 2 exemption").
 
 ${protocol(p)}
 
