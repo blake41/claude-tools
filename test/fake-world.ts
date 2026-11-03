@@ -35,6 +35,7 @@ export class FakeWorld {
   paneText = ''
   commits = new Set<string>()
   dirty: string[] = []
+  unpublished: string[] = []
   merges: string[] = []
   baseSha = 'f00dfeed0000000000000000000000000000beef'
   nmOutputs: string[] = []
@@ -188,6 +189,8 @@ export class FakeWorld {
         return ok(this.merges.join('\n'))
       case 'rev-parse':
         return ok(`${this.baseSha}\n`)
+      case 'cherry':
+        return ok(this.unpublished.map((c) => `+ ${c}\n`).join(''))
       default:
         return ok()
     }

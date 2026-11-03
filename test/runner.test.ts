@@ -73,6 +73,22 @@ describe('bead lifecycle', () => {
     expect(nm?.cwd).toBe(w.worktree)
     expect(nm?.args).toEqual(['axi', 'run', '--intent-file', join(w.stateRoot, 'bd-43aa7', 'intent-wave-1.md'), '--yes', '--skip', 'test,document,lint', '--wait', '8m'])
     expect(validated.waves[0]?.state).toEqual({ s: 'pr_open', pr: 4242, head: HEAD1 })
+    expect(w.callsTo('git', 'reset', '--hard', HEAD1)).toHaveLength(1)
+  })
+
+  it('after no-mistakes publishes a rebased head, a local commit missing from it halts instead of resetting', async () => {
+    const w = new FakeWorld()
+    const r = await startedBead(w)
+    w.commits.add(SHA1)
+    w.writeStatus(`done sha=${SHA1}`)
+    await ticks(r, 1)
+    w.nmOutputs.push('run:\n  id: r-01\noutcome: passed\n')
+    w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/skills/skill-registry.ts'], additions: 40, deletions: 12, checks: [greenCheck] }
+    w.unpublished = [SHA2]
+    const st = await ticks(r, 2)
+    expect(st.waves[0]?.state.s).toBe('validating')
+    expect(st.halted?.reason).toContain('local commits not in the published head')
+    expect(w.callsTo('git', 'reset', '--hard', HEAD1)).toHaveLength(0)
   })
 
   it('kill: resumes the same session with identical flags and a restart note', async () => {

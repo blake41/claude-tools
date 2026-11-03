@@ -42,8 +42,9 @@ You work on the epic branch \`${p.branch}\` in the worktree \`${p.worktree}\`. O
 3. Run the scope gates from CLAUDE.md for touched paths. Run \`bun run lint:suppressions:prune\` when a baselined site is fixed.
 4. Commit on \`${p.branch}\`. One bead = one commit (or a few).
 5. Write \`done sha=<sha>\`. End the turn.
-6. Before any question, read \`${p.statusFile.replace(/status$/, 'decisions.md')}\` (owner decisions earlier beads of this epic already got; it may not exist yet). If a recorded decision covers your case, apply it, cite it in the commit body, and do not ask. A question is allowed only for a one-way door. First classify it (reversible / default / needs-user, the \`open-question-resolver\` rules). Reversible or default: decide, and log it under \`REVIEW-THESE\` in the commit body. Needs-user: send it to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn. When the owner's answer arrives, append one entry to that decisions file before you continue: the date, this bead, the question in one line, the answer, and the class of cases it covers (for example: "60 s memo of an outside API with no Prisma source: route 2 exemption").
+6. Before any question, read \`${p.statusFile.replace(/status$/, 'decisions.md')}\` (owner decisions earlier beads of this epic already got; it may not exist yet). Apply a recorded decision without asking only when the owner's own words in it cover your case; an approval for one file never covers another file. Otherwise cite the entry as precedent in your question, with your recommendation, so the owner can answer in one click. A question is allowed only for a one-way door. First classify it (reversible / default / needs-user, the \`open-question-resolver\` rules). Reversible or default: decide, and log it under \`REVIEW-THESE\` in the commit body. Needs-user: send it to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn. When the owner's answer arrives, append one entry to that decisions file before you continue: the date, this bead, the question in one line, and the answer with exactly the scope the owner gave (never wider).
 
+7. Never restructure code only so a lint rule stops matching it (a wrapper class, a renamed variable, moving a write into a sync helper). That is lint evasion. If a site is truly not a cache, say so in a needs-user question with the evidence and let the owner choose: leave it baselined, exempt it, or fix it for real.
 ${protocol(p)}
 
 ## Bead ${p.beadId}
@@ -68,6 +69,7 @@ ${list}
 2. Fix with tests where testable. Run the scope gates from CLAUDE.md for touched paths.
 3. Commit on \`${p.branch}\` on top of the existing commits. Never rewrite or drop earlier commits.
 4. Write \`done sha=<sha>\`. End the turn.
+5. Never restructure code only so a lint rule stops matching it. That is lint evasion. For a finding that needs an owner decision (an exemption, keeping a site baselined), ask in the Plannotator Inbox and write \`needs-decision\`.
 
 ${protocol(p)}`
 }

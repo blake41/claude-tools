@@ -90,10 +90,34 @@ export async function stepValidating(ctx: Ctx, wave: number): Promise<Step> {
         await ctx.halt(`no-mistakes reported ${out.value} but no PR exists for ${p.branch}`)
         return 'progressed'
       }
+      const adopted = await adoptPublishedHead(ctx, pr.headRefOid)
+      if (adopted !== null) {
+        await ctx.halt(`wave ${wave + 1}: cannot move ${p.branch} to the published head ${pr.headRefOid.slice(0, 9)}: ${adopted}`)
+        return 'progressed'
+      }
       await ctx.setWave(wave, { s: 'pr_open', pr: pr.number, head: pr.headRefOid }, { nmStarted: false })
       return 'progressed'
     }
   }
+}
+
+async function adoptPublishedHead(ctx: Ctx, head: string): Promise<string | null> {
+  const p = ctx.policy
+  const run = (cmd: string, args: string[]) => ctx.deps.exec({ cmd, args, cwd: p.worktree, timeoutMs: 120_000 })
+  await run('no-mistakes', ['axi', 'handoff'])
+  const fetched = await run('git', ['fetch', 'origin', p.branch])
+  if (fetched.code !== 0) return `git fetch failed: ${fetched.stderr.trim()}`
+  const status = await run('git', ['status', '--porcelain'])
+  const dirty = status.stdout.split('\n').filter((l) => l.trim() !== '' && !/\s\.(epic-runner|baton)\//.test(l))
+  if (dirty.length > 0) return `worktree is dirty: ${dirty.join(', ')}`
+  const cherry = await run('git', ['cherry', head, 'HEAD'])
+  if (cherry.code !== 0) return `git cherry failed: ${cherry.stderr.trim()}`
+  const missing = cherry.stdout.split('\n').filter((l) => l.startsWith('+'))
+  if (missing.length > 0) return `local commits not in the published head: ${missing.join(', ')}`
+  const reset = await run('git', ['reset', '--hard', head])
+  if (reset.code !== 0) return `git reset failed: ${reset.stderr.trim()}`
+  await ctx.event('adopted_published_head', { head })
+  return null
 }
 
 async function runGate(ctx: Ctx, wave: number, gate: Gate, pr: number, head: string, rollup: Parameters<typeof ciState>[0]): Promise<GateVerdict | 'pending'> {
