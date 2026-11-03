@@ -125,7 +125,14 @@ export class Runner {
         notes.push(`${id}: queued for a fresh session`)
       }
     }
-    if (ctx.state.halted) notes.push(`cleared halt: ${ctx.state.halted.reason}`)
+    if (ctx.state.halted) {
+      for (const [wi, w] of ctx.state.waves.entries()) {
+        if (w.state.s !== 'validating') continue
+        await ctx.setWave(wi, { s: 'validating', nmRun: '' }, { nmStarted: false })
+        notes.push(`wave ${wi + 1}: a fresh no-mistakes run on the next tick`)
+      }
+      notes.push(`cleared halt: ${ctx.state.halted.reason}`)
+    }
     ctx.state.halted = null
     await ctx.save()
     await ctx.event('resumed', { notes })
