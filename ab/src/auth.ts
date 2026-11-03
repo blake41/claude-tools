@@ -178,6 +178,31 @@ async function runAgentBrowser(
 }
 
 const PRODUCTION_APP_HOST = "terra.clay.com";
+const PRODUCTION_APP_HOSTS = [PRODUCTION_APP_HOST, `www.${PRODUCTION_APP_HOST}`];
+const PRODUCTION_TICKET_HOST = "clerk.terra.clay.com";
+
+/**
+ * Gate for a pre-minted production ticket: the ticket must be an https URL on
+ * Terra's production Clerk host and the target app must be production Terra.
+ * Error text never contains the ticket.
+ */
+export function checkProdTicket(taskUrl: string, appBaseUrl: string): string | undefined {
+  let ticket: URL;
+  let app: URL;
+  try {
+    ticket = new URL(taskUrl);
+    app = new URL(appBaseUrl);
+  } catch {
+    return "Refusing production sign-in: ticket or app URL is not a valid URL.";
+  }
+  if (ticket.protocol !== "https:" || ticket.hostname !== PRODUCTION_TICKET_HOST) {
+    return `Refusing production sign-in: ticket is not on ${PRODUCTION_TICKET_HOST}.`;
+  }
+  if (!PRODUCTION_APP_HOSTS.includes(app.hostname.toLowerCase())) {
+    return "Refusing production sign-in: a production ticket is only valid for the production app origin.";
+  }
+  return undefined;
+}
 
 /**
  * Pure safety gate for minting an Agent Task. Refuses anything but a Clerk
@@ -357,45 +382,56 @@ export async function authenticate(
   }
 
   const secretKey = req.clerkSecretKey;
-  const guard = checkAgentTaskGuards({ secretKey, appBaseUrl });
-  if (!guard.ok) {
-    log.warn("Agent Task guard refused", { reason: guard.error });
-    return { ok: false, error: guard.error };
-  }
-
   let taskUrl = "";
-  try {
-    const mint = async () => {
-      const clerk = await createClerkClient(secretKey!);
-      log.info("Minting Agent Task", { email, appBaseUrl });
-      return clerk.agentTasks.create({
-        onBehalfOf: { identifier: email },
-        permissions: "*",
-        agentName: "ab",
-        taskDescription: "ab reauth",
-        redirectUrl: `${appBaseUrl}/`,
-        sessionMaxDurationInSeconds: AGENT_TASK_SESSION_SECONDS,
-      });
-    };
-    const task = await unlessAborted(mint(), signal);
-    if (task === ABORTED) return timedOut();
-    if (typeof task?.url !== "string" || !task.url) {
-      return { ok: false, error: "Agent Task mint returned invalid response: missing url" };
+  if (req.taskUrl) {
+    // Production: the CLI already minted a ticket (see prod-ticket.ts), so this
+    // daemon never sees a Clerk key. Accept it only for the production app origin.
+    const refusal = checkProdTicket(req.taskUrl, appBaseUrl);
+    if (refusal) {
+      log.warn("Production ticket refused", { reason: refusal });
+      return { ok: false, error: refusal };
     }
-    taskUrl = task.url;
-    log.info("Minted Agent Task", { taskId: task.taskId });
-  } catch (err) {
-    if (isClerkUserNotFound(err)) {
-      return {
-        ok: false,
-        error: `User ${email} has no Clerk account in this environment. `
-          + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
+    taskUrl = req.taskUrl;
+  } else {
+    const guard = checkAgentTaskGuards({ secretKey, appBaseUrl });
+    if (!guard.ok) {
+      log.warn("Agent Task guard refused", { reason: guard.error });
+      return { ok: false, error: guard.error };
+    }
+
+    try {
+      const mint = async () => {
+        const clerk = await createClerkClient(secretKey!);
+        log.info("Minting Agent Task", { email, appBaseUrl });
+        return clerk.agentTasks.create({
+          onBehalfOf: { identifier: email },
+          permissions: "*",
+          agentName: "ab",
+          taskDescription: "ab reauth",
+          redirectUrl: `${appBaseUrl}/`,
+          sessionMaxDurationInSeconds: AGENT_TASK_SESSION_SECONDS,
+        });
       };
+      const task = await unlessAborted(mint(), signal);
+      if (task === ABORTED) return timedOut();
+      if (typeof task?.url !== "string" || !task.url) {
+        return { ok: false, error: "Agent Task mint returned invalid response: missing url" };
+      }
+      taskUrl = task.url;
+      log.info("Minted Agent Task", { taskId: task.taskId });
+    } catch (err) {
+      if (isClerkUserNotFound(err)) {
+        return {
+          ok: false,
+          error: `User ${email} has no Clerk account in this environment. `
+            + `Log in via Google OAuth once at ${appBaseUrl} to create it, then retry.`,
+        };
+      }
+      const raw = err instanceof Error ? err.message : String(err);
+      const message = redactSecrets(raw, [secretKey]);
+      log.error("Agent Task mint failed", { message });
+      return { ok: false, error: `Agent Task mint failed: ${message}` };
     }
-    const raw = err instanceof Error ? err.message : String(err);
-    const message = redactSecrets(raw, [secretKey]);
-    log.error("Agent Task mint failed", { message });
-    return { ok: false, error: `Agent Task mint failed: ${message}` };
   }
 
   // -----------------------------------------------------------------------

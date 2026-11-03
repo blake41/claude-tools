@@ -77,13 +77,14 @@ ab record stop
 
 # Auth (automatic on first open, or manual)
 ab reauth               # authenticate via a Clerk Agent Task (needs CLERK_SECRET_KEY, sk_test_)
+ab reauth --prod        # sign in to https://www.terra.clay.com (via infisical-api + Clerk)
 ab heal                  # kill all sessions, restart Chrome
 ab status               # daemon health + Chrome state
 ```
 
 ## Auth
 
-Agents authenticate via a **Clerk Agent Task** — `ab` mints it directly against the development Clerk instance (`CLERK_SECRET_KEY` from the `ab` CLI env, `sk_test_` only, never `terra.clay.com`) and opens the one-time URL for a real session. No Google OAuth, no cookie stealing. Production uses `ab import`.
+Agents authenticate via a **Clerk Agent Task** — `ab` mints it directly against the development Clerk instance (`CLERK_SECRET_KEY` from the `ab` CLI env, `sk_test_` only, never `terra.clay.com`) and opens the one-time URL for a real session. No Google OAuth, no cookie stealing. Production: `ab reauth --prod` (CLI mints a ticket through Infisical + Clerk, see the doc below); `ab import` (headed Google login) is the fallback.
 
 `ab open <url>` logs in for you when the URL is a dev app origin (`http://localhost:5173`, `*.terra.localhost`, the staging and development onrender hosts) and the shard has no Clerk session cookie. It runs after the session's own tab exists, then re-navigates that tab to the URL; if the tab could not be confirmed as the session's own, it skips and hints at `ab reauth`. It checks the cookie first and leaves an existing session alone, so only `ab reauth` forces a re-login as another user. It never runs for `terra.clay.com` or any other site. If `CLERK_SECRET_KEY` is not set in the `ab` CLI env, it prints one hint and opens the URL anyway; a login failure prints one warning and `ab open` continues. Concurrent logins for the same shard and origin share one Agent Task.
 
@@ -122,6 +123,7 @@ bun run install.ts --uninstall  # Uninstall, restore old ab
 | `src/server.ts` | Unix socket HTTP server |
 | `src/auth.ts` | Agent Tasks auth flow |
 | `src/app-origins.ts` | App origin rules: reauth base URLs, env presets, worktree and auto-auth origins |
+| `src/prod-ticket.ts` | `reauth --prod`: mints the production sign-in ticket (Infisical, Clerk BAPI, Terra agent-sessions) |
 | `src/auto-auth.ts` | Auto-auth after `ab open` on a dev app origin |
 | `src/login-request.ts` | The `/auth/login` request body the CLI sends |
 | `src/cli.ts` | CLI entry point (replaces old bash ab) |

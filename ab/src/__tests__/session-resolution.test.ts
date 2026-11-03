@@ -148,14 +148,38 @@ describe("resolveReauthBaseUrls", () => {
     expect(r.appBaseUrl).toBe("https://bar.example.com");
   });
 
-  test("--prod returns error (reauth refuses production)", () => {
+  test("--prod targets the production app host and flags prod mode", () => {
     const r = resolveReauthBaseUrls(["--prod"], {});
-    expect(r.error).toContain("--prod is not supported");
+    expect(r.error).toBeUndefined();
+    expect(r.appBaseUrl).toBe("https://www.terra.clay.com");
+    expect(r.prod).toBe(true);
   });
 
-  test("--production returns same error", () => {
+  test("--production is an alias of --prod", () => {
     const r = resolveReauthBaseUrls(["--production"], {});
-    expect(r.error).toContain("--prod is not supported");
+    expect(r.appBaseUrl).toBe("https://www.terra.clay.com");
+    expect(r.prod).toBe(true);
+  });
+
+  test("--prod wins over AB_APP_BASE_URL (an explicit flag beats a stale env var)", () => {
+    const r = resolveReauthBaseUrls(["--prod"], { AB_APP_BASE_URL: "http://localhost:5173" });
+    expect(r.appBaseUrl).toBe("https://www.terra.clay.com");
+  });
+
+  test("--prod cannot combine with another target", () => {
+    expect(resolveReauthBaseUrls(["--prod", "--staging"], {}).error).toContain("Conflicting env flags");
+    expect(resolveReauthBaseUrls(["--prod", "--host", "x.terra.localhost"], {}).error).toContain("Cannot combine --host with --prod");
+    expect(resolveReauthBaseUrls(["--prod", "--local"], {}).error).toContain("Conflicting env flags");
+  });
+
+  test("non-prod targets do not flag prod mode", () => {
+    expect(resolveReauthBaseUrls(["--staging"], {}).prod).toBeUndefined();
+  });
+
+  test("an unknown flag errors instead of silently falling back to localhost", () => {
+    const r = resolveReauthBaseUrls(["--prod."], {});
+    expect(r.error).toContain("Unknown flag --prod.");
+    expect(r.error).toContain("--prod");
   });
 
   test("conflicting presets return error", () => {
@@ -163,9 +187,9 @@ describe("resolveReauthBaseUrls", () => {
     expect(r.error).toContain("Conflicting env flags");
   });
 
-  test("unrelated flags are ignored", () => {
+  test("an unknown flag errors even next to a valid one", () => {
     const r = resolveReauthBaseUrls(["--verbose", "--staging"], {});
-    expect(r.error).toBeUndefined();
+    expect(r.error).toContain("Unknown flag --verbose");
   });
 
   test("--host <*.localhost> targets portless HTTPS (443) directly", () => {

@@ -17,7 +17,9 @@ import * as rpc from "./rpc";
 import { isAuthenticatedUrl } from "./auth";
 import { resolveReauthBaseUrls } from "./app-origins";
 import { autoAuthAfterOpen } from "./auto-auth";
-import { loginRequest } from "./login-request";
+import { DEFAULT_AUTH_EMAIL, loginRequest } from "./login-request";
+import { mintProdTicketUrl } from "./prod-ticket";
+import type { ProdTicketResult } from "./prod-ticket";
 import type { AutoAuthDeps } from "./auto-auth";
 import type { ChromeState } from "./types";
 import { TARGET_ID_ENV } from "../cdp-target";
@@ -354,6 +356,7 @@ export async function cmdReauth(
   rest: string[],
   cdpPort: number,
   sessionName: string | null,
+  deps: { mintProdTicket: (email: string) => Promise<ProdTicketResult> } = { mintProdTicket: mintProdTicketUrl },
 ): Promise<number> {
   // Auto-detect: query the browser's current URL to pick up worktree origins
   // when no explicit --host/--staging/--dev flag is set.
@@ -366,9 +369,21 @@ export async function cmdReauth(
     stderr(urls.error);
     return 2;
   }
-  const result = await rpc.authLogin(
-    loginRequest(cdpPort, sessionName, urls.appBaseUrl, process.env.CLERK_SECRET_KEY),
-  );
+  let request;
+  if (urls.prod) {
+    // Production has no Agent Tasks: mint a sign-in ticket here (the daemon has
+    // no secrets) and hand the daemon only the single-use URL.
+    stderr("Minting production sign-in ticket...");
+    const ticket = await deps.mintProdTicket(DEFAULT_AUTH_EMAIL);
+    if (!ticket.ok) {
+      stderr(ticket.error);
+      return 1;
+    }
+    request = loginRequest(cdpPort, sessionName, urls.appBaseUrl, undefined, ticket.url);
+  } else {
+    request = loginRequest(cdpPort, sessionName, urls.appBaseUrl, process.env.CLERK_SECRET_KEY);
+  }
+  const result = await rpc.authLogin(request);
   if (result.ok) {
     stderr("Reauth complete");
     if (result.user) {
@@ -1115,7 +1130,7 @@ function printUsage(): void {
   stderr("  watch               Errors + auto-screenshot");
   stderr("");
   stderr("Auth & Lifecycle:");
-  stderr("  reauth [--staging|--dev|--host <hostname>]  Re-authenticate via daemon (default: auto-detects *.terra.localhost from browser URL, falls back to localhost)");
+  stderr("  reauth [--staging|--dev|--prod|--host <hostname>]  Re-authenticate via daemon (default: auto-detects *.terra.localhost from browser URL, falls back to localhost; --prod signs in to https://www.terra.clay.com via Infisical + Clerk, `ab import` is the fallback; unknown flags error)");
   stderr("  import              Headed login (manual Google/Clerk auth)");
   stderr("  heal                Restart the Chromes this daemon spawned (adopted ones are released and re-adopted, never killed)");
   stderr("  status              Show daemon status (JSON)");

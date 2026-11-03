@@ -193,6 +193,58 @@ describe("auth contract", () => {
     expect(calls.some((a) => a[0] === "open")).toBe(false);
   });
 
+  describe("production sign-in with a pre-minted ticket URL", () => {
+    const PROD_TICKET = "https://clerk.terra.clay.com/v1/agents/tasks?ticket=PRODTICKETSECRET";
+    const PROD_COOKIE = { name: "__session", value: "jwt.header.sig", domain: ".terra.clay.com" };
+    const prodReq = (over: Partial<Parameters<typeof authenticate>[0]> = {}) => ({
+      sessionId: "test", port: 9333, email: "blake.johnson@clay.com",
+      appBaseUrl: "https://www.terra.clay.com", taskUrl: PROD_TICKET, ...over,
+    });
+
+    test("opens the ticket, waits for the app origin, mints nothing through Clerk", async () => {
+      const calls = scriptBrowser(["about:blank", "https://www.terra.clay.com/"], [PROD_COOKIE]);
+      const { factory } = fakeClerk();
+      const result = await authenticate(prodReq(), budget(), { createClerkClient: factory, pollIntervalMs: 1 });
+      assertLoginSuccess(result);
+      expect(result.user?.email).toBe("blake.johnson@clay.com");
+      expect(factory).not.toHaveBeenCalled();
+      expect(calls.find((a) => a[0] === "open")).toEqual(["open", PROD_TICKET]);
+      expect(allLogs()).not.toContain("PRODTICKETSECRET");
+    });
+
+    test("refuses a ticket URL that is not on clerk.terra.clay.com", async () => {
+      const calls = scriptBrowser(["about:blank"]);
+      const result = await authenticate(prodReq({ taskUrl: "https://evil.example/x?ticket=T" }), budget());
+      assertLoginFailure(result);
+      expect(calls.some((a) => a[0] === "open")).toBe(false);
+    });
+
+    test("refuses a ticket URL paired with a non-production app origin", async () => {
+      const calls = scriptBrowser(["about:blank"]);
+      const result = await authenticate(prodReq({ appBaseUrl: "http://localhost:5173" }), budget());
+      assertLoginFailure(result);
+      expect(result.error).not.toContain("PRODTICKETSECRET");
+      expect(calls.some((a) => a[0] === "open")).toBe(false);
+    });
+
+    test("navigation failure never echoes the ticket", async () => {
+      spawnMock.mockImplementation((cmd: string[]) => {
+        const args = cmd.slice(5);
+        const fail = args[0] === "open";
+        const out = args[0] === "get" ? "about:blank" : "";
+        return {
+          pid: 1, exitCode: fail ? 1 : 0, exited: Promise.resolve(fail ? 1 : 0),
+          stdout: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(out)); c.close(); } }),
+          stderr: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(fail ? `boom ${PROD_TICKET}` : "")); c.close(); } }),
+          kill: () => {},
+        };
+      });
+      const result = await authenticate(prodReq(), budget());
+      assertLoginFailure(result);
+      expect(result.error).not.toContain("PRODTICKETSECRET");
+    });
+  });
+
   test("ignores the daemon's own CLERK_SECRET_KEY: the request must carry the key", async () => {
     const original = process.env.CLERK_SECRET_KEY;
     process.env.CLERK_SECRET_KEY = TEST_KEY;
@@ -969,6 +1021,70 @@ describe("reauth is shard-aware (chrome-pool-plan Unit 3)", () => {
     const loginCall = calls.find((c) => c.path === "/auth/login");
     expect((loginCall!.body as { clerkSecretKey?: string }).clerkSecretKey).toBe("sk_test_CLIFORWARDSECRET");
     expect(writes.join("")).not.toContain("CLIFORWARDSECRET");
+  });
+
+  async function captureStderr<T>(run: () => Promise<T>): Promise<{ result: T; text: string }> {
+    const writes: string[] = [];
+    const origStderr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => { writes.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      return { result: await run(), text: writes.join("") };
+    } finally {
+      process.stderr.write = origStderr;
+    }
+  }
+
+  test("reauth --prod mints a ticket in the CLI and sends it as taskUrl, never the Clerk key", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=0\n`);
+    const calls = installDaemonRouter();
+    const original = process.env.CLERK_SECRET_KEY;
+    process.env.CLERK_SECRET_KEY = "sk_test_SHOULDNOTFORWARD";
+    const minted: string[] = [];
+    try {
+      const { cmdReauth } = await import("../cli");
+      const { result, text } = await captureStderr(() =>
+        cmdReauth(["--prod"], 9333, `ab-${testPid}`, {
+          mintProdTicket: async (email) => {
+            minted.push(email);
+            return { ok: true, url: "https://clerk.terra.clay.com/v1/agents/tasks?ticket=CLITICKETSECRET" };
+          },
+        }),
+      );
+      expect(result).toBe(0);
+      expect(text).not.toContain("CLITICKETSECRET");
+    } finally {
+      if (original === undefined) delete process.env.CLERK_SECRET_KEY;
+      else process.env.CLERK_SECRET_KEY = original;
+    }
+    expect(minted).toEqual(["blake.johnson@clay.com"]);
+    const body = calls.find((c) => c.path === "/auth/login")!.body as Record<string, unknown>;
+    expect(body.appBaseUrl).toBe("https://www.terra.clay.com");
+    expect(body.taskUrl).toBe("https://clerk.terra.clay.com/v1/agents/tasks?ticket=CLITICKETSECRET");
+    expect(body.clerkSecretKey).toBeUndefined();
+  });
+
+  test("reauth --prod stops with exit 1 and no login RPC when minting fails", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=0\n`);
+    const calls = installDaemonRouter();
+    const { cmdReauth } = await import("../cli");
+    const { result, text } = await captureStderr(() =>
+      cmdReauth(["--prod"], 9333, `ab-${testPid}`, {
+        mintProdTicket: async () => ({ ok: false, error: "Production sign-in failed: nope" }),
+      }),
+    );
+    expect(result).toBe(1);
+    expect(text).toContain("Production sign-in failed: nope");
+    expect(calls.some((c) => c.path === "/auth/login")).toBe(false);
+  });
+
+  test("reauth with an unknown flag exits 2 and never reaches the daemon login", async () => {
+    fs.writeFileSync(markerPath, `${testPid}\nshard=0\n`);
+    const calls = installDaemonRouter();
+    const { cmdReauth } = await import("../cli");
+    const { result, text } = await captureStderr(() => cmdReauth(["--prod."], 9333, `ab-${testPid}`));
+    expect(result).toBe(2);
+    expect(text).toContain("Unknown flag --prod.");
+    expect(calls.some((c) => c.path === "/auth/login")).toBe(false);
   });
 
   test("headed reauth keeps port 9444 regardless of the session's headless shard assignment", async () => {

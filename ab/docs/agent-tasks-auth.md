@@ -57,13 +57,26 @@ For staging:
 ab reauth --staging     # preset: https://slack-feedback-staging.onrender.com
 ```
 
+## Production: `ab reauth --prod`
+
+Signs the ab browser in to `https://www.terra.clay.com` as `AB_AUTH_EMAIL` (default `blake.johnson@clay.com`). The Clerk production instance has no Agent Tasks, so the **CLI** (not the daemon) does this, all in memory (`src/prod-ticket.ts`):
+
+1. `infisical-api secrets get CLERK_SECRET_KEY` (Terra project, env `production`) reads the production Clerk secret.
+2. Clerk BAPI: look up the user by email, list their API keys, pick the first non-revoked, unexpired key with scope `agent:session:mint`, fetch its `ak_` secret. No key is ever created. If none exists, it errors.
+3. `POST https://www.terra.clay.com/api/agent-sessions` with the `ak_` token returns a single-use `clerk.terra.clay.com` ticket URL.
+4. The CLI sends only that URL to the daemon as `taskUrl`. The daemon opens it (same open, poll, cookie-check steps as the dev flow) and accepts it only if it is on `clerk.terra.clay.com` and the app origin is `terra.clay.com` or `www.terra.clay.com`.
+
+Secrets, the `ak_` token and the ticket URL are redacted from errors and never logged or written to disk. `--prod` (alias `--production`) cannot combine with `--host`, `--staging`, `--dev` or `--local`, and it overrides `AB_APP_BASE_URL`. Needs `infisical-api` on PATH with access to the production secret. `ab import` (headed Google login) remains the fallback.
+
+Unknown `--flags` on `ab reauth` are an error (exit 2) so a typo such as `--prod.` cannot silently fall back to localhost.
+
 ## Safety Guards
 
 All in `checkAgentTaskGuards` (`src/auth.ts`), unit-tested:
 
 - No key, or a key that is not `sk_test_`: refused. Production (`sk_live_`) keys are never used.
 - App host `terra.clay.com`: refused, even with a test key.
-- `ab reauth --prod`: errors out. Production uses `ab import` (headed Google login).
+- A Clerk key or Agent Task is never used for production. `ab reauth --prod` takes a separate path (next section).
 
 The already-authenticated-on-same-origin shortcut runs before the guards. `ab import` relies on it: after you log in by hand, `ab import` reads the browser's current URL and sends its origin as `appBaseUrl`, so the daemon sees an authenticated page on the same origin and never mints (and never needs a key). If the browser is on `/sign-in` or a non-app page, `ab import` says so and exits 1 without calling the daemon. This works for any origin, production included.
 

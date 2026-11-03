@@ -46,6 +46,7 @@ const AuthLoginRequestSchema = z.object({
   email: z.string().email().optional(),
   appBaseUrl: z.string().optional(),
   clerkSecretKey: z.string().optional(),
+  taskUrl: z.string().optional(),
 });
 
 const ChromeEnsureRequestSchema = z.object({

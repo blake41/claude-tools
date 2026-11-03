@@ -1,12 +1,15 @@
 import { DEFAULT_AUTH_APP_BASE } from "./auth";
 
-// Environment presets for `ab reauth`. Terra-specific: reauth mints a Clerk
-// Agent Task against the development Clerk instance, so only non-production
-// app hosts are valid targets (production is refused; use `ab import`).
+// Environment presets for `ab reauth`. Terra-specific: these hosts sign in by
+// minting a Clerk Agent Task against the development Clerk instance.
+// Production (`--prod`) is a separate path: see PROD_APP_BASE and prod-ticket.ts.
 export const REAUTH_ENV_PRESETS: Record<string, string> = {
   staging: "https://slack-feedback-staging.onrender.com",
   dev: "https://slack-feedback-development.onrender.com",
 };
+
+/** Production Terra. The www host is canonical: the bare host 307-redirects to it. */
+export const PROD_APP_BASE = "https://www.terra.clay.com";
 
 /**
  * Detect whether a browser URL is a Terra worktree origin (*.terra.localhost
@@ -51,7 +54,7 @@ export function resolveReauthBaseUrls(
   args: string[],
   env: { AB_APP_BASE_URL?: string },
   browserUrl?: string,
-): { appBaseUrl: string | undefined; error?: string } {
+): { appBaseUrl: string | undefined; prod?: true; error?: string } {
   let preset: string | undefined;
   let host: string | undefined;
   for (let i = 0; i < args.length; i++) {
@@ -80,22 +83,26 @@ export function resolveReauthBaseUrls(
       continue;
     }
 
-    const name = arg.slice(2);
-    if (name in REAUTH_ENV_PRESETS) {
+    const rawName = arg.slice(2);
+    const name = rawName === "production" ? "prod" : rawName;
+    if (Object.hasOwn(REAUTH_ENV_PRESETS, name) || name === "prod" || name === "local") {
       if (preset && preset !== name) {
         return { appBaseUrl: undefined, error: `Conflicting env flags: --${preset} and --${name}` };
       }
       preset = name;
-    } else if (name === "prod" || name === "production") {
+    } else {
       return {
-          appBaseUrl: undefined,
-        error: "--prod is not supported: reauth only mints against the development Clerk instance. Production uses `ab import` (headed Google login).",
+        appBaseUrl: undefined,
+        error: `Unknown flag ${arg}. Valid: --staging, --dev, --prod, --local, --host <hostname>`,
       };
-    } else if (name === "local") {
-      // Explicit no-op: use defaults (localhost) from auth.ts.
-      preset = "local";
     }
   }
+  if (host && preset === "prod") {
+    return { appBaseUrl: undefined, error: "Cannot combine --host with --prod" };
+  }
+  // --prod wins over AB_APP_BASE_URL: an explicit flag beats a stale env var, and
+  // a prod login must never aim at some other origin.
+  if (preset === "prod") return { appBaseUrl: PROD_APP_BASE, prod: true };
   if (host && preset && preset !== "local") {
     return {
       appBaseUrl: undefined,

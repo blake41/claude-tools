@@ -203,6 +203,12 @@ export interface AuthLoginRequest {
    * request: the launchd daemon has no such variable. Never persisted or logged.
    */
   clerkSecretKey?: string;
+  /**
+   * Production only: a single-use sign-in URL the CLI already minted (see
+   * prod-ticket.ts). When set, the daemon opens it instead of minting an Agent
+   * Task. Never persisted or logged.
+   */
+  taskUrl?: string;
 }
 
 export interface AuthLoginResponse {
