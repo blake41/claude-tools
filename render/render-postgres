@@ -184,7 +184,48 @@ cmd_resume() {
     json_ok "$TOOL_NAME resume" "$(jq -n --arg id "$db_id" '{id: $id, resumed: true}')" "$na"
 }
 
+METRIC_NAMES=(cpu cpu-limit memory memory-limit active-connections disk-usage disk-capacity disk-read-throughput disk-write-throughput)
+
+cmd_metrics() {
+    local db_id="${1:-}"
+    if [[ -z "$db_id" ]]; then
+        json_error "$TOOL_NAME metrics" "Database ID required" "MISSING_ARG" "Usage: render-postgres metrics <database-id> [hours] [resolution-seconds]"
+    fi
+    local hours="${2:-24}"
+    local res="${3:-300}"
+
+    load_api_key || json_error "$TOOL_NAME metrics" "RENDER_API_KEY not found" "AUTH_MISSING" "Set it in .env or ~/.config/render/api_key"
+
+    local end start
+    end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    start=$(date -u -v-"${hours}"H +%Y-%m-%dT%H:%M:%SZ)
+
+    local out="[]" name raw summary
+    for name in "${METRIC_NAMES[@]}"; do
+        raw=$(render_api "/metrics/$name?resource=$db_id&startTime=$start&endTime=$end&resolutionSeconds=$res")
+        summary=$(echo "$raw" | jq --arg name "$name" '
+            (.[0] // {unit: null, values: []}) as $s
+            | ($s.values | map(.value) | sort) as $v
+            | {metric: $name, unit: $s.unit, samples: ($v | length),
+               last: ($s.values | last | .value // null),
+               median: ($v | if length == 0 then null else .[(length / 2 | floor)] end),
+               p95: ($v | if length == 0 then null else .[(length * 0.95 | floor)] end),
+               max: ($v | last // null)}')
+        out=$(echo "$out" | jq --argjson s "$summary" '. + [$s]')
+    done
+
+    local na
+    na=$(next_actions \
+        "$(next_action "render-postgres metrics $db_id 168 60" "Last 7 days at 1-minute resolution")" \
+        "$(next_action "render-postgres get $db_id" "View database plan and disk size")")
+
+    json_ok "$TOOL_NAME metrics" "$(jq -n --arg start "$start" --arg end "$end" --argjson res "$res" --argjson m "$out" '{window: {start: $start, end: $end, resolutionSeconds: $res}, note: "No IOPS metric exists in the Render API; disk throughput is bytes per second.", metrics: $m}')" "$na"
+}
+
 case "${1:-}" in
+    metrics)
+        cmd_metrics "${2:-}" "${3:-}" "${4:-}"
+        ;;
     list)
         cmd_list
         ;;
@@ -217,6 +258,7 @@ case "${1:-}" in
             {name: "backups", description: "List backup exports (with download links)", usage: "render-postgres backups <database-id>"},
             {name: "export", description: "Trigger a new logical backup export", usage: "render-postgres export <database-id>"},
             {name: "recovery-status", description: "Check PITR recovery window availability", usage: "render-postgres recovery-status <database-id>"},
+            {name: "metrics", description: "CPU, memory, connections, disk usage and disk read/write throughput (median, p95, max over a window)", usage: "render-postgres metrics <database-id> [hours=24] [resolution-seconds=300]"},
             {name: "suspend", description: "Suspend a database", usage: "render-postgres suspend <database-id>"},
             {name: "resume", description: "Resume a suspended database", usage: "render-postgres resume <database-id>"}
         ]')"
