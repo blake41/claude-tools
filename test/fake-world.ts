@@ -42,6 +42,10 @@ export class FakeWorld {
   nmOutputs: string[] = []
   reviewOutputs: string[] = []
   pr: FakePr | null = null
+  herdrDown = false
+  serverStartFails = false
+  serverStarts = 0
+  nextHerdrError: string | null = null
   private uuids = 0
 
   constructor() {
@@ -81,6 +85,13 @@ export class FakeWorld {
       resumeCommand: 'bun run /opt/epic-runner/src/cli.ts resume /work/policy.json',
       notifier: { send: async (n) => void this.notices.push(n) },
       quota: async () => ({ ok: true }),
+      startServer: async () => {
+        this.serverStarts++
+        if (this.serverStartFails) return { ok: false, message: 'fake: herdr server failed to start' }
+        this.herdrDown = false
+        this.panes = new Map()
+        return { ok: true }
+      },
     }
   }
 
@@ -134,7 +145,12 @@ export class FakeWorld {
   }
 
   private herdr(a: string[]): ExecResult {
+    if (this.herdrDown) {
+      return herdrErr('server_not_running', 'no herdr server is running at /tmp/fake.sock; run `herdr session attach epic` to start or attach it')
+    }
+    if (this.nextHerdrError) return herdrErr(this.nextHerdrError, 'injected herdr error')
     const [group, sub] = a
+    if (group === 'status' && sub === 'server') return ok('running\n')
     const target = group === 'agent' && sub === 'start' ? a[a.indexOf('--pane') + 1] : a[2]
     if (group === 'workspace' && sub === 'create') {
       const n = ++this.workspaces

@@ -3,6 +3,7 @@ import { beadBrief } from './brief.ts'
 import { actionBlock, Ctx, type RunnerDeps } from './context.ts'
 import { ExecError, mustRun } from './exec.ts'
 import { realFs } from './fs.ts'
+import { HerdrServerDownError } from './herdr.ts'
 import { ensureNoMistakesConfig } from './nomistakes.ts'
 import type { BeadState, EpicPolicy, RunnerState, WorkerJob, WorkerRun } from './types.ts'
 import { stepGating, stepMerge, stepStopped, stepValidating } from './wave.ts'
@@ -35,6 +36,7 @@ export class Runner {
   }
 
   async tick(): Promise<TickResult> {
+    this.ctx.herdr.beginTick()
     try {
       const r = await this.step()
       this.consecutiveErrors = 0
@@ -47,7 +49,11 @@ export class Runner {
         await this.ctx.halt(`tick failed twice: ${message}`, {
           key: `${this.ctx.policy.epicId}:tick-error:${this.ctx.now()}`,
           subject: `epic-runner halted on ${this.ctx.policy.epicId}`,
-          body: `Two ticks in a row failed. Last error:\n\n\`\`\`\n${message}\n\`\`\`\n\nFix the cause, then resume.`,
+          body:
+            `Two ticks in a row failed. Last error:\n\n\`\`\`\n${message}\n\`\`\`\n\nFix the cause, then resume.` +
+            (e instanceof HerdrServerDownError
+              ? `\n\n${actionBlock(`Start the herdr server for ${this.ctx.policy.epicId}`, 'The runner could not start it headless.', [`Run: ${e.command}`])}`
+              : ''),
         })
       }
       return { progressed: false, summary: `error: ${message}` }

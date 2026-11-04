@@ -644,3 +644,64 @@ describe('convergent review gate', () => {
     expect(loaded?.waves[0]?.lastReview).toBeUndefined()
   })
 })
+
+describe('dead herdr server (E4)', () => {
+  const events_ = (w: FakeWorld, type: string) => events(w).filter((e) => e.type === type)
+
+  it('restarts a dead server headless and the tick succeeds without halting', async () => {
+    const w = new FakeWorld()
+    const r = await startedBead(w)
+    w.herdrDown = true
+    const res = await r.tick()
+    expect(w.serverStarts).toBe(1)
+    expect(res.summary).not.toMatch(/^error/)
+    expect(r.mustState().halted).toBeNull()
+    expect(events_(w, 'tick_error')).toHaveLength(0)
+    expect(events_(w, 'herdr_server_restarted')[0]).toMatchObject({ ok: true, session: 'epic' })
+  })
+
+  it('attempts the restart once per tick, not in a loop', async () => {
+    const w = new FakeWorld()
+    const r = await startedBead(w)
+    w.serverStartFails = true
+    w.herdrDown = true
+    await r.tick()
+    expect(w.serverStarts).toBe(1)
+    await r.tick()
+    expect(w.serverStarts).toBe(2)
+  })
+
+  it('halts with the exact manual command as an :::action block when the start fails', async () => {
+    const w = new FakeWorld()
+    const r = await startedBead(w)
+    w.serverStartFails = true
+    w.herdrDown = true
+    await ticks(r, 2)
+    const st = r.mustState()
+    expect(st.halted?.reason).toContain('tick failed twice')
+    const body = w.notices.at(-1)?.body ?? ''
+    expect(body).toContain(':::action')
+    expect(body).toContain('Run: herdr --session epic server')
+    expect(events_(w, 'herdr_server_restarted')[0]).toMatchObject({ ok: false })
+  })
+
+  it('after a restart the missing pane takes the pane-gone path and the worker resumes', async () => {
+    const w = new FakeWorld()
+    const r = await startedBead(w)
+    w.herdrDown = true
+    const st = await ticks(r, 1)
+    expect(st.halted).toBeNull()
+    expect(events_(w, 'worker_died')[0]).toMatchObject({ paneMissing: true, recovery: 'resume' })
+    expect(w.agent('w2:p1')?.args.slice(0, 2)).toEqual(['--resume', SID1])
+    expect(st.beads['bd-43aa7.1']).toMatchObject({ s: 'working', sessionId: SID1, pane: 'w2:p1', restarts: 1 })
+  })
+
+  it('an unrelated herdr error still halts after two failed ticks and starts no server', async () => {
+    const w = new FakeWorld()
+    const r = await startedBead(w)
+    w.nextHerdrError = 'something_else'
+    const st = await ticks(r, 2)
+    expect(w.serverStarts).toBe(0)
+    expect(st.halted?.reason).toContain('something_else')
+  })
+})

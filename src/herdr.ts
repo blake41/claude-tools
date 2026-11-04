@@ -48,19 +48,90 @@ function herdrError(r: ExecResult): { code: string; message: string } {
   return { code: r.timedOut ? 'timeout' : `exit_${r.code}`, message: (r.stderr || r.stdout).trim().slice(0, 300) }
 }
 
+export type StartServer = (session: string) => Promise<{ ok: true } | { ok: false; message: string }>
+export type ServerRestartOutcome = { ok: boolean; session: string; detail: string }
+export type HerdrOptions = {
+  startServer?: StartServer
+  onServerRestart?: (outcome: ServerRestartOutcome) => Promise<void>
+  serverWaitMs?: number
+  serverPollMs?: number
+}
+
+export class HerdrServerDownError extends Error {
+  constructor(
+    readonly command: string,
+    readonly detail: string,
+  ) {
+    super(`herdr server is not running and could not be started (${detail}); start it by hand: ${command}`)
+  }
+}
+
+/** Starts `herdr --session <name> server` detached from the runner: no stdio, own process group, unref'd. */
+export const spawnHeadlessServer: StartServer = async (session) => {
+  try {
+    const proc = Bun.spawn(['herdr', '--session', session, 'server'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', detached: true })
+    proc.unref()
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) }
+  }
+}
+
 const BUSY_PANE_RETRY_MS = 3_000
 const BUSY_PANE_MAX_ATTEMPTS = 20
+const SERVER_WAIT_MS = 15_000
+const SERVER_POLL_MS = 500
 
 export class Herdr {
   constructor(
     private readonly exec: Exec,
     private readonly session: string,
     private readonly sleep: (ms: number) => Promise<void>,
+    private readonly opts: HerdrOptions = {},
   ) {}
 
-  private call(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
+  /** Outcome of this tick's one restart attempt; null until a call hits server_not_running. */
+  private restart: { ok: boolean; detail: string } | null = null
+
+  beginTick(): void {
+    this.restart = null
+  }
+
+  get serverCommand(): string {
+    return `herdr --session ${this.session} server`
+  }
+
+  private raw(args: string[], timeoutMs: number): Promise<ExecResult> {
     const req: ExecRequest = { cmd: 'herdr', args: ['--session', this.session, ...args], timeoutMs }
     return this.exec(req)
+  }
+
+  private async call(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
+    const r = await this.raw(args, timeoutMs)
+    if (r.code === 0 || herdrError(r).code !== 'server_not_running') return r
+    if (this.restart === null) this.restart = await this.restartServer()
+    if (!this.restart.ok) throw new HerdrServerDownError(this.serverCommand, this.restart.detail)
+    return this.raw(args, timeoutMs)
+  }
+
+  private async restartServer(): Promise<{ ok: boolean; detail: string }> {
+    const started = await (this.opts.startServer ?? spawnHeadlessServer)(this.session)
+    let outcome: { ok: boolean; detail: string }
+    if (!started.ok) outcome = { ok: false, detail: `start command failed: ${started.message}` }
+    else {
+      outcome = { ok: false, detail: `server not running ${(this.opts.serverWaitMs ?? SERVER_WAIT_MS) / 1000}s after start` }
+      const pollMs = this.opts.serverPollMs ?? SERVER_POLL_MS
+      for (let waited = 0; waited <= (this.opts.serverWaitMs ?? SERVER_WAIT_MS); waited += pollMs) {
+        const s = await this.raw(['status', 'server'], 10_000)
+        if (s.code === 0 && /\brunning\b/.test(s.stdout) && !/not running/.test(s.stdout)) {
+          outcome = { ok: true, detail: 'running' }
+          break
+        }
+        await this.sleep(pollMs)
+      }
+    }
+    await this.opts.onServerRestart?.({ ...outcome, session: this.session })
+    return outcome
   }
 
   async createWorkspace(cwd: string, label: string): Promise<{ workspaceId: string; paneId: string }> {

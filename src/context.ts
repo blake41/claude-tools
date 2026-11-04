@@ -2,7 +2,7 @@ import type { Exec } from './exec.ts'
 import type { Fs } from './fs.ts'
 import { Gh } from './gh.ts'
 import { Git } from './git.ts'
-import { Herdr } from './herdr.ts'
+import { Herdr, type StartServer } from './herdr.ts'
 import type { Notice, Notifier } from './notifier.ts'
 import type { QuotaCheck } from './quota.ts'
 import { StateStore } from './store.ts'
@@ -22,6 +22,8 @@ export type RunnerDeps = {
   resumeCommand: string
   notifier: Notifier
   quota: QuotaCheck
+  /** Start the headless herdr server for a session. Defaults to a detached `herdr --session <name> server`. */
+  startServer?: StartServer
 }
 
 export class Ctx {
@@ -38,7 +40,10 @@ export class Ctx {
     readonly fs: Fs,
   ) {
     this.store = new StateStore(fs, deps.stateRoot, policy.epicId, deps.now)
-    this.herdr = new Herdr(deps.exec, policy.herdrSession, deps.sleep)
+    this.herdr = new Herdr(deps.exec, policy.herdrSession, deps.sleep, {
+      startServer: deps.startServer,
+      onServerRestart: (outcome) => this.event('herdr_server_restarted', outcome),
+    })
     this.git = new Git(deps.exec, policy.worktree)
     this.gh = new Gh(deps.exec, policy.worktree)
     this.paths = workerPaths(policy.worktree)

@@ -65,6 +65,7 @@ function deps(policy: EpicPolicy, stateRoot: string, dry: boolean, policyPath: s
       ? { send: async (n) => print(`# notify [${policy.epicId}/runner] ${n.subject} (key ${n.key})`) }
       : inboxNotifier(exec, { wrapperPath: join(ROOT, 'src', 'inbox-send.ts'), projectPath: policy.repo, thread: `${policy.epicId}/runner` }),
     quota: alwaysOk,
+    startServer: dry ? async (session) => (print(`$ herdr --session ${session} server  # detached`), { ok: true as const }) : undefined,
   }
 }
 

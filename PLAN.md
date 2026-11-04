@@ -135,6 +135,8 @@ The runner trusts files, exit codes and git, not prose. `done` is checked: the s
 | 3 restarts on one bead | park bead, Inbox message, continue independent beads |
 | Restart after a death with no baton | new session with `/baton grab <deadSessionId>` |
 | quota-axi says window exhausted | sleep until `resetsAt` |
+
+Dead herdr server: `herdr session attach` needs a terminal, so the runner cannot use it. `herdr --session <name> server` runs headless and exits with `error: herdr server is already running` if one is up. On `server_not_running` the runner starts that command detached, waits up to 15 s for `herdr --session <name> status server` to report `running`, logs `herdr_server_restarted`, and retries the call once (at most one restart per tick). The old panes are gone, so the worker takes the "pane process gone" row above. A failed restart counts as a failed tick; the halt notice names the command to run by hand.
 ### 4.5 Context rotation
 - Runner starts each worker with `--session-id <uuid>`, so the transcript path is known.
   
