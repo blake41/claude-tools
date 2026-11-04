@@ -474,6 +474,11 @@ else
 fi
 [ -n "$cost_seg" ] && line_ctx+="  ${cost_seg}"
 [ -n "$cache_seg" ] && line_ctx+="  ${cache_seg}"
+# keep-alive state, written by the prompt-cache-control mod: "<pings sent>/<max pings>", empty when off
+if [ "$NOCACHE" = 0 ] && [ -n "$session_id" ] && [ -f "$CACHE_DIR/${session_id}.ka" ] && [ ! -L "$CACHE_DIR/${session_id}.ka" ]; then
+  ka_state=$(cat "$CACHE_DIR/${session_id}.ka" 2>/dev/null)
+  [[ "$ka_state" =~ ^[0-9]+/[0-9]+$ ]] && line_ctx+="  🔁 $(c $C_CACHE)ka ${ka_state}$(rst)"
+fi
 
 printf '\n%s' "$line_meta"
 printf '\n%s' "$line_ctx"

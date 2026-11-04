@@ -47,6 +47,9 @@
 ~/.local/share/uv/tools/
 ~/.plannotator
 ~/.local/share/mergiraf
+~/.cmuxterm/claude-settings
+~/.epic-runner/
+~/.orbstack/log/
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
