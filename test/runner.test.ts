@@ -204,6 +204,89 @@ describe('bead lifecycle', () => {
   })
 })
 
+describe('deferred question', () => {
+  const T1 = 'bd-43aa7.1'
+  const T2 = 'bd-43aa7.2'
+
+  async function deferFirst(w: FakeWorld): Promise<Runner> {
+    const r = new Runner(w.policy({ waves: [[T1, T2]] }), w.deps())
+    await ticks(r, 2)
+    w.writeStatus(`needs-decision thread=bd-43aa7/${T1}: bust on SfAccount or TTL?`)
+    await ticks(r, 1)
+    const agent = w.agent()
+    if (agent) agent.status = 'working'
+    await ticks(r, 1)
+    w.writeStatus('deferred: bust on SfAccount or TTL?')
+    await ticks(r, 1)
+    return r
+  }
+
+  async function finishSecond(w: FakeWorld, r: Runner): Promise<RunnerState> {
+    await ticks(r, 1)
+    w.commits.add(SHA2)
+    w.writeStatus(`done sha=${SHA2}`)
+    return ticks(r, 2)
+  }
+
+  it('parks that bead only, and an independent bead in the same wave still runs and finishes', async () => {
+    const w = new FakeWorld()
+    const r = await deferFirst(w)
+    let st = r.mustState()
+    expect(st.beads[T1]).toEqual({ s: 'parked', reason: 'deferred: bust on SfAccount or TTL?', thread: `bd-43aa7/${T1}` })
+    expect(st.halted).toBeNull()
+    expect(st.worker).toBeNull()
+    st = await ticks(r, 1)
+    expect(st.beads[T2]).toMatchObject({ s: 'working' })
+    expect(st.halted).toBeNull()
+    w.commits.add(SHA2)
+    w.writeStatus(`done sha=${SHA2}`)
+    st = await ticks(r, 1)
+    expect(st.beads[T2]).toEqual({ s: 'committed', sha: SHA2 })
+    expect(st.beads[T1]).toMatchObject({ s: 'parked' })
+  })
+
+  it('does not halt while a bead can run', async () => {
+    const w = new FakeWorld()
+    const r = await deferFirst(w)
+    await ticks(r, 1)
+    expect(r.mustState().halted).toBeNull()
+    expect(w.notices).toEqual([])
+  })
+
+  it('halts with an action notice naming each deferred bead, its question and thread, when only deferred beads remain', async () => {
+    const w = new FakeWorld()
+    const r = await deferFirst(w)
+    const st = await finishSecond(w, r)
+    expect(st.halted?.reason).toBe(`only deferred beads remain: ${T1}`)
+    expect(w.notices).toHaveLength(1)
+    const body = w.notices[0]?.body ?? ''
+    expect(body).toContain(':::action')
+    expect(body).toContain(`Deferred ${T1}: bust on SfAccount or TTL? (Inbox thread bd-43aa7/${T1})`)
+    expect(body).not.toContain(T2)
+  })
+
+  it('resume re-queues the deferred bead and starts a fresh worker', async () => {
+    const w = new FakeWorld()
+    const r = await deferFirst(w)
+    await finishSecond(w, r)
+    const notes = await r.resume()
+    expect(notes).toContain(`${T1}: queued for a fresh session`)
+    expect(r.mustState().halted).toBeNull()
+    const st = await ticks(r, 1)
+    expect(st.beads[T1]).toMatchObject({ s: 'working' })
+    expect(st.worker?.job).toEqual({ kind: 'bead', beadId: T1 })
+  })
+
+  it('the brief lists the deferred line and tells the worker a skipped question is not a failure', async () => {
+    const w = new FakeWorld()
+    await startedBead(w)
+    const brief = readFileSync(join(w.worktree, '.epic-runner', 'brief-bd-43aa7.1.md'), 'utf8')
+    expect(brief).toContain('`deferred: <what is waiting>`')
+    expect(brief).toContain('A skipped question is not a failure.')
+    expect(brief).toContain('Do not write `failed`.')
+  })
+})
+
 describe('rotation', () => {
   it('rotate line: stops the agent and starts a fresh session with /baton grab in the same pane', async () => {
     const w = new FakeWorld()

@@ -13,7 +13,7 @@ export type Launch =
   | { k: 'grab'; fromSession: string }
   | { k: 'resume'; sessionId: string }
 
-export type WorkerEnd = { k: 'done'; sha: string } | { k: 'failed'; reason: string } | { k: 'parked'; reason: string }
+export type WorkerEnd = { k: 'done'; sha: string } | { k: 'failed'; reason: string } | { k: 'deferred'; what: string } | { k: 'parked'; reason: string }
 
 const TOKEN_EVENT_STEP = 10_000
 const MAX_DONE_REJECTIONS = 2
@@ -189,6 +189,8 @@ async function apply(ctx: Ctx, run: WorkerRun, action: LivenessAction, paneMissi
         }
         case 'failed':
           return { k: 'failed', reason: line.reason }
+        case 'deferred':
+          return { k: 'deferred', what: line.what }
         case 'needs_decision': {
           run.waitingOnOwner = true
           await ctx.event('needs_decision', { job: run.job, thread: line.thread, question: line.question })

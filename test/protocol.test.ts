@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { parseStatusLine, newStatusLines } from '../src/status-protocol.ts'
+import { isTerminal, parseStatusLine, newStatusLines } from '../src/status-protocol.ts'
 import { contextTokens, transcriptPath, projectSlug } from '../src/transcript.ts'
 
 describe('status protocol', () => {
@@ -17,6 +17,14 @@ describe('status protocol', () => {
     expect(parseStatusLine('done sha=96a276fa4')).toEqual({ k: 'done', sha: '96a276fa4' })
     expect(parseStatusLine('failed: suppression file conflict')).toEqual({ k: 'failed', reason: 'suppression file conflict' })
     expect(parseStatusLine('I think I am done')).toEqual({ k: 'unknown', raw: 'I think I am done' })
+  })
+
+  it('parses deferred and rejects malformed deferred lines', () => {
+    expect(parseStatusLine('deferred: bust on SfAccount or TTL?')).toEqual({ k: 'deferred', what: 'bust on SfAccount or TTL?' })
+    expect(parseStatusLine('deferred:')).toEqual({ k: 'unknown', raw: 'deferred:' })
+    expect(parseStatusLine('deferred:   ')).toEqual({ k: 'unknown', raw: 'deferred:' })
+    expect(parseStatusLine('deferred the question')).toEqual({ k: 'unknown', raw: 'deferred the question' })
+    expect(isTerminal(parseStatusLine('deferred: x'))).toBe(true)
   })
 
   it('returns only lines after the cursor and the new cursor', () => {

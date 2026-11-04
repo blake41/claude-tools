@@ -119,7 +119,7 @@ export const BeadStateSchema = z.discriminatedUnion('s', [
   z.object({ s: z.literal('needs_decision'), sessionId: z.string(), inboxThread: z.string(), since: z.number() }),
   z.object({ s: z.literal('rotating'), fromSession: z.string(), baton: z.string() }),
   z.object({ s: z.literal('committed'), sha: z.string() }),
-  z.object({ s: z.literal('parked'), reason: z.string() }),
+  z.object({ s: z.literal('parked'), reason: z.string(), thread: z.string().optional() }),
   z.object({ s: z.literal('failed'), reason: z.string() }),
 ])
 export type BeadState = z.infer<typeof BeadStateSchema>

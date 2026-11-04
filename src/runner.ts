@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { beadBrief } from './brief.ts'
-import { Ctx, type RunnerDeps } from './context.ts'
+import { actionBlock, Ctx, type RunnerDeps } from './context.ts'
 import { ExecError, mustRun } from './exec.ts'
 import { realFs } from './fs.ts'
 import { ensureNoMistakesConfig } from './nomistakes.ts'
@@ -223,6 +223,7 @@ export class Runner {
     const worker = ctx.state.worker
     if (worker) return this.superviseJob(worker)
     const wave = ctx.wave(wi)
+    const deferred: Array<[string, ParkedBead]> = []
     for (const id of wave.beads) {
       const bead = ctx.state.beads[id] ?? { s: 'queued' as const }
       const relaunch = relaunchFor(bead)
@@ -230,6 +231,12 @@ export class Runner {
         case 'committed':
           continue
         case 'parked':
+          if (isDeferred(bead)) {
+            deferred.push([id, bead])
+            continue
+          }
+          await ctx.halt(`bead ${id} is ${bead.s}: ${bead.reason}`)
+          return 'progressed'
         case 'failed':
           await ctx.halt(`bead ${id} is ${bead.s}: ${bead.reason}`)
           return 'progressed'
@@ -253,8 +260,25 @@ export class Runner {
         }
       }
     }
+    if (deferred.length > 0) {
+      await this.haltForDeferred(deferred)
+      return 'progressed'
+    }
     await ctx.setWave(wi, { s: 'validating', nmRun: '' }, { nmStarted: false })
     return 'progressed'
+  }
+
+  /** Every bead that can run has run. Only deferred beads remain, so the owner must answer. */
+  private async haltForDeferred(deferred: Array<[string, ParkedBead]>): Promise<void> {
+    const ctx = this.ctx
+    const epic = ctx.policy.epicId
+    const items = deferred.map(([id, b]) => `Deferred ${id}: ${b.reason.replace(/^deferred:\s*/, '')} (Inbox thread ${b.thread ?? `${epic}/${id}`})`)
+    const ids = deferred.map(([id]) => id).join(', ')
+    await ctx.halt(`only deferred beads remain: ${ids}`, {
+      key: `${epic}:deferred:${ids}:${ctx.now()}`,
+      subject: `Epic ${epic} waits on ${deferred.length} deferred question${deferred.length === 1 ? '' : 's'}`,
+      body: actionBlock(`Answer the deferred questions in epic ${epic}`, 'Every other bead is finished. These beads wait on an owner answer.', items),
+    })
   }
 
   private async superviseJob(run: WorkerRun): Promise<'progressed' | 'idle'> {
@@ -278,6 +302,18 @@ export class Runner {
         if (job.kind === 'bead') await ctx.setBead(job.beadId, { s: 'committed', sha: end.sha })
         else await ctx.setWave(job.wave, { s: 'validating', nmRun: '' }, { nmStarted: false })
         return
+      case 'deferred': {
+        await ctx.setWorker(null)
+        if (job.kind === 'bead') {
+          const prev = ctx.state.beads[job.beadId]
+          const thread = prev?.s === 'needs_decision' ? prev.inboxThread : `${ctx.policy.epicId}/${job.beadId}`
+          await ctx.setBead(job.beadId, { s: 'parked', reason: `deferred: ${end.what}`, thread })
+          await ctx.event('bead_deferred', { bead: job.beadId, what: end.what, thread })
+        } else {
+          await ctx.halt(`${jobKey(job)} deferred: ${end.what}`)
+        }
+        return
+      }
       case 'failed': {
         await ctx.setWorker(null)
         if (job.kind === 'bead') await ctx.setBead(job.beadId, { s: 'failed', reason: end.reason })
@@ -291,6 +327,12 @@ export class Runner {
       }
     }
   }
+}
+
+type ParkedBead = Extract<BeadState, { s: 'parked' }>
+
+function isDeferred(bead: ParkedBead): boolean {
+  return bead.reason.startsWith('deferred:')
 }
 
 function relaunchFor(bead: BeadState): Launch | null {

@@ -109,6 +109,7 @@ needs-decision thread=<inbox thread id>: <question in one line>
 rotate baton=<path>
 done sha=<commit sha>
 failed: <reason>
+deferred: <what is waiting>
 ```
 
 The runner trusts files, exit codes and git, not prose. `done` is checked: the sha must exist on the epic branch and `git status` must be clean.
