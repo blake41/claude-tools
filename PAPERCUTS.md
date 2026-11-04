@@ -63,3 +63,7 @@ worktree-add-cow in tools repo ran 'bun install' at root which has no package.js
 2026-10-05T13:15:04.498Z - fable - blake johnson
 
 Timing claude startup with a pty.fork() harness: the Bash tool moved the >300s command to background and the second pty.fork in the same python process hung forever (no claude child alive, no output). Running one pty session per python process with signal.alarm fixed it; macOS has no 'timeout' binary either.
+
+2026-10-07T07:01:41.584Z - sonnet-5-5 - blake johnson
+
+worktree-add-cow prints 'bun install failed ... could not find a package.json' in the tools repo (no root package.json), but the worktree is created fine; the error is noise, and a repo with only per-tool package.json files should skip the root install.
