@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# clerk-app <app> <env> <clerk args...>
+#
+# Run the Clerk CLI against one app + environment with BOTH credentials loaded:
+#   CLERK_SECRET_KEY        Backend API (users, sessions, api_keys). One per app+env.
+#   CLERK_PLATFORM_API_KEY  Platform API (config, apps, session lifetime). One per Clerk
+#                           account, so it is shared by every app.
+# Both come from Infisical per call, go to the child by env (never argv), and are never
+# written to disk. `clerk auth login` is never needed.
+#
+#   clerk-app ops-hub prod api /users?limit=1
+#   clerk-app ops-hub prod config pull
+#   clerk-app terra prod users list --email-address a@clay.com
+#
+# apps: terra | keystone | ops-hub     envs: dev | staging | prod
+set -euo pipefail
+
+PLATFORM_KEY_PROJECT=c5d811f5-e17a-4a69-a58a-382eb9472bf0   # Ops-Hub
+PLATFORM_KEY_ENV=production
+
+die() { echo "clerk-app: $*" >&2; exit 1; }
+[[ $# -ge 3 ]] || die "usage: clerk-app <terra|keystone|ops-hub> <dev|staging|prod> <clerk args...>"
+app=$1 env=$2; shift 2
+
+case "$app" in
+  terra)    project=320dfa64-a77c-4a51-ba4f-6ccbc21208ef ;;
+  keystone) project=32d390f3-bada-40cb-942d-536252fe001f ;;
+  ops-hub)  project=c5d811f5-e17a-4a69-a58a-382eb9472bf0 ;;
+  *) die "unknown app '$app'" ;;
+esac
+case "$env" in
+  dev) ienv=dev ;; staging) ienv=staging ;; prod) ienv=production ;;
+  *) die "unknown env '$env'" ;;
+esac
+
+get() { infisical-api secrets get "$1" -p "$2" -e "$3" 2>/dev/null | jq -r '.result.secret.secretValue // empty'; }
+
+secret=$(get CLERK_SECRET_KEY "$project" "$ienv")
+[[ "$secret" == sk_* ]] || die "no CLERK_SECRET_KEY for $app/$env in Infisical (project $project, env $ienv)"
+export CLERK_SECRET_KEY="$secret"
+
+platform=$(get CLERK_PLATFORM_API_KEY "$PLATFORM_KEY_PROJECT" "$PLATFORM_KEY_ENV")
+if [[ -n "$platform" ]]; then
+  export CLERK_PLATFORM_API_KEY="$platform"
+else
+  echo "clerk-app: no CLERK_PLATFORM_API_KEY in Infisical; Platform API commands (config, apps) will fail" >&2
+fi
+
+exec clerk "$@"
