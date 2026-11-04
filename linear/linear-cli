@@ -196,11 +196,11 @@ cmd_comment() {
     json_error "$TOOL_NAME comment" "Issue '$issue_id' not found" "NOT_FOUND" "Check the issue identifier"
   fi
 
-  # Escape quotes and newlines in body
-  body=$(echo "$body" | sed 's/"/\\\\"/g' | tr '\n' ' ')
+  [[ "$body" == "-" ]] && body=$(cat)
 
-  local result
-  result=$(graphql "mutation { commentCreate(input: { issueId: \\\"$issue_uuid\\\", body: \\\"$body\\\" }) { success comment { id body createdAt user { name } } } }")
+  local vars result
+  vars=$(jq -n --arg id "$issue_uuid" --arg body "$body" '{input: {issueId: $id, body: $body}}')
+  result=$(graphql_mutation 'mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id body createdAt user { name } } } }' "$vars")
 
   local success
   success=$(echo "$result" | jq -r '.data.commentCreate.success')
@@ -401,7 +401,7 @@ cmd_update() {
   shift
 
   local state="" assignee="" priority="" label_add="" label_rm="" cycle="" parent="" project=""
-  local title="" description="" description_set=""
+  local title="" description="" description_set="" parent_clear=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -411,7 +411,10 @@ cmd_update() {
       --label) label_add="$2"; shift 2 ;;
       --remove-label) label_rm="$2"; shift 2 ;;
       --cycle) cycle="$2"; shift 2 ;;
-      --parent) parent="$2"; shift 2 ;;
+      --parent)
+        if [[ -z "$2" || "$2" == "none" ]]; then parent_clear=1; parent=""; else parent="$2"; fi
+        shift 2 ;;
+      --no-parent) parent_clear=1; parent=""; shift ;;
       --project) project="$2"; shift 2 ;;
       --title|-t) title="$2"; shift 2 ;;
       --description|-d) description="$2"; description_set=1; shift 2 ;;
@@ -458,7 +461,9 @@ cmd_update() {
     input=$(echo "$input" | jq --arg id "$cycle_id" '. + {cycleId: $id}')
   fi
 
-  if [[ -n "$parent" ]]; then
+  if [[ -n "$parent_clear" ]]; then
+    input=$(echo "$input" | jq '. + {parentId: null}')
+  elif [[ -n "$parent" ]]; then
     local parent_uuid
     try_resolve parent_uuid resolve_issue_uuid "$parent"
     input=$(echo "$input" | jq --arg id "$parent_uuid" '. + {parentId: $id}')
@@ -886,6 +891,8 @@ case "$CMD" in
     cmd_issue "$1"
     ;;
   update)
+    [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && json_error "$TOOL_NAME update" "Help requested; nothing changed" "USAGE" \
+      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123|none] [--no-parent] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME update" "Issue ID required" "MISSING_ARG" \
       "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
     cmd_update "$@"
@@ -904,6 +911,10 @@ case "$CMD" in
     ;;
   issues) cmd_issues "$@" ;;
   create)
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+      json_error "$TOOL_NAME create" "Help requested; nothing created" "USAGE" \
+        "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] (team defaults to GTMOPS)"
+    fi
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME create" "Title required" "MISSING_ARG" \
       "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] (team defaults to GTMOPS)"
     if [[ $# -ge 2 && "$1" =~ ^[A-Z][A-Z0-9]*$ && "$2" != --* ]]; then
