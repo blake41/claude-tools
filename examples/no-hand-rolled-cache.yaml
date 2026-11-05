@@ -4,6 +4,8 @@ repo: /Users/blake/Documents/Development/clay/terra
 branch: epic/bd-43aa7
 base: master
 prUnit: wave
+# E6: stop_at_pr is also the default when onPass is omitted. To move a wave to merge after one
+# verified live fix round of the review gate, set `onPass: merge` on that wave only.
 onPass: stop_at_pr
 workerModel: sonnet
 workerSandbox: true
@@ -14,9 +16,9 @@ waves:
   - beads: [bd-43aa7.1, bd-43aa7.2, bd-43aa7.3, bd-43aa7.4, bd-43aa7.5, bd-43aa7.6, bd-43aa7.7]
     onPass: stop_at_pr
   - beads: [bd-43aa7.8, bd-43aa7.9]
-    onPass: merge
+    onPass: stop_at_pr
   - beads: [bd-43aa7.10, bd-43aa7.11, bd-43aa7.12]
-    onPass: merge
+    onPass: stop_at_pr
 
 gates:
   - kind: ci_green_at_head

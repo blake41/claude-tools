@@ -155,6 +155,8 @@ Dead herdr server: `herdr session attach` needs a terminal, so the runner cannot
 | `thermo-merge` (default) | CI at head, linear, `p:thermonuclear-code-quality-review` on opus, fix loop sonnet x3, pass when no finding at `major` or above | merge |
 | `full` | thermo-merge + seeded adversarial review (post-pipeline-review rule) | merge |
 
+**First live runs (PLAN-escalation E6).** The policy file's top-level `onPass` defaults to `stop_at_pr`, and a wave without its own `onPass` inherits it, so every wave of a new epic stops at the PR unless the file says otherwise. The same default covers waves the runner builds from `br ready` when the policy lists none. To move a wave to merge, set `onPass: merge` on that wave in the epic policy file (see `examples/no-hand-rolled-cache.yaml`) after one verified live fix round of the review gate. Do not set top-level `onPass: merge` until every wave has earned it.
+
 Default downgrades (merge becomes stop-at-PR): touches `prisma/migrations/**`, `render.yaml`, `.github/**`, `Dockerfile*`, `scripts/pre-deploy.sh`; diff over 800 lines; files outside bead scope; fix rounds exhausted.
 
 Reviewers are fresh `claude -p` processes given the diff and bead text only. They return JSON findings. The runner applies `passWhen`.

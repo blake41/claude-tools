@@ -76,4 +76,13 @@ describe('parsePolicyText', () => {
       ),
     ).toThrow()
   })
+
+  it('E6: onPass defaults to stop_at_pr; only an explicit onPass: merge merges', () => {
+    const p = parsePolicyText(
+      JSON.stringify({ epicId: 'e', repo: '/r', branch: 'b', waves: [['a'], { beads: ['b'] }, { beads: ['c'], onPass: 'merge' }] }),
+      'p.json',
+    )
+    expect(p.onPass).toBe('stop_at_pr')
+    expect(p.waves.map((w) => w.onPass)).toEqual(['stop_at_pr', 'stop_at_pr', 'merge'])
+  })
 })

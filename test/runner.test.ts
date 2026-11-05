@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { Ctx } from '../src/context.ts'
 import { Runner } from '../src/runner.ts'
 import { StateStore } from '../src/store.ts'
+import { parsePolicyText } from '../src/policy.ts'
 import { realFs } from '../src/fs.ts'
 import type { EpicPolicy, RunnerState } from '../src/types.ts'
 import { FakeWorld, greenCheck } from './fake-world.ts'
@@ -201,6 +202,26 @@ describe('bead lifecycle', () => {
     if (agent) agent.status = 'working'
     st = await ticks(r, 1)
     expect(st.beads['bd-43aa7.1']).toMatchObject({ s: 'working', sessionId: SID1 })
+  })
+})
+
+describe('E6 first-run policy', () => {
+  it('a fresh epic whose policy omits onPass has stop_at_pr on every wave', async () => {
+    const w = new FakeWorld()
+    const raw = JSON.parse(JSON.stringify({ epicId: 'bd-43aa7', repo: w.repo, branch: 'epic/bd-43aa7', waves: [['bd-43aa7.1'], { beads: ['bd-43aa7.2'] }] }))
+    const policy = parsePolicyText(JSON.stringify(raw), 'policy.json')
+    const st = await ticks(new Runner(policy, w.deps()), 1)
+    expect(st.waves.map((x) => x.onPass)).toEqual(['stop_at_pr', 'stop_at_pr'])
+  })
+
+  it('waves built from br ready also stop at the PR by default', async () => {
+    const w = new FakeWorld()
+    const policy = parsePolicyText(JSON.stringify({ epicId: 'bd-43aa7', repo: w.repo, branch: 'epic/bd-43aa7' }), 'policy.json')
+    const deps = w.deps()
+    const inner = deps.exec
+    deps.exec = async (req) => (req.cmd === 'br' ? { code: 0, stdout: '[{"id":"bd-43aa7.1"}]', stderr: '', timedOut: false } : inner(req))
+    const st = await ticks(new Runner(policy, deps), 1)
+    expect(st.waves.map((x) => x.onPass)).toEqual(['stop_at_pr'])
   })
 })
 

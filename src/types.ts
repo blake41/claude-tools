@@ -54,7 +54,8 @@ export const RawPolicySchema = z.object({
   prUnit: z.enum(['bead', 'wave', 'epic']).default('wave'),
   waves: z.array(WaveSpecSchema).default([]),
   gates: z.array(GateSchema).default([]),
-  onPass: OnPassSchema,
+  // E6: stop_at_pr is the default for every wave. A wave merges only when this field or the wave's own onPass says `merge`.
+  onPass: OnPassSchema.default('stop_at_pr'),
   downgradeToStopIf: z.array(DowngradeSchema).optional(),
   beadScopes: z.record(z.string(), z.array(z.string().min(1))).default({}),
   rotateAtTokens: z.number().int().positive().default(300_000),
