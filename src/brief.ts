@@ -34,6 +34,7 @@ The runner reads only this file, git and exit codes. It does not read your prose
 }
 
 export function beadBrief(p: BriefParams): string {
+  const decisions = p.statusFile.replace(/status$/, 'decisions.md')
   return `# Bead ${p.beadId} (epic ${p.epicId})
 
 You work on the epic branch \`${p.branch}\` in the worktree \`${p.worktree}\`. One bead, start to finish.
@@ -43,9 +44,14 @@ You work on the epic branch \`${p.branch}\` in the worktree \`${p.worktree}\`. O
 3. Run the scope gates from CLAUDE.md for touched paths. Run \`bun run lint:suppressions:prune\` when a baselined site is fixed.
 4. Commit on \`${p.branch}\`. One bead = one commit (or a few).
 5. Write \`done sha=<sha>\`. End the turn.
-6. Before any question, read \`${p.statusFile.replace(/status$/, 'decisions.md')}\` (owner decisions earlier beads of this epic already got; it may not exist yet). Apply a recorded decision without asking only when the owner's own words in it cover your case; an approval for one file never covers another file. Otherwise cite the entry as precedent in your question, with your recommendation, so the owner can answer in one click. A question is allowed only for a one-way door. First classify it (reversible / default / needs-user, the \`open-question-resolver\` rules). Reversible or default: decide, and log it under \`REVIEW-THESE\` in the commit body. Needs-user: send it to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn. When the owner's answer arrives, append one entry to that decisions file before you continue: the date, this bead, the question in one line, and the answer with exactly the scope the owner gave (never wider). If the owner closes your question unanswered, write \`deferred: <what is waiting>\` and end the turn. Do not write \`failed\`. A skipped question is not a failure.
-
-7. Never restructure code only so a lint rule stops matching it (a wrapper class, a renamed variable, moving a write into a sync helper). That is lint evasion. If a site is truly not a cache, say so in a needs-user question with the evidence and let the owner choose: leave it baselined, exempt it, or fix it for real.
+6. The rules are already recorded. They live in this bead, this epic, \`${decisions}\` (owner decisions earlier beads of this epic got; it may not exist yet) and the target repo docs that the epic text names by path, plus \`CLAUDE.md\` in the worktree. Read them before you decide anything. Follow them. Apply a recorded decision only when the owner's own words in it cover your case; an approval for one file never covers another file. When nothing recorded covers a choice, decide it yourself and log it under \`REVIEW-THESE\` in the commit body. Do not ask.
+7. Ask only when you disagree with a recorded rule or a bead instruction, and only with evidence. "I feel it is right" is not a reason. Send the question to the Plannotator Inbox with \`thread: "${p.inboxThread}"\` and \`project_path: "${p.repoRoot}"\`, write \`needs-decision\`, end the turn. The question has exactly these four parts, in this order:
+   1. **The rule.** Quote the instruction or the \`decisions.md\` entry, with its date. Quote it; do not paraphrase it.
+   2. **What I found.** The facts, each with \`file:line\`.
+   3. **Why this case differs.** One short paragraph. Say what the rule assumed that is not true here.
+   4. **My proposal.** What you would do instead, what it costs, and what you will do if the owner does not answer (the default).
+   A question that is only a menu ("pick option 1, 2 or 3") is rejected: do not send it. Do not restate the rule's content from the target repo docs; name the doc by path and quote only the line you disagree with. When the owner's answer arrives, append one entry to the decisions file before you continue: the date, this bead, the question in one line, and the answer with exactly the scope the owner gave (never wider). If the owner closes your question unanswered, write \`deferred: <what is waiting>\` and end the turn. Do not write \`failed\`. A skipped question is not a failure.
+8. Never restructure code only so a lint rule stops matching it (a wrapper class, a renamed variable, moving a write into a sync helper). That is lint evasion. If you think a site is truly exempt, that is a disagreement with a rule: ask with the four parts above.
 ${protocol(p)}
 
 ## Bead ${p.beadId}

@@ -64,3 +64,5 @@ Verify with `bun test` and `bunx tsc --noEmit -p tsconfig.json` in this repo. Th
 - Should a deferred question be re-sent by the runner on a timer, or only when the owner is active? Lean: only when the owner is active. A timer produces noise.
 - Where should the "target repo doc" pointer live? Lean: a field in the epic policy file (`docsRef`), so the brief stays generic.
 - Does E1 belong in the runner or in the planning skill? Lean: the planning skill, with the runner enforcing the gap check.
+
+Status: E2, E6 done 2026-11-05
