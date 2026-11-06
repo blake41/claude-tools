@@ -193,6 +193,7 @@ describeMaybe('report-review', () => {
           'report-review ticketed 2026-11-06#3:a1b2c3 <ref>',
           'report-review fixed 2026-11-06#3:a1b2c3 <ref>',
           'report-review wontfix 2026-11-06#3:a1b2c3 <note>',
+          'report-review investigated 2026-11-06#3:a1b2c3 <note>',
         ]);
       } finally {
         stub.server.stop(true);
@@ -312,6 +313,35 @@ describeMaybe('report-review', () => {
         expect(r.exitCode).toBe(1);
         const code = JSON.parse(r.stdout).error.code;
         expect(['INVALID_ARG', 'MISSING_ARG']).toContain(code);
+      }
+      expect(stub.requests).toHaveLength(0);
+    } finally {
+      stub.server.stop(true);
+    }
+  });
+
+  it('investigated POSTs item, status and note', async () => {
+    const stub = startStub(() => ok({ ok: true, review: { status: 'investigated' } }));
+    try {
+      const r = await run(['investigated', '2026-11-06#3:a1b2c3', 'looked, no action'], env(stub.url, 'tok'));
+      expect(r.exitCode).toBe(0);
+      expect(JSON.parse(stub.requests[0].bodyText)).toEqual({
+        item: '2026-11-06#3:a1b2c3',
+        status: 'investigated',
+        note: 'looked, no action',
+      });
+    } finally {
+      stub.server.stop(true);
+    }
+  });
+
+  it('refuses investigated with an empty or blank note locally', async () => {
+    const stub = startStub(() => ok({}));
+    try {
+      for (const args of [['investigated', '2026-11-06#3:a1b2c3'], ['investigated', '2026-11-06#3:a1b2c3', ''], ['investigated', '2026-11-06#3:a1b2c3', '   ']]) {
+        const r = await run(args, env(stub.url, 'tok'));
+        expect(r.exitCode).toBe(1);
+        expect(JSON.parse(r.stdout).error.code).toBe('MISSING_ARG');
       }
       expect(stub.requests).toHaveLength(0);
     } finally {
@@ -475,11 +505,11 @@ describeMaybe('report-review', () => {
     expect(JSON.parse(r.stdout).error.code).toBe('UNKNOWN_COMMAND');
   });
 
-  it('root invocation lists exactly the six subcommands', async () => {
+  it('root invocation lists exactly the seven subcommands', async () => {
     const r = await run([], env('http://127.0.0.1:1'));
     expect(r.exitCode).toBe(0);
     const names = JSON.parse(r.stdout).result.commands.map((c: { name: string }) => c.name);
-    expect(names).toEqual(['ticketed', 'fixed', 'wontfix', 'list', 'show', 'clear']);
+    expect(names).toEqual(['ticketed', 'fixed', 'wontfix', 'investigated', 'list', 'show', 'clear']);
   });
 
   it('refuses a non-https REPORT_REVIEW_URL unless the host is localhost or 127.0.0.1, before any request', async () => {
