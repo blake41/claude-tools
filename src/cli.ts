@@ -60,6 +60,7 @@ function deps(policy: EpicPolicy, stateRoot: string, dry: boolean, policyPath: s
     claudeProjectsDir: join(homedir(), '.claude', 'projects'),
     nmConfigPath: join(nmHome, 'config.yaml'),
     hookPath: join(ROOT, 'hooks', 'rotate.sh'),
+    codexCallPath: join(homedir(), '.claude', 'skills', 'codex', 'scripts', 'codex-call.sh'),
     resumeCommand: `bun run ${join(ROOT, 'src', 'cli.ts')} resume ${policyPath}`,
     notifier: dry
       ? { send: async (n) => print(`# notify [${policy.epicId}/runner] ${n.subject} (key ${n.key})`) }

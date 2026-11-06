@@ -11,6 +11,8 @@ export const FindingSchema = z.object({
 })
 export type Finding = z.infer<typeof FindingSchema>
 
+const FixLoopSchema = z.object({ model: z.string().min(1), maxRounds: z.number().int().min(0), reReview: z.enum(['verify', 'full']).optional() })
+
 export const GateSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('ci_green_at_head') }),
   z.object({ kind: z.literal('linear_on_base') }),
@@ -19,13 +21,22 @@ export const GateSchema = z.discriminatedUnion('kind', [
     skill: z.string().min(1),
     model: z.enum(['opus', 'fable', 'sonnet']),
     passWhen: z.object({ maxSeverity: z.enum(['minor', 'major']) }),
-    fixLoop: z
-      .object({ model: z.string().min(1), maxRounds: z.number().int().min(0), reReview: z.enum(['verify', 'full']).optional() })
-      .optional(),
+    fixLoop: FixLoopSchema.optional(),
+  }),
+  // Adversarial review always runs on Codex gpt-6-sol (review.ts ADVERSARIAL_MODEL). It has no `skill` or `model`
+  // field and the object is strict, so a policy cannot point it at a Claude model.
+  z.strictObject({
+    kind: z.literal('adversarial_review'),
+    passWhen: z.object({ maxSeverity: z.enum(['minor', 'major']) }),
+    fixLoop: FixLoopSchema.optional(),
   }),
 ])
 export type Gate = z.infer<typeof GateSchema>
 export type ReviewGate = Extract<Gate, { kind: 'review' }>
+export type AdversarialGate = Extract<Gate, { kind: 'adversarial_review' }>
+/** The gates that review the diff and can start a fix round. */
+export type FixableGate = ReviewGate | AdversarialGate
+export const isFixableGate = (g: Gate): g is FixableGate => g.kind === 'review' || g.kind === 'adversarial_review'
 
 export const DowngradeSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('touches'), globs: z.array(z.string().min(1)).min(1) }),
@@ -126,7 +137,7 @@ export const BeadStateSchema = z.discriminatedUnion('s', [
 export type BeadState = z.infer<typeof BeadStateSchema>
 
 export const GateVerdictSchema = z.object({
-  gate: z.enum(['ci_green_at_head', 'linear_on_base', 'review']),
+  gate: z.enum(['ci_green_at_head', 'linear_on_base', 'review', 'adversarial_review']),
   head: z.string(),
   pass: z.boolean(),
   findings: z.array(FindingSchema).optional(),
@@ -185,6 +196,7 @@ export const WaveRecordSchema = z.object({
   nmStarted: z.boolean(),
   nmRecoveries: z.number().int().optional(),
   lastReview: LastReviewSchema.optional(),
+  lastAdversarial: LastReviewSchema.optional(),
 })
 export type WaveRecord = z.infer<typeof WaveRecordSchema>
 

@@ -85,4 +85,10 @@ describe('parsePolicyText', () => {
     expect(p.onPass).toBe('stop_at_pr')
     expect(p.waves.map((w) => w.onPass)).toEqual(['stop_at_pr', 'stop_at_pr', 'merge'])
   })
+
+  it('adversarial_review has no model or skill: a policy cannot point it at claude', () => {
+    const base = 'epicId: e\nrepo: /r\nbranch: b\ngates:\n  - kind: adversarial_review\n    passWhen: { maxSeverity: minor }\n'
+    expect(parsePolicyText(base, 'p.yaml').gates).toEqual([{ kind: 'adversarial_review', passWhen: { maxSeverity: 'minor' } }])
+    expect(() => parsePolicyText(`${base}    model: opus\n`, 'p.yaml')).toThrow()
+  })
 })

@@ -5,8 +5,22 @@ import { mustRun } from './exec.ts'
 import { currentVerdicts, downgradeReason } from './gates.ts'
 import { ciState } from './gh.ts'
 import { isBoundedHoldEnd, isRecoverablePushFailure, MAX_NM_RECOVERIES, nmRunArgs, parseAxiFailure, parseAxiOutput } from './nomistakes.ts'
-import { buildReviewArgs, judgeVerify, parseReviewOutput, parseVerifyOutput, reviewPasses, VERIFY_JSON_SCHEMA } from './review.ts'
-import type { Finding, Gate, GateVerdict, ReviewGate } from './types.ts'
+import {
+  ADVERSARIAL_MODEL,
+  ADVERSARIAL_PREAMBLE,
+  ADVERSARIAL_REASONING,
+  buildReviewArgs,
+  CODEX_FINDINGS_SHAPE,
+  CODEX_VERIFY_SHAPE,
+  judgeVerify,
+  parseCodexReview,
+  parseCodexVerify,
+  parseReviewOutput,
+  parseVerifyOutput,
+  reviewPasses,
+  VERIFY_JSON_SCHEMA,
+} from './review.ts'
+import { isFixableGate, type FixableGate, type Finding, type Gate, type GateVerdict } from './types.ts'
 import { jobKey, startWorker } from './worker.ts'
 
 type Step = 'progressed' | 'idle'
@@ -150,13 +164,15 @@ async function runGate(ctx: Ctx, wave: number, gate: Gate, pr: number, head: str
       return { gate: gate.kind, head, pass: merges.length === 0, at }
     }
     case 'review':
+    case 'adversarial_review':
       return runReview(ctx, wave, gate, pr, head)
   }
 }
 
-async function runReview(ctx: Ctx, wave: number, gate: ReviewGate, pr: number, head: string): Promise<GateVerdict> {
+async function runReview(ctx: Ctx, wave: number, gate: FixableGate, pr: number, head: string): Promise<GateVerdict> {
   const w = ctx.wave(wave)
-  const prev = w.lastReview
+  const adversarial = gate.kind === 'adversarial_review'
+  const prev = adversarial ? w.lastAdversarial : w.lastReview
   const verify = prev !== undefined && prev.head !== head && (gate.fixLoop?.reReview ?? 'verify') === 'verify'
   const base = `origin/${ctx.policy.base}`
   const beadsLine = `It delivers beads ${w.beads.join(', ')} of epic ${ctx.policy.epicId} (\`br show <id>\` for the bead text).`
@@ -176,26 +192,42 @@ async function runReview(ctx: Ctx, wave: number, gate: ReviewGate, pr: number, h
           beadsLine,
           'Report every finding with severity nit, minor, major or blocker, file and line.',
         ].join(' ')
-  const args = buildReviewArgs({ skill: gate.skill, model: gate.model, prompt, ...(verify ? { schema: VERIFY_JSON_SCHEMA } : {}) })
-  const r = await mustRun(ctx.deps.exec, { cmd: 'claude', args, cwd: ctx.policy.worktree, timeoutMs: 30 * 60_000 })
-  const common = { wave: wave + 1, pr, head, skill: gate.skill, model: gate.model }
+  const r = adversarial
+    ? await mustRun(ctx.deps.exec, {
+        cmd: ctx.deps.codexCallPath,
+        args: ['--model', ADVERSARIAL_MODEL, '--reasoning', ADVERSARIAL_REASONING],
+        stdin: `${ADVERSARIAL_PREAMBLE}\n\n${prompt}\n\nReply shape: ${verify ? CODEX_VERIFY_SHAPE : CODEX_FINDINGS_SHAPE}`,
+        cwd: ctx.policy.worktree,
+        timeoutMs: 30 * 60_000,
+      })
+    : await mustRun(ctx.deps.exec, {
+        cmd: 'claude',
+        args: buildReviewArgs({ skill: gate.kind === 'review' ? gate.skill : '', model: gate.kind === 'review' ? gate.model : '', prompt, ...(verify ? { schema: VERIFY_JSON_SCHEMA } : {}) }),
+        cwd: ctx.policy.worktree,
+        timeoutMs: 30 * 60_000,
+      })
+  const common = { wave: wave + 1, pr, head, gate: gate.kind, ...(gate.kind === 'review' ? { skill: gate.skill, model: gate.model } : { model: ADVERSARIAL_MODEL }) }
+  const parseVerify = adversarial ? parseCodexVerify : parseVerifyOutput
+  const parseFull = adversarial ? parseCodexReview : parseReviewOutput
   let pass: boolean
   let findings: Finding[]
   if (verify && prev) {
-    const out = parseVerifyOutput(r)
+    const out = parseVerify(r)
     const v = judgeVerify(prev.findings, out, gate.passWhen.maxSeverity)
     pass = v.pass
     findings = v.findings
     await ctx.event('review_verdict', { ...common, mode: 'verify', pass, findings: findings.length, resolved: v.resolved, unresolved: v.unresolved, newFindings: v.newFindings, tokens: out.tokens, costUsd: out.costUsd })
   } else {
-    const out = parseReviewOutput(r)
+    const out = parseFull(r)
     pass = reviewPasses(out.findings, gate.passWhen.maxSeverity)
     findings = out.findings
     await ctx.event('review_verdict', { ...common, mode: 'full', pass, findings: findings.length, tokens: out.tokens, costUsd: out.costUsd })
   }
-  w.lastReview = pass ? undefined : { head, findings: findings.map((f, i) => ({ ...f, id: `F${i + 1}` })) }
+  const last = pass ? undefined : { head, findings: findings.map((f, i) => ({ ...f, id: `F${i + 1}` })) }
+  if (adversarial) w.lastAdversarial = last
+  else w.lastReview = last
   await ctx.save()
-  return { gate: 'review', head, pass, findings, at: ctx.now() }
+  return { gate: gate.kind, head, pass, findings, at: ctx.now() }
 }
 
 async function stopAtPr(ctx: Ctx, wave: number, pr: number, why: string, url?: string): Promise<void> {
@@ -213,7 +245,7 @@ async function stopAtPr(ctx: Ctx, wave: number, pr: number, why: string, url?: s
   })
 }
 
-async function startFix(ctx: Ctx, wave: number, gate: ReviewGate, pr: number, verdict: GateVerdict): Promise<void> {
+async function startFix(ctx: Ctx, wave: number, gate: FixableGate, pr: number, verdict: GateVerdict): Promise<void> {
   const w = ctx.wave(wave)
   const round = w.fixRounds + 1
   const job = { kind: 'fix' as const, wave, round }
@@ -280,18 +312,18 @@ export async function stepGating(ctx: Ctx, wave: number): Promise<Step> {
       await ctx.event('gate_verdict', { wave: wave + 1, pr: st.pr, verdict: { ...v, findings: v.findings?.length } })
     }
     if (!v.pass) {
-      const fix = gate.kind === 'review' ? gate.fixLoop : undefined
-      if (gate.kind === 'review' && fix && w.fixRounds < fix.maxRounds) {
+      const fix = isFixableGate(gate) ? gate.fixLoop : undefined
+      if (isFixableGate(gate) && fix && w.fixRounds < fix.maxRounds) {
         await startFix(ctx, wave, gate, st.pr, v)
         return 'progressed'
       }
-      const why = gate.kind === 'review' && fix ? `${gate.kind} failed and fix rounds are exhausted (${w.fixRounds}/${fix.maxRounds})` : `${gate.kind} failed at ${st.head}`
+      const why = isFixableGate(gate) && fix ? `${gate.kind} failed and fix rounds are exhausted (${w.fixRounds}/${fix.maxRounds})` : `${gate.kind} failed at ${st.head}`
       await stopAtPr(ctx, wave, st.pr, why, view.url)
       return 'progressed'
     }
   }
 
-  const maxRounds = p.gates.reduce((m, g) => (g.kind === 'review' && g.fixLoop ? Math.max(m, g.fixLoop.maxRounds) : m), 0)
+  const maxRounds = p.gates.reduce((m, g) => (isFixableGate(g) && g.fixLoop ? Math.max(m, g.fixLoop.maxRounds) : m), 0)
   const downgrade = downgradeReason(p.downgradeToStopIf, {
     files: await ctx.gh.changedFiles(st.pr),
     lines: (view.additions ?? 0) + (view.deletions ?? 0),

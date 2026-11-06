@@ -28,6 +28,10 @@ gates:
     model: opus
     passWhen: { maxSeverity: minor }
     fixLoop: { model: sonnet, maxRounds: 3 }
+  # Adversarial review always runs on Codex gpt-6-sol. The gate takes no `model` or `skill`.
+  - kind: adversarial_review
+    passWhen: { maxSeverity: minor }
+    fixLoop: { model: sonnet, maxRounds: 3 }
 
 downgradeToStopIf:
   - kind: touches

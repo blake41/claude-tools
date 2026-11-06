@@ -42,6 +42,7 @@ export class FakeWorld {
   baseSha = 'f00dfeed0000000000000000000000000000beef'
   nmOutputs: string[] = []
   reviewOutputs: string[] = []
+  codexOutputs: string[] = []
   pr: FakePr | null = null
   herdrDown = false
   serverStartFails = false
@@ -83,6 +84,7 @@ export class FakeWorld {
       claudeProjectsDir: this.projectsDir,
       nmConfigPath: join(this.root, 'nm', 'config.yaml'),
       hookPath: '/opt/epic-runner/hooks/rotate.sh',
+      codexCallPath: '/opt/epic-runner/fake-codex-call.sh',
       resumeCommand: 'bun run /opt/epic-runner/src/cli.ts resume /work/policy.json',
       notifier: { send: async (n) => void this.notices.push(n) },
       quota: async () => ({ ok: true }),
@@ -142,6 +144,8 @@ export class FakeWorld {
         this.nmExit = null
         return { ...out, code: exit.code, stderr: exit.stderr }
       }
+      case '/opt/epic-runner/fake-codex-call.sh':
+        return ok(this.codexOutputs.shift() ?? '')
       case 'claude':
         return ok(this.reviewOutputs.shift() ?? '')
       case 'br':

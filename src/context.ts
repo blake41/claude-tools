@@ -19,6 +19,8 @@ export type RunnerDeps = {
   claudeProjectsDir: string
   nmConfigPath: string
   hookPath: string
+  /** `codex-call.sh`, the Codex wrapper the adversarial review gate pipes its prompt to. */
+  codexCallPath: string
   resumeCommand: string
   notifier: Notifier
   quota: QuotaCheck

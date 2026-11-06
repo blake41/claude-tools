@@ -476,6 +476,13 @@ const review = { kind: 'review', skill: 'p:thermonuclear-code-quality-review', m
 const reviewOut = (severity: string) =>
   JSON.stringify({ type: 'result', is_error: false, total_cost_usd: 0.5, usage: { input_tokens: 5, output_tokens: 3000, cache_read_input_tokens: 300000, cache_creation_input_tokens: 80000 }, structured_output: { findings: [{ severity, file: 'src/services/render-api.ts', line: 12, summary: 'cache never invalidates' }] } })
 
+const adversarial = { kind: 'adversarial_review', passWhen: { maxSeverity: 'minor' }, fixLoop: { model: 'sonnet', maxRounds: 3 } }
+const codexOut = (severity: string) =>
+  [
+    JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: `\`\`\`json\n${JSON.stringify({ findings: [{ severity, file: 'src/services/render-api.ts', line: 12, summary: 'cache never invalidates' }] })}\n\`\`\`` } }),
+    JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 20 } }),
+  ].join('\n')
+
 describe('merge gates', () => {
   it('a verdict for an older head is void once the PR head moves', async () => {
     const w = new FakeWorld()
@@ -531,6 +538,36 @@ describe('merge gates', () => {
     const done = await ticks(r, 1)
     expect(done.done).toBe(true)
     expect(w.notices.map((n) => n.subject)).toEqual(['Merged PR #4242', 'Epic bd-43aa7 done'])
+  })
+
+  it('adversarial_review runs on codex gpt-6-sol, never on claude, alongside the claude review gate', async () => {
+    const w = new FakeWorld()
+    w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/render-api.ts'], additions: 30, deletions: 20, checks: [greenCheck] }
+    w.reviewOutputs.push(reviewOut('nit'))
+    w.codexOutputs.push(codexOut('minor'))
+    const r = await gatingRunner(w, 'merge', [{ kind: 'ci_green_at_head' }, review, adversarial])
+    const st = await ticks(r, 4)
+    const call = w.callsTo('/opt/epic-runner/fake-codex-call.sh')[0]
+    expect(call?.args).toEqual(['--model', 'gpt-6-sol', '--reasoning', 'xhigh'])
+    expect(call?.stdin).toContain('You are an adversarial reviewer')
+    expect(call?.stdin).toContain(`git diff origin/master...${HEAD1}`)
+    expect(w.callsTo('claude', '-p')).toHaveLength(1)
+    const verdicts = events(w).filter((e) => e.type === 'review_verdict')
+    expect(verdicts.map((v) => v.gate)).toEqual(['review', 'adversarial_review'])
+    expect(verdicts[1]).toMatchObject({ model: 'gpt-6-sol', pass: true, tokens: 30 })
+    expect(st.waves[0]?.state).toEqual({ s: 'merged', pr: 4242, sha: w.baseSha })
+  })
+
+  it('a failed adversarial review starts a fix round with its findings and re-reviews in verify mode', async () => {
+    const w = new FakeWorld()
+    w.pr = { number: 4242, headRefOid: HEAD1, state: 'OPEN', files: ['src/services/render-api.ts'], additions: 30, deletions: 20, checks: [greenCheck] }
+    w.codexOutputs.push(codexOut('major'))
+    const r = await gatingRunner(w, 'merge', [{ kind: 'ci_green_at_head' }, adversarial])
+    const st = await ticks(r, 2)
+    expect(st.worker?.job).toEqual({ kind: 'fix', wave: 0, round: 1 })
+    expect(readFileSync(join(w.worktree, '.epic-runner', 'brief-fix-w1-r1.md'), 'utf8')).toContain('[major] src/services/render-api.ts:12 cache never invalidates')
+    expect(st.waves[0]?.lastAdversarial?.findings[0]?.id).toBe('F1')
+    expect(st.waves[0]?.lastReview).toBeUndefined()
   })
 
   it('a failed review starts a fix worker with the findings, then re-validates through no-mistakes', async () => {

@@ -108,3 +108,59 @@ export function judgeVerify(prior: Array<Finding & { id: string }>, out: Pick<Ve
   const strip = ({ id: _id, ...f }: Finding & { id: string }): Finding => f
   return { pass, findings: [...unresolved.map(strip), ...out.findings], resolved: prior.length - unresolved.length, unresolved: unresolved.length, newFindings: out.findings.length }
 }
+
+/** Adversarial review is always Codex sol, never a Claude model (owner decision, 2026-11-06). */
+export const ADVERSARIAL_MODEL = 'gpt-6-sol'
+export const ADVERSARIAL_REASONING = 'xhigh'
+
+export const ADVERSARIAL_PREAMBLE = [
+  'You are an adversarial reviewer. Do not check style. Construct concrete failure scenarios and test each against the code you read:',
+  'races on async state, deploy-order skew, trust-boundary gaps, retry and restart safety, lifecycle and remount bugs, cross-repo contract drift, and tests that only assert a mock.',
+  'Read only. Do not edit files, commit, or use the network. Cite file and line you actually read. If you are not sure, leave it out.',
+  'Reply with ONLY one JSON object and no other text.',
+].join(' ')
+
+const CodexEventSchema = z.object({
+  type: z.string(),
+  item: z.object({ type: z.string(), text: z.string().optional() }).optional(),
+  usage: z.object({ input_tokens: z.number().default(0), output_tokens: z.number().default(0) }).optional(),
+})
+
+/** Last agent message and token total from `codex exec --json` output. */
+function codexMessage(jsonl: string): { text: string; tokens: number } {
+  let text: string | null = null
+  let tokens = 0
+  for (const line of jsonl.split('\n')) {
+    const t = line.trim()
+    if (!t.startsWith('{')) continue
+    const parsed = CodexEventSchema.safeParse(JSON.parse(t))
+    if (!parsed.success) continue
+    const e = parsed.data
+    if (e.type === 'item.completed' && e.item?.type === 'agent_message' && e.item.text !== undefined) text = e.item.text
+    if (e.type === 'turn.completed' && e.usage) tokens += e.usage.input_tokens + e.usage.output_tokens
+  }
+  if (text === null) throw new Error('codex returned no agent_message')
+  return { text, tokens }
+}
+
+/** The first balanced-looking JSON object in a reply, tolerant of a code fence around it. */
+function jsonObject(text: string): unknown {
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end < start) throw new Error('codex reply holds no JSON object')
+  return JSON.parse(text.slice(start, end + 1))
+}
+
+export function parseCodexReview(jsonl: string): ReviewOutput {
+  const { text, tokens } = codexMessage(jsonl)
+  const out = z.object({ findings: z.array(FindingSchema) }).parse(jsonObject(text))
+  return { findings: out.findings, tokens, costUsd: null }
+}
+
+export function parseCodexVerify(jsonl: string): VerifyOutput {
+  const { text, tokens } = codexMessage(jsonl)
+  return { ...VerifyOutputSchema.parse(jsonObject(text)), tokens, costUsd: null }
+}
+
+export const CODEX_FINDINGS_SHAPE = '{"findings":[{"severity":"nit|minor|major|blocker","file":"path","line":1,"summary":"..."}]}'
+export const CODEX_VERIFY_SHAPE = '{"prior":[{"id":"F1","resolved":true,"note":"..."}],"findings":[{"severity":"nit|minor|major|blocker","file":"path","line":1,"summary":"..."}]}'
