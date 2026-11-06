@@ -191,6 +191,7 @@ describeMaybe('report-review', () => {
         const commands = envelope.next_actions.map((a: { command: string }) => a.command);
         expect(commands).toEqual([
           'report-review ticketed 2026-11-06#3:a1b2c3 <ref>',
+          'report-review fixed 2026-11-06#3:a1b2c3 <ref>',
           'report-review wontfix 2026-11-06#3:a1b2c3 <note>',
         ]);
       } finally {
@@ -332,6 +333,93 @@ describeMaybe('report-review', () => {
     }
   });
 
+  describe('fixed', () => {
+    const ITEM = '2026-11-06#3:a1b2c3';
+
+    it('POSTs item, status fixed and ref (no note key) with the bearer token', async () => {
+      const stub = startStub(() => ok({ ok: true, review: { status: 'fixed' } }));
+      try {
+        const r = await run(['fixed', ITEM, 'clay-run/terra#123'], env(stub.url, 'tok-abc'));
+        expect(r.exitCode).toBe(0);
+        expect(JSON.parse(r.stdout).result.review.status).toBe('fixed');
+        expect(stub.requests).toHaveLength(1);
+        const req = stub.requests[0];
+        expect(req.method).toBe('POST');
+        expect(req.path).toBe('/api/admin/report-reviews');
+        expect(req.authorization).toBe('Bearer tok-abc');
+        expect(JSON.parse(req.bodyText)).toEqual({ item: ITEM, status: 'fixed', ref: 'clay-run/terra#123' });
+      } finally {
+        stub.server.stop(true);
+      }
+    });
+
+    it('passes an optional note through', async () => {
+      const stub = startStub(() => ok({ ok: true }));
+      try {
+        const r = await run(['fixed', ITEM, '#42', 'shipped in the retry fix'], env(stub.url, 'tok'));
+        expect(r.exitCode).toBe(0);
+        expect(JSON.parse(stub.requests[0].bodyText)).toEqual({
+          item: ITEM,
+          status: 'fixed',
+          ref: '#42',
+          note: 'shipped in the retry fix',
+        });
+      } finally {
+        stub.server.stop(true);
+      }
+    });
+
+    it('accepts a PR URL and a ticket id as ref, and a 200-char ref and 500-char note', async () => {
+      const stub = startStub(() => ok({ ok: true }));
+      try {
+        for (const ref of ['https://github.com/clay-run/terra/pull/9', 'ENG-1234', 'x'.repeat(200)]) {
+          const r = await run(['fixed', ITEM, ref], env(stub.url, 'tok'));
+          expect(r.exitCode).toBe(0);
+        }
+        const r = await run(['fixed', ITEM, 'ENG-1', 'n'.repeat(500)], env(stub.url, 'tok'));
+        expect(r.exitCode).toBe(0);
+        expect(stub.requests).toHaveLength(4);
+      } finally {
+        stub.server.stop(true);
+      }
+    });
+
+    it('rejects a missing, blank, or 201-char ref locally with zero requests', async () => {
+      const stub = startStub(() => ok({}));
+      try {
+        const cases: Array<[string[], string]> = [
+          [['fixed', ITEM], 'MISSING_ARG'],
+          [['fixed', ITEM, ''], 'MISSING_ARG'],
+          [['fixed', ITEM, '   '], 'MISSING_ARG'],
+          [['fixed', ITEM, 'x'.repeat(201)], 'INVALID_ARG'],
+        ];
+        for (const [args, code] of cases) {
+          const r = await run(args, env(stub.url, 'tok'));
+          expect(r.exitCode).toBe(1);
+          expect(JSON.parse(r.stdout).error.code).toBe(code);
+        }
+        expect(stub.requests).toHaveLength(0);
+      } finally {
+        stub.server.stop(true);
+      }
+    });
+
+    it('rejects a 501-char note and a bad item ref locally with zero requests', async () => {
+      const stub = startStub(() => ok({}));
+      try {
+        const long = await run(['fixed', ITEM, 'ENG-1', 'n'.repeat(501)], env(stub.url, 'tok'));
+        expect(long.exitCode).toBe(1);
+        expect(JSON.parse(long.stdout).error.code).toBe('INVALID_ARG');
+        const bad = await run(['fixed', '2026-11-06#3', 'ENG-1'], env(stub.url, 'tok'));
+        expect(bad.exitCode).toBe(1);
+        expect(JSON.parse(bad.stdout).error.code).toBe('INVALID_ARG');
+        expect(stub.requests).toHaveLength(0);
+      } finally {
+        stub.server.stop(true);
+      }
+    });
+  });
+
   it('passes the server detail through on 422 (no signature)', async () => {
     const detail = 'this item has no signature, so it cannot be tracked across days';
     const stub = startStub(() => problemResponse(422, detail));
@@ -387,11 +475,11 @@ describeMaybe('report-review', () => {
     expect(JSON.parse(r.stdout).error.code).toBe('UNKNOWN_COMMAND');
   });
 
-  it('root invocation lists exactly the five subcommands', async () => {
+  it('root invocation lists exactly the six subcommands', async () => {
     const r = await run([], env('http://127.0.0.1:1'));
     expect(r.exitCode).toBe(0);
     const names = JSON.parse(r.stdout).result.commands.map((c: { name: string }) => c.name);
-    expect(names).toEqual(['ticketed', 'wontfix', 'list', 'show', 'clear']);
+    expect(names).toEqual(['ticketed', 'fixed', 'wontfix', 'list', 'show', 'clear']);
   });
 
   it('refuses a non-https REPORT_REVIEW_URL unless the host is localhost or 127.0.0.1, before any request', async () => {

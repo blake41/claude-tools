@@ -201,6 +201,7 @@ linear-cli create GTM "Fix login bug" --priority 2
 ```bash
 report-review show 2026-11-06#3                          # resolve date#index to its full reviewRef (no write)
 report-review ticketed 2026-11-06#3:a1b2c3 ENG-1234      # mark ticketed, with a ticket ref
+report-review fixed 2026-11-06#3:a1b2c3 clay-run/terra#123 "retry fix"   # mark fixed: PR URL, owner/repo#123, #123 or ticket ID, optional note
 report-review wontfix 2026-11-06#3:a1b2c3 "expected during deploys"
 report-review list                                       # all item reviews
 report-review clear 2026-11-06#3:a1b2c3                  # remove a review

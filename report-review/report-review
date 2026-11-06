@@ -8,7 +8,7 @@
 #
 # Two HTTP shapes: a write (`report_review_http POST|DELETE` with a body) and
 # a read (`report_review_http GET`, optionally with a path suffix and query).
-# Five subcommands: ticketed, wontfix, list, show, clear.
+# Six subcommands: ticketed, fixed, wontfix, list, show, clear.
 #
 # Auth: REPORT_REVIEW_TOKEN (env, else ~/.config/report-review/token), a
 # personal Clerk API key with scope `render-ops`, sent as a bearer token.
@@ -188,6 +188,30 @@ cmd_ticketed() {
   json_ok "$cmd" "$RESP" "[$(next_action "report-review list" "List all reviews")]"
 }
 
+cmd_fixed() {
+  local cmd="$TOOL_NAME fixed" usage="report-review fixed <date#index:tag> <ref> [note]"
+  local item="${1:-}" ref="${2:-}" note="${3:-}"
+  require_item_ref "$item" "$cmd" "$usage"
+  if [[ -z "${ref//[[:space:]]/}" ]]; then
+    json_error "$cmd" "ref required" "MISSING_ARG" "Usage: $usage (a PR URL, owner/repo#123, #123, or a ticket ID)"
+  fi
+  if (( ${#ref} > 200 )); then
+    json_error "$cmd" "ref too long (${#ref} chars, max 200)" "INVALID_ARG" "Usage: $usage (ref is a PR URL, owner/repo#123, #123, or a ticket ID)"
+  fi
+  if (( ${#note} > 500 )); then
+    json_error "$cmd" "note too long (${#note} chars, max 500)" "INVALID_ARG" "Usage: $usage (note is at most 500 characters)"
+  fi
+  require_token "$cmd"
+  local body
+  if [[ -n "$note" ]]; then
+    body=$(jq -n --arg item "$item" --arg ref "$ref" --arg note "$note" '{item: $item, status: "fixed", ref: $ref, note: $note}')
+  else
+    body=$(jq -n --arg item "$item" --arg ref "$ref" '{item: $item, status: "fixed", ref: $ref}')
+  fi
+  report_review_http "$cmd" POST "$body"
+  json_ok "$cmd" "$RESP" "[$(next_action "report-review list" "List all reviews")]"
+}
+
 cmd_wontfix() {
   local cmd="$TOOL_NAME wontfix" usage="report-review wontfix <date#index:tag> <note>"
   local item="${1:-}" note="${2:-}"
@@ -228,6 +252,7 @@ cmd_show() {
   if [[ -n "$ref" ]]; then
     actions=$(next_actions \
       "$(next_action "report-review ticketed $ref <ref>" "Mark this item as ticketed, after confirming the title")" \
+      "$(next_action "report-review fixed $ref <ref>" "Mark this item as fixed, with the PR or ticket that fixed it, after confirming the title")" \
       "$(next_action "report-review wontfix $ref <note>" "Mark this item as wontfix, after confirming the title")")
   else
     actions="[$(next_action "report-review list" "This item has no signature, so it cannot be reviewed or tracked across days. Nothing is wrong with your command")]"
@@ -249,6 +274,7 @@ cmd_clear() {
 report_review_commands_json() {
   jq -n '[
     {name: "ticketed", description: "Mark a needs-human item as ticketed, with a ticket ref", usage: "report-review ticketed <date#index:tag> <ref>"},
+    {name: "fixed", description: "Mark a needs-human item as fixed, with a PR URL or ticket ref and an optional note", usage: "report-review fixed <date#index:tag> <ref> [note]"},
     {name: "wontfix", description: "Mark a needs-human item as wontfix, with a note", usage: "report-review wontfix <date#index:tag> <note>"},
     {name: "list", description: "List all item reviews", usage: "report-review list"},
     {name: "show", description: "Resolve a needs-human item (date#index, no tag) to its full reviewRef, title and current review", usage: "report-review show <date#index>"},
@@ -263,6 +289,7 @@ main() {
       cmd_tree "$TOOL_NAME" "Record review status on daily report needs-human items" "$(report_review_commands_json)"
       ;;
     ticketed) shift; cmd_ticketed "$@" ;;
+    fixed) shift; cmd_fixed "$@" ;;
     wontfix) shift; cmd_wontfix "$@" ;;
     list) shift; cmd_list "$@" ;;
     show) shift; cmd_show "$@" ;;
