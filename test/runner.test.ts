@@ -147,6 +147,16 @@ describe('bead lifecycle', () => {
     expect(w.notices.at(-1)?.body).toContain('step review failed: 2 findings')
   })
 
+  it('the bounded --wait hold ending (exit 1) is not a failure: the wave keeps validating', async () => {
+    const w = new FakeWorld()
+    const r = await validatingRunner(w)
+    w.nmExit = { code: 1, stderr: 'error: wait of 8m0s elapsed while driving the run\n' }
+    w.nmOutputs.push('run:\n  id: r-01\n  status: running\n')
+    const st = await ticks(r, 1)
+    expect(st.halted).toBeNull()
+    expect(st.waves[0]?.state.s).toBe('validating')
+  })
+
   it('a first prompt that stalls is retried once on a fresh workspace', async () => {
     const w = new FakeWorld()
     w.promptStalls = 1

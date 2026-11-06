@@ -4,7 +4,7 @@ import { actionBlock, type Ctx } from './context.ts'
 import { mustRun } from './exec.ts'
 import { currentVerdicts, downgradeReason } from './gates.ts'
 import { ciState } from './gh.ts'
-import { isRecoverablePushFailure, MAX_NM_RECOVERIES, nmRunArgs, parseAxiFailure, parseAxiOutput } from './nomistakes.ts'
+import { isBoundedHoldEnd, isRecoverablePushFailure, MAX_NM_RECOVERIES, nmRunArgs, parseAxiFailure, parseAxiOutput } from './nomistakes.ts'
 import { buildReviewArgs, judgeVerify, parseReviewOutput, parseVerifyOutput, reviewPasses, VERIFY_JSON_SCHEMA } from './review.ts'
 import type { Finding, Gate, GateVerdict, ReviewGate } from './types.ts'
 import { jobKey, startWorker } from './worker.ts'
@@ -55,7 +55,7 @@ export async function stepValidating(ctx: Ctx, wave: number): Promise<Step> {
   const out = parseAxiOutput(r.stdout)
   await ctx.event('nm_result', { wave: wave + 1, code: r.code, timedOut: r.timedOut, result: out.k, runId: out.runId, tail: r.stdout.slice(-1500), stderr: r.stderr.slice(-500) })
   const nmRun = out.runId ?? w.state.nmRun
-  if (r.code !== 0 && out.k === 'running') {
+  if (r.code !== 0 && out.k === 'running' && !isBoundedHoldEnd(`${r.stdout}\n${r.stderr}`)) {
     await ctx.halt(`no-mistakes exited ${r.code} in wave ${wave + 1}`, {
       key: `${p.epicId}:nm-exit:${wave}:${nmRun || 'none'}:${r.code}`,
       subject: `no-mistakes failed on wave ${wave + 1}`,

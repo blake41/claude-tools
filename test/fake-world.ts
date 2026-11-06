@@ -31,6 +31,7 @@ export class FakeWorld {
   panes = new Map<string, FakeAgent | null>()
   workspaces = 0
   promptStalls = 0
+  nmExit: { code: number; stderr: string } | null = null
   startBusy = 0
   onPrompt: ((text: string) => void) | null = null
   paneText = ''
@@ -134,7 +135,13 @@ export class FakeWorld {
       case 'gh':
         return this.gh(req.args)
       case 'no-mistakes':
-        return ok(this.nmOutputs.shift() ?? 'run:\n  id: r-idle\n  status: running\n')
+      {
+        const out = ok(this.nmOutputs.shift() ?? 'run:\n  id: r-idle\n  status: running\n')
+        if (!this.nmExit) return out
+        const exit = this.nmExit
+        this.nmExit = null
+        return { ...out, code: exit.code, stderr: exit.stderr }
+      }
       case 'claude':
         return ok(this.reviewOutputs.shift() ?? '')
       case 'br':

@@ -36,6 +36,11 @@ export function parseAxiOutput(text: string): AxiResult {
   return { k: 'running', runId: id }
 }
 
+/** `axi run --wait` exits 1 with this text when its bounded hold ends; the run itself is fine. */
+export function isBoundedHoldEnd(text: string): boolean {
+  return /wait of \S+ elapsed while driving the run/.test(text)
+}
+
 export type AxiFailure = { error: string | null; nextAction: string | null }
 
 /** Pull the `error:` line and `branch_sync.next_action.command` out of `no-mistakes axi status` output. */
