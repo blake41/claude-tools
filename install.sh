@@ -39,12 +39,13 @@ tool_files() {
     tmux)             echo "tmux/tmux-monitor" ;;
     beam)             echo "beam/beam" ;;
     session-export)   echo "session-explorer/session-export" ;;
+    report-review)    echo "report-review/report-review" ;;
     *)                return 1 ;;
   esac
 }
 
 DEFAULT_TOOLS="render infisical langsmith"
-EXTRA_TOOLS="linear notion cloudflare c7 db-safe git-prune-merged codex-ask api-probe skill-gen watch-deploy tmux beam session-export"
+EXTRA_TOOLS="linear notion cloudflare c7 db-safe git-prune-merged codex-ask api-probe skill-gen watch-deploy tmux beam session-export report-review"
 
 list_map() {
   for t in $DEFAULT_TOOLS; do printf '%-18s (default) %s\n' "$t" "$(tool_files "$t")"; done

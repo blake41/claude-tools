@@ -1,0 +1,274 @@
+#!/bin/bash
+#
+# report-review — record a human review status on a daily report's
+# needs-human item. Server contract, routes and agent flow: ops-hub
+# docs/report-review.md. Follows the cli-envelope.sh conventions of the other
+# CLIs in this repo: one JSON envelope on stdout, diagnostics on stderr. No
+# generic API passthrough.
+#
+# Two HTTP shapes: a write (`report_review_http POST|DELETE` with a body) and
+# a read (`report_review_http GET`, optionally with a path suffix and query).
+# Five subcommands: ticketed, wontfix, list, show, clear.
+#
+# Auth: REPORT_REVIEW_TOKEN (env, else ~/.config/report-review/token), a
+# personal Clerk API key with scope `render-ops`, sent as a bearer token.
+
+set -euo pipefail
+
+TOOL_NAME="report-review"
+RESP=""
+
+# Temp files hold the bearer token (curl config) and the request body. Remove
+# them on every way out, including a signal mid-request. bash 3.2 (macOS
+# /bin/bash) errors on an empty array under `set -u`, hence the ${arr[@]+...}.
+TMP_FILES=()
+CURL_PID=""
+cleanup() {
+  if [[ -n "$CURL_PID" ]]; then
+    kill "$CURL_PID" 2>/dev/null || true
+    CURL_PID=""
+  fi
+  if (( ${#TMP_FILES[@]} > 0 )); then
+    rm -f ${TMP_FILES[@]+"${TMP_FILES[@]}"}
+    TMP_FILES=()
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+CLI_ENVELOPE_SH="${CLI_ENVELOPE_SH:-$HOME/.local/bin/cli-envelope.sh}"
+if [[ ! -f "$CLI_ENVELOPE_SH" ]]; then
+  echo "report-review: cli-envelope.sh not found at $CLI_ENVELOPE_SH" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$CLI_ENVELOPE_SH"
+
+ITEM_REF_PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2}#[0-9]+:[0-9a-f]{6}$'
+# `show` takes the item WITHOUT its tag: that is the thing it resolves.
+ITEM_NO_TAG_PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2}#[0-9]+$'
+
+require_item_ref() {
+  local value="$1" cmd="$2" usage="$3"
+  if [[ -z "$value" ]]; then
+    json_error "$cmd" "item ref required" "MISSING_ARG" "Usage: $usage"
+  fi
+  if [[ ! "$value" =~ $ITEM_REF_PATTERN ]]; then
+    json_error "$cmd" "Invalid item ref: $value" "INVALID_ARG" \
+      "Item ref must look like YYYY-MM-DD#<index>:<tag>, e.g. 2026-11-06#3:a1b2c3 (the reviewRef of the report item; a ref without :tag is refused)"
+  fi
+}
+
+# The bearer token goes to REPORT_REVIEW_URL, so a typo or a hostile value must
+# not downgrade it to cleartext: https, or http only to this machine.
+URL_PATTERN='^(https://[^/@[:space:]]+|http://(localhost|127\.0\.0\.1)(:[0-9]+)?)(/.*)?$'
+
+require_safe_url() {
+  local cmd="$1" base="$2"
+  if [[ ! "$base" =~ $URL_PATTERN ]]; then
+    json_error "$cmd" "Refusing REPORT_REVIEW_URL: $base" "INVALID_URL" \
+      "REPORT_REVIEW_URL must be https://..., or http://localhost or http://127.0.0.1 for local testing"
+  fi
+}
+
+warn_if_token_file_open() {
+  local file="$1" mode
+  # GNU first: on GNU stat, -f means filesystem status and exits 0 with
+  # non-mode output, so BSD's -f must only run after GNU's -c has failed.
+  mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || true)
+  if [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 8#077) != 0 )); then
+    echo "report-review: warning: $file is readable by group or others (mode $mode); run: chmod 600 $file" >&2
+  fi
+}
+
+load_token() {
+  if [[ -n "${REPORT_REVIEW_TOKEN:-}" ]]; then
+    export REPORT_REVIEW_TOKEN
+    return 0
+  fi
+  local token_file="$HOME/.config/report-review/token"
+  if [[ -f "$token_file" ]]; then
+    warn_if_token_file_open "$token_file"
+    local raw
+    raw=$(cat "$token_file")
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    if [[ -n "$raw" ]]; then
+      REPORT_REVIEW_TOKEN="$raw"
+      export REPORT_REVIEW_TOKEN
+      return 0
+    fi
+  fi
+  return 1
+}
+
+require_token() {
+  local cmd="$1"
+  if ! load_token; then
+    json_error "$cmd" "REPORT_REVIEW_TOKEN not found" "AUTH_MISSING" \
+      "Set REPORT_REVIEW_TOKEN or write a render-ops Clerk API key to ~/.config/report-review/token (chmod 600)"
+  fi
+}
+
+# report_review_http <cmd> <METHOD> [body_json] [path_and_query_suffix]
+# On 2xx sets the global RESP to the response body (not stdout: a subshell
+# would swallow json_error's envelope). Any other status becomes an
+# error envelope that echoes the server's `detail`.
+report_review_http() {
+  local cmd="$1" method="$2" body="${3:-}" suffix="${4:-}"
+  local base="${REPORT_REVIEW_URL:-https://ops-hub-9iu8.onrender.com}"
+  base="${base%/}"
+  require_safe_url "$cmd" "$base"
+  local url="${base}/api/admin/report-reviews${suffix}"
+
+  # Token and body go to curl by file, never argv (visible in the process list).
+  local authfile bodyfile outfile codefile
+  authfile=$(mktemp "${TMPDIR:-/tmp}/report-review.XXXXXX")
+  TMP_FILES+=("$authfile")
+  outfile=$(mktemp "${TMPDIR:-/tmp}/report-review.XXXXXX")
+  TMP_FILES+=("$outfile")
+  codefile=$(mktemp "${TMPDIR:-/tmp}/report-review.XXXXXX")
+  TMP_FILES+=("$codefile")
+  bodyfile=""
+  printf 'header = "Authorization: Bearer %s"\n' "${REPORT_REVIEW_TOKEN:-}" > "$authfile"
+  local curl_args=(-sS -w '%{http_code}' -o "$outfile" -X "$method" -K "$authfile" -H "Accept: application/json")
+  if [[ -n "$body" ]]; then
+    bodyfile=$(mktemp "${TMPDIR:-/tmp}/report-review.XXXXXX")
+    TMP_FILES+=("$bodyfile")
+    printf '%s' "$body" > "$bodyfile"
+    curl_args+=(-H "Content-Type: application/json" --data-binary @"$bodyfile")
+  fi
+
+  # curl runs in the background and is waited on, so a trapped INT/TERM
+  # interrupts the wait and cleanup runs now, not after curl finishes.
+  local http_code rc=0
+  curl "${curl_args[@]}" "$url" > "$codefile" &
+  CURL_PID=$!
+  wait "$CURL_PID" || rc=$?
+  CURL_PID=""
+  http_code=$(cat "$codefile")
+  local resp
+  resp=$(cat "$outfile")
+  cleanup
+  if (( rc != 0 )); then
+    echo "report-review: curl failed (exit $rc) calling $method $url" >&2
+    json_error "$cmd" "curl failed (exit $rc)" "NETWORK_ERROR" "Check network connectivity and REPORT_REVIEW_URL"
+  fi
+
+  if [[ "$http_code" =~ ^2 ]]; then
+    RESP="$resp"
+    return 0
+  fi
+
+  local detail
+  detail=$(printf '%s' "$resp" | jq -r '.detail // .title // empty' 2>/dev/null || true)
+  [[ -n "$detail" ]] || detail="HTTP $http_code"
+  case "$http_code" in
+    401) json_error "$cmd" "Unauthorized: $detail" "UNAUTHORIZED" "Check the token in REPORT_REVIEW_TOKEN or ~/.config/report-review/token" ;;
+    403) json_error "$cmd" "Forbidden: $detail" "FORBIDDEN" "The token needs scope render-ops and an operator role" ;;
+    404) json_error "$cmd" "Not found: $detail" "NOT_FOUND" "Check the date and index of the item ref" ;;
+    409) json_error "$cmd" "Conflict: $detail" "CONFLICT" "The report was replaced after you read the ref. Reload the report and use the new reviewRef" ;;
+    422) json_error "$cmd" "Unprocessable: $detail" "UNPROCESSABLE" "This item has no signature and cannot be reviewed" ;;
+    *)   json_error "$cmd" "HTTP $http_code: $detail" "HTTP_ERROR" "See the server detail above" ;;
+  esac
+}
+
+cmd_ticketed() {
+  local cmd="$TOOL_NAME ticketed" usage="report-review ticketed <date#index:tag> <ref>"
+  local item="${1:-}" ref="${2:-}"
+  require_item_ref "$item" "$cmd" "$usage"
+  if [[ -z "$ref" ]]; then
+    json_error "$cmd" "ref required" "MISSING_ARG" "Usage: $usage"
+  fi
+  require_token "$cmd"
+  local body
+  body=$(jq -n --arg item "$item" --arg ref "$ref" '{item: $item, status: "ticketed", ref: $ref}')
+  report_review_http "$cmd" POST "$body"
+  json_ok "$cmd" "$RESP" "[$(next_action "report-review list" "List all reviews")]"
+}
+
+cmd_wontfix() {
+  local cmd="$TOOL_NAME wontfix" usage="report-review wontfix <date#index:tag> <note>"
+  local item="${1:-}" note="${2:-}"
+  require_item_ref "$item" "$cmd" "$usage"
+  if [[ -z "${note//[[:space:]]/}" ]]; then
+    json_error "$cmd" "note required" "MISSING_ARG" "Usage: $usage (say why it will not be fixed)"
+  fi
+  require_token "$cmd"
+  local body
+  body=$(jq -n --arg item "$item" --arg note "$note" '{item: $item, status: "wontfix", note: $note}')
+  report_review_http "$cmd" POST "$body"
+  json_ok "$cmd" "$RESP" "[$(next_action "report-review list" "List all reviews")]"
+}
+
+cmd_list() {
+  local cmd="$TOOL_NAME list"
+  require_token "$cmd"
+  report_review_http "$cmd" GET
+  json_ok "$cmd" "$RESP" "[]"
+}
+
+cmd_show() {
+  local cmd="$TOOL_NAME show" usage="report-review show <date#index>"
+  local item="${1:-}"
+  if [[ -z "$item" ]]; then
+    json_error "$cmd" "item required" "MISSING_ARG" "Usage: $usage"
+  fi
+  if [[ ! "$item" =~ $ITEM_NO_TAG_PATTERN ]]; then
+    json_error "$cmd" "Invalid item: $item" "INVALID_ARG" \
+      "Item must look like YYYY-MM-DD#<index>, e.g. 2026-11-06#3 (no :tag: show looks the tag up for you)"
+  fi
+  require_token "$cmd"
+  # The only characters in $item are digits, '-' and one '#'; '#' must be
+  # percent-encoded or curl would treat it as a fragment and drop the index.
+  report_review_http "$cmd" GET "" "/item?item=${item/\#/%23}"
+  local ref actions
+  ref=$(printf '%s' "$RESP" | jq -r '.item.reviewRef // empty')
+  if [[ -n "$ref" ]]; then
+    actions=$(next_actions \
+      "$(next_action "report-review ticketed $ref <ref>" "Mark this item as ticketed, after confirming the title")" \
+      "$(next_action "report-review wontfix $ref <note>" "Mark this item as wontfix, after confirming the title")")
+  else
+    actions="[$(next_action "report-review list" "This item has no signature, so it cannot be reviewed or tracked across days. Nothing is wrong with your command")]"
+  fi
+  json_ok "$cmd" "$RESP" "$actions"
+}
+
+cmd_clear() {
+  local cmd="$TOOL_NAME clear" usage="report-review clear <date#index:tag>"
+  local item="${1:-}"
+  require_item_ref "$item" "$cmd" "$usage"
+  require_token "$cmd"
+  local body
+  body=$(jq -n --arg item "$item" '{item: $item}')
+  report_review_http "$cmd" DELETE "$body"
+  json_ok "$cmd" "$RESP" "[]"
+}
+
+report_review_commands_json() {
+  jq -n '[
+    {name: "ticketed", description: "Mark a needs-human item as ticketed, with a ticket ref", usage: "report-review ticketed <date#index:tag> <ref>"},
+    {name: "wontfix", description: "Mark a needs-human item as wontfix, with a note", usage: "report-review wontfix <date#index:tag> <note>"},
+    {name: "list", description: "List all item reviews", usage: "report-review list"},
+    {name: "show", description: "Resolve a needs-human item (date#index, no tag) to its full reviewRef, title and current review", usage: "report-review show <date#index>"},
+    {name: "clear", description: "Remove the review for a needs-human item", usage: "report-review clear <date#index:tag>"}
+  ]'
+}
+
+main() {
+  local sub="${1:-}"
+  case "$sub" in
+    ""|--help|-h)
+      cmd_tree "$TOOL_NAME" "Record review status on daily report needs-human items" "$(report_review_commands_json)"
+      ;;
+    ticketed) shift; cmd_ticketed "$@" ;;
+    wontfix) shift; cmd_wontfix "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    show) shift; cmd_show "$@" ;;
+    clear) shift; cmd_clear "$@" ;;
+    *) json_error "$TOOL_NAME" "Unknown subcommand: $sub" "UNKNOWN_COMMAND" "Run: report-review (with no args) to see the command tree" ;;
+  esac
+}
+
+main "$@"

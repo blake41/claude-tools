@@ -19,6 +19,7 @@ tools/
 ├── infisical/            # Infisical secrets management
 ├── salesforce/           # Salesforce SOQL queries
 ├── linear/               # Linear issue tracking
+├── report-review/        # ops-hub daily report item review CLI (+ tests)
 ├── notion/               # Notion kanban board
 ├── api-probe/            # API endpoint discovery
 ├── session-explorer/     # Claude session history browser (web app) + session-export CLI
@@ -56,6 +57,7 @@ tools/
 | Salesforce | `~/.local/bin/sf-query` | uses `sf` CLI auth |
 | Linear | `~/.local/bin/linear-cli` | `~/.config/linear/api-key` |
 | Notion | `~/.local/bin/notion-cc` | `~/.config/notion/api_token` |
+| report-review | `~/.local/bin/report-review` | `~/.config/report-review/token` |
 | iMessage | `~/.local/bin/imsg` | Full Disk Access required |
 | git-prune-merged | `~/.local/bin/git-prune-merged` | — |
 | watch-deploy | `~/.local/bin/watch-deploy` | — |
@@ -193,6 +195,18 @@ linear-cli issue GTM-3424
 linear-cli search "authentication bug"
 linear-cli create GTM "Fix login bug" --priority 2
 ```
+
+### report-review
+
+```bash
+report-review show 2026-11-06#3                          # resolve date#index to its full reviewRef (no write)
+report-review ticketed 2026-11-06#3:a1b2c3 ENG-1234      # mark ticketed, with a ticket ref
+report-review wontfix 2026-11-06#3:a1b2c3 "expected during deploys"
+report-review list                                       # all item reviews
+report-review clear 2026-11-06#3:a1b2c3                  # remove a review
+```
+
+The key is a personal Clerk API key with scope `render-ops`, minted by an ops-hub `infra_operator` via the `cli:clerk` skill. Server contract: ops-hub `docs/report-review.md`. Tests: `cd report-review && bun test`.
 
 ### Notion
 
