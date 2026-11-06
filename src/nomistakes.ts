@@ -36,6 +36,24 @@ export function parseAxiOutput(text: string): AxiResult {
   return { k: 'running', runId: id }
 }
 
+export type AxiFailure = { error: string | null; nextAction: string | null }
+
+/** Pull the `error:` line and `branch_sync.next_action.command` out of `no-mistakes axi status` output. */
+export function parseAxiFailure(text: string): AxiFailure {
+  const error = topLevel(text, 'error')
+  const cmd = text.match(/^[ \t]+next_action:[ \t]*\n(?:[ \t]+code:.*\n)?[ \t]+command:[ \t]*(.+)$/m)
+  return { error: error ? error.replace(/^"|"$/g, '') : null, nextAction: cmd?.[1]?.trim() ?? null }
+}
+
+const TRANSIENT_PUSH = /step push failed[\s\S]*(remote rejected|fatal error in commit_refs|timed out|connection (reset|refused)|could not resolve host|http 5\d\d|internal server error)/i
+
+/** A push the pipeline can safely redo: the remote failed, our commits were not rejected on merit. */
+export function isRecoverablePushFailure(f: AxiFailure): boolean {
+  return f.error !== null && f.nextAction === 'no-mistakes axi sync --recover' && TRANSIENT_PUSH.test(f.error)
+}
+
+export const MAX_NM_RECOVERIES = 2
+
 export type NmConfigCheck = { k: 'ok' } | { k: 'written' } | { k: 'mismatch'; reason: string }
 
 const NmConfigSchema = z.looseObject({

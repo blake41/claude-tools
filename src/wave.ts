@@ -4,7 +4,7 @@ import { actionBlock, type Ctx } from './context.ts'
 import { mustRun } from './exec.ts'
 import { currentVerdicts, downgradeReason } from './gates.ts'
 import { ciState } from './gh.ts'
-import { nmRunArgs, parseAxiOutput } from './nomistakes.ts'
+import { isRecoverablePushFailure, MAX_NM_RECOVERIES, nmRunArgs, parseAxiFailure, parseAxiOutput } from './nomistakes.ts'
 import { buildReviewArgs, judgeVerify, parseReviewOutput, parseVerifyOutput, reviewPasses, VERIFY_JSON_SCHEMA } from './review.ts'
 import type { Finding, Gate, GateVerdict, ReviewGate } from './types.ts'
 import { jobKey, startWorker } from './worker.ts'
@@ -77,11 +77,23 @@ export async function stepValidating(ctx: Ctx, wave: number): Promise<Step> {
       return 'progressed'
     case 'outcome': {
       if (!out.ok) {
+        const status = await ctx.deps.exec({ cmd: 'no-mistakes', args: ['axi', 'status'], cwd: p.worktree, timeoutMs: 60_000 })
+        const failure = parseAxiFailure(status.stdout)
+        const tries = w.nmRecoveries ?? 0
+        if (isRecoverablePushFailure(failure) && tries < MAX_NM_RECOVERIES) {
+          const rec = await ctx.deps.exec({ cmd: 'no-mistakes', args: ['axi', 'sync', '--recover'], cwd: p.worktree, timeoutMs: 120_000 })
+          await ctx.event('nm_recovered', { wave: wave + 1, attempt: tries + 1, code: rec.code, error: failure.error?.slice(0, 300) })
+          if (rec.code === 0) {
+            await ctx.setWave(wave, { s: 'validating', nmRun }, { nmStarted: true, nmRecoveries: tries + 1 })
+            return 'progressed'
+          }
+        }
         await ctx.setWave(wave, { s: 'validating', nmRun }, { nmStarted: true })
+        const detail = failure.error ? `Error: ${failure.error}\n${failure.nextAction ? `Next action: \`${failure.nextAction}\`\n` : ''}\n` : ''
         await ctx.halt(`no-mistakes outcome ${out.value} on wave ${wave + 1}`, {
           key: `${p.epicId}:nm-outcome:${wave}:${nmRun}:${out.value}`,
           subject: `no-mistakes ${out.value} on wave ${wave + 1}`,
-          body: `\`\`\`\n${r.stdout.slice(-2500)}\n\`\`\``,
+          body: `${detail}\`\`\`\n${(status.stdout || r.stdout).slice(-2500)}\n\`\`\``,
         })
         return 'progressed'
       }

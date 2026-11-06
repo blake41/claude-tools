@@ -1,0 +1,34 @@
+# External calls Epic B: async work and polling. Wave 1 only for the first live run.
+epicId: bd-3ggbr
+repo: /Users/blake/Documents/Development/clay/terra
+branch: epic/bd-3ggbr
+base: master
+prUnit: wave
+onPass: stop_at_pr
+workerModel: sonnet
+workerSandbox: true
+rotateAtTokens: 300000
+herdrSession: epic
+
+# Wave 1: cheap client fixes, enqueue awaits, Delphi pending-push sweep.
+# bd-3ggbr.8 is an owner-action bead: never listed here.
+waves:
+  - beads: [bd-3ggbr.1, bd-3ggbr.2, bd-3ggbr.3]
+    onPass: stop_at_pr
+
+gates:
+  - kind: ci_green_at_head
+  - kind: linear_on_base
+  - kind: review
+    skill: p:thermonuclear-code-quality-review
+    model: opus
+    passWhen: { maxSeverity: minor }
+    fixLoop: { model: sonnet, maxRounds: 3 }
+
+downgradeToStopIf:
+  - kind: touches
+    globs: ['prisma/migrations/**', 'render.yaml', '.github/**', 'Dockerfile*', 'scripts/pre-deploy.sh']
+  - kind: diffLinesOver
+    n: 800
+  - kind: filesOutsideBeadScope
+  - kind: fixRoundsExhausted

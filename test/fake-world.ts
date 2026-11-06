@@ -152,6 +152,10 @@ export class FakeWorld {
     const [group, sub] = a
     if (group === 'status' && sub === 'server') return ok('running\n')
     const target = group === 'agent' && sub === 'start' ? a[a.indexOf('--pane') + 1] : a[2]
+    if (group === 'workspace' && sub === 'close') {
+      this.panes.delete(`${a[2]}:p1`)
+      return ok('{}')
+    }
     if (group === 'workspace' && sub === 'create') {
       const n = ++this.workspaces
       this.panes.set(`w${n}:p1`, null)

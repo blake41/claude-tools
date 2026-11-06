@@ -93,6 +93,78 @@ describe('bead lifecycle', () => {
     expect(w.callsTo('git', 'reset', '--hard', HEAD1)).toHaveLength(0)
   })
 
+  const PUSH_FAILED_STATUS = [
+    'run:',
+    '  id: "r-01"',
+    'branch_sync:',
+    '  next_action:',
+    '    code: recover_custody',
+    '    command: no-mistakes axi sync --recover',
+    'outcome: failed',
+    'error: "step push failed: git push origin x: exit status 1: remote: fatal error in commit_refs\\n ! [remote rejected] x -> y (failure)"',
+    '',
+  ].join('\n')
+  const NM_FAILED = 'run:\n  id: r-01\noutcome: failed\n'
+
+  async function validatingRunner(w: FakeWorld): Promise<Runner> {
+    const r = await startedBead(w)
+    w.commits.add(SHA1)
+    w.writeStatus(`done sha=${SHA1}`)
+    await ticks(r, 1)
+    return r
+  }
+
+  it('a transient push failure is recovered with `axi sync --recover` and the wave re-runs', async () => {
+    const w = new FakeWorld()
+    const r = await validatingRunner(w)
+    w.nmOutputs.push(NM_FAILED, PUSH_FAILED_STATUS, 'synced\n')
+    const st = await ticks(r, 2)
+    expect(st.halted).toBeNull()
+    expect(st.waves[0]?.nmRecoveries).toBe(1)
+    expect(w.callsTo('no-mistakes', 'axi', 'sync', '--recover')).toHaveLength(1)
+    expect(events(w).some((e) => e.type === 'nm_recovered')).toBe(true)
+  })
+
+  it('after two recoveries a third push failure halts and the notice carries the real error', async () => {
+    const w = new FakeWorld()
+    const r = await validatingRunner(w)
+    for (let i = 0; i < 3; i++) w.nmOutputs.push(NM_FAILED, PUSH_FAILED_STATUS, 'synced\n')
+    const st = await ticks(r, 6)
+    expect(w.callsTo('no-mistakes', 'axi', 'sync', '--recover')).toHaveLength(2)
+    expect(st.halted?.reason).toContain('no-mistakes outcome failed')
+    const body = w.notices.at(-1)?.body ?? ''
+    expect(body).toContain('fatal error in commit_refs')
+    expect(body).toContain('no-mistakes axi sync --recover')
+  })
+
+  it('a failure that is not a transient push error halts without recovering', async () => {
+    const w = new FakeWorld()
+    const r = await validatingRunner(w)
+    w.nmOutputs.push(NM_FAILED, 'run:\n  id: r-01\noutcome: failed\nerror: "step review failed: 2 findings"\n')
+    const st = await ticks(r, 2)
+    expect(st.halted).not.toBeNull()
+    expect(w.callsTo('no-mistakes', 'axi', 'sync', '--recover')).toHaveLength(0)
+    expect(w.notices.at(-1)?.body).toContain('step review failed: 2 findings')
+  })
+
+  it('a first prompt that stalls is retried once on a fresh workspace', async () => {
+    const w = new FakeWorld()
+    w.promptStalls = 1
+    const r = new Runner(w.policy(), w.deps())
+    const st = await ticks(r, 2)
+    expect(st.beads['bd-43aa7.1']?.s).toBe('working')
+    expect(w.callsTo('herdr', '--session', 'epic', 'workspace', 'close')).toHaveLength(1)
+    expect(events(w).some((e) => e.type === 'first_prompt_stalled_retry')).toBe(true)
+  })
+
+  it('a first prompt that stalls twice parks the bead', async () => {
+    const w = new FakeWorld()
+    w.promptStalls = 2
+    const r = new Runner(w.policy(), w.deps())
+    const st = await ticks(r, 2)
+    expect(st.beads['bd-43aa7.1']).toEqual({ s: 'parked', reason: 'first prompt failed: agent_prompt_stalled' })
+  })
+
   it('kill: resumes the same session with identical flags and a restart note', async () => {
     const w = new FakeWorld()
     const r = await startedBead(w)

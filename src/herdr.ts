@@ -141,6 +141,10 @@ export class Herdr {
     return { workspaceId: parsed.result.workspace.workspace_id, paneId: parsed.result.root_pane.pane_id }
   }
 
+  async closeWorkspace(workspaceId: string): Promise<void> {
+    await this.call(['workspace', 'close', workspaceId])
+  }
+
   async observe(pane: string): Promise<AgentObservation> {
     const r = await this.call(['pane', 'get', pane])
     if (r.code !== 0) {

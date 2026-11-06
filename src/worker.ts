@@ -73,7 +73,7 @@ export async function writeSettings(ctx: Ctx): Promise<void> {
 export async function startWorker(
   ctx: Ctx,
   job: WorkerJob,
-  opts: { model: string; launch: Launch; restarts: number },
+  opts: { model: string; launch: Launch; restarts: number; freshPaneRetried?: boolean },
 ): Promise<WorkerRun | WorkerEnd> {
   await writeSettings(ctx)
   const pane = await ensurePane(ctx)
@@ -90,6 +90,14 @@ export async function startWorker(
   const briefPath = ctx.paths.brief(jobKey(job))
   const statusCursor = statusLineCount(await ctx.fs.readText(ctx.paths.status))
   const prompted = await ctx.herdr.prompt(pane.pane, firstPrompt(job, opts.launch, briefPath, ctx.paths.status))
+  if (!prompted.ok && prompted.code === 'agent_prompt_stalled' && !opts.freshPaneRetried && ctx.state.workspace) {
+    // A claude that never drew its screen hung at startup (first live run, 2026-11-05). A fresh workspace worked.
+    await ctx.event('first_prompt_stalled_retry', { pane: pane.pane, sessionId })
+    await ctx.herdr.closeWorkspace(ctx.state.workspace.id)
+    ctx.state.workspace = null
+    await ctx.save()
+    return startWorker(ctx, job, { ...opts, freshPaneRetried: true })
+  }
   if (!prompted.ok) {
     const text = await ctx.herdr.readPane(pane.pane, 'visible')
     return parkJob(ctx, job, null, `first prompt failed: ${prompted.code}`, text, 'parked')

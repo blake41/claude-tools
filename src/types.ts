@@ -183,6 +183,7 @@ export const WaveRecordSchema = z.object({
   fixRounds: z.number().int(),
   gatingSince: z.number().nullable(),
   nmStarted: z.boolean(),
+  nmRecoveries: z.number().int().optional(),
   lastReview: LastReviewSchema.optional(),
 })
 export type WaveRecord = z.infer<typeof WaveRecordSchema>
