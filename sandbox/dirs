@@ -50,6 +50,7 @@
 ~/.cmuxterm/claude-settings
 ~/.epic-runner/
 ~/.orbstack/log/
+~/.config/report-review
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
