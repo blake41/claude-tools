@@ -401,7 +401,7 @@ cmd_update() {
   shift
 
   local state="" assignee="" priority="" label_add="" label_rm="" cycle="" parent="" project=""
-  local title="" description="" description_set="" parent_clear=""
+  local title="" description="" description_set="" parent_clear="" due_date=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -411,6 +411,7 @@ cmd_update() {
       --label) label_add="$2"; shift 2 ;;
       --remove-label) label_rm="$2"; shift 2 ;;
       --cycle) cycle="$2"; shift 2 ;;
+      --due-date|--due) due_date="$2"; shift 2 ;;
       --parent)
         if [[ -z "$2" || "$2" == "none" ]]; then parent_clear=1; parent=""; else parent="$2"; fi
         shift 2 ;;
@@ -428,7 +429,7 @@ cmd_update() {
         fi
         description_set=1; shift 2 ;;
       *) json_error "$TOOL_NAME update" "Unknown option: $1" "INVALID_ARG" \
-           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]" ;;
+           "Usage: linear-cli update <ID> [--state STATE] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--due-date YYYY-MM-DD|none] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]" ;;
     esac
   done
 
@@ -459,6 +460,16 @@ cmd_update() {
     local cycle_id
     try_resolve cycle_id resolve_cycle_id "$team_key" "$cycle"
     input=$(echo "$input" | jq --arg id "$cycle_id" '. + {cycleId: $id}')
+  fi
+
+  if [[ -n "$due_date" ]]; then
+    if [[ "$due_date" == "none" ]]; then
+      input=$(echo "$input" | jq '. + {dueDate: null}')
+    elif [[ "$due_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      input=$(echo "$input" | jq --arg v "$due_date" '. + {dueDate: $v}')
+    else
+      json_error "$TOOL_NAME update" "Invalid --due-date: $due_date" "INVALID_ARG" "Use YYYY-MM-DD, or none to clear"
+    fi
   fi
 
   if [[ -n "$parent_clear" ]]; then
@@ -505,7 +516,7 @@ cmd_update() {
   if [[ "$input" != '{}' ]]; then
     local result
     result=$(graphql_mutation \
-      'mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier title state { name } priority assignee { name } parent { identifier } createdAt completedAt labels { nodes { name } } } } }' \
+      'mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier title state { name } priority assignee { name } parent { identifier } dueDate createdAt completedAt labels { nodes { name } } } } }' \
       "$(jq -n --arg id "$issue_uuid" --argjson input "$input" '{id: $id, input: $input}')")
 
     local success
@@ -658,19 +669,21 @@ cmd_create() {
   local state=""
   local created_at=""
   local completed_at=""
+  local due_date=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --state|-s) state="$2"; shift 2 ;;
       --created-at) created_at="$2"; shift 2 ;;
       --completed-at) completed_at="$2"; shift 2 ;;
+      --due-date|--due) due_date="$2"; shift 2 ;;
       --description|-d) description="$2"; shift 2 ;;
       --priority|-p) priority="$2"; shift 2 ;;
       --parent) parent="$2"; shift 2 ;;
       --label|-l) label="$2"; shift 2 ;;
       --assignee|-a) assignee="$2"; shift 2 ;;
       --project) project="$2"; shift 2 ;;
-      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601]" ;;
+      *) json_error "$TOOL_NAME create" "Unknown option: $1" "INVALID_ARG" "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] [--due-date YYYY-MM-DD]" ;;
     esac
   done
 
@@ -712,6 +725,14 @@ cmd_create() {
     input=$(echo "$input" | jq --arg v "$completed_at" '. + {completedAt: $v}')
   fi
 
+  if [[ -n "$due_date" ]]; then
+    if [[ "$due_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      input=$(echo "$input" | jq --arg v "$due_date" '. + {dueDate: $v}')
+    else
+      json_error "$TOOL_NAME create" "Invalid --due-date: $due_date" "INVALID_ARG" "Use YYYY-MM-DD"
+    fi
+  fi
+
   if [[ -n "$description" ]]; then
     input=$(echo "$input" | jq --arg desc "$description" '. + {description: $desc}')
   fi
@@ -738,7 +759,7 @@ cmd_create() {
     input=$(echo "$input" | jq --arg pid "$project_id" '. + {projectId: $pid}')
   fi
 
-  local query='mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url state { name } assignee { name } parent { identifier } createdAt completedAt } } }'
+  local query='mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url state { name } assignee { name } parent { identifier } dueDate createdAt completedAt } } }'
   local payload
   payload=$(jq -n --arg q "$query" --argjson vars "{\"input\": $input}" '{query: $q, variables: $vars}')
 
@@ -855,8 +876,8 @@ if [[ $# -lt 1 ]]; then
     cmd_tree "$TOOL_NAME" "Linear issue management for AI agents" "$(jq -n '[
         {name: "issues",   description: "List issues with optional filters",     usage: "linear-cli issues [--mine] [--project NAME] [--status STATUS] [--parent ID] [--limit N|all]"},
         {name: "issue",    description: "Get details for a specific issue",      usage: "linear-cli issue <ID>"},
-        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"},
-        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601]"},
+        {name: "update",   description: "Update issue fields",                   usage: "linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--remove-label NAME] [--cycle N|current] [--due-date YYYY-MM-DD|none] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"},
+        {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] [--due-date YYYY-MM-DD]"},
         {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
         {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
         {name: "search",   description: "Search issues by text",                usage: "linear-cli search <query>"},
@@ -892,9 +913,9 @@ case "$CMD" in
     ;;
   update)
     [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && json_error "$TOOL_NAME update" "Help requested; nothing changed" "USAGE" \
-      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123|none] [--no-parent] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
+      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--due-date YYYY-MM-DD|none] [--parent TEAM-123|none] [--no-parent] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME update" "Issue ID required" "MISSING_ARG" \
-      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
+      "Usage: linear-cli update <ID> [--state S] [--assignee NAME|me] [--priority 0-4] [--label NAME] [--cycle N|current] [--due-date YYYY-MM-DD|none] [--parent TEAM-123] [--project NAME] [--title TEXT] [--description TEXT|--description-file PATH|-]"
     cmd_update "$@"
     ;;
   comment)
@@ -913,10 +934,10 @@ case "$CMD" in
   create)
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
       json_error "$TOOL_NAME create" "Help requested; nothing created" "USAGE" \
-        "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] (team defaults to GTMOPS)"
+        "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] [--due-date YYYY-MM-DD] (team defaults to GTMOPS)"
     fi
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME create" "Title required" "MISSING_ARG" \
-      "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] (team defaults to GTMOPS)"
+      "Usage: linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] [--due-date YYYY-MM-DD] (team defaults to GTMOPS)"
     if [[ $# -ge 2 && "$1" =~ ^[A-Z][A-Z0-9]*$ && "$2" != --* ]]; then
       cmd_create "$@"
     else
