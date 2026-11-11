@@ -66,9 +66,8 @@ function cco-permissions
     # Ensure browser is ready before entering sandbox
     if command -q ab
         __cco_trace $session_id ab-ensure-start
-        if not ab ensure
-            echo "Browser setup failed. Run 'ab heal' and try again." >&2
-            return 1
+        if not __cco_ab_ensure_wait
+            echo "Browser not ready. Starting claude without it. Run 'ab heal' to recover." >&2
         end
         __cco_trace $session_id ab-ensure-done
     end
@@ -210,6 +209,24 @@ end
 # path), ab-ensure-start, ab-ensure-done, exec (just before claude launches),
 # wrapper-done (cco-cmux-claude, when cmux's wrapper execs claude), session-start and
 # prompt-submit (hooks in ~/.claude/settings.json).
+# At boot, cmux restores tabs before the ab-server launchd job is serving.
+# Retry `ab ensure` until it answers or CCO_AB_WAIT_SECS (default 60) passes.
+function __cco_ab_ensure_wait
+    set -l budget 60
+    set -q CCO_AB_WAIT_SECS; and set budget $CCO_AB_WAIT_SECS
+    set -l deadline (math (date +%s) + $budget)
+    set -l announced false
+    while true
+        ab ensure 2>/dev/null; and return 0
+        test (date +%s) -ge $deadline; and return 1
+        if not $announced
+            echo "Waiting for ab-server (up to "$budget"s)..." >&2
+            set announced true
+        end
+        sleep 2
+    end
+end
+
 function __cco_trace --argument-names session_id point detail
     test "$CCO_STARTUP_TRACE" = 0; and return 0
     printf '%s %s %s %s\n' (/usr/bin/perl -MTime::HiRes=time -e 'printf q(%.3f), time') $session_id $point "$detail" >>$HOME/.cmux/cco-startup-trace.log 2>/dev/null
