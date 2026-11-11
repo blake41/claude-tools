@@ -607,6 +607,31 @@ cmd_comments() {
   json_ok "$TOOL_NAME comments" "$result" "$na"
 }
 
+cmd_comment_delete() {
+  local comment_id="${1:-}"
+  [[ -z "$comment_id" ]] && json_error "$TOOL_NAME comment-delete" "Comment ID required" "MISSING_ARG" \
+    "Usage: linear-cli comment-delete <COMMENT_ID> (get ids from: linear-cli comments <ISSUE_ID>)"
+
+  if [[ ! "$comment_id" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    json_error "$TOOL_NAME comment-delete" "Invalid comment ID '$comment_id'. Expected a UUID" "INVALID_ARG" \
+      "Get comment ids from: linear-cli comments <ISSUE_ID>"
+  fi
+
+  local vars result success
+  vars=$(jq -n --arg id "$comment_id" '{id: $id}')
+  result=$(graphql_mutation 'mutation($id: String!) { commentDelete(id: $id) { success } }' "$vars") || {
+    echo "$result"
+    exit 1
+  }
+  success=$(echo "$result" | jq -r '.data.commentDelete.success')
+
+  if [[ "$success" != "true" ]]; then
+    json_error "$TOOL_NAME comment-delete" "Failed to delete comment" "API_ERROR" "Check the comment ID and that you may delete it"
+  fi
+
+  json_ok "$TOOL_NAME comment-delete" "$(jq -n --arg id "$comment_id" '{id: $id, deleted: true}')" "[]"
+}
+
 cmd_search() {
   local query="$1"
   # Escape quotes in search query
@@ -880,6 +905,7 @@ if [[ $# -lt 1 ]]; then
         {name: "create",   description: "Create a new issue (auto-assigned)",    usage: "linear-cli create [team-key] \"<title>\" [--description \"...\"] [--priority 1-4] [--parent TEAM-123] [--label NAME] [--assignee NAME|me] [--project NAME] [--state STATE] [--created-at ISO8601] [--completed-at ISO8601] [--due-date YYYY-MM-DD]"},
         {name: "comment",  description: "Add a comment to an issue",            usage: "linear-cli comment <ID> \"<body>\""},
         {name: "comments", description: "List comments on an issue",            usage: "linear-cli comments <ID>"},
+        {name: "comment-delete", description: "Delete a comment by its UUID (ids from comments)", usage: "linear-cli comment-delete <COMMENT_ID>"},
         {name: "search",   description: "Search issues by text",                usage: "linear-cli search <query>"},
         {name: "cancel",   description: "Cancel an issue (shortcut for update --state Canceled)", usage: "linear-cli cancel <ID>"},
         {name: "states",   description: "List workflow states for a team",       usage: "linear-cli states <team-key>"},
@@ -925,6 +951,10 @@ case "$CMD" in
   comments)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME comments" "Issue ID required" "MISSING_ARG" "Usage: linear-cli comments <ID>"
     cmd_comments "$1"
+    ;;
+  comment-delete)
+    [[ $# -lt 1 ]] && json_error "$TOOL_NAME comment-delete" "Comment ID required" "MISSING_ARG" "Usage: linear-cli comment-delete <COMMENT_ID>"
+    cmd_comment_delete "$1"
     ;;
   search)
     [[ $# -lt 1 ]] && json_error "$TOOL_NAME search" "Search query required" "MISSING_ARG" "Usage: linear-cli search <query>"
