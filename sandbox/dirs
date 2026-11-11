@@ -51,7 +51,7 @@
 ~/.epic-runner/
 ~/.orbstack/log/
 ~/.config/report-review
-/Users/blake/.thimble/cache
+~/.thimble/cache
 
 # === Cloud / API credentials (needs read-write for token refresh) ===
 ~/.sf
