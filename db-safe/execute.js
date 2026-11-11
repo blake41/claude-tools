@@ -198,7 +198,19 @@ Or use SQL mode instead:
     "delete",
     "deleteMany"
   ];
-  const prisma = new PrismaClient({ datasourceUrl: url }).$extends({
+  let clientOptions = { datasourceUrl: url };
+  try {
+    const adapterPath = resolve(configDir, "node_modules", "@prisma", "adapter-pg");
+    const { PrismaPg } = await import(adapterPath);
+    clientOptions = {
+      adapter: new PrismaPg({
+        connectionString: url,
+        options: "-c TimeZone=UTC",
+        ssl: url.includes("render.com") ? { rejectUnauthorized: false } : undefined
+      })
+    };
+  } catch {}
+  const prisma = new PrismaClient(clientOptions).$extends({
     query: {
       $allModels: {
         async $allOperations({ model, operation, args, query }) {

@@ -310,7 +310,27 @@ async function executePrisma(
   // Add write protection via a client extension — `$use` middleware was
   // removed in Prisma 5+ (this project's client is on a version where
   // `prisma.$use` is undefined; `$extends` is the replacement API).
-  const prisma = new PrismaClient({ datasourceUrl: url }).$extends({
+  // Prisma 7 removed `datasourceUrl`: a client needs a driver adapter. Use the
+  // project's @prisma/adapter-pg when installed (Prisma 7+), and keep
+  // `datasourceUrl` for projects still on Prisma 6 (no adapter package).
+  let clientOptions: Record<string, unknown> = { datasourceUrl: url };
+  try {
+    const adapterPath = resolve(configDir, "node_modules", "@prisma", "adapter-pg");
+    const { PrismaPg } = await import(adapterPath);
+    // Same TLS rule as executeSql; force UTC like the app's own factory, or
+    // timestamptz values drift.
+    clientOptions = {
+      adapter: new PrismaPg({
+        connectionString: url,
+        options: "-c TimeZone=UTC",
+        ssl: url.includes("render.com") ? { rejectUnauthorized: false } : undefined,
+      }),
+    };
+  } catch {
+    // No adapter-pg in the project: Prisma 6 path above.
+  }
+
+  const prisma = new PrismaClient(clientOptions).$extends({
     query: {
       $allModels: {
         async $allOperations({ model, operation, args, query }: any) {
