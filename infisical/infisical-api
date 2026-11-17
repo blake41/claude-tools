@@ -122,10 +122,11 @@ cmd_secrets_list() {
     if [[ "$names_only" == 1 ]]; then
         secrets=$(echo "$raw" | jq '[(.secrets // [])[] | {key: .secretKey}]')
     else
-        # secretKey/secretValue are additive aliases so one jq filter works on
-        # both `list` and `get`. secretValue is the SAME truncated (40 char)
-        # value as `value`, not the full secret that `get` returns.
-        secrets=$(echo "$raw" | jq '[(.secrets // [])[] | (.secretValue | if length > 40 then .[0:40] + "..." else . end) as $v | {key: .secretKey, value: $v, secretKey: .secretKey, secretValue: $v}]')
+        # `secretKey` is an additive alias so one name filter works on `list` and
+        # `get`. There is deliberately NO `secretValue` alias: `list` values are
+        # truncated to 40 chars, and a `get`-style `.secretValue` filter would
+        # silently read truncated data.
+        secrets=$(echo "$raw" | jq '[(.secrets // [])[] | (.secretValue | if length > 40 then .[0:40] + "..." else . end) as $v | {key: .secretKey, value: $v, secretKey: .secretKey}]')
     fi
 
     local na

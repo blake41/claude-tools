@@ -54,8 +54,8 @@ echo "--names / aliases"
 run "--names returns only the key field" \
     '.ok == true and (.result | length) > 0 and ([.result[] | keys[]] | unique) == ["key"]' \
     secrets list -p "$TERRA" -e staging --names
-run "default list keeps key/value and adds secretKey/secretValue equal to them" \
-    '.ok == true and (.result | all(.key == .secretKey and .value == .secretValue)) and ([.result[] | keys[]] | unique) == ["key","secretKey","secretValue","value"]' \
+run "default list keeps key/value and adds only a secretKey alias (no truncated secretValue)" \
+    '.ok == true and (.result | all(.key == .secretKey)) and ([.result[] | keys[]] | unique) == ["key","secretKey","value"]' \
     secrets list -p "$TERRA" -e staging
 
 echo "secrets find"
