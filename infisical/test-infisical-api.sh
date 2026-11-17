@@ -10,6 +10,7 @@ set -uo pipefail
 TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/infisical-api"
 TERRA=320dfa64-a77c-4a51-ba4f-6ccbc21208ef
 KEYSTONE=32d390f3-bada-40cb-942d-536252fe001f
+OPSHUB=c5d811f5-e17a-4a69-a58a-382eb9472bf0
 PASS=0
 FAIL=0
 
@@ -68,6 +69,60 @@ run "find with alias -e dev searches Terra development" \
 run "find with unknown env -> INVALID_ENV" '.error.code == "INVALID_ENV"' secrets find ANTHROPIC -e nope
 run "find with bad regex -> INVALID_ARG" '.error.code == "INVALID_ARG"' secrets find '('
 run "find with empty -p -> MISSING_PROJECT" '.error.code == "MISSING_PROJECT"' secrets find ANTHROPIC -p ""
+
+echo "folder awareness"
+run "list at a root with folders reports folders + note" \
+    '.ok == true and (.folders | index("/ops-hub-log-monitor")) != null and (.note | contains("subfolder") and contains("/ops-hub-log-monitor") and contains("--recursive"))' \
+    secrets list -p "$OPSHUB" -e production --names
+run "list at a root without folders has folders [] and no note" \
+    '.ok == true and .folders == [] and (has("note") | not)' \
+    secrets list -p "$TERRA" -e staging --names
+run "alias note and folder note combine into one string" \
+    '.ok == true and (.note | type == "string" and contains("Mapped") and contains("subfolder"))' \
+    secrets list -p "$OPSHUB" -e prod --names
+run "list --path into the folder lists its secrets" \
+    '.ok == true and (.result | length) > 0 and .folders == [] and (has("note") | not)' \
+    secrets list -p "$OPSHUB" -e production --path /ops-hub-log-monitor --names
+run "export carries folders too" \
+    '.ok == true and (.folders | index("/ops-hub-log-monitor")) != null' \
+    secrets export -p "$OPSHUB" -e production -f json
+run "get miss at a root with folders keeps ok:true 404 and adds a hint" \
+    '.ok == true and .result.statusCode == 404 and (.hint | contains("ops-hub-log-monitor") and contains("secrets find ANTHROPIC_API_KEY"))' \
+    secrets get ANTHROPIC_API_KEY -p "$OPSHUB" -e production
+run "get hit has no hint" \
+    '.ok == true and (has("hint") | not) and .result.secret.secretKey == "ANTHROPIC_API_KEY"' \
+    secrets get ANTHROPIC_API_KEY -p "$OPSHUB" -e production --path /ops-hub-log-monitor
+
+echo "list --recursive"
+run "--recursive --names returns key+path only, including the folder key" \
+    '.ok == true and ([.result[] | keys[]] | unique) == ["key","path"] and any(.result[]; .key == "ANTHROPIC_API_KEY" and .path == "/ops-hub-log-monitor") and any(.result[]; .path == "/")' \
+    secrets list -p "$OPSHUB" -e production --recursive --names
+run "-r alias works and default entries keep value fields plus path" \
+    '.ok == true and ([.result[] | keys[]] | unique) == ["key","path","secretKey","value"]' \
+    secrets list -p "$OPSHUB" -e production -r
+run "--recursive on a project without folders still works" \
+    '.ok == true and (.result | length) > 0' \
+    secrets list -p "$TERRA" -e staging --recursive --names
+
+echo "find at any depth"
+run "find lists visited folder paths and finds the folder-only key" \
+    '.ok == true and (.result.locations_searched | type == "array") and (.result.locations_searched_count == (.result.locations_searched | length)) and any(.result.locations_searched[]; .path == "/ops-hub-log-monitor") and any(.result.matches[]; .key == "ANTHROPIC_API_KEY" and .path == "/ops-hub-log-monitor")' \
+    secrets find '^ANTHROPIC_API_KEY$' -p "$OPSHUB" -e production
+
+echo "layout"
+run "layout shows the folder tree with counts, no names or values" \
+    '.ok == true and (.result.projects | length) == 1 and (.result.projects[0].environments | length) == 1 and (.result.projects[0].environments[0].tree | map(.path)) == ["/","/ops-hub-log-monitor"] and (.result.projects[0].environments[0].tree | all(.secrets | type == "number")) and ([.result.projects[0].environments[0].tree[] | keys[]] | unique | all(. == "path" or . == "depth" or . == "secrets" or . == "description"))' \
+    layout -p "$OPSHUB" -e production
+run "layout -e dev maps alias on Keystone with a note" \
+    '.ok == true and (.note | contains("Mapped")) and (.result.projects[0].environments[0].env == "dev")' \
+    layout -p "$KEYSTONE" -e development
+run "layout with unknown env -> INVALID_ENV" '.error.code == "INVALID_ENV"' layout -p "$TERRA" -e nope
+run "layout with empty -p -> MISSING_PROJECT" '.error.code == "MISSING_PROJECT"' layout -p ""
+run "layout with empty -e -> MISSING_ENV" '.error.code == "MISSING_ENV"' layout -p "$TERRA" -e ""
+run "layout with unknown option -> INVALID_ARG" '.error.code == "INVALID_ARG"' layout --bogus
+run "layout with unknown project -> PROJECT_NOT_FOUND" '.error.code == "PROJECT_NOT_FOUND"' layout -p not-a-real-id
+run "help lists layout" \
+    '.result.commands | any(.name == "layout")' 
 
 rm -f /tmp/.ia-test-err
 echo

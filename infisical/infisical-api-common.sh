@@ -223,3 +223,126 @@ resolve_env() {
     json_error "$CMD_LABEL" "Unknown environment '$want' for project '$PROJECT_NAME' ($pid). Valid slugs: $slugs_csv" "INVALID_ENV" \
         "Re-run with -e one of: $slugs_csv (dev/development and prod/production aliases are mapped automatically)"
 }
+
+# ============================================================================
+# FOLDER AWARENESS. A listing at "/" never shows secrets inside folders, so
+# every read reports the immediate subfolders, and find/layout walk the tree.
+# All helpers are read-only and set globals (no command substitution) so state
+# survives. Bash 3.2 compatible.
+# ============================================================================
+
+MAX_FOLDER_DEPTH=8
+
+# Envelope extras that json_ok (in infisical-api) copies into the output.
+FOLDERS_JSON=""     # JSON array of subfolder paths; empty string = not set
+FOLDER_NOTE=""      # appended to `note`
+HINT=""             # top-level `hint`
+
+# normalize_path <path>: leading slash, no trailing slash (root stays "/").
+normalize_path() {
+    local p="${1:-/}"
+    [[ "$p" == /* ]] || p="/$p"
+    while [[ "${#p}" -gt 1 && "$p" == */ ]]; do p="${p%/}"; done
+    printf '%s' "$p"
+}
+
+# fetch_subfolders <project_id> <env_slug> <path>
+# Sets SUBFOLDERS_JSON ([{path,name,description}]) and returns 0, or sets
+# SUBFOLDERS_ERR and returns 1. Never exits.
+fetch_subfolders() {
+    local pid="$1" env="$2" path base enc raw
+    path=$(normalize_path "${3:-/}")
+    SUBFOLDERS_JSON='[]'
+    SUBFOLDERS_ERR=""
+    enc=$(printf '%s' "$path" | jq -sRr @uri)
+    raw=$(infisical_api "/v1/folders?workspaceId=$pid&environment=$env&path=$enc" 2>/dev/null) || {
+        SUBFOLDERS_ERR="request failed"
+        return 1
+    }
+    base="$path"
+    [[ "$base" == "/" ]] && base=""
+    if printf '%s' "$raw" | jq -e '.folders | type == "array"' >/dev/null 2>&1; then
+        SUBFOLDERS_JSON=$(printf '%s' "$raw" | jq -c --arg b "$base" \
+            '[.folders[] | {path: ($b + "/" + .name), name, description: (if (.description // "") != "" then .description else null end)}]')
+        return 0
+    fi
+    SUBFOLDERS_ERR=$(printf '%s' "$raw" | jq -r 'if type == "object" then (.message // "unexpected response") else "non-JSON response" end' 2>/dev/null || true)
+    [[ -n "$SUBFOLDERS_ERR" ]] || SUBFOLDERS_ERR="non-JSON response"
+    return 1
+}
+
+# set_folder_awareness <project_id> <env_slug> <path> [recursive]
+# Adds `folders` (and, unless recursive, a `note`) to the envelope. If the
+# folder lookup fails the note says so: silence would look like "no folders".
+set_folder_awareness() {
+    local pid="$1" env="$2" path recursive="${4:-0}" n names
+    path=$(normalize_path "${3:-/}")
+    if fetch_subfolders "$pid" "$env" "$path"; then
+        FOLDERS_JSON=$(printf '%s' "$SUBFOLDERS_JSON" | jq -c 'map(.path)')
+        n=$(printf '%s' "$FOLDERS_JSON" | jq 'length')
+        if [[ "$n" -gt 0 && "$recursive" != 1 ]]; then
+            names=$(printf '%s' "$FOLDERS_JSON" | jq -r 'join(", ")')
+            FOLDER_NOTE="This path has $n subfolder$([[ "$n" == 1 ]] || printf 's') ($names). Secrets inside folders are NOT in this list. Use \`secrets list --recursive\`, \`secrets find <regex>\`, or \`--path /<folder>\`."
+        fi
+    else
+        FOLDER_NOTE="Could not list subfolders of $path ($SUBFOLDERS_ERR). Secrets inside folders are NOT in this list; check with \`folders list\` or use \`secrets list --recursive\`."
+    fi
+}
+
+# walk_folder_tree <project_id> <env_slug> [root]
+# Breadth-first walk with a visited set and depth cap MAX_FOLDER_DEPTH.
+# Sets WALK_NODES ([{path,depth,description?}]), WALK_PATHS (newline-separated,
+# every folder actually visited) and WALK_ERRORS ([{path,error}]).
+walk_folder_tree() {
+    local pid="$1" env="$2" root queue visited item path depth child descmap desc
+    root=$(normalize_path "${3:-/}")
+    WALK_NODES='[]'
+    WALK_PATHS=""
+    WALK_ERRORS='[]'
+    queue="$root"$'\t'"0"
+    visited=$'\n'"$root"$'\n'
+    descmap='{}'
+    while [[ -n "$queue" ]]; do
+        item="${queue%%$'\n'*}"
+        if [[ "$queue" == *$'\n'* ]]; then queue="${queue#*$'\n'}"; else queue=""; fi
+        path="${item%%$'\t'*}"
+        depth="${item#*$'\t'}"
+        desc=$(printf '%s' "$descmap" | jq -c --arg p "$path" '.[$p] // null')
+        WALK_NODES=$(printf '%s' "$WALK_NODES" | jq -c --arg p "$path" --argjson d "$depth" --argjson desc "$desc" \
+            '. + [{path: $p, depth: $d} + (if $desc != null then {description: $desc} else {} end)]')
+        WALK_PATHS="$WALK_PATHS$path"$'\n'
+        if fetch_subfolders "$pid" "$env" "$path"; then
+            [[ "$SUBFOLDERS_JSON" == "[]" ]] && continue
+            if [[ "$depth" -ge "$MAX_FOLDER_DEPTH" ]]; then
+                WALK_ERRORS=$(printf '%s' "$WALK_ERRORS" | jq -c --arg p "$path" --arg m "depth cap $MAX_FOLDER_DEPTH reached; folders below this path were not listed" \
+                    '. + [{path: $p, error: $m}]')
+                continue
+            fi
+            descmap=$(printf '%s' "$descmap" | jq -c --argjson s "$SUBFOLDERS_JSON" \
+                '. + ($s | map(select(.description != null) | {(.path): .description}) | add // {})')
+            while IFS= read -r child; do
+                [[ -n "$child" ]] || continue
+                [[ "$visited" == *$'\n'"$child"$'\n'* ]] && continue
+                visited="$visited$child"$'\n'
+                queue="${queue:+$queue$'\n'}$child"$'\t'"$((depth + 1))"
+            done < <(printf '%s' "$SUBFOLDERS_JSON" | jq -r '.[].path')
+        else
+            WALK_ERRORS=$(printf '%s' "$WALK_ERRORS" | jq -c --arg p "$path" --arg m "could not list subfolders: $SUBFOLDERS_ERR" \
+                '. + [{path: $p, error: $m}]')
+        fi
+    done
+}
+
+# load_targets <label> <have_project 0|1> <project_id>
+# Sets TARGETS: one line per project: id<TAB>name<TAB>slug,slug,...
+load_targets() {
+    local label="$1" have_project="$2" project_id="$3" ws
+    if [[ "$have_project" == 1 ]]; then
+        fetch_project_envs "$label" "$project_id"
+        TARGETS=$(printf '%s\t%s\t%s\n' "$project_id" "$PROJECT_NAME" "$(printf '%s' "$PROJECT_ENV_SLUGS" | paste -sd, -)")
+    else
+        ws=$(infisical_api "/v1/workspace") || json_error "$label" "Authentication failed" "AUTH_FAILED" "Check your credentials"
+        api_body_error "$label" "$ws" "API_ERROR" "Check credentials"
+        TARGETS=$(printf '%s' "$ws" | jq -r '.workspaces[] | [.id, .name, ([.environments[]?.slug] | join(","))] | @tsv')
+    fi
+}

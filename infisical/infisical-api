@@ -12,9 +12,17 @@ TOOL_NAME="infisical-api"
 # Wrap json_ok so an env-alias mapping (ENV_NOTE, set by resolve_env) shows up
 # in the envelope as a top-level `note`. Envelopes are byte-identical otherwise.
 eval "_envelope_json_ok() $(declare -f json_ok | tail -n +2)"
+# Folder awareness adds `folders` (JSON array) and `hint`, and appends
+# FOLDER_NOTE to `note` (joined with a space; the alias-only note is unchanged).
 json_ok() {
-    if [[ -n "${ENV_NOTE:-}" ]]; then
-        _envelope_json_ok "$@" | jq --arg n "$ENV_NOTE" '. + {note: $n}'
+    if [[ -n "${ENV_NOTE:-}" || -n "${FOLDER_NOTE:-}" || -n "${FOLDERS_JSON:-}" || -n "${HINT:-}" ]]; then
+        local note="${ENV_NOTE:-}"
+        [[ -n "$note" && -n "${FOLDER_NOTE:-}" ]] && note="$note "
+        note="$note${FOLDER_NOTE:-}"
+        _envelope_json_ok "$@" | jq --arg n "$note" --arg h "${HINT:-}" --argjson f "${FOLDERS_JSON:-null}" '
+            . + (if $n != "" then {note: $n} else {} end)
+              + (if $f != null then {folders: $f} else {} end)
+              + (if $h != "" then {hint: $h} else {} end)'
     else
         _envelope_json_ok "$@"
     fi
@@ -84,14 +92,16 @@ cmd_secrets_list() {
     local environment="prod"
     local path="/"
     local names_only=0
+    local recursive=0
 
     while [[ $# -gt 0 ]]; do
         case $1 in
             -p|--project) project_id="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
             -e|--env) environment="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
             --names) names_only=1; shift ;;
+            -r|--recursive) recursive=1; shift ;;
             --path) path="${2:-/}"; shift $(( $# > 1 ? 2 : 1 )) ;;
-            *) json_error "$TOOL_NAME secrets list" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api secrets list -p <project-id> [-e env] [--path /path] [--names]" ;;
+            *) json_error "$TOOL_NAME secrets list" "Unknown option: $1" "INVALID_ARG" "Usage: infisical-api secrets list -p <project-id> [-e env] [--path /path] [--names] [--recursive|-r]" ;;
         esac
     done
 
@@ -112,6 +122,9 @@ cmd_secrets_list() {
     # never reach this process at all.
     local view_param=""
     [[ "$names_only" == 1 ]] && view_param="&viewSecretValue=false"
+    # recursive=true makes Infisical return secrets from every nested folder,
+    # each carrying its own secretPath.
+    [[ "$recursive" == 1 ]] && view_param="$view_param&recursive=true"
 
     local raw
     raw=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path$view_param") || \
@@ -119,7 +132,15 @@ cmd_secrets_list() {
     api_body_error "$TOOL_NAME secrets list" "$raw" "NOT_FOUND" "Check the path: run 'infisical-api folders list -p $project_id -e $environment' (Keystone secrets live in folders)"
 
     local secrets
-    if [[ "$names_only" == 1 ]]; then
+    if [[ "$recursive" == 1 ]]; then
+        local rpath
+        rpath=$(normalize_path "$path")
+        if [[ "$names_only" == 1 ]]; then
+            secrets=$(echo "$raw" | jq --arg p "$rpath" '[(.secrets // [])[] | {key: .secretKey, path: (.secretPath // $p)}]')
+        else
+            secrets=$(echo "$raw" | jq --arg p "$rpath" '[(.secrets // [])[] | (.secretValue | if length > 40 then .[0:40] + "..." else . end) as $v | {key: .secretKey, value: $v, secretKey: .secretKey, path: (.secretPath // $p)}]')
+        fi
+    elif [[ "$names_only" == 1 ]]; then
         secrets=$(echo "$raw" | jq '[(.secrets // [])[] | {key: .secretKey}]')
     else
         # `secretKey` is an additive alias so one name filter works on `list` and
@@ -128,6 +149,8 @@ cmd_secrets_list() {
         # silently read truncated data.
         secrets=$(echo "$raw" | jq '[(.secrets // [])[] | (.secretValue | if length > 40 then .[0:40] + "..." else . end) as $v | {key: .secretKey, value: $v, secretKey: .secretKey}]')
     fi
+
+    set_folder_awareness "$project_id" "$environment" "$path" "$recursive"
 
     local na
     na=$(next_actions \
@@ -173,6 +196,18 @@ cmd_secrets_get() {
     local result
     result=$(infisical_api "/v3/secrets/raw/$secret_key?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path") || \
         json_error "$TOOL_NAME secrets get" "Failed to get secret" "NOT_FOUND" "Check the secret key, project ID, and environment"
+
+    # A miss comes back as ok:true with a 404 body (kept as is). Add a hint so
+    # nobody concludes the key does not exist when it may sit in a folder.
+    if printf '%s' "$result" | jq -e 'type == "object" and ((.statusCode? // 0) == 404)' >/dev/null 2>&1; then
+        local hpath
+        hpath=$(normalize_path "$path")
+        if fetch_subfolders "$project_id" "$environment" "$hpath" && [[ "$SUBFOLDERS_JSON" != "[]" ]]; then
+            HINT="Not found at $hpath. This path has subfolders: $(printf '%s' "$SUBFOLDERS_JSON" | jq -r 'map(.path) | "[" + join(", ") + "]"'). Try \`infisical-api secrets find $secret_key\`."
+        else
+            HINT="Not found at $hpath. The key may live in another folder, environment or project. Try \`infisical-api secrets find $secret_key\`."
+        fi
+    fi
 
     local na
     na=$(next_actions \
@@ -230,6 +265,8 @@ cmd_secrets_export() {
             json_error "$TOOL_NAME secrets export" "Unknown format: $format" "INVALID_ARG" "Supported formats: env, json"
             ;;
     esac
+
+    set_folder_awareness "$project_id" "$environment" "$path"
 
     local na
     na=$(next_actions \
@@ -608,7 +645,7 @@ cmd_secrets_batch_delete() {
 }
 
 # Search secret KEY NAMES (never values) across projects, environments and the
-# root plus one level of folders. Values are never requested
+# full folder tree (depth cap MAX_FOLDER_DEPTH). Values are never requested
 # (viewSecretValue=false) and only names survive the jq filter.
 cmd_secrets_find() {
     local pattern="" project_id="" environment="" icase=0 have_project=0 have_env=0
@@ -645,20 +682,12 @@ cmd_secrets_find() {
     load_credentials || json_error "$label" "Infisical credentials not found" "AUTH_MISSING" \
         "Set credentials in .env or ~/.config/infisical/credentials"
 
-    # targets: one line per project: id<TAB>name<TAB>slug,slug,...
-    local targets
-    if [[ "$have_project" == 1 ]]; then
-        fetch_project_envs "$label" "$project_id"
-        targets=$(printf '%s\t%s\t%s\n' "$project_id" "$PROJECT_NAME" "$(printf '%s' "$PROJECT_ENV_SLUGS" | paste -sd, -)")
-    else
-        local ws
-        ws=$(infisical_api "/v1/workspace") || json_error "$label" "Authentication failed" "AUTH_FAILED" "Check your credentials"
-        api_body_error "$label" "$ws" "API_ERROR" "Check credentials"
-        targets=$(printf '%s' "$ws" | jq -r '.workspaces[] | [.id, .name, ([.environments[]?.slug] | join(","))] | @tsv')
-    fi
+    # TARGETS: one line per project: id<TAB>name<TAB>slug,slug,...
+    load_targets "$label" "$have_project" "$project_id"
+    local targets="$TARGETS"
 
-    local matches='[]' errors='[]' skipped='[]' notes="" searched=0
-    local pid pname slugcsv slugs envs_to_search real e path folders_raw folder out
+    local matches='[]' errors='[]' skipped='[]' notes="" searched=0 locations='[]'
+    local pid pname slugcsv slugs envs_to_search real e path out
     while IFS=$'\t' read -r pid pname slugcsv; do
         [[ -n "$pid" && -n "$slugcsv" ]] || continue
         slugs=$(printf '%s' "$slugcsv" | tr ',' '\n')
@@ -680,15 +709,17 @@ cmd_secrets_find() {
 
         while IFS= read -r e; do
             [[ -n "$e" ]] || continue
-            # root plus one level of folders
-            local -a paths=("/")
-            folders_raw=$(infisical_api "/v1/folders?workspaceId=$pid&environment=$e&path=%2F" 2>/dev/null || true)
-            while IFS= read -r folder; do
-                [[ -n "$folder" ]] && paths+=("/$folder")
-            done < <(printf '%s' "$folders_raw" | jq -r '.folders[]?.name' 2>/dev/null || true)
+            # root plus every nested folder; a folder that cannot be listed is
+            # reported in `errors`, so a "no match" is never silently partial
+            walk_folder_tree "$pid" "$e" "/"
+            errors=$(jq -c --arg p "$pname" --arg e "$e" --argjson w "$WALK_ERRORS" \
+                '. + [$w[] | {project: $p, env: $e, path: .path, error: .error}]' <<< "$errors")
 
-            for path in "${paths[@]}"; do
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
                 searched=$((searched + 1))
+                locations=$(jq -c --arg p "$pname" --arg pid "$pid" --arg e "$e" --arg path "$path" \
+                    '. + [{project: $p, projectId: $pid, env: $e, path: $path}]' <<< "$locations")
                 local enc
                 enc=$(printf '%s' "$path" | jq -sRr @uri)
                 out=$( { infisical_api "/v3/secrets/raw?workspaceId=$pid&environment=$e&secretPath=$enc&viewSecretValue=false" 2>/dev/null; } \
@@ -705,7 +736,7 @@ cmd_secrets_find() {
                     matches=$(jq -c --arg p "$pname" --arg pid "$pid" --arg e "$e" --arg path "$path" --argjson o "$out" \
                         '. + [$o.names[] | {project: $p, projectId: $pid, env: $e, path: $path, key: .}]' <<< "$matches")
                 fi
-            done
+            done <<< "$WALK_PATHS"
         done <<< "$envs_to_search"
     done <<< "$targets"
 
@@ -719,13 +750,115 @@ cmd_secrets_find() {
 
     local result na
     result=$(jq -n --arg pattern "$pattern" --argjson searched "$searched" --argjson matches "$matches" \
-        --argjson skipped "$skipped" --argjson errors "$errors" \
-        '{pattern: $pattern, locations_searched: $searched, matches: $matches, skipped: $skipped, errors: $errors}')
+        --argjson skipped "$skipped" --argjson errors "$errors" --argjson locations "$locations" \
+        '{pattern: $pattern, locations_searched: $locations, locations_searched_count: $searched, matches: $matches, skipped: $skipped, errors: $errors}')
 
     local first
     first=$(printf '%s' "$matches" | jq -r 'first(.[]) | "infisical-api secrets get \(.key) -p \(.projectId) -e \(.env) --path \(.path)"' 2>/dev/null || true)
     if [[ -n "$first" ]]; then
         na=$(next_actions "$(next_action "$first" "Read the first match (never echo the value)")")
+    else
+        na=$(next_actions)
+    fi
+    json_ok "$label" "$result" "$na"
+}
+
+# Live map of every folder (with the number of secrets directly in each) per
+# project/environment. Counts only: names and values are never shown.
+cmd_layout() {
+    local project_id="" environment="" have_project=0 have_env=0
+    local label="$TOOL_NAME layout"
+    local usage="Usage: infisical-api layout [-p <project-id>] [-e <env>]"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project) project_id="${2:-}"; have_project=1; shift $(( $# > 1 ? 2 : 1 )) ;;
+            -e|--env) environment="${2:-}"; have_env=1; shift $(( $# > 1 ? 2 : 1 )) ;;
+            *) json_error "$label" "Unknown option: $1" "INVALID_ARG" "$usage" ;;
+        esac
+    done
+
+    if [[ "$have_project" == 1 ]]; then require_project "$project_id"; fi
+    if [[ "$have_env" == 1 && -z "$environment" ]]; then
+        json_error "$label" "Environment (-e) is empty" "MISSING_ENV" "$usage"
+    fi
+
+    load_credentials || json_error "$label" "Infisical credentials not found" "AUTH_MISSING" \
+        "Set credentials in .env or ~/.config/infisical/credentials"
+
+    load_targets "$label" "$have_project" "$project_id"
+    local targets="$TARGETS"
+
+    local projects='[]' skipped='[]' notes="" searched=0
+    local pid pname slugcsv slugs envs_to_search real e envs_json node npath out n nodes
+    while IFS=$'\t' read -r pid pname slugcsv; do
+        [[ -n "$pid" && -n "$slugcsv" ]] || continue
+        slugs=$(printf '%s' "$slugcsv" | tr ',' '\n')
+        if [[ "$have_env" == 1 ]]; then
+            if real=$(match_env "$environment" "$slugs"); then
+                envs_to_search="$real"
+                if [[ "$real" != "$environment" ]]; then
+                    notes="$notes Mapped -e '$environment' to '$real' for project '$pname'."
+                fi
+            else
+                skipped=$(jq -c --arg p "$pname" --arg e "$environment" --arg v "$slugcsv" \
+                    '. + [{project: $p, reason: ("no environment \($e); valid: " + $v)}]' <<< "$skipped")
+                continue
+            fi
+        else
+            envs_to_search="$slugs"
+        fi
+
+        envs_json='[]'
+        while IFS= read -r e; do
+            [[ -n "$e" ]] || continue
+            searched=$((searched + 1))
+            walk_folder_tree "$pid" "$e" "/"
+            nodes='[]'
+            while IFS= read -r node; do
+                [[ -n "$node" ]] || continue
+                npath=$(printf '%s' "$node" | jq -r '.path')
+                out=$(infisical_api "/v3/secrets/raw?workspaceId=$pid&environment=$e&secretPath=$(printf '%s' "$npath" | jq -sRr @uri)&viewSecretValue=false" 2>/dev/null \
+                    | jq -c 'if type == "object" and has("secrets")
+                             then {n: (.secrets | length)}
+                             else {error: (if type == "object" then (.message // "unexpected response") else "non-JSON response" end)}
+                             end' 2>/dev/null) || out=""
+                [[ -n "$out" ]] || out='{"error":"request failed"}'
+                nodes=$(jq -c --argjson node "$node" --argjson o "$out" \
+                    '. + [$node + (if $o | has("error") then {secrets: null, error: $o.error} else {secrets: $o.n} end)]' <<< "$nodes")
+            done < <(printf '%s' "$WALK_NODES" | jq -c 'sort_by(.path | split("/")) | .[]')
+
+            envs_json=$(jq -c --arg e "$e" --argjson nodes "$nodes" --argjson werr "$WALK_ERRORS" --argjson cap "$MAX_FOLDER_DEPTH" '
+                . + [{
+                    env: $e,
+                    folders_total: (($nodes | length) - 1),
+                    secrets_total: ([$nodes[].secrets // 0] | add // 0),
+                    depth_cap: $cap,
+                    tree: $nodes,
+                    outline: [$nodes[] | ((.depth * 2) as $i | ("" | . + (" " * $i))
+                        + (if .depth == 0 then "/" else "/" + (.path | split("/") | last) end)
+                        + "  (" + (if .secrets == null then "count unavailable" else "\(.secrets) secret" + (if .secrets == 1 then "" else "s" end) end) + ")"
+                        + (if .description then "  - " + .description else "" end))],
+                    errors: ($werr + [$nodes[] | select(.error) | {path, error}])
+                }]' <<< "$envs_json")
+        done <<< "$envs_to_search"
+
+        projects=$(jq -c --arg p "$pname" --arg pid "$pid" --argjson envs "$envs_json" \
+            '. + [{project: $p, projectId: $pid, environments: $envs}]' <<< "$projects")
+    done <<< "$targets"
+
+    if [[ "$have_env" == 1 && "$searched" == 0 ]]; then
+        json_error "$label" "Unknown environment '$environment' for every project searched: $(printf '%s' "$skipped" | jq -r 'map("\(.project) [\(.reason | sub(".*valid: "; ""))]") | join("; ")')" "INVALID_ENV" \
+            "Use a valid slug per project (dev/development and prod/production aliases are mapped). List them: infisical-api environments list <project-id>"
+    fi
+
+    ENV_NOTE="${notes# }"
+
+    local result na first
+    result=$(jq -n --argjson projects "$projects" --argjson skipped "$skipped" '{projects: $projects, skipped: $skipped}')
+    first=$(printf '%s' "$projects" | jq -r 'first(.[] | select(.environments | length > 0)) | "infisical-api secrets list -p \(.projectId) -e \(.environments[0].env) --recursive --names"' 2>/dev/null || true)
+    if [[ -n "$first" ]]; then
+        na=$(next_actions "$(next_action "$first" "List every key name in the first environment, including folders")")
     else
         na=$(next_actions)
     fi
@@ -1300,6 +1433,9 @@ case "${1:-}" in
             *) json_error "$TOOL_NAME debug" "Unknown subcommand: ${2:-}" "MISSING_ARG" "Usage: infisical-api debug <compare>" ;;
         esac
         ;;
+    layout)
+        shift; cmd_layout "$@"
+        ;;
     share)
         shift; cmd_share "$@"
         ;;
@@ -1311,15 +1447,16 @@ case "${1:-}" in
             {name: "setup", description: "Configure credentials (interactive)", usage: "infisical-api setup"},
             {name: "projects list", description: "List all projects", usage: "infisical-api projects list"},
             {name: "projects get", description: "Get project details", usage: "infisical-api projects get <id>"},
-            {name: "secrets list", description: "List secrets", usage: "infisical-api secrets list -p <project> [-e env] [--path /path] [--names]"},
+            {name: "secrets list", description: "List secrets at ONE path (folders are not included: the envelope lists subfolders in folders/note; --recursive includes every nested folder)", usage: "infisical-api secrets list -p <project> [-e env] [--path /path] [--names] [--recursive|-r]"},
             {name: "secrets get", description: "Get a specific secret", usage: "infisical-api secrets get <key> -p <project> [-e env]"},
-            {name: "secrets find", description: "Search secret key NAMES (never values) across projects/envs/folders", usage: "infisical-api secrets find <regex> [-p <project>] [-e env] [-i]"},
+            {name: "secrets find", description: "Search secret key NAMES (never values) across projects/envs and the full folder tree (depth cap 8); locations_searched lists every folder visited", usage: "infisical-api secrets find <regex> [-p <project>] [-e env] [-i]"},
             {name: "secrets create", description: "Create a secret", usage: "infisical-api secrets create <KEY> <VALUE> -p <project> [-e env] [--path /path]"},
             {name: "secrets update", description: "Update a secret value", usage: "infisical-api secrets update <KEY> <NEW_VALUE> -p <project> [-e env] [--path /path]"},
             {name: "secrets batch-update", description: "Update multiple secrets in one change request/approval/sync", usage: "infisical-api secrets batch-update --file <path|-> -p <project> [-e env] [--path /path]"},
             {name: "secrets delete", description: "Delete a secret", usage: "infisical-api secrets delete <KEY> -p <project> [-e env] [--path /path]"},
             {name: "secrets batch-delete", description: "Delete multiple secrets in one change request/approval/sync", usage: "infisical-api secrets batch-delete --file <path|-> -p <project> [-e env] [--path /path]"},
             {name: "secrets export", description: "Export secrets", usage: "infisical-api secrets export -p <project> [-f env|json]"},
+            {name: "layout", description: "Full folder tree per project/env with the number of secrets directly in each folder (counts only): the live what-folders-exist map", usage: "infisical-api layout [-p <project>] [-e env]"},
             {name: "folders list", description: "List secret folders", usage: "infisical-api folders list -p <project> [-e env] [--path /path]"},
             {name: "environments list", description: "List project environments", usage: "infisical-api environments list <project-id>"},
             {name: "syncs list", description: "List secret syncs", usage: "infisical-api syncs list <project-id>"},
