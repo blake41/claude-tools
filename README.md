@@ -174,7 +174,8 @@ pr-ship                                   # Create PR → green → merge → cl
 
 ```bash
 infisical-api projects list
-infisical-api secrets list -p <id> -e staging
+infisical-api secrets list -p <id> -e staging --names   # keys only, no values
+infisical-api secrets find ANTHROPIC                    # key names across projects/envs/folders
 infisical-api syncs force <sync-id>
 ```
 
